@@ -511,3 +511,131 @@ test "logs scan/read/follow/clear require a session and validate payloads" {
     );
     try std.testing.expect(std.mem.indexOf(u8, scan_bad_payload, "invalid payload") != null);
 }
+
+test "sftp handlers require a session and validate payloads" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // No live session: every sftp handler says so explicitly.
+    const ls = app.dispatch(
+        \\{"id":"1","command":"oars.sftp.ls","payload":{"server_id":"ghost","path":{"utf8":"/etc"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, ls, "not connected") != null);
+
+    const stat = app.dispatch(
+        \\{"id":"2","command":"oars.sftp.stat","payload":{"server_id":"ghost","path":{"utf8":"/etc/hosts"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, stat, "not connected") != null);
+
+    const read = app.dispatch(
+        \\{"id":"3","command":"oars.sftp.read","payload":{"server_id":"ghost","path":{"utf8":"/etc/hosts"},"offset":0,"max":4096}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, read, "not connected") != null);
+
+    const write = app.dispatch(
+        \\{"id":"4","command":"oars.sftp.write","payload":{"server_id":"ghost","path":{"utf8":"/tmp/x"},"offset":0,"base64":"aGk=","transfer_id":42}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, write, "not connected") != null);
+
+    const save = app.dispatch(
+        \\{"id":"5","command":"oars.sftp.save","payload":{"server_id":"ghost","path":{"utf8":"/tmp/x"},"base64":"aGk="}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, save, "not connected") != null);
+
+    const download = app.dispatch(
+        \\{"id":"6","command":"oars.sftp.download","payload":{"server_id":"ghost","remote_path":{"utf8":"/etc/hosts"},"local_path":"/tmp/hosts"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, download, "not connected") != null);
+
+    const mkdir = app.dispatch(
+        \\{"id":"7","command":"oars.sftp.mkdir","payload":{"server_id":"ghost","path":{"utf8":"/tmp/d"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, mkdir, "not connected") != null);
+
+    const rm = app.dispatch(
+        \\{"id":"8","command":"oars.sftp.rm","payload":{"server_id":"ghost","path":{"utf8":"/tmp/x"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, rm, "not connected") != null);
+
+    const rm_recursive = app.dispatch(
+        \\{"id":"9","command":"oars.sftp.rm","payload":{"server_id":"ghost","path":{"utf8":"/tmp/d"},"recursive":true}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, rm_recursive, "not connected") != null);
+
+    const rename = app.dispatch(
+        \\{"id":"10","command":"oars.sftp.rename","payload":{"server_id":"ghost","from":{"utf8":"/tmp/a"},"to":{"utf8":"/tmp/b"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, rename, "not connected") != null);
+
+    const chmod = app.dispatch(
+        \\{"id":"11","command":"oars.sftp.chmod","payload":{"server_id":"ghost","path":{"utf8":"/tmp/x"},"mode":420}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, chmod, "not connected") != null);
+
+    const unzip = app.dispatch(
+        \\{"id":"12","command":"oars.sftp.unzip","payload":{"server_id":"ghost","zip_path":{"utf8":"/tmp/a.zip"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, unzip, "not connected") != null);
+
+    const zip_download = app.dispatch(
+        \\{"id":"13","command":"oars.sftp.zipDownload","payload":{"server_id":"ghost","paths":[{"utf8":"/tmp/a"}],"local_path":"/tmp/a.zip"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, zip_download, "not connected") != null);
+
+    const folder_size = app.dispatch(
+        \\{"id":"14","command":"oars.sftp.folderSize","payload":{"server_id":"ghost","path":{"utf8":"/tmp"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, folder_size, "not connected") != null);
+
+    const poll = app.dispatch(
+        \\{"id":"15","command":"oars.sftp.poll","payload":{"server_id":"ghost"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, poll, "not connected") != null);
+
+    const cancel = app.dispatch(
+        \\{"id":"16","command":"oars.sftp.cancel","payload":{"server_id":"ghost","transfer_id":7}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, cancel, "not connected") != null);
+
+    // Payload validation happens before the session lookup.
+    const bad_b64 = app.dispatch(
+        \\{"id":"17","command":"oars.sftp.ls","payload":{"server_id":"ghost","path":{"base64":"%%%"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_b64, "invalid base64") != null);
+
+    const no_path = app.dispatch(
+        \\{"id":"18","command":"oars.sftp.stat","payload":{"server_id":"ghost","path":{}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, no_path, "path is required") != null);
+
+    const bad_max = app.dispatch(
+        \\{"id":"19","command":"oars.sftp.read","payload":{"server_id":"ghost","path":{"utf8":"/etc/hosts"},"max":999999}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_max, "max must be between 1 and 65536") != null);
+
+    const bad_local = app.dispatch(
+        \\{"id":"20","command":"oars.sftp.download","payload":{"server_id":"ghost","remote_path":{"utf8":"/etc/hosts"},"local_path":"relative.bin"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_local, "local path must be absolute") != null);
+
+    const bad_mode = app.dispatch(
+        \\{"id":"21","command":"oars.sftp.chmod","payload":{"server_id":"ghost","path":{"utf8":"/tmp/x"},"mode":32768}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_mode, "invalid mode") != null);
+
+    const overwrite = app.dispatch(
+        \\{"id":"22","command":"oars.sftp.unzip","payload":{"server_id":"ghost","zip_path":{"utf8":"/tmp/a.zip"},"overwrite":true}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, overwrite, "overwrite is not supported") != null);
+
+    const zero_tid = app.dispatch(
+        \\{"id":"23","command":"oars.sftp.write","payload":{"server_id":"ghost","path":{"utf8":"/tmp/x"},"base64":"aGk=","transfer_id":0}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, zero_tid, "invalid transfer id") != null);
+
+    const bad_payload = app.dispatch(
+        \\{"id":"24","command":"oars.sftp.poll","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_payload, "invalid payload") != null);
+}

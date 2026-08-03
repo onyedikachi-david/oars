@@ -14,10 +14,11 @@ const audit = @import("audit.zig");
 const json = @import("json.zig");
 const logs = @import("logs.zig");
 const shellquote = @import("shellquote.zig");
+const sftpmod = @import("sftp.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 21;
+const handler_count = 36;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -52,6 +53,21 @@ pub const Context = struct {
             .{ .name = "oars.logs.follow", .context = self, .invoke_fn = handleLogsFollow },
             .{ .name = "oars.logs.clear", .context = self, .invoke_fn = handleLogsClear },
             .{ .name = "oars.logs.addSource", .context = self, .invoke_fn = handleLogsAddSource },
+            .{ .name = "oars.sftp.ls", .context = self, .invoke_fn = handleSftpLs },
+            .{ .name = "oars.sftp.stat", .context = self, .invoke_fn = handleSftpStat },
+            .{ .name = "oars.sftp.read", .context = self, .invoke_fn = handleSftpRead },
+            .{ .name = "oars.sftp.write", .context = self, .invoke_fn = handleSftpWrite },
+            .{ .name = "oars.sftp.save", .context = self, .invoke_fn = handleSftpSave },
+            .{ .name = "oars.sftp.download", .context = self, .invoke_fn = handleSftpDownload },
+            .{ .name = "oars.sftp.mkdir", .context = self, .invoke_fn = handleSftpMkdir },
+            .{ .name = "oars.sftp.rm", .context = self, .invoke_fn = handleSftpRm },
+            .{ .name = "oars.sftp.rename", .context = self, .invoke_fn = handleSftpRename },
+            .{ .name = "oars.sftp.chmod", .context = self, .invoke_fn = handleSftpChmod },
+            .{ .name = "oars.sftp.unzip", .context = self, .invoke_fn = handleSftpUnzip },
+            .{ .name = "oars.sftp.zipDownload", .context = self, .invoke_fn = handleSftpZipDownload },
+            .{ .name = "oars.sftp.folderSize", .context = self, .invoke_fn = handleSftpFolderSize },
+            .{ .name = "oars.sftp.poll", .context = self, .invoke_fn = handleSftpPoll },
+            .{ .name = "oars.sftp.cancel", .context = self, .invoke_fn = handleSftpCancel },
         };
         self.policies = .{
             .{ .name = "oars.servers.list", .origins = &allowed_origins },
@@ -75,6 +91,21 @@ pub const Context = struct {
             .{ .name = "oars.logs.follow", .origins = &allowed_origins },
             .{ .name = "oars.logs.clear", .origins = &allowed_origins },
             .{ .name = "oars.logs.addSource", .origins = &allowed_origins },
+            .{ .name = "oars.sftp.ls", .origins = &allowed_origins },
+            .{ .name = "oars.sftp.stat", .origins = &allowed_origins },
+            .{ .name = "oars.sftp.read", .origins = &allowed_origins },
+            .{ .name = "oars.sftp.write", .origins = &allowed_origins },
+            .{ .name = "oars.sftp.save", .origins = &allowed_origins },
+            .{ .name = "oars.sftp.download", .origins = &allowed_origins },
+            .{ .name = "oars.sftp.mkdir", .origins = &allowed_origins },
+            .{ .name = "oars.sftp.rm", .origins = &allowed_origins },
+            .{ .name = "oars.sftp.rename", .origins = &allowed_origins },
+            .{ .name = "oars.sftp.chmod", .origins = &allowed_origins },
+            .{ .name = "oars.sftp.unzip", .origins = &allowed_origins },
+            .{ .name = "oars.sftp.zipDownload", .origins = &allowed_origins },
+            .{ .name = "oars.sftp.folderSize", .origins = &allowed_origins },
+            .{ .name = "oars.sftp.poll", .origins = &allowed_origins },
+            .{ .name = "oars.sftp.cancel", .origins = &allowed_origins },
         };
         return .{
             .policy = .{ .enabled = true, .commands = &self.policies },
@@ -1131,6 +1162,549 @@ fn handleLogsAddSource(context: *anyopaque, invocation: native_sdk.bridge.Invoca
     if (self.manager.get(payload.server_id)) |session| {
         session.logs_cache.invalidate(self.allocator);
     }
+    return ok_json;
+}
+
+// --- SFTP (spec 05) ----------------------------------------------------------
+
+const sftp_wait_ns = 20 * std.time.ns_per_s;
+const sftp_folder_size_timeout_ns = 60 * std.time.ns_per_s;
+const sftp_folder_size_cache_ns = 5 * std.time.ns_per_min;
+const sftp_folder_size_cmd_cap: usize = 4 * 1024;
+
+const SftpPathPayload = struct {
+    server_id: []const u8,
+    path: sftpmod.RemotePathJson,
+};
+
+const SftpReadPayload = struct {
+    server_id: []const u8,
+    path: sftpmod.RemotePathJson,
+    offset: u64 = 0,
+    max: usize = sftpmod.chunk_size,
+};
+
+const SftpWritePayload = struct {
+    server_id: []const u8,
+    path: sftpmod.RemotePathJson,
+    offset: u64 = 0,
+    base64: []const u8,
+    transfer_id: u32,
+    total: ?u64 = null,
+};
+
+const SftpSavePayload = struct {
+    server_id: []const u8,
+    path: sftpmod.RemotePathJson,
+    base64: []const u8,
+};
+
+const SftpDownloadPayload = struct {
+    server_id: []const u8,
+    remote_path: sftpmod.RemotePathJson,
+    local_path: []const u8,
+};
+
+const SftpRmPayload = struct {
+    server_id: []const u8,
+    path: sftpmod.RemotePathJson,
+    recursive: bool = false,
+};
+
+const SftpRenamePayload = struct {
+    server_id: []const u8,
+    from: sftpmod.RemotePathJson,
+    to: sftpmod.RemotePathJson,
+};
+
+const SftpChmodPayload = struct {
+    server_id: []const u8,
+    path: sftpmod.RemotePathJson,
+    mode: u32,
+};
+
+const SftpUnzipPayload = struct {
+    server_id: []const u8,
+    zip_path: sftpmod.RemotePathJson,
+    dest_dir: ?sftpmod.RemotePathJson = null,
+    overwrite: bool = false,
+};
+
+const SftpZipDownloadPayload = struct {
+    server_id: []const u8,
+    paths: []const sftpmod.RemotePathJson,
+    local_path: []const u8,
+};
+
+const SftpTransferIdPayload = struct {
+    server_id: []const u8,
+    transfer_id: u32,
+};
+
+/// Decodes + validates a RemotePath (spec 05 §5). On failure writes the
+/// error response and returns it; on success stores the owned raw bytes in
+/// `out_path` and returns null.
+fn decodeSftpPathArg(self: *Context, output: []u8, path: sftpmod.RemotePathJson, out_path: *?[]u8) ?[]const u8 {
+    const raw = sftpmod.decodeRemotePath(self.allocator, path) catch |err| {
+        return respondError(output, switch (err) {
+            error.NoPath => "path is required",
+            error.InvalidBase64 => "invalid base64 path",
+            error.InvalidPath => "path contains control characters",
+            error.OutOfMemory => "out of memory",
+        });
+    };
+    sftpmod.validatePath(raw) catch |err| {
+        self.allocator.free(raw);
+        return respondError(output, switch (err) {
+            error.NoPath => "path is required",
+            error.InvalidPath => "path contains control characters",
+            else => "invalid path",
+        });
+    };
+    out_path.* = raw;
+    return null;
+}
+
+/// Validates a LOCAL path (the native save dialog result). Returns the
+/// error response on failure, null on success.
+fn validateSftpLocalPathArg(output: []u8, path: []const u8) ?[]const u8 {
+    sftpmod.validateLocalPath(path) catch |err| {
+        return respondError(output, switch (err) {
+            error.NoPath => "local path is required",
+            error.InvalidPath => "local path must be absolute and free of control characters",
+            else => "invalid local path",
+        });
+    };
+    return null;
+}
+
+/// Decodes a base64 payload (chunk or editor save). On failure writes the
+/// error response and returns it; on success stores the owned bytes in
+/// `out_data` and returns null.
+fn decodeSftpBase64Arg(self: *Context, output: []u8, b64: []const u8, max: usize, out_data: *?[]u8) ?[]const u8 {
+    const size = std.base64.standard.Decoder.calcSizeForSlice(b64) catch {
+        return respondError(output, "invalid base64");
+    };
+    if (size > max) return respondError(output, "chunk too large");
+    const buf = self.allocator.alloc(u8, size) catch {
+        return respondError(output, "out of memory");
+    };
+    std.base64.standard.Decoder.decode(buf, b64) catch {
+        self.allocator.free(buf);
+        return respondError(output, "invalid base64");
+    };
+    out_data.* = buf;
+    return null;
+}
+
+/// Waits for a synchronous SFTP outcome (bounded), then copies the
+/// worker-built JSON into the output buffer and frees it.
+fn sftpSyncOutcome(self: *Context, output: []u8, outcome: *sessions.SftpOutcome) []const u8 {
+    const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + sftp_wait_ns;
+    outcome.wait(self.io, deadline);
+    if (!outcome.isDone()) return respondError(output, "timed out waiting for the server");
+    if (!outcome.ok) return respondError(output, outcome.message());
+    const payload_json = outcome.json orelse return respondError(output, "no response payload");
+    defer self.allocator.free(payload_json);
+    if (payload_json.len > output.len) return respondError(output, "response too large");
+    @memcpy(output[0..payload_json.len], payload_json);
+    return output[0..payload_json.len];
+}
+
+/// Maps queueing errors to user-facing messages.
+fn sftpQueueError(output: []u8, err: anyerror) []const u8 {
+    return respondError(output, switch (err) {
+        error.NoSession => "not connected",
+        error.NotReady => "session not ready",
+        else => "sftp failed",
+    });
+}
+
+/// Marks a transfer record failed (queue failure after the record was
+/// created, so poll never shows it stuck as queued).
+fn sftpFailTransfer(session: *sessions.Session, op_id: u32, msg: []const u8) void {
+    session.sftp_transfers.lock();
+    if (session.sftp_transfers.get(op_id)) |t| {
+        t.status = .failed;
+        t.err = msg;
+    }
+    session.sftp_transfers.unlock();
+}
+
+/// `{ok, op_id}` response for async ops.
+fn sftpOpIdResponse(output: []u8, op_id: u32) []const u8 {
+    var writer = std.Io.Writer.fixed(output);
+    writer.print("{{\"ok\":true,\"op_id\":{d}}}", .{op_id}) catch return output[0..0];
+    return writer.buffered();
+}
+
+/// `<dir>/<zip stem>` for Expand-in-place (spec 05 §5: a folder named after
+/// the archive appears next to it).
+fn sftpDefaultDest(allocator: std.mem.Allocator, zip_path: []const u8) ![]u8 {
+    const base = std.fs.path.basename(zip_path);
+    var stem = base;
+    if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| {
+        if (dot > 0) stem = base[0..dot];
+    }
+    if (std.fs.path.dirname(zip_path)) |dir| {
+        if (dir.len == 0) return allocator.dupe(u8, stem);
+        if (std.mem.eql(u8, dir, "/")) return std.fmt.allocPrint(allocator, "/{s}", .{stem});
+        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, stem });
+    }
+    return allocator.dupe(u8, stem);
+}
+
+fn handleSftpLs(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SftpPathPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    var path: ?[]u8 = null;
+    if (decodeSftpPathArg(self, output, parsed.value.path, &path)) |err_response| return err_response;
+    defer self.allocator.free(path.?);
+    var outcome: sessions.SftpOutcome = .{};
+    self.manager.sftpLs(parsed.value.server_id, path.?, &outcome) catch |err| return sftpQueueError(output, err);
+    return sftpSyncOutcome(self, output, &outcome);
+}
+
+fn handleSftpStat(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SftpPathPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    var path: ?[]u8 = null;
+    if (decodeSftpPathArg(self, output, parsed.value.path, &path)) |err_response| return err_response;
+    defer self.allocator.free(path.?);
+    var outcome: sessions.SftpOutcome = .{};
+    self.manager.sftpStat(parsed.value.server_id, path.?, &outcome) catch |err| return sftpQueueError(output, err);
+    return sftpSyncOutcome(self, output, &outcome);
+}
+
+/// Explicit-offset 64 KB read (spec 05 §5); the worker answers with
+/// `{ok, base64, eof}`.
+fn handleSftpRead(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SftpReadPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    if (parsed.value.max == 0 or parsed.value.max > sftpmod.chunk_size) {
+        return respondError(output, "max must be between 1 and 65536 bytes");
+    }
+    var path: ?[]u8 = null;
+    if (decodeSftpPathArg(self, output, parsed.value.path, &path)) |err_response| return err_response;
+    defer self.allocator.free(path.?);
+    var outcome: sessions.SftpOutcome = .{};
+    self.manager.sftpRead(parsed.value.server_id, path.?, parsed.value.offset, parsed.value.max, &outcome) catch |err| return sftpQueueError(output, err);
+    return sftpSyncOutcome(self, output, &outcome);
+}
+
+/// Upload chunk under the frontend's unguessable transfer_id (spec 05 §5):
+/// the first chunk registers the transfer, the last chunk no-clobber
+/// renames `<path>.partial` into place.
+fn handleSftpWrite(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SftpWritePayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (payload.transfer_id == 0) return respondError(output, "invalid transfer id");
+    var path: ?[]u8 = null;
+    if (decodeSftpPathArg(self, output, payload.path, &path)) |err_response| return err_response;
+    defer self.allocator.free(path.?);
+    var data: ?[]u8 = null;
+    if (decodeSftpBase64Arg(self, output, payload.base64, sftpmod.chunk_size, &data)) |err_response| return err_response;
+    defer self.allocator.free(data.?);
+
+    const session = self.manager.get(payload.server_id) orelse return respondError(output, "not connected");
+    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
+    self.manager.sftpStartUpload(session, payload.transfer_id, path.?) catch return respondError(output, "out of memory");
+    const total = payload.total orelse (payload.offset +| data.?.len);
+    var outcome: sessions.SftpOutcome = .{};
+    self.manager.sftpWriteChunk(payload.server_id, path.?, payload.offset, data.?, total, payload.transfer_id, &outcome) catch |err| return sftpQueueError(output, err);
+    return sftpSyncOutcome(self, output, &outcome);
+}
+
+/// Editor save (spec 05 §4.2): temp file + atomic posix-rename on the
+/// worker; refusal when the server lacks the extension.
+fn handleSftpSave(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SftpSavePayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    var path: ?[]u8 = null;
+    if (decodeSftpPathArg(self, output, parsed.value.path, &path)) |err_response| return err_response;
+    defer self.allocator.free(path.?);
+    var data: ?[]u8 = null;
+    if (decodeSftpBase64Arg(self, output, parsed.value.base64, sftpmod.max_inline_bytes, &data)) |err_response| return err_response;
+    defer self.allocator.free(data.?);
+    var outcome: sessions.SftpOutcome = .{};
+    self.manager.sftpSave(parsed.value.server_id, path.?, data.?, &outcome) catch |err| return sftpQueueError(output, err);
+    return sftpSyncOutcome(self, output, &outcome);
+}
+
+/// Remote→local download through the native writer: the core owns the
+/// `<local>.partial` file and no-clobber renames it only after success
+/// (spec 05 §5). Async — progress rides the transfer record.
+fn handleSftpDownload(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SftpDownloadPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (validateSftpLocalPathArg(output, payload.local_path)) |err_response| return err_response;
+    var remote: ?[]u8 = null;
+    if (decodeSftpPathArg(self, output, payload.remote_path, &remote)) |err_response| return err_response;
+    defer self.allocator.free(remote.?);
+    const partial = std.fmt.allocPrint(self.allocator, "{s}.partial", .{payload.local_path}) catch return respondError(output, "out of memory");
+    defer self.allocator.free(partial);
+
+    const session = self.manager.get(payload.server_id) orelse return respondError(output, "not connected");
+    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
+    const op_id = self.manager.sftpStartTransfer(session, "download", remote.?) catch return respondError(output, "out of memory");
+    self.manager.sftpDownload(payload.server_id, remote.?, partial, payload.local_path, op_id, null) catch |err| {
+        sftpFailTransfer(session, op_id, "failed to queue");
+        return sftpQueueError(output, err);
+    };
+    return sftpOpIdResponse(output, op_id);
+}
+
+fn handleSftpMkdir(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SftpPathPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    var path: ?[]u8 = null;
+    if (decodeSftpPathArg(self, output, parsed.value.path, &path)) |err_response| return err_response;
+    defer self.allocator.free(path.?);
+    var outcome: sessions.SftpOutcome = .{};
+    self.manager.sftpMkdir(parsed.value.server_id, path.?, &outcome) catch |err| return sftpQueueError(output, err);
+    return sftpSyncOutcome(self, output, &outcome);
+}
+
+/// Plain delete is synchronous; recursive deletes run as an async transfer
+/// with per-entry progress and cancel (spec 05 §5).
+fn handleSftpRm(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SftpRmPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    var path: ?[]u8 = null;
+    if (decodeSftpPathArg(self, output, payload.path, &path)) |err_response| return err_response;
+    defer self.allocator.free(path.?);
+
+    if (!payload.recursive) {
+        var outcome: sessions.SftpOutcome = .{};
+        self.manager.sftpRm(payload.server_id, path.?, false, 0, &outcome) catch |err| return sftpQueueError(output, err);
+        return sftpSyncOutcome(self, output, &outcome);
+    }
+    const session = self.manager.get(payload.server_id) orelse return respondError(output, "not connected");
+    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
+    const op_id = self.manager.sftpStartTransfer(session, "rm", path.?) catch return respondError(output, "out of memory");
+    // The worker's recursive path never writes the outcome; it signals
+    // through the transfer record instead.
+    var dummy: sessions.SftpOutcome = .{};
+    self.manager.sftpRm(payload.server_id, path.?, true, op_id, &dummy) catch |err| {
+        sftpFailTransfer(session, op_id, "failed to queue");
+        return sftpQueueError(output, err);
+    };
+    return sftpOpIdResponse(output, op_id);
+}
+
+fn handleSftpRename(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SftpRenamePayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    var from: ?[]u8 = null;
+    if (decodeSftpPathArg(self, output, parsed.value.from, &from)) |err_response| return err_response;
+    defer self.allocator.free(from.?);
+    var to: ?[]u8 = null;
+    if (decodeSftpPathArg(self, output, parsed.value.to, &to)) |err_response| return err_response;
+    defer self.allocator.free(to.?);
+    var outcome: sessions.SftpOutcome = .{};
+    self.manager.sftpRename(parsed.value.server_id, from.?, to.?, &outcome) catch |err| return sftpQueueError(output, err);
+    return sftpSyncOutcome(self, output, &outcome);
+}
+
+fn handleSftpChmod(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SftpChmodPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (payload.mode & ~@as(u32, 0o7777) != 0) return respondError(output, "invalid mode");
+    var path: ?[]u8 = null;
+    if (decodeSftpPathArg(self, output, payload.path, &path)) |err_response| return err_response;
+    defer self.allocator.free(path.?);
+    var outcome: sessions.SftpOutcome = .{};
+    self.manager.sftpChmod(payload.server_id, path.?, payload.mode, &outcome) catch |err| return sftpQueueError(output, err);
+    return sftpSyncOutcome(self, output, &outcome);
+}
+
+/// Expand in place (spec 05 §5): central-directory preflight on the worker,
+/// overwrite disabled, extraction into `dest_dir` (defaults to a folder
+/// named after the archive next to it). Async.
+fn handleSftpUnzip(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SftpUnzipPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (payload.overwrite) return respondError(output, "overwrite is not supported; choose an empty destination");
+    var zip_path: ?[]u8 = null;
+    if (decodeSftpPathArg(self, output, payload.zip_path, &zip_path)) |err_response| return err_response;
+    defer self.allocator.free(zip_path.?);
+    var dest: ?[]u8 = null;
+    if (payload.dest_dir) |d| {
+        if (decodeSftpPathArg(self, output, d, &dest)) |err_response| return err_response;
+    } else {
+        dest = sftpDefaultDest(self.allocator, zip_path.?) catch return respondError(output, "out of memory");
+    }
+    defer self.allocator.free(dest.?);
+
+    const session = self.manager.get(payload.server_id) orelse return respondError(output, "not connected");
+    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
+    const op_id = self.manager.sftpStartTransfer(session, "unzip", zip_path.?) catch return respondError(output, "out of memory");
+    self.manager.sftpUnzip(payload.server_id, zip_path.?, dest.?, op_id, null) catch |err| {
+        sftpFailTransfer(session, op_id, "failed to queue");
+        return sftpQueueError(output, err);
+    };
+    return sftpOpIdResponse(output, op_id);
+}
+
+/// Remote `zip -r` of the selected paths into a uniquely named staging
+/// archive, downloaded through the native writer; the staging archive is
+/// removed in success and failure (spec 05 §5). Async.
+fn handleSftpZipDownload(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SftpZipDownloadPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (payload.paths.len == 0) return respondError(output, "no paths");
+    if (validateSftpLocalPathArg(output, payload.local_path)) |err_response| return err_response;
+
+    var paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (paths.items) |p| self.allocator.free(p);
+        paths.deinit(self.allocator);
+    }
+    for (payload.paths) |rp| {
+        var p: ?[]u8 = null;
+        if (decodeSftpPathArg(self, output, rp, &p)) |err_response| return err_response;
+        paths.append(self.allocator, p.?) catch {
+            self.allocator.free(p.?);
+            return respondError(output, "out of memory");
+        };
+    }
+    const partial = std.fmt.allocPrint(self.allocator, "{s}.partial", .{payload.local_path}) catch return respondError(output, "out of memory");
+    defer self.allocator.free(partial);
+
+    const session = self.manager.get(payload.server_id) orelse return respondError(output, "not connected");
+    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
+    const op_id = self.manager.sftpStartTransfer(session, "zip_download", paths.items[0]) catch return respondError(output, "out of memory");
+    self.manager.sftpZipDownload(payload.server_id, paths.items, partial, payload.local_path, op_id, null) catch |err| {
+        sftpFailTransfer(session, op_id, "failed to queue");
+        return sftpQueueError(output, err);
+    };
+    return sftpOpIdResponse(output, op_id);
+}
+
+/// `du -sb <path>` parsed, cached 5 minutes per path (spec 05 §5).
+fn handleSftpFolderSize(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SftpPathPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    var path: ?[]u8 = null;
+    if (decodeSftpPathArg(self, output, parsed.value.path, &path)) |err_response| return err_response;
+    defer self.allocator.free(path.?);
+    const session = self.manager.get(parsed.value.server_id) orelse return respondError(output, "not connected");
+    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
+    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+    if (self.manager.sftpFolderSizeCached(session, path.?, now)) |size| {
+        var writer = std.Io.Writer.fixed(output);
+        writer.print("{{\"ok\":true,\"size\":{d}}}", .{size}) catch return output[0..0];
+        return writer.buffered();
+    }
+
+    var cmd_buf: [64 * 1024]u8 = undefined;
+    const qlen = shellquote.quotedLen(path.?);
+    if (qlen + 16 > cmd_buf.len) return respondError(output, "path too long");
+    const head = std.fmt.bufPrint(&cmd_buf, "du -sb ", .{}) catch unreachable;
+    const q = shellquote.quoteAppend(cmd_buf[head.len..], path.?);
+    var outcome = self.manager.execWait(parsed.value.server_id, cmd_buf[0 .. head.len + q.len], sftp_folder_size_cmd_cap, sftp_folder_size_timeout_ns) catch |err| return sftpQueueError(output, err);
+    defer outcome.output.deinit(self.allocator);
+    if (outcome.exit != 0 or outcome.output.items.len == 0) return respondError(output, "cannot measure folder size");
+    const text = std.mem.trim(u8, outcome.output.items, " \t\r\n");
+    const end = std.mem.indexOfAny(u8, text, " \t") orelse text.len;
+    const size = std.fmt.parseInt(u64, text[0..end], 10) catch {
+        return respondError(output, "cannot parse folder size");
+    };
+    self.manager.sftpFolderSizeCacheSet(session, path.?, size, now);
+    var writer = std.Io.Writer.fixed(output);
+    writer.print("{{\"ok\":true,\"size\":{d}}}", .{size}) catch return output[0..0];
+    return writer.buffered();
+}
+
+/// Non-destructive snapshot of active + recent transfers (spec 05 §5): two
+/// views can poll without consuming each other's progress.
+fn handleSftpPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(IdPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const session = self.manager.get(parsed.value.server_id) orelse {
+        return respondError(output, "not connected");
+    };
+    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
+
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"transfers\":[") catch return output[0..0];
+    session.sftp_transfers.lock();
+    defer session.sftp_transfers.unlock();
+    var first = true;
+    for (session.sftp_transfers.list.items) |t| {
+        if (!first) writer.writeAll(",") catch return output[0..0];
+        first = false;
+        writer.print("{{\"id\":{d},\"kind\":", .{t.id}) catch return output[0..0];
+        json.writeJsonString(&writer, t.kind) catch return output[0..0];
+        writer.writeAll(",\"path\":") catch return output[0..0];
+        json.writeJsonString(&writer, t.path) catch return output[0..0];
+        writer.print(",\"bytes\":{d},\"total\":{d},\"status\":", .{ t.bytes_done, t.bytes_total }) catch return output[0..0];
+        json.writeJsonString(&writer, t.status.jsonName()) catch return output[0..0];
+        writer.writeAll(",\"error\":") catch return output[0..0];
+        json.writeJsonString(&writer, t.err) catch return output[0..0];
+        writer.writeAll("}") catch return output[0..0];
+    }
+    writer.writeAll("]}") catch return output[0..0];
+    return writer.buffered();
+}
+
+/// Cancels an async transfer: the worker cleanup op deletes the upload
+/// partial; long-running ops check the flag between entries.
+fn handleSftpCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SftpTransferIdPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    self.manager.sftpCancel(parsed.value.server_id, parsed.value.transfer_id) catch |err| return sftpQueueError(output, err);
     return ok_json;
 }
 

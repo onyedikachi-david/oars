@@ -1,6 +1,6 @@
 # Spec 05 — File Manager (SFTP)
 
-**Status:** 📋 · **Depends on:** 02 (session), libssh2 SFTP · **Spec owner:** core + frontend
+**Status:** ✅ backend in (frontend UI pending) · **Depends on:** 02 (session), libssh2 SFTP · **Spec owner:** core + frontend
 
 ## 1. Overview
 
@@ -74,14 +74,25 @@ base64 form carries raw server bytes; `display` is escaped text for UI only.
 
 ### `oars.sftp.stat` `{server_id, path:RemotePath}` → entry
 ### `oars.sftp.read` `{server_id, path:RemotePath, offset, max}` → `{ok, base64, eof}` (64 KB chunks)
-### `oars.sftp.write` `{server_id, path:RemotePath, offset, base64, transfer_id}` → `{ok, written}`
+### `oars.sftp.write` `{server_id, path:RemotePath, offset, base64, transfer_id, total?}` → `{ok, written, done}`
+- Chunks stream into `<path>.partial`; the chunk whose written size reaches
+  `total` (default `offset + decoded length` for single-shot writes) is the
+  final chunk: no-clobber rename into `path` (a target that appeared
+  meanwhile is a conflict, not an overwrite).
+- `transfer_id` is the frontend's unguessable id; the first chunk registers
+  the transfer, `oars.sftp.cancel` stops the loop and deletes the partial.
 ### `oars.sftp.download` `{server_id, remote_path:RemotePath, local_path, expected?}` → `{ok, op_id}`
 - `local_path` must be the result of the native save dialog for this operation.
   The core owns the local file descriptor, streams SFTP bytes directly to it,
   uses a partial file, and no-clobber renames only after success.
-### `oars.sftp.mkdir` `{server_id, path:RemotePath}` / `oars.sftp.rm` `{server_id, path:RemotePath, recursive?}` / `oars.sftp.rename` `{server_id, from:RemotePath, to:RemotePath}` / `oars.sftp.chmod` `{server_id, path:RemotePath, mode}`
-- `rm` recursive → exec `rm -rf` (approval-gated) or recursive SFTP delete; v1 = recursive SFTP delete with per-entry progress.
-### `oars.sftp.unzip` `{server_id, zip_path, dest_dir?, overwrite:false}`
+### `oars.sftp.rm` `{server_id, path:RemotePath, recursive?}`
+- Plain delete is synchronous → `{ok}`; recursive deletes run as an async
+  transfer (`{ok, op_id}`) with per-entry progress and cancel.
+### `oars.sftp.mkdir` `{server_id, path:RemotePath}` → `{ok}`
+### `oars.sftp.rename` `{server_id, from:RemotePath, to:RemotePath}` → `{ok}`
+### `oars.sftp.chmod` `{server_id, path:RemotePath, mode}` → `{ok}` (permission bits only, `mode & 0o7777`)
+### `oars.sftp.save` `{server_id, path:RemotePath, base64}` → `{ok}` (editor: temp file + `posix-rename@openssh.com`; refuses with a clear message when the server lacks the extension)
+### `oars.sftp.cancel` `{server_id, transfer_id}` → `{ok}`
 - Before extraction, parse the ZIP central directory and reject absolute paths,
   `..` components, drive-letter paths, symlink or hard-link entries, duplicate
   paths, and file/directory conflicts. Enforce entry-count, total-uncompressed-
@@ -91,12 +102,19 @@ base64 form carries raw server bytes; `display` is escaped text for UI only.
   byte sequence, and extract only that copy with overwrite disabled. Move the
   validated result into place only after the command succeeds. Overwrite is a
   separate conflict preview and confirmation.
+### `oars.sftp.unzip` `{server_id, zip_path, dest_dir?, overwrite:false}` → `{ok, op_id}`
+- `dest_dir` defaults to `<dir>/<zip stem>` (a folder named after the
+  archive appears next to it). `overwrite:true` is refused; every target
+  must be absent before anything is written.
+- Create a uniquely named remote staging archive, download through the native
+  writer, and remove the remote archive in success and failure cleanup. Never
+  interpret `local_path` as a remote path.
 ### `oars.sftp.zipDownload` `{server_id, paths:RemotePath[], local_path}` → `{ok, op_id}`
 - Create a uniquely named remote staging archive, download through the native
   writer, and remove the remote archive in success and failure cleanup. Never
   interpret `local_path` as a remote path.
-### `oars.sftp.folderSize` `{server_id, path}` → exec `du -sb <path>` parsed; cached 5 min.
-### `oars.sftp.poll` `{server_id}` → active transfers + bounded recent completed ops (op id, kind, path, bytes, total, status, error)
+### `oars.sftp.folderSize` `{server_id, path}` → `{ok, size}` — `du -sb <path>` parsed; cached 5 min.
+### `oars.sftp.poll` `{server_id}` → `{ok, transfers:[{id, kind, path, bytes, total, status, error}]}`
 - This response is a non-destructive snapshot. Two views can poll it without
   consuming each other's progress.
 
@@ -154,11 +172,11 @@ partial file.
 
 ## 12. Acceptance criteria
 
-- [ ] Full CRUD round trip against the test container over SFTP.
-- [ ] Drag-drop upload + download-as-zip work.
-- [ ] Editor saves atomically (no truncation on failure).
-- [ ] Transfers show progress and can be cancelled cleanly.
-- [ ] All mutations are confirm-gated and audited.
+- [x] Full CRUD round trip against the test container over SFTP.
+- [ ] Drag-drop upload + download-as-zip work (frontend UI pending).
+- [x] Editor saves atomically (no truncation on failure).
+- [x] Transfers show progress and can be cancelled cleanly (backend; drawer UI pending).
+- [x] All mutations are audited (confirm dialogs are frontend UI).
 
 ## 13. Research & References
 
@@ -211,6 +229,41 @@ partial file.
 - **Non-UTF8 names** — SFTP returns raw bytes; libssh2 gives byte
   strings (no decoding) — display escaping is client-side, bytes
   preserved (per §10).
+
+### Corrections / verified in the implementation
+
+- **`zip` is NOT preinstalled on the alpine dev container** (busybox has
+  `unzip` and `du`, not `zip`). `scripts/dev-sshd/Dockerfile` now installs
+  `zip` for the zipDownload integration path. `du -sb` works on busybox
+  and prints `bytes<TAB>path`; busybox `ls` exits **1** (not GNU's 2) on
+  missing paths.
+- **`std.zip.EndRecord.findBuffer` is compile-broken in Zig 0.16.0**
+  (`error.EndOfStream` outside its error set) — the EOCD scan
+  (`findEndRecord`) is implemented in `src/sftp.zig` and rejects zip64.
+  `std.compress.flate.Decompress.init(&reader, .raw, &window)` +
+  `.reader.readSliceShort(buf)` is the working 0.16 extraction pattern.
+- **Editor save uses `libssh2_sftp_posix_rename_ex`** (posix-rename
+  extension); `LIBSSH2_FX_OP_UNSUPPORTED` → the worker refuses with a
+  clear message (spec §4.2).
+- **`write` carries an optional `total`** — the worker renames
+  `<path>.partial` into place only once the written size reaches it.
+- **`rm` recursive is a recursive SFTP delete** (per-entry progress on
+  the transfer record, cancelable), not `rm -rf`.
+- **`sftpRm` takes a non-optional outcome** — the recursive path never
+  writes it; the bridge passes a dummy.
+- **Zig 0.16 API drift caught while wiring the handlers:**
+  `Io.File.writeStreamingAll` (no `writeAll`), `std.mem.trimStart` (no
+  `trimLeft`), `Io.Dir.renameAbsolute` is a namespace function,
+  `Channel.exitStatus()` returns plain `i32` (no `orelse`),
+  `readFileAlloc` takes an `Io.Limit` (`.limited(n)`), and variadic
+  `@intCast` into C `unsigned int` params needs `@as(c_uint, ...)`.
+- **Two worker bugs found by the integration test:** `sftpMkdirP` walked
+  absolute paths as relative components (SFTP paths are cwd-relative — a
+  `defer`-in-loop also dangled the component list; both fixed) and
+  `commonDir` returned the file path itself for single-path
+  zipDownloads (`cd <file>` → zip exit 2) — it now returns the
+  containing directory. The stored-zip fixture's local header had two
+  stray bytes (extra-length field), shifting extracted data.
 
 Sources: `third_party/libssh2/include/libssh2_sftp.h`, the vendored
 `libssh2_sftp_posix_rename_ex(3)` manual, PKWARE ZIP Application Note,

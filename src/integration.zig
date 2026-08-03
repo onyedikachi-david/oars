@@ -18,6 +18,7 @@ const sessions = @import("sessions.zig");
 const audit = @import("audit.zig");
 const logs = @import("logs.zig");
 const bridge = @import("bridge.zig");
+const sftpmod = @import("sftp.zig");
 
 /// Reads an environment variable from the process environment. The raw
 /// environ pointer is the only env source in 0.16 outside `main(init)`.
@@ -852,4 +853,247 @@ test "integration: logs scan, read, follow, clear, and addSource" {
     try std.testing.expect(channel_gone);
 
     rig.manager.disconnect("itest-logs");
+}
+
+// --- SFTP helpers (spec 05) ---------------------------------------------------
+
+/// Parses `"op_id":N` out of an async-op response.
+fn sftpOpId(resp: []const u8) ?u32 {
+    const pos = std.mem.indexOf(u8, resp, "\"op_id\":") orelse return null;
+    const rest = resp[pos + 8 ..];
+    var end: usize = 0;
+    while (end < rest.len and rest[end] >= '0' and rest[end] <= '9') end += 1;
+    if (end == 0) return null;
+    return std.fmt.parseInt(u32, rest[0..end], 10) catch null;
+}
+
+/// The status string of transfer `op_id` in a poll response (null when the
+/// transfer is not present). The needle includes the kind delimiter so
+/// `"id":1` never matches `"id":1001`.
+fn sftpTransferStatus(resp: []const u8, op_id: u32) ?[]const u8 {
+    var needle_buf: [48]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"id\":{d},\"kind\":\"", .{op_id}) catch return null;
+    const start = std.mem.indexOf(u8, resp, needle) orelse return null;
+    const tail = resp[start..];
+    const marker = "\"status\":\"";
+    const status_pos = std.mem.indexOf(u8, tail, marker) orelse return null;
+    const value = tail[status_pos + marker.len ..];
+    const end = std.mem.indexOfScalar(u8, value, '"') orelse return null;
+    return value[0..end];
+}
+
+/// Polls `oars.sftp.poll` until transfer `op_id` reaches `want`.
+fn sftpWaitTransfer(rig: *TestRig, op_id: u32, want: []const u8) !void {
+    var req_buf: [256]u8 = undefined;
+    const deadline = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds + 20 * std.time.ns_per_s;
+    while (std.Io.Timestamp.now(std.testing.io, .real).nanoseconds < deadline) {
+        const req = std.fmt.bufPrint(&req_buf, "{{\"id\":\"p\",\"command\":\"oars.sftp.poll\",\"payload\":{{\"server_id\":\"itest-sftp\"}}}}", .{}) catch unreachable;
+        const resp = rig.dispatch(req);
+        if (sftpTransferStatus(resp, op_id)) |status| {
+            if (std.mem.eql(u8, status, want)) return;
+        }
+        testSleep(50);
+    }
+    const dbg_req = std.fmt.bufPrint(&req_buf, "{{\"id\":\"p\",\"command\":\"oars.sftp.poll\",\"payload\":{{\"server_id\":\"itest-sftp\"}}}}", .{}) catch unreachable;
+    std.debug.print("sftpWaitTransfer timeout: op_id={d} want={s} last_poll={s}\n", .{ op_id, want, rig.dispatch(dbg_req) });
+    return error.TestUnexpectedResult;
+}
+
+/// Parses `"size":N` out of a folderSize response.
+fn sftpSize(resp: []const u8) ?u64 {
+    const pos = std.mem.indexOf(u8, resp, "\"size\":") orelse return null;
+    const rest = resp[pos + 7 ..];
+    var end: usize = 0;
+    while (end < rest.len and rest[end] >= '0' and rest[end] <= '9') end += 1;
+    if (end == 0) return null;
+    return std.fmt.parseInt(u64, rest[0..end], 10) catch null;
+}
+
+test "integration: sftp crud, editor save, transfers, cancel, and zip paths" {
+    const env = TestEnv.load();
+    if (!env.active) return; // skipped: run scripts/integration-test.sh
+
+    ssh.initGlobal();
+
+    var rig: TestRig = undefined;
+    try rig.init("sftp");
+    defer rig.deinit();
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const server = servers.Server{
+        .id = "itest-sftp",
+        .name = "dev-sshd",
+        .host = env.host,
+        .port = env.port,
+        .user = env.user,
+        .auth_method = .password,
+    };
+    try rig.store.upsert(io, server);
+    _ = try rig.manager.connect(server, env.password, null);
+    try waitForStatus(&rig.manager, "itest-sftp", .needs_trust, 20 * std.time.ns_per_s);
+    try rig.manager.trust("itest-sftp", true);
+    try waitForStatus(&rig.manager, "itest-sftp", .ready, 20 * std.time.ns_per_s);
+
+    // Fresh scratch space on the server.
+    try execWait(&rig.manager, "itest-sftp", "rm -rf /tmp/oars-sftp-itest && mkdir -p /tmp/oars-sftp-itest/dir", 0, "");
+
+    // --- mkdir ---
+    const mkdir = rig.dispatch(
+        \\{"id":"1","command":"oars.sftp.mkdir","payload":{"server_id":"itest-sftp","path":{"utf8":"/tmp/oars-sftp-itest/dir/sub"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, mkdir, "\"ok\":true") != null);
+
+    // --- write two chunks under a frontend-chosen transfer id ---
+    var b64_1_buf: [64]u8 = undefined;
+    const b64_1 = std.base64.standard.Encoder.encode(&b64_1_buf, "hello ");
+    var b64_2_buf: [64]u8 = undefined;
+    const b64_2 = std.base64.standard.Encoder.encode(&b64_2_buf, "world");
+    var write1_buf: [768]u8 = undefined;
+    const write1 = std.fmt.bufPrint(&write1_buf, "{{\"id\":\"2\",\"command\":\"oars.sftp.write\",\"payload\":{{\"server_id\":\"itest-sftp\",\"path\":{{\"utf8\":\"/tmp/oars-sftp-itest/dir/file.txt\"}},\"offset\":0,\"base64\":\"{s}\",\"transfer_id\":1001,\"total\":11}}}}", .{b64_1}) catch unreachable;
+    const w1 = rig.dispatch(write1);
+    try std.testing.expect(std.mem.indexOf(u8, w1, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w1, "\"written\":6") != null);
+    var write2_buf: [768]u8 = undefined;
+    const write2 = std.fmt.bufPrint(&write2_buf, "{{\"id\":\"3\",\"command\":\"oars.sftp.write\",\"payload\":{{\"server_id\":\"itest-sftp\",\"path\":{{\"utf8\":\"/tmp/oars-sftp-itest/dir/file.txt\"}},\"offset\":6,\"base64\":\"{s}\",\"transfer_id\":1001,\"total\":11}}}}", .{b64_2}) catch unreachable;
+    const w2 = rig.dispatch(write2);
+    try std.testing.expect(std.mem.indexOf(u8, w2, "\"done\":true") != null);
+
+    // --- read back ---
+    const read = rig.dispatch(
+        \\{"id":"4","command":"oars.sftp.read","payload":{"server_id":"itest-sftp","path":{"utf8":"/tmp/oars-sftp-itest/dir/file.txt"},"offset":0,"max":65536}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, read, "aGVsbG8gd29ybGQ=") != null); // "hello world"
+    try std.testing.expect(std.mem.indexOf(u8, read, "\"eof\":true") != null);
+
+    // --- ls and stat ---
+    const ls = rig.dispatch(
+        \\{"id":"5","command":"oars.sftp.ls","payload":{"server_id":"itest-sftp","path":{"utf8":"/tmp/oars-sftp-itest/dir"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, ls, "\"utf8\":\"file.txt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ls, "\"kind\":\"file\"") != null);
+
+    const stat = rig.dispatch(
+        \\{"id":"6","command":"oars.sftp.stat","payload":{"server_id":"itest-sftp","path":{"utf8":"/tmp/oars-sftp-itest/dir/file.txt"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, stat, "\"size\":11") != null);
+
+    // --- rename + chmod (verified through the shell) ---
+    const rename = rig.dispatch(
+        \\{"id":"7","command":"oars.sftp.rename","payload":{"server_id":"itest-sftp","from":{"utf8":"/tmp/oars-sftp-itest/dir/file.txt"},"to":{"utf8":"/tmp/oars-sftp-itest/dir/renamed.txt"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, rename, "\"ok\":true") != null);
+
+    const chmod = rig.dispatch(
+        \\{"id":"8","command":"oars.sftp.chmod","payload":{"server_id":"itest-sftp","path":{"utf8":"/tmp/oars-sftp-itest/dir/renamed.txt"},"mode":384}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, chmod, "\"ok\":true") != null);
+    try execWait(&rig.manager, "itest-sftp", "stat -c %a /tmp/oars-sftp-itest/dir/renamed.txt", 0, "600");
+
+    // --- editor save (atomic posix-rename path) ---
+    var b64_save_buf: [128]u8 = undefined;
+    const save_content = "edited content\n";
+    const b64_save = std.base64.standard.Encoder.encode(&b64_save_buf, save_content);
+    var save_buf: [1024]u8 = undefined;
+    const save_req = std.fmt.bufPrint(&save_buf, "{{\"id\":\"9\",\"command\":\"oars.sftp.save\",\"payload\":{{\"server_id\":\"itest-sftp\",\"path\":{{\"utf8\":\"/tmp/oars-sftp-itest/dir/renamed.txt\"}},\"base64\":\"{s}\"}}}}", .{b64_save}) catch unreachable;
+    const saved = rig.dispatch(save_req);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"ok\":true") != null);
+    const read_back = rig.dispatch(
+        \\{"id":"10","command":"oars.sftp.read","payload":{"server_id":"itest-sftp","path":{"utf8":"/tmp/oars-sftp-itest/dir/renamed.txt"},"offset":0,"max":65536}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, read_back, "ZWRpdGVkIGNvbnRlbnQK") != null);
+
+    // --- folderSize (du -sb, cached) ---
+    const folder_size = rig.dispatch(
+        \\{"id":"11","command":"oars.sftp.folderSize","payload":{"server_id":"itest-sftp","path":{"utf8":"/tmp/oars-sftp-itest/dir"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, folder_size, "\"ok\":true") != null);
+    const size = sftpSize(folder_size) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(size > 0);
+
+    // --- download through the native writer, poll to done, verify bytes ---
+    const local_dir = try std.fmt.allocPrint(allocator, "/tmp/{s}", .{rig.dir_name});
+    defer allocator.free(local_dir);
+    const down_path = try std.fmt.allocPrint(allocator, "{s}/down.txt", .{local_dir});
+    defer allocator.free(down_path);
+    var download_buf: [1024]u8 = undefined;
+    const download_req = std.fmt.bufPrint(&download_buf, "{{\"id\":\"12\",\"command\":\"oars.sftp.download\",\"payload\":{{\"server_id\":\"itest-sftp\",\"remote_path\":{{\"utf8\":\"/tmp/oars-sftp-itest/dir/renamed.txt\"}},\"local_path\":\"{s}\"}}}}", .{down_path}) catch unreachable;
+    const download = rig.dispatch(download_req);
+    const dl_op_id = sftpOpId(download) orelse return error.TestUnexpectedResult;
+    try sftpWaitTransfer(&rig, dl_op_id, "done");
+    const downloaded = std.Io.Dir.cwd().readFileAlloc(io, down_path, allocator, .limited(1024 * 1024)) catch return error.TestUnexpectedResult;
+    defer allocator.free(downloaded);
+    try std.testing.expect(std.mem.eql(u8, downloaded, save_content));
+
+    // --- cancel: chunk 1 ok, cancel, chunk 2 refuses ---
+    var b64_c1_buf: [64]u8 = undefined;
+    const b64_c1 = std.base64.standard.Encoder.encode(&b64_c1_buf, "abc");
+    var cancel1_buf: [768]u8 = undefined;
+    const cancel1_req = std.fmt.bufPrint(&cancel1_buf, "{{\"id\":\"13\",\"command\":\"oars.sftp.write\",\"payload\":{{\"server_id\":\"itest-sftp\",\"path\":{{\"utf8\":\"/tmp/oars-sftp-itest/dir/cancel.txt\"}},\"offset\":0,\"base64\":\"{s}\",\"transfer_id\":2002,\"total\":9}}}}", .{b64_c1}) catch unreachable;
+    const c1 = rig.dispatch(cancel1_req);
+    try std.testing.expect(std.mem.indexOf(u8, c1, "\"ok\":true") != null);
+    const cancel = rig.dispatch(
+        \\{"id":"14","command":"oars.sftp.cancel","payload":{"server_id":"itest-sftp","transfer_id":2002}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, cancel, "\"ok\":true") != null);
+    var b64_c2_buf: [64]u8 = undefined;
+    const b64_c2 = std.base64.standard.Encoder.encode(&b64_c2_buf, "defghij");
+    var cancel2_buf: [768]u8 = undefined;
+    const cancel2_req = std.fmt.bufPrint(&cancel2_buf, "{{\"id\":\"15\",\"command\":\"oars.sftp.write\",\"payload\":{{\"server_id\":\"itest-sftp\",\"path\":{{\"utf8\":\"/tmp/oars-sftp-itest/dir/cancel.txt\"}},\"offset\":3,\"base64\":\"{s}\",\"transfer_id\":2002,\"total\":9}}}}", .{b64_c2}) catch unreachable;
+    const c2 = rig.dispatch(cancel2_req);
+    try std.testing.expect(std.mem.indexOf(u8, c2, "canceled") != null);
+    // The partial file must be gone.
+    try execWait(&rig.manager, "itest-sftp", "test ! -e /tmp/oars-sftp-itest/dir/cancel.txt.partial", 0, "");
+
+    // --- unzip: host-built stored fixture, default dest, conflict refusal ---
+    const archive = try sftpmod.buildStoredZip(allocator, &.{"sub/inner.txt"}, &.{"zipped content\n"});
+    defer allocator.free(archive);
+    var b64_zip_buf: [1024]u8 = undefined;
+    const b64_zip = std.base64.standard.Encoder.encode(&b64_zip_buf, archive);
+    var zip_upload_buf: [2048]u8 = undefined;
+    const zip_upload_req = std.fmt.bufPrint(&zip_upload_buf, "{{\"id\":\"16\",\"command\":\"oars.sftp.write\",\"payload\":{{\"server_id\":\"itest-sftp\",\"path\":{{\"utf8\":\"/tmp/oars-sftp-itest/archive.zip\"}},\"offset\":0,\"base64\":\"{s}\",\"transfer_id\":3003,\"total\":{d}}}}}", .{ b64_zip, archive.len }) catch unreachable;
+    const zip_uploaded = rig.dispatch(zip_upload_req);
+    try std.testing.expect(std.mem.indexOf(u8, zip_uploaded, "\"done\":true") != null);
+
+    const unzip = rig.dispatch(
+        \\{"id":"17","command":"oars.sftp.unzip","payload":{"server_id":"itest-sftp","zip_path":{"utf8":"/tmp/oars-sftp-itest/archive.zip"}}}
+    );
+    const unzip_op_id = sftpOpId(unzip) orelse return error.TestUnexpectedResult;
+    try sftpWaitTransfer(&rig, unzip_op_id, "done");
+    const unzipped = rig.dispatch(
+        \\{"id":"18","command":"oars.sftp.read","payload":{"server_id":"itest-sftp","path":{"utf8":"/tmp/oars-sftp-itest/archive/sub/inner.txt"},"offset":0,"max":65536}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, unzipped, "emlwcGVkIGNvbnRlbnQK") != null);
+
+    // Overwrite is disabled: extracting again must fail on the conflict.
+    const unzip_again = rig.dispatch(
+        \\{"id":"19","command":"oars.sftp.unzip","payload":{"server_id":"itest-sftp","zip_path":{"utf8":"/tmp/oars-sftp-itest/archive.zip"}}}
+    );
+    const again_op_id = sftpOpId(unzip_again) orelse return error.TestUnexpectedResult;
+    try sftpWaitTransfer(&rig, again_op_id, "failed");
+
+    // --- zipDownload: remote zip -r, staged, downloaded, staging removed ---
+    const bundle_path = try std.fmt.allocPrint(allocator, "{s}/bundle.zip", .{local_dir});
+    defer allocator.free(bundle_path);
+    var zip_dl_buf: [2048]u8 = undefined;
+    const zip_dl_req = std.fmt.bufPrint(&zip_dl_buf, "{{\"id\":\"20\",\"command\":\"oars.sftp.zipDownload\",\"payload\":{{\"server_id\":\"itest-sftp\",\"paths\":[{{\"utf8\":\"/tmp/oars-sftp-itest/dir/renamed.txt\"}}],\"local_path\":\"{s}\"}}}}", .{bundle_path}) catch unreachable;
+    const zip_dl = rig.dispatch(zip_dl_req);
+    const zip_dl_op_id = sftpOpId(zip_dl) orelse return error.TestUnexpectedResult;
+    try sftpWaitTransfer(&rig, zip_dl_op_id, "done");
+    const bundle = std.Io.Dir.cwd().readFileAlloc(io, bundle_path, allocator, .limited(1024 * 1024)) catch return error.TestUnexpectedResult;
+    defer allocator.free(bundle);
+    try std.testing.expect(bundle.len >= 4 and bundle[0] == 'P' and bundle[1] == 'K');
+    // The staging archive on the server must be cleaned up.
+    try execWait(&rig.manager, "itest-sftp", "ls /tmp/oars-sftp-itest/.oars-zip-*.zip", 1, "");
+
+    // --- recursive rm with per-entry progress ---
+    const rm = rig.dispatch(
+        \\{"id":"21","command":"oars.sftp.rm","payload":{"server_id":"itest-sftp","path":{"utf8":"/tmp/oars-sftp-itest"},"recursive":true}}
+    );
+    const rm_op_id = sftpOpId(rm) orelse return error.TestUnexpectedResult;
+    try sftpWaitTransfer(&rig, rm_op_id, "done");
+    // busybox ls exits 1 (not GNU's 2) on a missing path.
+    try execWait(&rig.manager, "itest-sftp", "ls /tmp/oars-sftp-itest", 1, "");
+
+    rig.manager.disconnect("itest-sftp");
 }

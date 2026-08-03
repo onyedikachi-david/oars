@@ -550,6 +550,21 @@ clear conflict → re-scan → fresh clear + audit, closeChannel. See spec 04
     Verify by forcing the run (content change) and reading the runtime;
     the integration tests are in the binary only because of pitfall 24's
     fix.
+30. **`defer` inside a loop body runs at the end of each iteration.** A
+    buffer retained across iterations (e.g. a component list for a path
+    walk) dangles the moment the next iteration starts. Own such buffers
+    at function scope and free them in a function-level `defer`.
+31. **SFTP paths are server-cwd-relative.** A `mkdir -p`-style walk over
+    absolute paths must start at `/`; a relative walk silently builds a
+    parallel tree under the home directory (the unzip dest bug).
+32. **busybox `ls` exits 1 (not GNU's 2) on missing paths** — assert exit
+    1 in container tests.
+33. **Zig 0.16 API drift:** `Io.File.writeStreamingAll` (no `writeAll`),
+    `std.mem.trimStart` (no `trimLeft`), `Io.Dir.renameAbsolute` is a
+    namespace function, `Channel.exitStatus()` returns plain `i32`,
+    `readFileAlloc` takes `Io.Limit` (`.limited(n)`), `free` on a `?[]u8`
+    is a compile error, and `@intCast` into C `unsigned int` params needs
+    an explicit `@as(c_uint, …)` when the callee is `anytype`.
 
 ### 13.4 Next
 
@@ -559,3 +574,62 @@ pattern for identity-bound SFTP handles. Keep the spec-04 convention: every
 new feature module imported by `main.zig` must be referenced (pitfall 24),
 and every new integration test must be observed running with the container
 up (pitfall 25).
+
+## 14. Session handover — 2026-08-03 (session 4): spec 05 file-manager backend
+
+### 14.1 What landed
+
+**`src/sftp.zig` (new):** `RemotePath` codec (`utf8`/`base64`), path
+validation (control chars; traversal is the server's boundary per spec 05
+§8), `Entry` model with custom JSON (name `{utf8,base64}`, display, kind,
+size, mtime, mode string, uid/gid, link_target), `Transfers` registry
+(spin-locked, bounded completed history, client-chosen upload ids), the
+ZIP central-directory preflight (`findEndRecord` EOCD scan — the std
+`findBuffer` is compile-broken in 0.16 — + entry/path/depth/size/ratio
+limits), and `buildStoredZip` for tests.
+
+**`src/sessions.zig`:** 13 `Op.sftp_*` variants + the worker ops
+(`sftpOpLs/Stat/Read/WriteChunk/Save/Mkdir/Rm/Rename/Chmod/Download/
+Unzip/…`), `SftpOutcome` (worker-built JSON, bounded wait), `Transfers`
+per session, folder-size cache, `execSync`, `sftpStreamRemoteToLocal`
+(`<local>.partial` → no-clobber rename), `sftpDeleteRecursive`, ZIP
+preflight + extraction (stored and raw-deflate), `commonDir`, shell-quoted
+`zip -r` staging with cleanup in success AND failure.
+
+**`src/bridge.zig`:** 15 handlers `oars.sftp.{ls,stat,read,write,save,
+download,mkdir,rm,rename,chmod,unzip,zipDownload,folderSize,poll,cancel}`
+(handler_count 21 → 36). Sync ops wait on the outcome (bounded) and copy
+the worker's JSON into the result buffer; async ops create the transfer
+record and return `{ok, op_id}` immediately. `folderSize` runs quoted
+`du -sb` with a 5 min per-path cache.
+
+**Tests:** dispatcher-level validation suite (all 15 handlers: not
+connected, bad base64, bad max/mode/local path, overwrite refusal, zero
+transfer id); a full container integration test — mkdir → 2-chunk upload
+→ read → ls → stat → rename → chmod (verified via `stat -c %a`) → editor
+save → folderSize → download + local byte check → cancel (partial deleted)
+→ unzip fixture + conflict refusal → zipDownload (staging cleaned up) →
+recursive rm. **67/67 pass, leak-checked, container up.**
+
+`scripts/dev-sshd/Dockerfile` now installs `zip` (busybox lacks it).
+
+### 14.2 Bugs the integration test found (all fixed)
+
+- `sftpMkdirP` walked absolute paths as cwd-relative components → a
+  parallel tree under `/root`; plus a `defer`-in-loop dangled the
+  component list (pitfall 30). Both fixed; unzip now extracts to the
+  absolute dest.
+- `commonDir` returned the file path itself for single-path
+  zipDownloads → `cd <file>` → `zip` exit 2. It now returns the
+  containing directory when the prefix equals one of the paths.
+- `buildStoredZip`'s local header wrote 4 bytes for the 2-byte
+  extra-length field, shifting extracted data by 2.
+- `sftpOpRead` leaked its base64 buffer (the JSON copies the bytes; the
+  worker owns the base64 itself).
+- busybox `ls` exits 1 (not 2) on missing paths — assertion fixed.
+
+### 14.3 Next
+
+Spec 05 frontend UI (file manager pane, transfers drawer, editor) — the
+bridge contract in spec 05 §5 is the wire format. Or spec 06 (scripts).
+The transfer poll is non-destructive; two views may poll freely.

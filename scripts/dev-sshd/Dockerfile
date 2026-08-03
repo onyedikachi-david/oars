@@ -11,7 +11,7 @@
 
 FROM alpine:3.20
 
-RUN apk add --no-cache openssh \
+RUN apk add --no-cache openssh zip unzip \
     && ssh-keygen -A \
     && echo 'root:oars-test-password' | chpasswd \
     && mkdir -p /root/.ssh \
