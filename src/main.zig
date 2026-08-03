@@ -5,6 +5,7 @@ const servers = @import("servers.zig");
 const sessions = @import("sessions.zig");
 const ssh = @import("ssh.zig");
 const bridge = @import("bridge.zig");
+const audit = @import("audit.zig");
 const integration = @import("integration.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
@@ -30,9 +31,13 @@ const App = struct {
     io: std.Io,
     env_map: *std.process.Environ.Map,
     store: servers.Store,
+    audit_store: audit.Store,
     manager: sessions.Manager,
     bridge_ctx: bridge.Context,
     store_path_buf: [2048]u8 = undefined,
+    audit_path_buf: [2048]u8 = undefined,
+    data_dir_buf: [1024]u8 = undefined,
+    fallback_dir_buf: [1024]u8 = undefined,
 
     fn init(self: *App, process: std.process.Init) !void {
         self.allocator = process.gpa;
@@ -43,35 +48,39 @@ const App = struct {
         // any session worker can touch the library (spec 02 §6).
         ssh.initGlobal();
 
-        var data_dir_buf: [1024]u8 = undefined;
         const data_dir = native_sdk.app_dirs.resolveOne(
             .{ .name = "Oars" },
             native_sdk.app_dirs.currentPlatform(),
             .{ .home = self.env_map.get("HOME") },
             .data,
-            &data_dir_buf,
+            &self.data_dir_buf,
         ) catch null;
-        if (data_dir) |dir| {
-            const path = native_sdk.app_dirs.join(
-                native_sdk.app_dirs.currentPlatform(),
-                &self.store_path_buf,
-                &.{ dir, "servers.json" },
-            ) catch unreachable;
-            self.store = .{ .allocator = self.allocator, .path = path };
-        } else {
+        const base: []const u8 = if (data_dir) |dir| dir else blk: {
             // Last-resort fallback when the OS has no home directory:
             // keep state somewhere writable rather than refusing to run.
             const tmp = process.environ_map.get("TMPDIR") orelse "/tmp";
-            const fallback = std.fmt.bufPrint(&self.store_path_buf, "{s}/oars-data/servers.json", .{tmp}) catch unreachable;
-            self.store = .{ .allocator = self.allocator, .path = fallback };
-        }
+            break :blk std.fmt.bufPrint(&self.fallback_dir_buf, "{s}/oars-data", .{tmp}) catch unreachable;
+        };
+        const store_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.store_path_buf,
+            &.{ base, "servers.json" },
+        ) catch unreachable;
+        const audit_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.audit_path_buf,
+            &.{ base, "audit.jsonl" },
+        ) catch unreachable;
+        self.store = .{ .allocator = self.allocator, .path = store_path };
+        self.audit_store = .{ .allocator = self.allocator, .path = audit_path };
 
-        self.manager = sessions.Manager.init(self.allocator, self.io, &self.store, self.env_map.get("HOME"));
+        self.manager = sessions.Manager.init(self.allocator, self.io, &self.store, &self.audit_store, self.env_map.get("HOME"));
         self.bridge_ctx = .{
             .allocator = self.allocator,
             .io = self.io,
             .store = &self.store,
             .manager = &self.manager,
+            .audit = &self.audit_store,
         };
     }
 
@@ -137,9 +146,12 @@ test "servers.save round trips through the bridge dispatcher" {
     const store_alloc = arena_state.allocator();
 
     var store = servers.Store{ .allocator = store_alloc, .path = store_path };
-    var manager = sessions.Manager.init(store_alloc, io, &store, null);
+    var audit_buf: [512]u8 = undefined;
+    const audit_path = std.fmt.bufPrint(&audit_buf, "/tmp/{s}/audit.jsonl", .{dir_name}) catch unreachable;
+    var audit_store = audit.Store{ .allocator = store_alloc, .path = audit_path };
+    var manager = sessions.Manager.init(store_alloc, io, &store, &audit_store, null);
     defer manager.deinit();
-    var ctx = bridge.Context{ .allocator = store_alloc, .io = io, .store = &store, .manager = &manager };
+    var ctx = bridge.Context{ .allocator = store_alloc, .io = io, .store = &store, .manager = &manager, .audit = &audit_store };
     var dispatcher = ctx.dispatcher();
     var output: [64 * 1024]u8 = undefined;
 
@@ -202,12 +214,14 @@ fn parseSaveResponse(allocator: std.mem.Allocator, response: []const u8) !std.js
 const TestApp = struct {
     arena: std.heap.ArenaAllocator,
     store: servers.Store,
+    audit_store: audit.Store,
     manager: sessions.Manager,
     ctx: bridge.Context,
     dispatcher: native_sdk.BridgeDispatcher,
     output: [64 * 1024]u8 = undefined,
     dir_buf: [128]u8 = undefined,
     path_buf: [512]u8 = undefined,
+    audit_path_buf: [512]u8 = undefined,
     dir_name: []const u8,
 
     fn init(self: *TestApp) !void {
@@ -217,10 +231,12 @@ const TestApp = struct {
         const now = std.Io.Timestamp.now(io, .real).nanoseconds;
         self.dir_name = try std.fmt.bufPrint(&self.dir_buf, "oars-test-{d}", .{now});
         const store_path = try std.fmt.bufPrint(&self.path_buf, "/tmp/{s}/servers.json", .{self.dir_name});
+        const audit_path = try std.fmt.bufPrint(&self.audit_path_buf, "/tmp/{s}/audit.jsonl", .{self.dir_name});
         const store_alloc = self.arena.allocator();
         self.store = .{ .allocator = store_alloc, .path = store_path };
-        self.manager = sessions.Manager.init(store_alloc, io, &self.store, null);
-        self.ctx = .{ .allocator = store_alloc, .io = io, .store = &self.store, .manager = &self.manager };
+        self.audit_store = .{ .allocator = store_alloc, .path = audit_path };
+        self.manager = sessions.Manager.init(store_alloc, io, &self.store, &self.audit_store, null);
+        self.ctx = .{ .allocator = store_alloc, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store };
         self.dispatcher = self.ctx.dispatcher();
     }
 

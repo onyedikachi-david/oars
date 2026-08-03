@@ -11,9 +11,12 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const native_sdk = @import("native_sdk");
 const ssh = @import("ssh.zig");
 const servers = @import("servers.zig");
 const sessions = @import("sessions.zig");
+const audit = @import("audit.zig");
+const bridge = @import("bridge.zig");
 
 /// Reads an environment variable from the process environment. The raw
 /// environ pointer is the only env source in 0.16 outside `main(init)`.
@@ -58,22 +61,37 @@ const TestEnv = struct {
 const TestRig = struct {
     dir_buf: [128]u8 = undefined,
     path_buf: [512]u8 = undefined,
+    audit_path_buf: [512]u8 = undefined,
     dir_name: []const u8,
     store: servers.Store,
+    audit_store: audit.Store,
     manager: sessions.Manager,
+    ctx: bridge.Context,
+    dispatcher: native_sdk.BridgeDispatcher,
+    output: [64 * 1024]u8 = undefined,
 
     fn init(self: *TestRig, tag: []const u8) !void {
         const io = std.testing.io;
         const now = std.Io.Timestamp.now(io, .real).nanoseconds;
         self.dir_name = try std.fmt.bufPrint(&self.dir_buf, "oars-itest-{s}-{d}", .{ tag, now });
         const store_path = try std.fmt.bufPrint(&self.path_buf, "/tmp/{s}/servers.json", .{self.dir_name});
+        const audit_path = try std.fmt.bufPrint(&self.audit_path_buf, "/tmp/{s}/audit.jsonl", .{self.dir_name});
         self.store = .{ .allocator = std.testing.allocator, .path = store_path };
-        self.manager = sessions.Manager.init(std.testing.allocator, io, &self.store, null);
+        self.audit_store = .{ .allocator = std.testing.allocator, .path = audit_path };
+        self.manager = sessions.Manager.init(std.testing.allocator, io, &self.store, &self.audit_store, null);
+        self.ctx = .{ .allocator = std.testing.allocator, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store };
+        self.dispatcher = self.ctx.dispatcher();
     }
 
     fn deinit(self: *TestRig) void {
         self.manager.deinit();
         std.Io.Dir.cwd().deleteTree(std.testing.io, self.dir_name) catch {};
+    }
+
+    /// Returns a slice into `self.output`; the caller must read or parse
+    /// it before the next dispatch call.
+    fn dispatch(self: *TestRig, request: []const u8) []const u8 {
+        return self.dispatcher.dispatch(request, .{ .origin = "zero://app" }, &self.output);
     }
 };
 
@@ -344,4 +362,222 @@ test "integration: disconnect during needs_trust returns promptly" {
     const elapsed = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds - started;
     try std.testing.expect(elapsed < 2 * std.time.ns_per_s);
     try std.testing.expectError(error.NoSession, rig.manager.sessionSnapshot("itest-disc"));
+}
+
+test "integration: monitor probes, cleanup plans, and drop-caches audits" {
+    const env = TestEnv.load();
+    if (!env.active) return;
+
+    ssh.initGlobal();
+
+    var rig: TestRig = undefined;
+    try rig.init("monitor");
+    defer rig.deinit();
+    const io = std.testing.io;
+
+    // Fast cadence so probe behavior is observable in seconds.
+    rig.manager.monitor_interval_ns = 200 * std.time.ns_per_ms;
+    rig.manager.monitor_liveness_ns = 150 * std.time.ns_per_ms;
+
+    var server = servers.Server{
+        .id = "itest-mon",
+        .name = "dev-sshd",
+        .host = env.host,
+        .port = env.port,
+        .user = env.user,
+        .auth_method = .password,
+    };
+    defer server.deinit(std.testing.allocator);
+    try rig.store.upsert(io, server);
+    _ = try rig.manager.connect(server, env.password, null);
+    try waitForStatus(&rig.manager, "itest-mon", .needs_trust, 20 * std.time.ns_per_s);
+    try rig.manager.trust("itest-mon", true);
+    try waitForStatus(&rig.manager, "itest-mon", .ready, 20 * std.time.ns_per_s);
+
+    // Before any monitor activity the cache must be empty: no poll -> no
+    // probe traffic (spec 03 acceptance).
+    std.Thread.sleep(500 * std.time.ns_per_ms);
+    const session = rig.manager.get("itest-mon").?;
+    session.monitor_cache.lock();
+    const idle_empty = session.monitor_cache.current() == null;
+    session.monitor_cache.unlock();
+    try std.testing.expect(idle_empty);
+
+    // Polling enqueues probes; wait for the first real snapshot.
+    const PollResp = struct {
+        ok: bool,
+        ts: i64 = 0,
+        probe_error: ?[]const u8 = null,
+        cpu: struct {
+            utilization_pct: ?f32 = null,
+            cpu_warming: bool = false,
+            load_1: f32 = 0,
+            uptime_sec: u64 = 0,
+            cores: u32 = 0,
+        } = .{},
+        mem: struct {
+            used_bytes: u64 = 0,
+            total_bytes: u64 = 0,
+            available_bytes: u64 = 0,
+        } = .{},
+        disk: struct {
+            used_bytes: u64 = 0,
+            total_bytes: u64 = 0,
+            available_bytes: u64 = 0,
+        } = .{},
+        processes: []const struct { pid: u32 } = &.{},
+    };
+
+    var first_ts: i64 = 0;
+    var warming_seen = false;
+    const deadline = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds + 15 * std.time.ns_per_s;
+    while (std.Io.Timestamp.now(std.testing.io, .real).nanoseconds < deadline) {
+        const response = rig.dispatch(
+            \\{"id":"1","command":"oars.monitor.poll","payload":{"server_id":"itest-mon"}}
+        );
+        const parsed = try std.json.parseFromSlice(PollResp, std.testing.allocator, response, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        });
+        defer parsed.deinit();
+        if (parsed.value.ts > 0) {
+            // The busybox ps fallback yields null cpu/mem per row, but the
+            // probe itself must not have failed.
+            try std.testing.expect(parsed.value.probe_error == null);
+            try std.testing.expect(parsed.value.cpu.cores >= 1);
+            try std.testing.expect(parsed.value.cpu.uptime_sec > 0);
+            try std.testing.expect(parsed.value.mem.total_bytes > 0);
+            try std.testing.expect(parsed.value.mem.available_bytes > 0);
+            try std.testing.expect(parsed.value.disk.total_bytes > 0);
+            try std.testing.expect(parsed.value.processes.len >= 1);
+            first_ts = parsed.value.ts;
+            warming_seen = parsed.value.cpu.cpu_warming;
+            break;
+        }
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(first_ts > 0);
+
+    // The first probe warms up (no previous sample): no invented percent.
+    try std.testing.expect(warming_seen);
+    try std.testing.expect(std.mem.indexOf(u8, rig.output[0..], "\"cpu_warming\":true") != null);
+
+    // Keep polling past the interval: the second probe must produce a real
+    // utilization delta.
+    const util_deadline = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds + 15 * std.time.ns_per_s;
+    var util_seen = false;
+    while (std.Io.Timestamp.now(std.testing.io, .real).nanoseconds < util_deadline) {
+        const response = rig.dispatch(
+            \\{"id":"2","command":"oars.monitor.poll","payload":{"server_id":"itest-mon"}}
+        );
+        const parsed = try std.json.parseFromSlice(PollResp, std.testing.allocator, response, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        });
+        defer parsed.deinit();
+        if (parsed.value.ts > first_ts and parsed.value.cpu.utilization_pct != null) {
+            util_seen = true;
+            break;
+        }
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(util_seen);
+
+    // Stop polling: the liveness window elapses and the snapshot freezes
+    // (no new probes, no new ts).
+    const frozen_ts = blk: {
+        const response = rig.dispatch(
+            \\{"id":"3","command":"oars.monitor.poll","payload":{"server_id":"itest-mon"}}
+        );
+        const parsed = try std.json.parseFromSlice(PollResp, std.testing.allocator, response, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        });
+        defer parsed.deinit();
+        break :blk parsed.value.ts;
+    };
+    std.Thread.sleep(600 * std.time.ns_per_ms);
+    const after_idle = rig.dispatch(
+        \\{"id":"4","command":"oars.monitor.poll","payload":{"server_id":"itest-mon"}}
+    );
+    const parsed_idle = try std.json.parseFromSlice(PollResp, std.testing.allocator, after_idle, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer parsed_idle.deinit();
+    try std.testing.expectEqual(frozen_ts, parsed_idle.value.ts);
+
+    // Manual refresh forces a probe even without a poll cadence.
+    _ = rig.dispatch(
+        \\{"id":"5","command":"oars.monitor.probe","payload":{"server_id":"itest-mon"}}
+    );
+    const force_deadline = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds + 10 * std.time.ns_per_s;
+    var forced = false;
+    while (std.Io.Timestamp.now(std.testing.io, .real).nanoseconds < force_deadline) {
+        const response = rig.dispatch(
+            \\{"id":"6","command":"oars.monitor.poll","payload":{"server_id":"itest-mon"}}
+        );
+        const parsed = try std.json.parseFromSlice(PollResp, std.testing.allocator, response, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        });
+        defer parsed.deinit();
+        if (parsed.value.ts > frozen_ts) {
+            forced = true;
+            break;
+        }
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(forced);
+
+    // Cleanup plans: the estimate streams on a channel; the apt plan runs
+    // and is audited.
+    const estimate = rig.dispatch(
+        \\{"id":"7","command":"oars.monitor.cleanDiskEstimate","payload":{"server_id":"itest-mon","plan":"apt"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, estimate, "\"ok\":true") != null);
+    const cleaned = rig.dispatch(
+        \\{"id":"8","command":"oars.monitor.cleanDisk","payload":{"server_id":"itest-mon","plan":"apt"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, cleaned, "\"ok\":true") != null);
+    const bad_plan = rig.dispatch(
+        \\{"id":"9","command":"oars.monitor.cleanDisk","payload":{"server_id":"itest-mon","plan":"nope"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_plan, "unknown disk plan") != null);
+
+    // Drop caches: exact level chosen, audited before; the forced probe
+    // writes the after snapshot (the container's /proc may be read-only, so
+    // the exec's own exit code is not asserted — the audit trail is).
+    const dropped = rig.dispatch(
+        \\{"id":"10","command":"oars.monitor.dropCaches","payload":{"server_id":"itest-mon","level":3}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, dropped, "\"ok\":true") != null);
+    const bad_level = rig.dispatch(
+        \\{"id":"11","command":"oars.monitor.dropCaches","payload":{"server_id":"itest-mon","level":9}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_level, "must be 1, 2, or 3") != null);
+
+    const audit_deadline = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds + 10 * std.time.ns_per_s;
+    while (std.Io.Timestamp.now(std.testing.io, .real).nanoseconds < audit_deadline) {
+        const content = std.Io.Dir.cwd().readFileAlloc(io, rig.audit_store.path, std.testing.allocator, .limited(256 * 1024)) catch null;
+        if (content) |c| {
+            defer std.testing.allocator.free(c);
+            if (std.mem.indexOf(u8, c, "monitor.clean_disk") != null and
+                std.mem.indexOf(u8, c, "monitor.drop_caches") != null and
+                std.mem.indexOf(u8, c, "monitor.drop_caches.after") != null)
+            {
+                break;
+            }
+        }
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+    const final_audit = try std.Io.Dir.cwd().readFileAlloc(io, rig.audit_store.path, std.testing.allocator, .limited(256 * 1024));
+    defer std.testing.allocator.free(final_audit);
+    try std.testing.expect(std.mem.indexOf(u8, final_audit, "monitor.clean_disk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_audit, "\"plan=apt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_audit, "monitor.drop_caches") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_audit, "level=3 before_mem_used_bytes=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_audit, "monitor.drop_caches.after") != null);
+
+    rig.manager.disconnect("itest-mon");
 }

@@ -9,16 +9,20 @@ const std = @import("std");
 const native_sdk = @import("native_sdk");
 const servers = @import("servers.zig");
 const sessions = @import("sessions.zig");
+const monitor = @import("monitor.zig");
+const audit = @import("audit.zig");
+const json = @import("json.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 11;
+const handler_count = 16;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     store: *servers.Store,
     manager: *sessions.Manager,
+    audit: *audit.Store,
     handlers: [handler_count]native_sdk.BridgeHandler = undefined,
     policies: [handler_count]native_sdk.BridgeCommandPolicy = undefined,
 
@@ -35,6 +39,11 @@ pub const Context = struct {
             .{ .name = "oars.ssh.resize", .context = self, .invoke_fn = handleSshResize },
             .{ .name = "oars.ssh.trust", .context = self, .invoke_fn = handleSshTrust },
             .{ .name = "oars.ssh.poll", .context = self, .invoke_fn = handleSshPoll },
+            .{ .name = "oars.monitor.poll", .context = self, .invoke_fn = handleMonitorPoll },
+            .{ .name = "oars.monitor.probe", .context = self, .invoke_fn = handleMonitorProbe },
+            .{ .name = "oars.monitor.cleanDiskEstimate", .context = self, .invoke_fn = handleMonitorCleanDiskEstimate },
+            .{ .name = "oars.monitor.cleanDisk", .context = self, .invoke_fn = handleMonitorCleanDisk },
+            .{ .name = "oars.monitor.dropCaches", .context = self, .invoke_fn = handleMonitorDropCaches },
         };
         self.policies = .{
             .{ .name = "oars.servers.list", .origins = &allowed_origins },
@@ -48,6 +57,11 @@ pub const Context = struct {
             .{ .name = "oars.ssh.resize", .origins = &allowed_origins },
             .{ .name = "oars.ssh.trust", .origins = &allowed_origins },
             .{ .name = "oars.ssh.poll", .origins = &allowed_origins },
+            .{ .name = "oars.monitor.poll", .origins = &allowed_origins },
+            .{ .name = "oars.monitor.probe", .origins = &allowed_origins },
+            .{ .name = "oars.monitor.cleanDiskEstimate", .origins = &allowed_origins },
+            .{ .name = "oars.monitor.cleanDisk", .origins = &allowed_origins },
+            .{ .name = "oars.monitor.dropCaches", .origins = &allowed_origins },
         };
         return .{
             .policy = .{ .enabled = true, .commands = &self.policies },
@@ -67,26 +81,9 @@ const HandlerFn = *const fn (context: *anyopaque, invocation: native_sdk.bridge.
 fn respondError(output: []u8, message: []const u8) []const u8 {
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":false,\"error\":") catch return output[0..0];
-    writeJsonString(&writer, message) catch return output[0..0];
+    json.writeJsonString(&writer, message) catch return output[0..0];
     writer.writeAll("}") catch return output[0..0];
     return writer.buffered();
-}
-
-/// Minimal JSON string writer (the SDK does not expose its json helper
-/// through the native_sdk root).
-fn writeJsonString(w: *std.Io.Writer, value: []const u8) !void {
-    try w.writeAll("\"");
-    for (value) |ch| {
-        switch (ch) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            else => if (ch < 0x20) try w.print("\\u{x:0>4}", .{ch}) else try w.writeByte(ch),
-        }
-    }
-    try w.writeAll("\"");
 }
 
 const ok_json = "{\"ok\":true}";
@@ -113,7 +110,7 @@ fn handleServersList(context: *anyopaque, invocation: native_sdk.bridge.Invocati
         var msg_buf: [640]u8 = undefined;
         const msg = std.fmt.bufPrint(&msg_buf, "servers.json was unreadable and was moved to {s}; the server list starts fresh", .{q}) catch "servers.json was unreadable and was moved aside";
         writer.writeAll(",\"recovery_error\":") catch return output[0..0];
-        writeJsonString(&writer, msg) catch return output[0..0];
+        json.writeJsonString(&writer, msg) catch return output[0..0];
     }
     writer.writeAll("}") catch return output[0..0];
     return writer.buffered();
@@ -263,35 +260,35 @@ fn handleServersSave(context: *anyopaque, invocation: native_sdk.bridge.Invocati
 
 fn writeServer(writer: anytype, server: servers.Server) !void {
     try writer.writeAll("{\"id\":");
-    try writeJsonString(writer, server.id);
+    try json.writeJsonString(writer, server.id);
     try writer.writeAll(",\"name\":");
-    try writeJsonString(writer, server.name);
+    try json.writeJsonString(writer, server.name);
     try writer.writeAll(",\"host\":");
-    try writeJsonString(writer, server.host);
+    try json.writeJsonString(writer, server.host);
     try writer.print(",\"port\":{d}", .{server.port});
     try writer.writeAll(",\"user\":");
-    try writeJsonString(writer, server.user);
+    try json.writeJsonString(writer, server.user);
     try writer.writeAll(",\"auth_method\":");
-    try writeJsonString(writer, server.auth_method.jsonName());
+    try json.writeJsonString(writer, server.auth_method.jsonName());
     try writer.writeAll(",\"key_path\":");
-    try writeJsonString(writer, server.key_path);
+    try json.writeJsonString(writer, server.key_path);
     try writer.print(",\"key_has_passphrase\":{s}", .{if (server.key_has_passphrase) "true" else "false"});
     try writer.writeAll(",\"host_fingerprint\":");
     if (server.host_fingerprint) |fp| {
-        try writeJsonString(writer, fp);
+        try json.writeJsonString(writer, fp);
     } else {
         try writer.writeAll("null");
     }
     try writer.writeAll(",\"group\":");
-    try writeJsonString(writer, server.group);
+    try json.writeJsonString(writer, server.group);
     try writer.writeAll(",\"tags\":[");
     for (server.tags, 0..) |tag, i| {
         if (i > 0) try writer.writeByte(',');
-        try writeJsonString(writer, tag);
+        try json.writeJsonString(writer, tag);
     }
     try writer.writeAll("],\"via_server_id\":");
     if (server.via_server_id) |via| {
-        try writeJsonString(writer, via);
+        try json.writeJsonString(writer, via);
     } else {
         try writer.writeAll("null");
     }
@@ -532,13 +529,13 @@ fn handleSshPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
 
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":true,\"status\":") catch return output[0..0];
-    writeJsonString(&writer, info.status.jsonName()) catch return output[0..0];
+    json.writeJsonString(&writer, info.status.jsonName()) catch return output[0..0];
     writer.writeAll(",\"error\":") catch return output[0..0];
-    writeJsonString(&writer, info.@"error") catch return output[0..0];
+    json.writeJsonString(&writer, info.@"error") catch return output[0..0];
     writer.writeAll(",\"trust\":{") catch return output[0..0];
     if (info.trust_pending) {
         writer.writeAll("\"pending\":true,\"fingerprint\":") catch return output[0..0];
-        writeJsonString(&writer, info.trust_fingerprint) catch return output[0..0];
+        json.writeJsonString(&writer, info.trust_fingerprint) catch return output[0..0];
     } else {
         writer.writeAll("\"pending\":false") catch return output[0..0];
     }
@@ -549,9 +546,9 @@ fn handleSshPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
         if (!first) writer.writeAll(",") catch return output[0..0];
         first = false;
         writer.print("{{\"id\":{d},\"kind\":", .{ch.id}) catch return output[0..0];
-        writeJsonString(&writer, ch.kind.jsonName()) catch return output[0..0];
+        json.writeJsonString(&writer, ch.kind.jsonName()) catch return output[0..0];
         writer.writeAll(",\"command\":") catch return output[0..0];
-        writeJsonString(&writer, ch.command) catch return output[0..0];
+        json.writeJsonString(&writer, ch.command) catch return output[0..0];
         writer.print(",\"cursor\":{d},\"dropped\":{d},\"pending\":{d},\"eof\":{s},\"exit\":", .{
             ch.cursor, ch.gap, ch.pending, if (ch.eof) "true" else "false",
         }) catch return output[0..0];
@@ -561,9 +558,192 @@ fn handleSshPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
             writer.writeAll("null") catch return output[0..0];
         }
         writer.writeAll(",\"data\":") catch return output[0..0];
-        writeJsonString(&writer, ch.data) catch return output[0..0];
+        json.writeJsonString(&writer, ch.data) catch return output[0..0];
         writer.writeAll("}") catch return output[0..0];
     }
     writer.writeAll("]}") catch return output[0..0];
+    return writer.buffered();
+}
+
+// --- monitor (spec 03) ----------------------------------------------------
+
+/// Not-ready envelope: the monitor contract has exactly two statuses
+/// (spec 03 §10) and the UI shows "waiting for connection".
+const monitor_not_ready = "{\"ok\":true,\"status\":\"not_ready\"}";
+
+/// Cached snapshot, refreshed on demand: marks poll activity (the probe
+/// liveness heartbeat) and enqueues one probe when the cache is stale and
+/// none is running. Never blocks on the network.
+fn handleMonitorPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(IdPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+
+    const session = self.manager.get(parsed.value.server_id) orelse return monitor_not_ready;
+    if (session.status.load(.acquire) != .ready) return monitor_not_ready;
+
+    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+    session.monitor_last_poll_ns.store(now, .release);
+    // Refresh-if-stale: enqueue one probe when the cache is stale and no
+    // probe is already running (spec 03 §6).
+    if (now - session.monitor_last_probe_ns.load(.acquire) >= session.monitor_interval_ns and
+        !session.monitor_probe_active.load(.acquire))
+    {
+        session.monitor_force.store(true, .release);
+    }
+
+    session.monitor_cache.lock();
+    defer session.monitor_cache.unlock();
+    const snap = session.monitor_cache.current() orelse &monitor_empty_snapshot;
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,") catch return output[0..0];
+    std.json.Stringify.value(snap.*, .{}, &writer) catch return output[0..0];
+    return writer.buffered();
+}
+
+/// Honest "no sample yet" state: real zeros and an explicit reason, never
+/// fabricated gauge values.
+const monitor_empty_snapshot = monitor.Snapshot{ .probe_error = "no sample yet" };
+
+/// Manual refresh: enqueues a probe immediately.
+fn handleMonitorProbe(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(IdPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+    self.manager.monitorForce(parsed.value.server_id, now) catch |err| {
+        return respondError(output, switch (err) {
+            error.NoSession => "not connected",
+            error.NotReady => "session not ready",
+        });
+    };
+    return ok_json;
+}
+
+/// Read-only preview for a disk plan (spec 03 §6: each plan has its own
+/// preview before any cleanup runs). Output streams on the channel.
+fn handleMonitorCleanDiskEstimate(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(CleanDiskPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const plan = monitor.DiskPlan.fromJsonName(parsed.value.plan) orelse {
+        return respondError(output, "unknown disk plan");
+    };
+    const channel_id = self.manager.exec(parsed.value.server_id, plan.estimateCommand()) catch |err| {
+        return respondError(output, switch (err) {
+            error.NoSession => "not connected",
+            error.NotReady => "session not ready",
+            else => "estimate failed",
+        });
+    };
+    var writer = std.Io.Writer.fixed(output);
+    writer.print("{{\"ok\":true,\"channel\":{d}}}", .{channel_id}) catch return output[0..0];
+    return writer.buffered();
+}
+
+const CleanDiskPayload = struct {
+    server_id: []const u8,
+    plan: []const u8,
+};
+
+/// Mutating disk cleanup for one fixed plan (spec 03 §6). Approval is the
+/// frontend's confirmation; every execution is audited.
+fn handleMonitorCleanDisk(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(CleanDiskPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const plan = monitor.DiskPlan.fromJsonName(parsed.value.plan) orelse {
+        return respondError(output, "unknown disk plan");
+    };
+    const channel_id = self.manager.exec(parsed.value.server_id, plan.command()) catch |err| {
+        return respondError(output, switch (err) {
+            error.NoSession => "not connected",
+            error.NotReady => "session not ready",
+            else => "cleanup failed",
+        });
+    };
+    var detail_buf: [64]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "plan={s}", .{plan.jsonName()}) catch "plan";
+    self.audit.append(self.io, .{
+        .ts = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds),
+        .action = "monitor.clean_disk",
+        .server_id = parsed.value.server_id,
+        .detail = detail,
+    }) catch {
+        return respondError(output, "cleanup ran but the audit entry could not be written");
+    };
+    var writer = std.Io.Writer.fixed(output);
+    writer.print("{{\"ok\":true,\"channel\":{d}}}", .{channel_id}) catch return output[0..0];
+    return writer.buffered();
+}
+
+const DropCachesPayload = struct {
+    server_id: []const u8,
+    level: u8 = monitor.drop_cache_default,
+};
+
+/// Advanced diagnostics: `sync` then write the selected kernel-documented
+/// value to /proc/sys/vm/drop_caches (spec 03 §6). The exact choice and the
+/// before snapshot are audited at issue time; the worker records the after
+/// snapshot when the forced probe completes.
+fn handleMonitorDropCaches(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(DropCachesPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const level = parsed.value.level;
+    if (level < 1 or level > 3) return respondError(output, "drop-caches level must be 1, 2, or 3");
+
+    const session = self.manager.get(parsed.value.server_id) orelse {
+        return respondError(output, "not connected");
+    };
+    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
+
+    // Before snapshot for the audit record.
+    session.monitor_cache.lock();
+    const before = if (session.monitor_cache.current()) |s| s.* else monitor.Snapshot{};
+    session.monitor_cache.unlock();
+
+    var cmd_buf: [64]u8 = undefined;
+    const command = std.fmt.bufPrint(&cmd_buf, monitor.drop_cache_command, .{level}) catch {
+        return respondError(output, "invalid drop-caches level");
+    };
+    const channel_id = self.manager.exec(parsed.value.server_id, command) catch |err| {
+        return respondError(output, switch (err) {
+            error.NoSession => "not connected",
+            error.NotReady => "session not ready",
+            else => "drop-caches failed",
+        });
+    };
+
+    var detail_buf: [512]u8 = undefined;
+    const detail = std.fmt.bufPrint(
+        &detail_buf,
+        "level={d} before_mem_used_bytes={d} before_mem_available_bytes={d}",
+        .{ level, before.mem.used_bytes, before.mem.available_bytes },
+    ) catch "drop_caches";
+    self.audit.append(self.io, .{
+        .ts = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds),
+        .action = "monitor.drop_caches",
+        .server_id = parsed.value.server_id,
+        .detail = detail,
+    }) catch {
+        return respondError(output, "drop-caches ran but the audit entry could not be written");
+    };
+    session.monitor_drop_pending.store(true, .release);
+    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+    self.manager.monitorForce(parsed.value.server_id, now) catch {};
+
+    var writer = std.Io.Writer.fixed(output);
+    writer.print("{{\"ok\":true,\"channel\":{d}}}", .{channel_id}) catch return output[0..0];
     return writer.buffered();
 }

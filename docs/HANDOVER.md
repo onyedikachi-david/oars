@@ -457,3 +457,17 @@ Store gained a mutex (the worker now writes during fingerprint migration).
 Spec 03 (Infra Monitoring) backend: `/proc/stat` CPU delta utilization,
 probe-on-demand cache, itemized cleanup plans, drop-caches diagnostic,
 audit store (`audit.jsonl`, spec 15 shape).
+
+### 12.4 Spec 03 landed (same day, third commit)
+
+`src/monitor.zig` (parsers + snapshot model + per-session cache), probe
+machinery in the session worker (internal channel, marker-delimited
+output, CPU delta vs the previous sample, warming state), bridge handlers
+`oars.monitor.{poll,probe,cleanDiskEstimate,cleanDisk,dropCaches}`, and
+`src/audit.zig` (jsonl, fsync'd appends, spec 15 shape). Cleanup is
+itemized fixed plans (journal vacuum, apt clean) — no broad `find -delete`.
+Drop-caches audits the exact level + before snapshot at issue time and the
+after snapshot when the forced probe lands. Busybox `ps` (verified live)
+can't emit CPU%/Mem%, so the fallback is `ps -eo pid,comm` and the payload
+carries nulls. Container pass green: idle → no probe, warming → utilization
+delta, snapshot freeze, forced refresh, cleanup + audit trail.

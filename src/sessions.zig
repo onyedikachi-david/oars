@@ -10,6 +10,8 @@ const std = @import("std");
 const ssh = @import("ssh.zig");
 const servers = @import("servers.zig");
 const openssh = @import("openssh.zig");
+const monitor = @import("monitor.zig");
+const audit = @import("audit.zig");
 
 /// Blocking acquire on std.atomic.Mutex (spinlock) — 0.16's atomic.Mutex
 /// only exposes tryLock. Sections are short (buffer/cursor updates), so
@@ -168,6 +170,9 @@ pub const ChannelEntry = struct {
     /// Set once the raw libssh2 channel is closed and freed; session
     /// teardown must not close it again.
     raw_closed: bool = false,
+    /// Worker-internal channel (monitor probe): never exposed in polls;
+    /// its output is consumed by the worker at EOF.
+    internal: bool = false,
 };
 
 const Op = union(enum) {
@@ -195,6 +200,7 @@ pub const Session = struct {
     io: std.Io,
     transport: ssh.Session,
     store: *servers.Store,
+    audit: *audit.Store,
     status: std.atomic.Value(Status) = .init(.connecting),
     error_mutex: std.atomic.Mutex = .unlocked,
     error_msg: [error_buf_len]u8 = undefined,
@@ -215,6 +221,19 @@ pub const Session = struct {
     home: ?[]const u8 = null,
     last_keepalive_ns: i128 = 0,
     keepalive_interval_ns: i128 = 30 * std.time.ns_per_s,
+    /// Monitor probe state (spec 03). The cache is read by bridge handlers
+    /// and written by the worker under its spinlock; the cadence fields are
+    /// copied from the manager at connect.
+    monitor_cache: monitor.Cache = .{},
+    monitor_last_poll_ns: std.atomic.Value(i128) = .init(0),
+    monitor_force: std.atomic.Value(bool) = .init(false),
+    monitor_last_probe_ns: std.atomic.Value(i128) = .init(0),
+    monitor_probe_active: std.atomic.Value(bool) = .init(false),
+    monitor_interval_ns: i128 = 2 * std.time.ns_per_s,
+    monitor_liveness_ns: i128 = 4 * std.time.ns_per_s,
+    /// Set by dropCaches so the next completed probe writes the after
+    /// snapshot audit entry (before/after contract, spec 03 §6).
+    monitor_drop_pending: std.atomic.Value(bool) = .init(false),
 
     pub fn setError(self: *Session, msg: []const u8) void {
         lockSpin(&self.error_mutex);
@@ -247,18 +266,24 @@ pub const Session = struct {
 pub const Manager = struct {
     allocator: std.mem.Allocator,
     store: *servers.Store,
+    audit: *audit.Store,
     io: std.Io,
     /// Borrowed from the process environment (outlives the manager);
     /// used to expand "~/" in key paths on the worker threads.
     home: ?[]const u8 = null,
+    /// Monitor probe cadence, copied to each session at connect (tests
+    /// shrink these to keep probe assertions fast).
+    monitor_interval_ns: i128 = 2 * std.time.ns_per_s,
+    monitor_liveness_ns: i128 = 4 * std.time.ns_per_s,
     mutex: std.atomic.Mutex = .unlocked,
     sessions: std.StringHashMap(*Session) = undefined,
     next_session_id: u64 = 1,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, store: *servers.Store, home: ?[]const u8) Manager {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, store: *servers.Store, audit_store: *audit.Store, home: ?[]const u8) Manager {
         return .{
             .allocator = allocator,
             .store = store,
+            .audit = audit_store,
             .io = io,
             .home = home,
             .sessions = std.StringHashMap(*Session).init(allocator),
@@ -301,6 +326,9 @@ pub const Manager = struct {
             .io = undefined,
             .transport = try ssh.Session.init(self.allocator),
             .store = self.store,
+            .audit = self.audit,
+            .monitor_interval_ns = self.monitor_interval_ns,
+            .monitor_liveness_ns = self.monitor_liveness_ns,
             .started_at_ns = std.Io.Timestamp.now(self.io, .real).nanoseconds,
         };
         errdefer {
@@ -466,6 +494,7 @@ pub const Manager = struct {
         defer session.channels_mutex.unlock();
         var budget = data_budget;
         for (session.channels.items) |entry| {
+            if (entry.internal) continue; // monitor probes are worker-owned
             const requested: u64 = if (rewind) 0 else cursorFor(cursors, entry.id) orelse 0;
             const view = entry.stream.view(requested);
             const take = @min(view.pending, @as(u64, @min(channel_budget, budget)));
@@ -520,6 +549,22 @@ pub const Manager = struct {
             .trust_pending = session.trustPending(),
             .trust_fingerprint = session.trustFingerprint(),
         };
+    }
+
+    /// Marks monitor poll activity: the worker probes only while polls are
+    /// recent (spec 03 §6: no poll → no probe traffic).
+    pub fn monitorTouch(self: *Manager, server_id: []const u8, now_ns: i128) !void {
+        const session = self.get(server_id) orelse return error.NoSession;
+        session.monitor_last_poll_ns.store(now_ns, .release);
+    }
+
+    /// Enqueues an immediate probe (manual refresh, or right after a
+    /// mutating monitor action so the cache refreshes).
+    pub fn monitorForce(self: *Manager, server_id: []const u8, now_ns: i128) !void {
+        const session = self.get(server_id) orelse return error.NoSession;
+        if (session.status.load(.acquire) != .ready) return error.NotReady;
+        session.monitor_last_poll_ns.store(now_ns, .release);
+        session.monitor_force.store(true, .release);
     }
 };
 
@@ -836,16 +881,31 @@ fn workerMain(session: *Session) void {
                         entry.stream.exit_status = entry.raw.exitStatus();
                         entry.stream.mutex.unlock();
                         entry.raw.sendEof();
-                        if (entry.kind == .exec) {
-                            // Exec output must survive for the frontend to
-                            // drain through polls: release the raw channel
-                            // but keep entry + stream until session teardown
-                            // (bounded by evictCompletedExecs).
-                            entry.raw.close(session.io);
-                            entry.raw_closed = true;
+                        entry.raw.close(session.io);
+                        entry.raw_closed = true;
+                        if (entry.internal) {
+                            drainProbe(session, entry);
+                            session.monitor_probe_active.store(false, .release);
                         }
                     }
-                    if (entry.kind == .exec) evictCompletedExecs(session);
+                    if (entry.internal) {
+                        // Consumed by the worker; drop the entry now (the
+                        // next item shifts into slot i).
+                        lockSpin(&session.channels_mutex);
+                        const still = i < session.channels.items.len and session.channels.items[i] == entry;
+                        if (still) _ = session.channels.orderedRemove(i);
+                        session.channels_mutex.unlock();
+                        if (still) {
+                            entry.stdin_queue.deinit(allocator);
+                            allocator.free(entry.command);
+                            entry.stream.deinit(allocator);
+                            allocator.destroy(entry.stream);
+                            allocator.destroy(entry);
+                            continue;
+                        }
+                    } else if (entry.kind == .exec) {
+                        evictCompletedExecs(session);
+                    }
                     i += 1;
                 },
                 .data => |n| {
@@ -853,6 +913,22 @@ fn workerMain(session: *Session) void {
                     i += 1;
                 },
                 .again => i += 1,
+            }
+        }
+
+        // --- monitor probe (probe-on-demand, spec 03 §6) -----------------
+        // The worker probes only while monitor polls are recent (liveness
+        // window) or a poll explicitly enqueued one (force); a session with
+        // no monitor view generates no probe traffic.
+        if (!session.monitor_probe_active.load(.acquire)) {
+            const force = session.monitor_force.swap(false, .acquire);
+            const now = std.Io.Timestamp.now(io, .real).nanoseconds;
+            const poll_recent = now - session.monitor_last_poll_ns.load(.acquire) < session.monitor_liveness_ns;
+            if (force or (poll_recent and now - session.monitor_last_probe_ns.load(.acquire) >= session.monitor_interval_ns)) {
+                session.monitor_last_probe_ns.store(now, .release);
+                startProbe(session) catch {
+                    storeProbeFailure(session, "probe could not start");
+                };
             }
         }
 
@@ -882,12 +958,12 @@ fn evictCompletedExecs(session: *Session) void {
     defer session.channels_mutex.unlock();
     var completed: usize = 0;
     for (session.channels.items) |e| {
-        if (e.kind == .exec and e.eof_seen) completed += 1;
+        if (e.kind == .exec and e.eof_seen and !e.internal) completed += 1;
     }
     while (completed > max_completed_execs) {
         var found: ?usize = null;
         for (session.channels.items, 0..) |e, i| {
-            if (e.kind == .exec and e.eof_seen) {
+            if (e.kind == .exec and e.eof_seen and !e.internal) {
                 found = i;
                 break;
             }
@@ -902,6 +978,97 @@ fn evictCompletedExecs(session: *Session) void {
         session.allocator.destroy(entry);
         completed -= 1;
     }
+}
+
+/// Opens an internal channel and runs the probe command on it. The entry
+/// is marked internal so polls never see it; the worker drains and parses
+/// it at EOF (spec 03 §6: probe via the exec path, bounded read).
+fn startProbe(session: *Session) !void {
+    const raw = try session.transport.openChannel(session.io);
+    errdefer raw.close(session.io);
+    try raw.exec(session.io, monitor.probe_command);
+    const stream = try session.allocator.create(Stream);
+    errdefer session.allocator.destroy(stream);
+    stream.* = Stream.init(session.allocator);
+    const entry = try session.allocator.create(ChannelEntry);
+    errdefer session.allocator.destroy(entry);
+    entry.* = .{
+        .id = session.next_channel_id.fetchAdd(1, .monotonic),
+        .kind = .exec,
+        .command = "",
+        .stream = stream,
+        .raw = raw,
+        .internal = true,
+    };
+    lockSpin(&session.channels_mutex);
+    session.channels.append(session.allocator, entry) catch {
+        session.channels_mutex.unlock();
+        return error.OutOfMemory;
+    };
+    session.channels_mutex.unlock();
+    session.monitor_probe_active.store(true, .release);
+}
+
+/// Drains an internal probe channel, parses the output, computes the CPU
+/// delta against the previous sample, and commits the snapshot. Failures
+/// surface as `probe_error` — the UI degrades honestly, it never sees
+/// fabricated numbers.
+fn drainProbe(session: *Session, entry: *ChannelEntry) void {
+    const allocator = session.allocator;
+    var total: std.ArrayList(u8) = .empty;
+    defer total.deinit(allocator);
+    var buf: [32 * 1024]u8 = undefined;
+    const cap: usize = 256 * 1024;
+    var cursor = entry.stream.start();
+    while (true) {
+        const n = entry.stream.readAt(cursor, &buf);
+        if (n == 0) break;
+        if (total.items.len + n > cap) {
+            storeProbeFailure(session, "probe output exceeded the capture cap");
+            return;
+        }
+        total.appendSlice(allocator, buf[0..n]) catch {
+            storeProbeFailure(session, "out of memory capturing probe output");
+            return;
+        };
+        cursor += n;
+    }
+
+    session.monitor_cache.lock();
+    const previous = session.monitor_cache.previous_cpu;
+    session.monitor_cache.unlock();
+    var result = monitor.parseProbeOutput(allocator, total.items, previous);
+    result.snapshot.ts = @intCast(std.Io.Timestamp.now(session.io, .real).nanoseconds);
+    // A nonzero probe exit means the output is suspect even if it parsed.
+    if (entry.stream.exit_status != null and entry.stream.exit_status.? != 0) {
+        result.snapshot.probe_error = "probe command failed";
+    }
+    session.monitor_cache.commit(allocator, result.snapshot, result.cpu_sample);
+
+    // Drop-caches before/after contract (spec 03 §6): the next completed
+    // probe records the after snapshot.
+    if (session.monitor_drop_pending.swap(false, .acquire)) {
+        var detail_buf: [256]u8 = undefined;
+        const detail = std.fmt.bufPrint(
+            &detail_buf,
+            "after drop_caches: mem_used_bytes={d} mem_available_bytes={d}",
+            .{ result.snapshot.mem.used_bytes, result.snapshot.mem.available_bytes },
+        ) catch "after drop_caches";
+        session.audit.append(session.io, .{
+            .ts = result.snapshot.ts,
+            .action = "monitor.drop_caches.after",
+            .server_id = session.server.id,
+            .detail = detail,
+        }) catch {};
+    }
+}
+
+/// Commits an honest failure snapshot (zeros + explicit probe_error).
+fn storeProbeFailure(session: *Session, msg: []const u8) void {
+    var snap = monitor.Snapshot{};
+    snap.ts = @intCast(std.Io.Timestamp.now(session.io, .real).nanoseconds);
+    snap.probe_error = msg;
+    session.monitor_cache.commit(session.allocator, snap, null);
 }
 
 fn processOps(session: *Session) void {
@@ -1015,6 +1182,7 @@ fn sessionDone(session: *Session) void {
     session.channels.clearRetainingCapacity();
     session.channels_mutex.unlock();
 
+    session.monitor_cache.deinit(session.allocator);
     session.transport.disconnect(session.io);
     const status = session.status.load(.acquire);
     if (status != .@"error" and status != .closed) session.status.store(.closed, .release);

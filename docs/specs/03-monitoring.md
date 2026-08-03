@@ -1,6 +1,6 @@
 # Spec 03 — Infra Monitoring
 
-**Status:** 📋 · **Depends on:** 02 (exec) · **Spec owner:** core + frontend
+**Status:** ✅ backend in (frontend UI pending) · **Depends on:** 02 (exec) · **Spec owner:** core + frontend
 
 ## 1. Overview
 
@@ -60,7 +60,7 @@ type, parses them, and serves a cached snapshot to the UI on demand.
 ### `oars.monitor.poll` `{server_id}` → snapshot (cached, ≤ 2 s old)
 ```json
 {"ok":true,"ts":1754…,
- "cpu":{"utilization_pct":12.7,"load_1":0.25,"load_5":0.20,"load_15":0.18,
+ "cpu":{"utilization_pct":12.7,"cpu_warming":false,"load_1":0.25,"load_5":0.20,"load_15":0.18,
         "uptime_sec":19500000,"cores":2},
  "mem":{"used_bytes":4.63e9,"total_bytes":7.64e9,"available_bytes":3.01e9,
         "swap_used_bytes":0,"swap_total_bytes":0},
@@ -69,12 +69,22 @@ type, parses them, and serves a cached snapshot to the UI on demand.
  "probe_error":null}
 ```
 - `probe_error` set when the probe command fails (e.g. permission) — UI shows a degraded state, never a crash.
+- Before the first sample lands the response carries the same shape with
+  `ts:0` and `probe_error:"no sample yet"` — real zeros plus an explicit
+  reason, never fabricated gauges.
+- Requested before the session is ready → `{"ok":true,"status":"not_ready"}`;
+  UI shows "waiting for connection".
+- `cpu`/`mem` per process are `null` on platforms whose `ps` cannot report
+  them (busybox fallback) — never invented zeros.
 
 ### `oars.monitor.probe` `{server_id}` (internal) — runs the command set, parses
-Probe commands (read-only, one exec):
+Probe commands (read-only, one exec), marker-delimited so parsing never
+positions-guesses across variable-line sections:
 ```
-cat /proc/stat; cat /proc/loadavg; nproc; cat /proc/uptime; cat /proc/meminfo;
-df -kP /; ps -eo pid=,comm=,%cpu=,%mem= --sort=-%cpu | head -n 11
+printf '%%BEGIN_STAT%%\n'; cat /proc/stat; printf '%%BEGIN_LOADAVG%%\n'; cat /proc/loadavg;
+printf '%%BEGIN_NPROC%%\n'; nproc; printf '%%BEGIN_UPTIME%%\n'; cat /proc/uptime;
+printf '%%BEGIN_MEMINFO%%\n'; cat /proc/meminfo; printf '%%BEGIN_DF%%\n'; df -kP /;
+printf '%%BEGIN_PS%%\n'; (ps -eo pid=,comm=,%cpu=,%mem= --sort=-%cpu 2>/dev/null || ps -eo pid,comm) | head -n 11
 ```
 - CPU utilization is computed from deltas between the current and previous
   cached `/proc/stat` samples. The first valid probe returns
@@ -83,17 +93,39 @@ df -kP /; ps -eo pid=,comm=,%cpu=,%mem= --sort=-%cpu | head -n 11
   `/proc/loadavg` is reported as load average and is never labeled as a
   percentage. Parsing uses capability-specific command variants for procps and
   BusyBox; it does not assume one `ps -o` form works on both.
+- The probe runs on the session worker as an internal exec channel; probes
+  never appear in `oars.ssh.poll` channel lists.
+
+### `oars.monitor.cleanDiskEstimate` `{server_id, plan: journal|apt}` → `{ok, channel}`
+- Read-only preview for one fixed plan; output streams on the channel.
+### `oars.monitor.cleanDisk` `{server_id, plan: journal|apt}` → `{ok, channel}`
+- Runs the plan's fixed command (journal vacuum / apt cache clean). Approval
+  is the frontend's confirmation; every execution writes an audit entry
+  (`monitor.clean_disk`, spec 15 shape) before the response.
+### `oars.monitor.dropCaches` `{server_id, level?: 1|2|3}` → `{ok, channel}`
+- Advanced diagnostics: `sync` first, then write the selected
+  kernel-documented value to `/proc/sys/vm/drop_caches` (default 3). The
+  exact choice and the before snapshot are audited at issue time
+  (`monitor.drop_caches`); the worker records the after snapshot
+  (`monitor.drop_caches.after`) when the forced probe completes.
 - Oars+ PM2: `oars.monitor.pm2` `{server_id}` → `pm2 jlist` parsed to a bounded array; `oars.monitor.pm2Action` `{server_id, action: restart|stop|start, name}` — approval-gated.
 
 ## 6. Zig core design
 
-- `src/monitor.zig` — probe runner + parsers (`parseProcLoadAvg`, `parseMemInfo`, `parseDf`, `parsePs`), each pure + unit-tested with fixture strings.
-- `MonitorCache` per session: `{snapshot, previous_cpu_sample,
-  probe_in_flight, last_probe_ns}` guarded by a spinlock. A poll returns the
-  current snapshot immediately and enqueues one worker probe when the cache is
-  stale and no probe is already running. Thus a visible view can refresh every
-  2 s, while a session with no monitor poll generates no probe traffic.
-- Probe runs on the session worker via the exec path (channel opened, output captured until EOF; bounded read).
+- `src/monitor.zig` — probe runner + parsers (`parseProcStat`, `parseLoadAvg`,
+  `parseNproc`, `parseUptime`, `parseMemInfo`, `parseDf`, `parsePs`), each
+  pure + unit-tested with fixture strings; `parseProbeOutput` composes the
+  marker-delimited sections and computes the CPU delta.
+- `MonitorCache` per session: `{snapshot, previous_cpu_sample}` guarded by a
+  spinlock. A poll returns the current snapshot immediately and enqueues one
+  worker probe when the cache is stale and no probe is already running. The
+  worker probes on the 2 s cadence only while polls are recent (a 4 s liveness
+  window) or an explicit probe/refresh enqueued one. Thus a visible view can
+  refresh every 2 s, while a session with no monitor poll generates no probe
+  traffic. Cadence fields are manager-tunable (tests shrink them).
+- Probe runs on the session worker as an internal exec channel (opened,
+  output captured until EOF, 256 KB bounded read; never visible in
+  `oars.ssh.poll`).
 - Disk cleanup uses separate fixed action plans. Examples are archived-journal
   vacuuming and package-cache cleanup. Each plan has its own preview, required
   privilege, command, result, and audit record. Log and temporary-file cleanup
@@ -102,7 +134,7 @@ df -kP /; ps -eo pid=,comm=,%cpu=,%mem= --sort=-%cpu | head -n 11
   value (`1`, `2`, or `3`) to `/proc/sys/vm/drop_caches` with approved root or
   non-interactive sudo authority. The default is `3`, matching the product's
   combined page-cache and reclaimable-slab action. Record the exact choice and
-  before/after snapshot in audit history.
+  before/after snapshot in audit history (`audit.jsonl`, spec 15 shape).
 
 ## 7. Data model
 
@@ -125,32 +157,51 @@ df -kP /; ps -eo pid=,comm=,%cpu=,%mem= --sort=-%cpu | head -n 11
 
 ## 10. Edge cases
 
-- Server without `/proc` (containers) → `probe_error: "no /proc"`, gauges show "—".
-- Busybox `ps` without `--sort` → fallback `ps -eo pid,comm,%cpu,%mem` unsorted (parse both).
+- Server without `/proc` (containers) → `probe_error` naming the unreadable
+  section (the loadavg case reads "no /proc readable (loadavg empty)");
+  gauges show "—".
+- Busybox `ps` cannot emit CPU%/Mem% columns at all (its `-o` supports only
+  pid/comm/…; verified live against BusyBox v1.36): the fallback is
+  `ps -eo pid,comm` and the payload carries `cpu:null`/`mem:null` per row.
 - Huge process table → bounded to 10 rows after parse.
 - Monitor requested before `ready` → `{"status":"not_ready"}`; UI shows "waiting for connection".
 - First CPU sample → utilization shows "warming up" until the next valid
   delta; load average and other gauges still render.
 - Disk at 100% → parse still works; gauges clamp to 100.
+- A section that fails mid-probe keeps the sections parsed before it
+  (degraded state: partial data plus an explicit `probe_error`).
 
 ## 11. Testing
 
-- Unit: each parser against fixtures (procps, busybox, weird whitespace, missing fields).
-- Integration: run probes against dockerized sshd container; verify numbers vs `top` inside container.
-- Manual: gauge color transitions, sort, drop-caches warning and result,
+- Unit (`src/monitor.zig`): each parser against fixtures (procps, busybox,
+  weird whitespace, missing fields), `/proc/stat` delta math + clamping,
+  marker-delimited composition, honest failure semantics, cache commit.
+- Integration (dockerized sshd container, `src/integration.zig`): no poll →
+  no probe; poll → first snapshot with valid fields + `cpu_warming`; second
+  probe → real `utilization_pct`; snapshot freezes when polls stop; forced
+  probe advances it; `cleanDiskEstimate`/`cleanDisk`/`dropCaches` run through
+  the bridge and every mutation lands in `audit.jsonl` (before + after for
+  drop-caches). **Container pass green 2026-08-03.**
+- Manual (frontend): gauge color transitions, sort, drop-caches warning and result,
   disk-analysis preview, PM2 actions.
 
 ## 12. Acceptance criteria
 
-- [ ] Gauges + top-10 render live for a connected server, refresh ≤ 2 s.
-- [ ] Parser fixtures green for procps + busybox variants.
-- [ ] Disk analysis is read-only. Each selected cleanup runs only after confirm
-      and writes an audit entry.
-- [ ] Drop filesystem caches is hidden under Advanced diagnostics, requires an
-      explicit warning confirmation and privilege check, and records the exact
-      operation and before/after snapshot.
-- [ ] Idle servers consume no probe traffic (no poll → no exec).
-- [ ] PM2 list/restart/stop work against a container running PM2.
+- [ ] Gauges + top-10 render live for a connected server, refresh ≤ 2 s —
+      backend snapshot pipeline lands and is container-verified; the gauge
+      UI is frontend work (pending).
+- [x] Parser fixtures green for procps + busybox variants (unit suite).
+- [x] Disk analysis is read-only. Each selected cleanup runs only after
+      confirm and writes an audit entry — backend: fixed plans, channel
+      output, `monitor.clean_disk` audit; the confirmation dialog is
+      frontend (pending).
+- [x] Drop filesystem caches records the exact operation and before/after
+      snapshot — backend audited before + after; the hidden-under-Advanced
+      UI and warning copy are frontend (pending).
+- [x] Idle servers consume no probe traffic (no poll → no exec) —
+      container-verified.
+- [ ] PM2 list/restart/stop work against a container running PM2 — Oars+,
+      not yet implemented.
 
 ## 13. Research & References
 
@@ -172,6 +223,12 @@ df -kP /; ps -eo pid=,comm=,%cpu=,%mem= --sort=-%cpu | head -n 11
   `/proc/loadavg` is not CPU utilization. This review added `/proc/stat`
   delta sampling and split the API fields so the UI cannot label load average
   as a percent.
+  **Correction (landed 2026-08-03):** the probe is marker-delimited
+  (`%BEGIN_X%`) because positional parsing of concatenated sections cannot be
+  robust across variable-line sections (df/ps); the busybox `ps` fallback is
+  `ps -eo pid,comm` with nullable cpu/mem — busybox rejects `%cpu` entirely
+  (verified live, BusyBox v1.36), so the previous `ps -eo pid,comm,%cpu,%mem`
+  fallback was wrong. CPU idle counts idle + iowait (kernel convention).
 - **`nproc`** — GNU coreutils (manual:
   `https://www.gnu.org/software/coreutils/manual/html_node/nproc-invocation.html`),
   prints the number of processing units available to the current process
