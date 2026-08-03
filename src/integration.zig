@@ -19,6 +19,7 @@ const audit = @import("audit.zig");
 const logs = @import("logs.zig");
 const bridge = @import("bridge.zig");
 const sftpmod = @import("sftp.zig");
+const scripts = @import("scripts.zig");
 
 /// Reads an environment variable from the process environment. The raw
 /// environ pointer is the only env source in 0.16 outside `main(init)`.
@@ -71,10 +72,12 @@ const TestRig = struct {
     path_buf: [512]u8 = undefined,
     audit_path_buf: [512]u8 = undefined,
     logs_path_buf: [512]u8 = undefined,
+    scripts_path_buf: [512]u8 = undefined,
     dir_name: []const u8,
     store: servers.Store,
     audit_store: audit.Store,
     logs_store: logs.SourceStore,
+    scripts_store: scripts.Store,
     manager: sessions.Manager,
     ctx: bridge.Context,
     dispatcher: native_sdk.BridgeDispatcher,
@@ -87,11 +90,13 @@ const TestRig = struct {
         const store_path = try std.fmt.bufPrint(&self.path_buf, "/tmp/{s}/servers.json", .{self.dir_name});
         const audit_path = try std.fmt.bufPrint(&self.audit_path_buf, "/tmp/{s}/audit.jsonl", .{self.dir_name});
         const logs_path = try std.fmt.bufPrint(&self.logs_path_buf, "/tmp/{s}/logs.json", .{self.dir_name});
+        const scripts_path = try std.fmt.bufPrint(&self.scripts_path_buf, "/tmp/{s}/scripts.json", .{self.dir_name});
         self.store = .{ .allocator = std.testing.allocator, .path = store_path };
         self.audit_store = .{ .allocator = std.testing.allocator, .path = audit_path };
         self.logs_store = .{ .allocator = std.testing.allocator, .path = logs_path };
+        self.scripts_store = .{ .allocator = std.testing.allocator, .path = scripts_path };
         self.manager = sessions.Manager.init(std.testing.allocator, io, &self.store, &self.audit_store, null);
-        self.ctx = .{ .allocator = std.testing.allocator, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store };
+        self.ctx = .{ .allocator = std.testing.allocator, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store, .scripts = &self.scripts_store };
         self.dispatcher = self.ctx.dispatcher();
     }
 
@@ -1096,4 +1101,268 @@ test "integration: sftp crud, editor save, transfers, cancel, and zip paths" {
     try execWait(&rig.manager, "itest-sftp", "ls /tmp/oars-sftp-itest", 1, "");
 
     rig.manager.disconnect("itest-sftp");
+}
+
+// --- scripts helpers (spec 06) --------------------------------------------------
+
+/// Polls an existing exec channel by id until EOF; asserts the exit code
+/// and an output marker.
+fn execChannelWait(manager: *sessions.Manager, server_id: []const u8, channel: u32, want_exit: i32, want_out: []const u8) !void {
+    const deadline = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds + 15 * std.time.ns_per_s;
+    var acc: std.ArrayList(u8) = .empty;
+    defer acc.deinit(std.testing.allocator);
+    var cursor: u64 = 0;
+    var saw_eof = false;
+    var exit: ?i32 = null;
+    while (std.Io.Timestamp.now(std.testing.io, .real).nanoseconds < deadline) {
+        const polls = try manager.pollChannels(server_id, &.{.{ .id = channel, .pos = cursor }}, false, 64 * 1024, 64 * 1024);
+        for (polls) |*poll| {
+            if (poll.id != channel) continue;
+            try acc.appendSlice(std.testing.allocator, poll.data);
+            cursor = poll.cursor;
+            saw_eof = poll.eof;
+            exit = poll.exit_status;
+        }
+        for (polls) |*poll| poll.deinit(std.testing.allocator);
+        std.testing.allocator.free(polls);
+        if (saw_eof and exit != null) {
+            try std.testing.expectEqual(want_exit, exit.?);
+            if (want_out.len > 0) {
+                try std.testing.expect(std.mem.indexOf(u8, acc.items, want_out) != null);
+            }
+            return;
+        }
+        testSleep(50);
+    }
+    return error.TestUnexpectedResult;
+}
+
+/// Parses `"channel":N` out of a run response.
+fn scriptsChannel(resp: []const u8) ?u32 {
+    const pos = std.mem.indexOf(u8, resp, "\"channel\":") orelse return null;
+    const rest = resp[pos + 10 ..];
+    var end: usize = 0;
+    while (end < rest.len and rest[end] >= '0' and rest[end] <= '9') end += 1;
+    if (end == 0) return null;
+    return std.fmt.parseInt(u32, rest[0..end], 10) catch null;
+}
+
+/// Parses `"run_id":N` out of a broadcast response.
+fn scriptsRunId(resp: []const u8) ?u32 {
+    const pos = std.mem.indexOf(u8, resp, "\"run_id\":") orelse return null;
+    const rest = resp[pos + 9 ..];
+    var end: usize = 0;
+    while (end < rest.len and rest[end] >= '0' and rest[end] <= '9') end += 1;
+    if (end == 0) return null;
+    return std.fmt.parseInt(u32, rest[0..end], 10) catch null;
+}
+
+const BroadcastServer = struct {
+    server_id: []const u8,
+    status: []const u8,
+    exit: ?i32 = null,
+    cursor: u64 = 0,
+    eof: bool = false,
+    data: []const u8 = "",
+    @"error": []const u8 = "",
+    gap: u64 = 0,
+};
+
+const BroadcastResp = struct {
+    result: struct {
+        ok: bool,
+        run_id: u32,
+        servers: []BroadcastServer = &.{},
+        done: bool = false,
+        canceled: bool = false,
+    },
+};
+
+/// Polls a broadcast until every server is terminal; returns the last
+/// response (alloc_always — the caller must deinit). Cursors stay empty,
+/// so the final response carries each server's full retained output.
+fn broadcastWaitFor(rig: *TestRig, run_id: u32) !std.json.Parsed(BroadcastResp) {
+    var req_buf: [256]u8 = undefined;
+    const deadline = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds + 25 * std.time.ns_per_s;
+    while (std.Io.Timestamp.now(std.testing.io, .real).nanoseconds < deadline) {
+        const req = std.fmt.bufPrint(&req_buf, "{{\"id\":\"p\",\"command\":\"oars.scripts.broadcastPoll\",\"payload\":{{\"run_id\":{d},\"cursors\":{{}}}}}}", .{run_id}) catch unreachable;
+        const resp = rig.dispatch(req);
+        var parsed = std.json.parseFromSlice(BroadcastResp, std.testing.allocator, resp, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        }) catch return error.TestUnexpectedResult;
+        var all_terminal = true;
+        for (parsed.value.result.servers) |s| {
+            if (std.mem.eql(u8, s.status, "queued") or std.mem.eql(u8, s.status, "running")) all_terminal = false;
+        }
+        if (all_terminal) return parsed;
+        parsed.deinit();
+        testSleep(100);
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "integration: scripts run with variables, injection neutralization, broadcast, and cancel" {
+    const env = TestEnv.load();
+    if (!env.active) return; // skipped: run scripts/integration-test.sh
+
+    ssh.initGlobal();
+
+    var rig: TestRig = undefined;
+    try rig.init("scripts");
+    defer rig.deinit();
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    // Two sessions to the same container: the broadcast fan-out needs two
+    // servers (spec 06 §11).
+    const s1 = servers.Server{
+        .id = "itest-scr-a",
+        .name = "dev-sshd-a",
+        .host = env.host,
+        .port = env.port,
+        .user = env.user,
+        .auth_method = .password,
+    };
+    const s2 = servers.Server{
+        .id = "itest-scr-b",
+        .name = "dev-sshd-b",
+        .host = env.host,
+        .port = env.port,
+        .user = env.user,
+        .auth_method = .password,
+    };
+    try rig.store.upsert(io, s1);
+    try rig.store.upsert(io, s2);
+    _ = try rig.manager.connect(s1, env.password, null);
+    try waitForStatus(&rig.manager, "itest-scr-a", .needs_trust, 20 * std.time.ns_per_s);
+    try rig.manager.trust("itest-scr-a", true);
+    try waitForStatus(&rig.manager, "itest-scr-a", .ready, 20 * std.time.ns_per_s);
+    _ = try rig.manager.connect(s2, env.password, null);
+    try waitForStatus(&rig.manager, "itest-scr-b", .needs_trust, 20 * std.time.ns_per_s);
+    try rig.manager.trust("itest-scr-b", true);
+    try waitForStatus(&rig.manager, "itest-scr-b", .ready, 20 * std.time.ns_per_s);
+
+    // Save the scripts.
+    const saved = rig.dispatch(
+        \\{"id":"1","command":"oars.scripts.save","payload":{"script":{"id":"sc-hello","name":"hello","body":"echo hello {{who}}","variables":[{"name":"who","label":"Who"}]}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"ok\":true") != null);
+    _ = rig.dispatch(
+        \\{"id":"2","command":"oars.scripts.save","payload":{"script":{"id":"sc-echo","name":"echo","body":"echo {{x}}"}}}
+    );
+    _ = rig.dispatch(
+        \\{"id":"3","command":"oars.scripts.save","payload":{"script":{"id":"sc-secret","name":"secret","body":"echo {{pw}}"}}}
+    );
+    _ = rig.dispatch(
+        \\{"id":"4","command":"oars.scripts.save","payload":{"script":{"id":"sc-sleep","name":"sleep","body":"sleep 30"}}}
+    );
+
+    // --- run with a variable ---
+    const run = rig.dispatch(
+        \\{"id":"5","command":"oars.scripts.run","payload":{"server_id":"itest-scr-a","script_id":"sc-hello","vars":{"who":{"value":"world"}}}}
+    );
+    const channel = scriptsChannel(run) orelse return error.TestUnexpectedResult;
+    try execChannelWait(&rig.manager, "itest-scr-a", channel, 0, "hello world");
+
+    // --- injection value stays a literal argument ---
+    const inj = rig.dispatch(
+        \\{"id":"6","command":"oars.scripts.run","payload":{"server_id":"itest-scr-a","script_id":"sc-echo","vars":{"x":{"value":"'; touch /tmp/oars-pwned"}}}}
+    );
+    const inj_channel = scriptsChannel(inj) orelse return error.TestUnexpectedResult;
+    try execChannelWait(&rig.manager, "itest-scr-a", inj_channel, 0, "'; touch /tmp/oars-pwned");
+    // The injected command never ran.
+    try execWait(&rig.manager, "itest-scr-a", "ls /tmp/oars-pwned", 1, "");
+
+    // --- missing variable blocks the run ---
+    const missing = rig.dispatch(
+        \\{"id":"7","command":"oars.scripts.run","payload":{"server_id":"itest-scr-a","script_id":"sc-hello","vars":{}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, missing, "missing variable: who") != null);
+
+    // --- a bad-syntax body is refused by the bash -n check ---
+    _ = rig.dispatch(
+        \\{"id":"8","command":"oars.scripts.save","payload":{"script":{"id":"sc-broken","name":"broken","body":"if then fi"}}}
+    );
+    const broken = rig.dispatch(
+        \\{"id":"9","command":"oars.scripts.run","payload":{"server_id":"itest-scr-a","script_id":"sc-broken","vars":{}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, broken, "syntax check failed") != null);
+
+    // --- broadcast to both servers ---
+    const broadcast = rig.dispatch(
+        \\{"id":"10","command":"oars.scripts.broadcast","payload":{"script_id":"sc-hello","server_ids":["itest-scr-a","itest-scr-b"],"vars":{"who":{"value":"alice"}}}}
+    );
+    const run_id = scriptsRunId(broadcast) orelse return error.TestUnexpectedResult;
+    var final_poll = try broadcastWaitFor(&rig, run_id);
+    defer final_poll.deinit();
+    try std.testing.expect(final_poll.value.result.done);
+    var saw_a = false;
+    var saw_b = false;
+    for (final_poll.value.result.servers) |s| {
+        try std.testing.expectEqualStrings("done", s.status);
+        try std.testing.expectEqual(@as(i32, 0), s.exit orelse -1);
+        try std.testing.expect(std.mem.indexOf(u8, s.data, "hello alice") != null);
+        if (std.mem.eql(u8, s.server_id, "itest-scr-a")) saw_a = true;
+        if (std.mem.eql(u8, s.server_id, "itest-scr-b")) saw_b = true;
+    }
+    try std.testing.expect(saw_a and saw_b);
+
+    // --- secret values never reach the audit file ---
+    const secret_run = rig.dispatch(
+        \\{"id":"11","command":"oars.scripts.run","payload":{"server_id":"itest-scr-b","script_id":"sc-secret","vars":{"pw":{"value":"s3cret-value","secret":true}}}}
+    );
+    const secret_channel = scriptsChannel(secret_run) orelse return error.TestUnexpectedResult;
+    try execChannelWait(&rig.manager, "itest-scr-b", secret_channel, 0, "s3cret-value");
+    const audit_content = std.Io.Dir.cwd().readFileAlloc(io, rig.audit_store.path, allocator, .limited(256 * 1024)) catch return error.TestUnexpectedResult;
+    defer allocator.free(audit_content);
+    try std.testing.expect(std.mem.indexOf(u8, audit_content, "scripts.run") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_content, "scripts.broadcast") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_content, "s3cret-value") == null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_content, "***") != null);
+
+    // --- run counts and last-run stamps persist ---
+    const list = rig.dispatch(
+        \\{"id":"12","command":"oars.scripts.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, list, "\"run_count\":2") != null); // sc-hello: run + broadcast
+    try std.testing.expect(std.mem.indexOf(u8, list, "\"run_count\":1") != null); // sc-echo / sc-secret
+    try std.testing.expect(std.mem.indexOf(u8, list, "\"last_run_at\":") != null);
+
+    // --- cancel a running broadcast ---
+    const cancel_broadcast = rig.dispatch(
+        \\{"id":"13","command":"oars.scripts.broadcast","payload":{"script_id":"sc-sleep","server_ids":["itest-scr-a","itest-scr-b"],"vars":{}}}
+    );
+    const cancel_run = scriptsRunId(cancel_broadcast) orelse return error.TestUnexpectedResult;
+    // Give the runner a moment to start both, then cancel.
+    var saw_running = false;
+    var req_buf: [256]u8 = undefined;
+    const start_deadline = std.Io.Timestamp.now(io, .real).nanoseconds + 10 * std.time.ns_per_s;
+    while (std.Io.Timestamp.now(io, .real).nanoseconds < start_deadline) {
+        const req = std.fmt.bufPrint(&req_buf, "{{\"id\":\"14\",\"command\":\"oars.scripts.broadcastPoll\",\"payload\":{{\"run_id\":{d},\"cursors\":{{}}}}}}", .{cancel_run}) catch unreachable;
+        const resp = rig.dispatch(req);
+        var parsed = std.json.parseFromSlice(BroadcastResp, allocator, resp, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return error.TestUnexpectedResult;
+        defer parsed.deinit();
+        for (parsed.value.result.servers) |s| {
+            if (std.mem.eql(u8, s.status, "running")) saw_running = true;
+        }
+        if (saw_running) break;
+        testSleep(100);
+    }
+    try std.testing.expect(saw_running);
+    var cancel_buf: [128]u8 = undefined;
+    const cancel_req = std.fmt.bufPrint(&cancel_buf, "{{\"id\":\"15\",\"command\":\"oars.scripts.broadcastCancel\",\"payload\":{{\"run_id\":{d}}}}}", .{cancel_run}) catch unreachable;
+    const canceled_resp = rig.dispatch(cancel_req);
+    try std.testing.expect(std.mem.indexOf(u8, canceled_resp, "\"ok\":true") != null);
+
+    var canceled_poll = try broadcastWaitFor(&rig, cancel_run);
+    defer canceled_poll.deinit();
+    try std.testing.expect(canceled_poll.value.result.canceled);
+    for (canceled_poll.value.result.servers) |s| {
+        try std.testing.expectEqualStrings("canceled", s.status);
+        try std.testing.expect(std.mem.indexOf(u8, s.@"error", "cancel requested") != null);
+    }
+
+    rig.manager.disconnect("itest-scr-a");
+    rig.manager.disconnect("itest-scr-b");
 }

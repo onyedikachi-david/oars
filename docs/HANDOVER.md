@@ -565,6 +565,20 @@ clear conflict → re-scan → fresh clear + audit, closeChannel. See spec 04
     `readFileAlloc` takes `Io.Limit` (`.limited(n)`), `free` on a `?[]u8`
     is a compile error, and `@intCast` into C `unsigned int` params needs
     an explicit `@as(c_uint, …)` when the callee is `anytype`.
+34. **`std.json.ObjectMap`-typed struct fields break the 0.16 static
+    parser** (`field.defaultValue()` comptime error, even without a
+    default). Parse maps as `std.json.Value = .null` and read them via
+    `.object` (a StringArrayHashMap of `Value`).
+35. **Zig keyword field names** (e.g. `error`) are legal as `@"error"` —
+    used for the broadcastPoll per-server error field.
+36. **Free a `poll.data` slice before serializing it** — `ChannelPoll`
+    deinit owns the data buffer; writing it into a response after the
+    frees emits DebugAllocator's 0xAA fill (the container test caught it
+    as invalid UTF-8).
+37. **`defer` inside a loop body runs at the end of each iteration** —
+    correct when nothing retains the buffer (e.g. a per-iteration quoted
+    string copied via `appendSlice`), fatal when a list keeps pointers
+    into it (see pitfall 30).
 
 ### 13.4 Next
 
@@ -633,3 +647,59 @@ recursive rm. **67/67 pass, leak-checked, container up.**
 Spec 05 frontend UI (file manager pane, transfers drawer, editor) — the
 bridge contract in spec 05 §5 is the wire format. Or spec 06 (scripts).
 The transfer poll is non-destructive; two views may poll freely.
+
+## 15. Session handover — 2026-08-03 (session 5): spec 06 scripts + safe broadcast backend
+
+### 15.1 What landed
+
+**`src/scripts.zig` (new):** the Script model, the persistent store
+(`scripts.json`, 0600, quarantine-on-corrupt like the servers store), and
+the shell-aware `{{variable}}` template expansion. The lexer tracks
+single/double quotes, backticks, comments, `$(…)`/`${…}` nesting, and
+word/command/redirection/assignment position; every ambiguous context is
+rejected before expansion (spec 06 §5). Accepted placeholders are replaced
+with single-quoted literals (the spec's own `/var/log/{{service}}`
+mid-word form works — the quoted value merges into the word safely);
+missing variables block with no partial substitution; multiline values are
+refused; secret values are masked as `***` in a second (audit) command.
+
+**`src/broadcast.zig` (new):** pure run-state machine — queued/running/
+done/failed/canceled/skipped per server, dedupe, bounded completed-run
+history, at-most-4 concurrent.
+
+**`src/bridge.zig`:** 7 handlers `oars.scripts.{list,save,delete,run,
+broadcast,broadcastPoll,broadcastCancel}` (handler_count 36 → 43). Runs
+expand once, audit per server (redacted command + variable names; secrets
+never written), `bash -n -c` syntax-check each server before exec, bump
+run stats, and stream per-server deltas with the spec-02 cursor protocol.
+`src/sessions.zig` owns the `broadcasts` registry (Manager field).
+`scripts.json` is wired into App/TestApp/TestRig alongside the other
+stores.
+
+**Tests:** 8 unit (store round trip + validation + quarantine, lexer
+boundaries, injection literals, secrets, missing vars, multiline), 4
+broadcast-state unit, 3 dispatcher suites, and one container integration
+test: run with vars, injection value (`'; touch /tmp/oars-pwned` — stays
+literal, no file), missing-variable block, `bash -n` refusal of a broken
+body, 2-server broadcast with per-server exit 0 + output, secret value
+absent from audit.jsonl, run_count/last_run_at persistence, and cancel
+(`canceled` + "cancel requested"). **83/83 pass, leak-checked, container
+up.**
+
+`scripts/dev-sshd/Dockerfile` now installs `bash` (the `bash -n` check).
+
+### 15.2 Bugs the integration test found (all fixed)
+
+- The poll handler serialized a channel's `data` AFTER freeing the polls
+  (pitfall 36) — the response carried DebugAllocator's 0xAA fill, caught
+  as invalid UTF-8 by the test's JSON parse.
+- A done broadcast server was polled again on the next poll (late cursors
+  still drain retained data) and decremented `run.running` twice —
+  integer overflow; the transition is now guarded.
+
+### 15.3 Next
+
+Spec 06 frontend UI (script library, variable prompt, broadcast preview /
+side-by-side streams). Or spec 07 (deployment). The broadcast wire format
+in spec 06 §5 is final; `broadcastPoll` cursors are per-view absolute
+positions.

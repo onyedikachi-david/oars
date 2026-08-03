@@ -15,10 +15,12 @@ const json = @import("json.zig");
 const logs = @import("logs.zig");
 const shellquote = @import("shellquote.zig");
 const sftpmod = @import("sftp.zig");
+const scripts = @import("scripts.zig");
+const broadcast = @import("broadcast.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 36;
+const handler_count = 43;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -27,6 +29,7 @@ pub const Context = struct {
     manager: *sessions.Manager,
     audit: *audit.Store,
     logs: *logs.SourceStore,
+    scripts: *scripts.Store,
     handlers: [handler_count]native_sdk.BridgeHandler = undefined,
     policies: [handler_count]native_sdk.BridgeCommandPolicy = undefined,
 
@@ -68,6 +71,13 @@ pub const Context = struct {
             .{ .name = "oars.sftp.folderSize", .context = self, .invoke_fn = handleSftpFolderSize },
             .{ .name = "oars.sftp.poll", .context = self, .invoke_fn = handleSftpPoll },
             .{ .name = "oars.sftp.cancel", .context = self, .invoke_fn = handleSftpCancel },
+            .{ .name = "oars.scripts.list", .context = self, .invoke_fn = handleScriptsList },
+            .{ .name = "oars.scripts.save", .context = self, .invoke_fn = handleScriptsSave },
+            .{ .name = "oars.scripts.delete", .context = self, .invoke_fn = handleScriptsDelete },
+            .{ .name = "oars.scripts.run", .context = self, .invoke_fn = handleScriptsRun },
+            .{ .name = "oars.scripts.broadcast", .context = self, .invoke_fn = handleScriptsBroadcast },
+            .{ .name = "oars.scripts.broadcastPoll", .context = self, .invoke_fn = handleScriptsBroadcastPoll },
+            .{ .name = "oars.scripts.broadcastCancel", .context = self, .invoke_fn = handleScriptsBroadcastCancel },
         };
         self.policies = .{
             .{ .name = "oars.servers.list", .origins = &allowed_origins },
@@ -106,6 +116,13 @@ pub const Context = struct {
             .{ .name = "oars.sftp.folderSize", .origins = &allowed_origins },
             .{ .name = "oars.sftp.poll", .origins = &allowed_origins },
             .{ .name = "oars.sftp.cancel", .origins = &allowed_origins },
+            .{ .name = "oars.scripts.list", .origins = &allowed_origins },
+            .{ .name = "oars.scripts.save", .origins = &allowed_origins },
+            .{ .name = "oars.scripts.delete", .origins = &allowed_origins },
+            .{ .name = "oars.scripts.run", .origins = &allowed_origins },
+            .{ .name = "oars.scripts.broadcast", .origins = &allowed_origins },
+            .{ .name = "oars.scripts.broadcastPoll", .origins = &allowed_origins },
+            .{ .name = "oars.scripts.broadcastCancel", .origins = &allowed_origins },
         };
         return .{
             .policy = .{ .enabled = true, .commands = &self.policies },
@@ -1705,6 +1722,479 @@ fn handleSftpCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
     };
     defer parsed.deinit();
     self.manager.sftpCancel(parsed.value.server_id, parsed.value.transfer_id) catch |err| return sftpQueueError(output, err);
+    return ok_json;
+}
+
+// --- scripts (spec 06) ---------------------------------------------------------
+
+const scripts_run_check_timeout_ns = 30 * std.time.ns_per_s;
+const scripts_check_cap: usize = 16 * 1024;
+const scripts_poll_data_budget: usize = 256 * 1024;
+
+const ScriptsSavePayload = struct {
+    script: scripts.ScriptInput,
+};
+
+const ScriptsIdPayload = struct {
+    id: []const u8,
+};
+
+const ScriptsRunPayload = struct {
+    server_id: []const u8,
+    script_id: []const u8,
+    vars: std.json.Value = .null,
+};
+
+const ScriptsBroadcastPayload = struct {
+    script_id: []const u8,
+    server_ids: []const []const u8,
+    vars: std.json.Value = .null,
+};
+
+const ScriptsBroadcastPollPayload = struct {
+    run_id: u32,
+    cursors: std.json.Value = .null,
+};
+
+const ScriptsBroadcastCancelPayload = struct {
+    run_id: u32,
+};
+
+/// Extracts `{name: {value, secret}}` from the payload. The returned
+/// RunVars reference the parsed tree (valid until the parse is freed —
+/// expansion happens before that). Returns the error response on failure.
+fn scriptsVars(self: *Context, output: []u8, value: std.json.Value, out: *std.ArrayList(scripts.RunVar)) ?[]const u8 {
+    if (value == .null) return null; // no variables
+    if (value != .object) return respondError(output, "invalid vars payload");
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        const v: std.json.Value = entry.value_ptr.*;
+        if (v != .object) return respondError(output, "invalid variable value");
+        const value_field = v.object.get("value") orelse return respondError(output, "missing variable value");
+        if (value_field != .string) return respondError(output, "invalid variable value");
+        const secret = if (v.object.get("secret")) |s| s == .bool and s.bool else false;
+        out.append(self.allocator, .{ .name = entry.key_ptr.*, .value = value_field.string, .secret = secret }) catch return respondError(output, "out of memory");
+    }
+    return null;
+}
+
+/// Appends one audit entry: script id/name, variable names, and the
+/// redacted command (spec 06 §8 — secret values never written). Returns
+/// the error response on failure.
+fn scriptsAudit(self: *Context, output: []u8, action: []const u8, server_id: []const u8, script: *const scripts.Script, expansion: *const scripts.Expansion) ?[]const u8 {
+    var names_buf: std.ArrayList(u8) = .empty;
+    defer names_buf.deinit(self.allocator);
+    for (expansion.names, 0..) |n, i| {
+        if (names_buf.items.len >= 256) break;
+        if (i > 0) names_buf.append(self.allocator, ',') catch return respondError(output, "out of memory");
+        names_buf.appendSlice(self.allocator, n.name) catch return respondError(output, "out of memory");
+    }
+    const redacted = if (expansion.redacted.len > 1000) expansion.redacted[0..1000] else expansion.redacted;
+    var detail_buf: [1800]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "script={s} name={s} vars={s} command={s}", .{ script.id, script.name, names_buf.items, redacted }) catch "scripts.run";
+    self.audit.append(self.io, .{
+        .ts = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds),
+        .action = action,
+        .server_id = server_id,
+        .detail = detail,
+    }) catch return respondError(output, "audit failed");
+    return null;
+}
+
+/// Loads the script, expands the template with the payload vars, and
+/// writes one audit entry per server (redacted command + variable names).
+/// On failure writes an error response and returns null.
+fn scriptsPrepare(
+    self: *Context,
+    output: []u8,
+    err_response: *[]const u8,
+    action: []const u8,
+    server_ids: []const []const u8,
+    script_id: []const u8,
+    vars: std.json.Value,
+) ?scripts.Expansion {
+    err_response.* = "";
+    var owned_script = self.scripts.find(self.io, script_id) catch {
+        err_response.* = respondError(output, "script library is unreadable");
+        return null;
+    } orelse {
+        err_response.* = respondError(output, "script not found");
+        return null;
+    };
+    defer scripts.deinit(self.allocator, &owned_script);
+
+    var var_list: std.ArrayList(scripts.RunVar) = .empty;
+    defer var_list.deinit(self.allocator);
+    if (scriptsVars(self, output, vars, &var_list)) |resp| {
+        err_response.* = resp;
+        return null;
+    }
+
+    var missing: []const u8 = undefined;
+    var expansion = scripts.expandTemplate(self.allocator, owned_script.body, var_list.items, &missing) catch |err| {
+        err_response.* = respondError(output, switch (err) {
+            error.MissingVariable => blk: {
+                var buf: [256]u8 = undefined;
+                break :blk std.fmt.bufPrint(&buf, "missing variable: {s}", .{missing}) catch "missing variable";
+            },
+            error.MultilineValue => "multiline variable values are not supported",
+            error.UnterminatedPlaceholder => "script contains an unterminated placeholder",
+            error.InvalidPlaceholderName => "script contains an invalid placeholder name",
+            error.AmbiguousPlaceholder => "a placeholder appears in an ambiguous shell context (quotes, redirection, assignment, or command name)",
+            error.TooManyVariables => "script references too many variables",
+            error.OutOfMemory => "out of memory",
+        });
+        return null;
+    };
+    errdefer expansion.deinit(self.allocator);
+
+    for (server_ids) |sid| {
+        if (scriptsAudit(self, output, action, sid, &owned_script, &expansion)) |resp| {
+            err_response.* = resp;
+            return null;
+        }
+    }
+    return expansion;
+}
+
+fn handleScriptsList(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    _ = invocation;
+    var loaded = self.scripts.loadParsed(self.io) catch {
+        return "{\"ok\":false,\"error\":\"failed to load scripts\"}";
+    };
+    defer loaded.deinit(self.allocator);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"scripts\":") catch return output[0..0];
+    std.json.Stringify.value(loaded.parsed.value, .{}, &writer) catch return output[0..0];
+    if (loaded.quarantined) |q| {
+        var msg_buf: [640]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "scripts.json was unreadable and was moved to {s}; the script library starts fresh", .{q}) catch "scripts.json was unreadable and was moved aside";
+        writer.writeAll(",\"recovery_error\":") catch return output[0..0];
+        json.writeJsonString(&writer, msg) catch return output[0..0];
+    }
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+/// Upserts a script (spec 06 §7); ids are generated for creates. The body
+/// is capped at 64 KB; variables must match the placeholder name charset.
+fn handleScriptsSave(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(ScriptsSavePayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const input = parsed.value.script;
+    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+    var owned_id: ?[]const u8 = null;
+    defer if (owned_id) |o| self.allocator.free(o);
+    const id = input.id orelse blk: {
+        owned_id = servers.makeId(self.allocator, now) catch return respondError(output, "out of memory");
+        break :blk owned_id.?;
+    };
+
+    var saved = self.scripts.saveScript(self.io, .{
+        .id = id,
+        .name = input.name,
+        .description = input.description,
+        .tags = input.tags,
+        .color = input.color,
+        .body = input.body,
+        .variables = input.variables,
+    }, now) catch |err| {
+        return respondError(output, switch (err) {
+            error.MissingName => "script name is required",
+            error.NameTooLong => "script name is too long",
+            error.EmptyBody => "script body is required",
+            error.BodyTooLarge => "script body must be under 64 KB",
+            error.InvalidName => "invalid name or description",
+            error.InvalidTag => "invalid tag",
+            error.TooManyTags => "too many tags",
+            error.InvalidColor => "invalid color",
+            error.InvalidVariable => "invalid variable definition",
+            error.DuplicateVariable => "duplicate variable",
+            error.TooManyVariables => "too many variables",
+            error.TooManyScripts => "script library is full",
+            error.StoreCorrupt => "script library is unreadable",
+            error.SerializeFailed => "failed to save scripts",
+            error.OutOfMemory => "out of memory",
+            error.MissingId => "missing script id",
+        });
+    };
+    defer scripts.deinit(self.allocator, &saved);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"script\":") catch return output[0..0];
+    std.json.Stringify.value(saved, .{}, &writer) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleScriptsDelete(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(ScriptsIdPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    _ = self.scripts.delete(self.io, parsed.value.id) catch {
+        return respondError(output, "failed to delete script");
+    };
+    return ok_json;
+}
+
+/// Runs a script on one server: expand, `bash -n` syntax check on the
+/// server, then exec (spec 06 §5). The channel id carries the output.
+fn handleScriptsRun(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(ScriptsRunPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+
+    var err_response: []const u8 = "";
+    var expansion = scriptsPrepare(self, output, &err_response, "scripts.run", &.{payload.server_id}, payload.script_id, payload.vars) orelse return err_response;
+    defer expansion.deinit(self.allocator);
+
+    const quoted = shellquote.quote(self.allocator, expansion.command) catch return respondError(output, "out of memory");
+    defer self.allocator.free(quoted);
+    const check_cmd = std.fmt.allocPrint(self.allocator, "bash -n -c {s}", .{quoted}) catch return respondError(output, "out of memory");
+    defer self.allocator.free(check_cmd);
+    var check = self.manager.execWait(payload.server_id, check_cmd, scripts_check_cap, scripts_run_check_timeout_ns) catch |err| {
+        return respondError(output, switch (err) {
+            error.NoSession => "not connected",
+            error.NotReady => "session not ready",
+            else => "syntax check failed",
+        });
+    };
+    defer check.output.deinit(self.allocator);
+    if (check.exit != 0) {
+        if (check.exit == 127) return respondError(output, "bash is not available on this server");
+        const tail = if (check.output.items.len > 200) check.output.items[check.output.items.len - 200 ..] else check.output.items;
+        var msg_buf: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "syntax check failed (exit {d}): {s}", .{ check.exit, tail }) catch "syntax check failed";
+        return respondError(output, msg);
+    }
+    const channel = self.manager.exec(payload.server_id, expansion.command) catch |err| {
+        return respondError(output, switch (err) {
+            error.NoSession => "not connected",
+            error.NotReady => "session not ready",
+            else => "run failed",
+        });
+    };
+    self.scripts.touchRun(self.io, payload.script_id, std.Io.Timestamp.now(self.io, .real).nanoseconds);
+    var writer = std.Io.Writer.fixed(output);
+    writer.print("{{\"ok\":true,\"channel\":{d}}}", .{channel}) catch return output[0..0];
+    return writer.buffered();
+}
+
+/// `bash -n` syntax check on one broadcast server (spec 06 §5). On failure
+/// the server state carries the reason; returns whether it may run.
+fn scriptsCheckSyntax(self: *Context, server: *broadcast.ServerState, command: []const u8) bool {
+    const quoted = shellquote.quote(self.allocator, command) catch {
+        server.status = .failed;
+        server.err = "out of memory";
+        return false;
+    };
+    defer self.allocator.free(quoted);
+    const check_cmd = std.fmt.allocPrint(self.allocator, "bash -n -c {s}", .{quoted}) catch {
+        server.status = .failed;
+        server.err = "out of memory";
+        return false;
+    };
+    defer self.allocator.free(check_cmd);
+    var check = self.manager.execWait(server.server_id, check_cmd, scripts_check_cap, scripts_run_check_timeout_ns) catch {
+        server.status = .skipped;
+        server.err = "unreachable";
+        return false;
+    };
+    defer check.output.deinit(self.allocator);
+    if (check.exit != 0) {
+        server.status = .failed;
+        server.err = if (check.exit == 127) "bash unavailable" else "syntax check failed";
+        return false;
+    }
+    return true;
+}
+
+/// Safe broadcast (spec 06 §4.2/§6): expands once, audits per server, and
+/// registers the run. Queued servers start as slots free during polling.
+fn handleScriptsBroadcast(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(ScriptsBroadcastPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (payload.server_ids.len == 0) return respondError(output, "no servers selected");
+
+    var err_response: []const u8 = "";
+    var expansion = scriptsPrepare(self, output, &err_response, "scripts.broadcast", payload.server_ids, payload.script_id, payload.vars) orelse return err_response;
+    defer expansion.deinit(self.allocator);
+
+    const run_id = self.manager.broadcasts.start(payload.script_id, "", expansion.command, payload.server_ids) catch |err| {
+        return respondError(output, switch (err) {
+            error.NoServers => "no servers selected",
+            else => "out of memory",
+        });
+    };
+    self.scripts.touchRun(self.io, payload.script_id, std.Io.Timestamp.now(self.io, .real).nanoseconds);
+    var writer = std.Io.Writer.fixed(output);
+    writer.print("{{\"ok\":true,\"run_id\":{d}}}", .{run_id}) catch return output[0..0];
+    return writer.buffered();
+}
+
+/// The broadcast cursor map value for one server (absolute stream cursor;
+/// spec 02 protocol — each view polls with its own cursors).
+fn scriptsCursor(cursors: std.json.Value, server_id: []const u8) u64 {
+    if (cursors != .object) return 0;
+    const v = cursors.object.get(server_id) orelse return 0;
+    return switch (v) {
+        .integer => |i| if (i < 0) 0 else @intCast(i),
+        .float => |f| if (f < 0) 0 else @intFromFloat(f),
+        else => 0,
+    };
+}
+
+/// Starts queued servers as slots free, polls running channels with the
+/// caller's cursors, and returns the per-server status/output snapshot
+/// (spec 06 §5 — non-destructive: nothing is consumed).
+fn handleScriptsBroadcastPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(ScriptsBroadcastPollPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+
+    self.manager.broadcasts.lock();
+    const run = self.manager.broadcasts.get(payload.run_id) orelse {
+        self.manager.broadcasts.unlock();
+        return respondError(output, "unknown run");
+    };
+    self.manager.broadcasts.unlock();
+    // The bridge is single-threaded: no other handler can mutate or evict
+    // the run while this one runs, so the pointer stays valid.
+
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"run_id\":") catch return output[0..0];
+    writer.print("{d}", .{run.id}) catch return output[0..0];
+    writer.writeAll(",\"script_name\":") catch return output[0..0];
+    json.writeJsonString(&writer, run.script_name) catch return output[0..0];
+    writer.print(",\"canceled\":{s}", .{if (run.canceled) "true" else "false"}) catch return output[0..0];
+
+    // Start queued servers as slots free (spec 06 §6: at most four at a
+    // time; polling drives the queue).
+    while (run.running < broadcast.max_concurrent and run.next_to_start < run.servers.items.len and !run.canceled) {
+        const idx = run.next_to_start;
+        run.next_to_start += 1;
+        const server = &run.servers.items[idx];
+        if (!scriptsCheckSyntax(self, server, run.command)) continue;
+        const channel = self.manager.exec(server.server_id, run.command) catch {
+            server.status = .skipped;
+            server.err = "unreachable";
+            continue;
+        };
+        server.status = .running;
+        server.channel = channel;
+        run.running += 1;
+    }
+
+    writer.writeAll(",\"servers\":[") catch return output[0..0];
+    var first = true;
+    var budget = scripts_poll_data_budget;
+    for (run.servers.items) |*server| {
+        if (!first) writer.writeAll(",") catch return output[0..0];
+        first = false;
+        writer.writeAll("{\"server_id\":") catch return output[0..0];
+        json.writeJsonString(&writer, server.server_id) catch return output[0..0];
+        writer.writeAll(",\"status\":") catch return output[0..0];
+        json.writeJsonString(&writer, server.status.jsonName()) catch return output[0..0];
+        writer.writeAll(",\"exit\":") catch return output[0..0];
+        if (server.exit) |exit| {
+            writer.print("{d}", .{exit}) catch return output[0..0];
+        } else {
+            writer.writeAll("null") catch return output[0..0];
+        }
+        writer.writeAll(",\"error\":") catch return output[0..0];
+        json.writeJsonString(&writer, server.err) catch return output[0..0];
+
+        if (server.status == .running or server.status == .done) {
+            const channel = server.channel orelse continue;
+            const cursor = scriptsCursor(payload.cursors, server.server_id);
+            const polls = self.manager.pollChannels(server.server_id, &.{.{ .id = channel, .pos = cursor }}, false, budget, 128 * 1024) catch {
+                server.status = .failed;
+                server.err = "session lost";
+                run.running -= 1;
+                continue;
+            };
+            var data: []u8 = &.{};
+            var new_cursor = cursor;
+            var eof = false;
+            var exit: ?i32 = null;
+            var gap: u64 = 0;
+            for (polls) |*poll| {
+                if (poll.id != channel) continue;
+                data = poll.data;
+                new_cursor = poll.cursor;
+                eof = poll.eof;
+                exit = poll.exit_status;
+                gap = poll.gap;
+            }
+            budget = budget -| data.len;
+            writer.print(",\"cursor\":{d},\"gap\":{d},\"eof\":{s},\"data\":", .{ new_cursor, gap, if (eof) "true" else "false" }) catch return output[0..0];
+            json.writeJsonString(&writer, data) catch return output[0..0];
+            // The serialized data must be written BEFORE the polls are
+            // freed (poll.deinit owns the data buffer).
+            for (polls) |*poll| poll.deinit(self.allocator);
+            self.allocator.free(polls);
+            // Done servers keep being polled (late cursors still get their
+            // retained data), so the transition happens exactly once.
+            if (eof and server.status == .running) {
+                server.status = .done;
+                server.exit = exit;
+                run.running -= 1;
+            }
+        }
+        writer.writeAll("}") catch return output[0..0];
+    }
+    writer.writeAll("]") catch return output[0..0];
+
+    if (run.allTerminal()) run.finished = true;
+    // The done flag must be serialized before eviction can free the run.
+    writer.print(",\"done\":{s}}}", .{if (run.finished) "true" else "false"}) catch return output[0..0];
+    self.manager.broadcasts.evictFinished();
+    return writer.buffered();
+}
+
+/// Cancels a broadcast: queued servers never start; running channels are
+/// closed and reported `canceled` ("cancel requested" — closing a channel
+/// does not prove the remote process died; spec 06 §10).
+fn handleScriptsBroadcastCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(ScriptsBroadcastCancelPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    self.manager.broadcasts.lock();
+    const run = self.manager.broadcasts.get(parsed.value.run_id) orelse {
+        self.manager.broadcasts.unlock();
+        return respondError(output, "unknown run");
+    };
+    run.canceled = true;
+    for (run.servers.items) |*server| {
+        switch (server.status) {
+            .queued => server.status = .canceled,
+            .running => {
+                if (server.channel) |ch| self.manager.closeChannel(server.server_id, ch) catch {};
+                server.status = .canceled;
+                server.err = "cancel requested";
+                run.running -= 1;
+            },
+            else => {},
+        }
+    }
+    self.manager.broadcasts.unlock();
     return ok_json;
 }
 

@@ -15,6 +15,7 @@ const audit = @import("audit.zig");
 const logs = @import("logs.zig");
 const sftpmod = @import("sftp.zig");
 const shellquote = @import("shellquote.zig");
+const broadcast = @import("broadcast.zig");
 
 /// Blocking acquire on std.atomic.Mutex (spinlock) — 0.16's atomic.Mutex
 /// only exposes tryLock. Sections are short (buffer/cursor updates), so
@@ -451,9 +452,12 @@ pub const Manager = struct {
     mutex: std.atomic.Mutex = .unlocked,
     sessions: std.StringHashMap(*Session) = undefined,
     next_session_id: u64 = 1,
+    /// Safe-broadcast runs (spec 06 §6): bridge handlers drive the state
+    /// machine; the manager owns the registry and its memory.
+    broadcasts: broadcast.Runs = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, store: *servers.Store, audit_store: *audit.Store, home: ?[]const u8) Manager {
-        return .{
+        var self: Manager = .{
             .allocator = allocator,
             .store = store,
             .audit = audit_store,
@@ -461,11 +465,14 @@ pub const Manager = struct {
             .home = home,
             .sessions = std.StringHashMap(*Session).init(allocator),
         };
+        self.broadcasts = .{ .allocator = allocator };
+        return self;
     }
 
     pub fn deinit(self: *Manager) void {
         self.shutdownAll();
         self.sessions.deinit();
+        self.broadcasts.deinit();
     }
 
     pub fn get(self: *Manager, server_id: []const u8) ?*Session {

@@ -7,6 +7,7 @@ const ssh = @import("ssh.zig");
 const bridge = @import("bridge.zig");
 const audit = @import("audit.zig");
 const logs = @import("logs.zig");
+const scripts = @import("scripts.zig");
 const integration = @import("integration.zig");
 
 // Zig 0.16 only collects test blocks from files that are actually
@@ -42,11 +43,13 @@ const App = struct {
     store: servers.Store,
     audit_store: audit.Store,
     logs_store: logs.SourceStore,
+    scripts_store: scripts.Store,
     manager: sessions.Manager,
     bridge_ctx: bridge.Context,
     store_path_buf: [2048]u8 = undefined,
     audit_path_buf: [2048]u8 = undefined,
     logs_path_buf: [2048]u8 = undefined,
+    scripts_path_buf: [2048]u8 = undefined,
     data_dir_buf: [1024]u8 = undefined,
     fallback_dir_buf: [1024]u8 = undefined,
 
@@ -87,9 +90,15 @@ const App = struct {
             &self.logs_path_buf,
             &.{ base, "logs.json" },
         ) catch unreachable;
+        const scripts_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.scripts_path_buf,
+            &.{ base, "scripts.json" },
+        ) catch unreachable;
         self.store = .{ .allocator = self.allocator, .path = store_path };
         self.audit_store = .{ .allocator = self.allocator, .path = audit_path };
         self.logs_store = .{ .allocator = self.allocator, .path = logs_path };
+        self.scripts_store = .{ .allocator = self.allocator, .path = scripts_path };
 
         self.manager = sessions.Manager.init(self.allocator, self.io, &self.store, &self.audit_store, self.env_map.get("HOME"));
         self.bridge_ctx = .{
@@ -99,6 +108,7 @@ const App = struct {
             .manager = &self.manager,
             .audit = &self.audit_store,
             .logs = &self.logs_store,
+            .scripts = &self.scripts_store,
         };
     }
 
@@ -170,9 +180,12 @@ test "servers.save round trips through the bridge dispatcher" {
     var logs_buf: [512]u8 = undefined;
     const logs_path = std.fmt.bufPrint(&logs_buf, "/tmp/{s}/logs.json", .{dir_name}) catch unreachable;
     var logs_store = logs.SourceStore{ .allocator = store_alloc, .path = logs_path };
+    var scripts_buf: [512]u8 = undefined;
+    const scripts_path = std.fmt.bufPrint(&scripts_buf, "/tmp/{s}/scripts.json", .{dir_name}) catch unreachable;
+    var scripts_store = scripts.Store{ .allocator = store_alloc, .path = scripts_path };
     var manager = sessions.Manager.init(store_alloc, io, &store, &audit_store, null);
     defer manager.deinit();
-    var ctx = bridge.Context{ .allocator = store_alloc, .io = io, .store = &store, .manager = &manager, .audit = &audit_store, .logs = &logs_store };
+    var ctx = bridge.Context{ .allocator = store_alloc, .io = io, .store = &store, .manager = &manager, .audit = &audit_store, .logs = &logs_store, .scripts = &scripts_store };
     var dispatcher = ctx.dispatcher();
     var output: [64 * 1024]u8 = undefined;
 
@@ -237,6 +250,7 @@ const TestApp = struct {
     store: servers.Store,
     audit_store: audit.Store,
     logs_store: logs.SourceStore,
+    scripts_store: scripts.Store,
     manager: sessions.Manager,
     ctx: bridge.Context,
     dispatcher: native_sdk.BridgeDispatcher,
@@ -245,6 +259,7 @@ const TestApp = struct {
     path_buf: [512]u8 = undefined,
     audit_path_buf: [512]u8 = undefined,
     logs_path_buf: [512]u8 = undefined,
+    scripts_path_buf: [512]u8 = undefined,
     dir_name: []const u8,
 
     fn init(self: *TestApp) !void {
@@ -256,12 +271,14 @@ const TestApp = struct {
         const store_path = try std.fmt.bufPrint(&self.path_buf, "/tmp/{s}/servers.json", .{self.dir_name});
         const audit_path = try std.fmt.bufPrint(&self.audit_path_buf, "/tmp/{s}/audit.jsonl", .{self.dir_name});
         const logs_path = try std.fmt.bufPrint(&self.logs_path_buf, "/tmp/{s}/logs.json", .{self.dir_name});
+        const scripts_path = try std.fmt.bufPrint(&self.scripts_path_buf, "/tmp/{s}/scripts.json", .{self.dir_name});
         const store_alloc = self.arena.allocator();
         self.store = .{ .allocator = store_alloc, .path = store_path };
         self.audit_store = .{ .allocator = store_alloc, .path = audit_path };
         self.logs_store = .{ .allocator = store_alloc, .path = logs_path };
+        self.scripts_store = .{ .allocator = store_alloc, .path = scripts_path };
         self.manager = sessions.Manager.init(store_alloc, io, &self.store, &self.audit_store, null);
-        self.ctx = .{ .allocator = store_alloc, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store };
+        self.ctx = .{ .allocator = store_alloc, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store, .scripts = &self.scripts_store };
         self.dispatcher = self.ctx.dispatcher();
     }
 
@@ -638,4 +655,157 @@ test "sftp handlers require a session and validate payloads" {
         \\{"id":"24","command":"oars.sftp.poll","payload":{}}
     );
     try std.testing.expect(std.mem.indexOf(u8, bad_payload, "invalid payload") != null);
+}
+
+test "scripts save/list/delete round trip through the dispatcher" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // Create.
+    const created = app.dispatch(
+        \\{"id":"1","command":"oars.scripts.save","payload":{"script":{"name":"tail errors","body":"tail -f /var/log/{{service}}/error.log","tags":["logs"],"color":"#ff6b6b","variables":[{"name":"service","label":"Service"}]}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, created, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, created, "\"created_at\"") != null);
+    // Pull the generated id out NOW — the output buffer is reused by the
+    // next dispatch, so the slice must not outlive this response.
+    var id_buf: [128]u8 = undefined;
+    const id_pos = std.mem.indexOf(u8, created, "\"script\":{\"id\":\"") orelse return error.TestUnexpectedResult;
+    const id_start = id_pos + "\"script\":{\"id\":\"".len;
+    const id_end = std.mem.indexOfScalarPos(u8, created, id_start, '"') orelse return error.TestUnexpectedResult;
+    const id = try std.fmt.bufPrint(&id_buf, "{s}", .{created[id_start..id_end]});
+
+    const script_id = app.dispatch(
+        \\{"id":"2","command":"oars.scripts.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, script_id, "tail errors") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script_id, "\"service\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script_id, "\"run_count\":0") != null);
+
+    // Delete, then the list is empty again.
+    var delete_buf: [256]u8 = undefined;
+    const delete_req = try std.fmt.bufPrint(&delete_buf, "{{\"id\":\"3\",\"command\":\"oars.scripts.delete\",\"payload\":{{\"id\":\"{s}\"}}}}", .{id});
+    const deleted = app.dispatch(delete_req);
+    try std.testing.expect(std.mem.indexOf(u8, deleted, "\"ok\":true") != null);
+    const after = app.dispatch(
+        \\{"id":"4","command":"oars.scripts.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, after, "tail errors") == null);
+}
+
+test "scripts.save validates payloads through the dispatcher" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    const no_name = app.dispatch(
+        \\{"id":"1","command":"oars.scripts.save","payload":{"script":{"name":"","body":"echo hi"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, no_name, "script name is required") != null);
+
+    const no_body = app.dispatch(
+        \\{"id":"2","command":"oars.scripts.save","payload":{"script":{"name":"x","body":""}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, no_body, "script body is required") != null);
+
+    const bad_var = app.dispatch(
+        \\{"id":"3","command":"oars.scripts.save","payload":{"script":{"name":"x","body":"echo hi","variables":[{"name":"bad-name"}]}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_var, "invalid variable definition") != null);
+
+    const dup_var = app.dispatch(
+        \\{"id":"4","command":"oars.scripts.save","payload":{"script":{"name":"x","body":"echo hi","variables":[{"name":"a"},{"name":"a"}]}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, dup_var, "duplicate variable") != null);
+
+    // A body over 64 KB is rejected at save (spec 06 §10).
+    var big_buf: [64 * 1024 + 32]u8 = undefined;
+    @memset(&big_buf, 'a');
+    var save_buf: [70 * 1024]u8 = undefined;
+    const payload_head = "{\"id\":\"5\",\"command\":\"oars.scripts.save\",\"payload\":{\"script\":{\"name\":\"big\",\"body\":\"";
+    @memcpy(save_buf[0..payload_head.len], payload_head);
+    const body_start = payload_head.len;
+    @memcpy(save_buf[body_start .. body_start + big_buf.len], &big_buf);
+    const tail = "\"}}}";
+    @memcpy(save_buf[body_start + big_buf.len .. body_start + big_buf.len + tail.len], tail);
+    const big = app.dispatch(save_buf[0 .. body_start + big_buf.len + tail.len]);
+    try std.testing.expect(std.mem.indexOf(u8, big, "script body must be under 64 KB") != null);
+}
+
+test "scripts.run and broadcast require a session and validate inputs" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // Save a script for the run paths.
+    _ = app.dispatch(
+        \\{"id":"1","command":"oars.scripts.save","payload":{"script":{"id":"sc-run","name":"hello","body":"echo {{who}}"}}}
+    );
+
+    // No session.
+    const run = app.dispatch(
+        \\{"id":"2","command":"oars.scripts.run","payload":{"server_id":"ghost","script_id":"sc-run","vars":{"who":{"value":"world"}}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, run, "not connected") != null);
+
+    // Missing script.
+    const missing_script = app.dispatch(
+        \\{"id":"3","command":"oars.scripts.run","payload":{"server_id":"ghost","script_id":"nope","vars":{}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, missing_script, "script not found") != null);
+
+    // Missing variable blocks the run (no partial substitution).
+    const missing_var = app.dispatch(
+        \\{"id":"4","command":"oars.scripts.run","payload":{"server_id":"ghost","script_id":"sc-run","vars":{}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, missing_var, "missing variable: who") != null);
+
+    // Multiline values are refused.
+    const multiline = app.dispatch(
+        \\{"id":"5","command":"oars.scripts.run","payload":{"server_id":"ghost","script_id":"sc-run","vars":{"who":{"value":"a\nb"}}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, multiline, "multiline variable values are not supported") != null);
+
+    // Ambiguous placeholder context is rejected before execution.
+    _ = app.dispatch(
+        \\{"id":"6","command":"oars.scripts.save","payload":{"script":{"id":"sc-bad","name":"bad","body":"x={{y}}"}}}
+    );
+    const ambiguous = app.dispatch(
+        \\{"id":"7","command":"oars.scripts.run","payload":{"server_id":"ghost","script_id":"sc-bad","vars":{"y":{"value":"v"}}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, ambiguous, "ambiguous shell context") != null);
+
+    // Broadcast requires servers.
+    const no_servers = app.dispatch(
+        \\{"id":"8","command":"oars.scripts.broadcast","payload":{"script_id":"sc-run","server_ids":[],"vars":{"who":{"value":"world"}}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, no_servers, "no servers selected") != null);
+
+    // Broadcasting to a ghost server still registers the run (the run
+    // reports it skipped/unreachable when polled).
+    const broadcast = app.dispatch(
+        \\{"id":"9","command":"oars.scripts.broadcast","payload":{"script_id":"sc-run","server_ids":["ghost"],"vars":{"who":{"value":"world"}}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, broadcast, "\"run_id\"") != null);
+    const run_id_pos = std.mem.indexOf(u8, broadcast, "\"run_id\":") orelse return error.TestUnexpectedResult;
+    var run_id_end: usize = run_id_pos + "\"run_id\":".len;
+    while (run_id_end < broadcast.len and broadcast[run_id_end] >= '0' and broadcast[run_id_end] <= '9') run_id_end += 1;
+    const run_id = broadcast[run_id_pos + "\"run_id\":".len .. run_id_end];
+    var poll_buf: [256]u8 = undefined;
+    const poll_req = try std.fmt.bufPrint(&poll_buf, "{{\"id\":\"10\",\"command\":\"oars.scripts.broadcastPoll\",\"payload\":{{\"run_id\":{s}}}}}", .{run_id});
+    const poll = app.dispatch(poll_req);
+    // The ghost server is marked skipped (unreachable), never dropped.
+    try std.testing.expect(std.mem.indexOf(u8, poll, "\"status\":\"skipped\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, poll, "unreachable") != null);
+
+    // Unknown run ids are explicit errors.
+    const unknown = app.dispatch(
+        \\{"id":"11","command":"oars.scripts.broadcastPoll","payload":{"run_id":9999}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "unknown run") != null);
+    const cancel_unknown = app.dispatch(
+        \\{"id":"12","command":"oars.scripts.broadcastCancel","payload":{"run_id":9999}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, cancel_unknown, "unknown run") != null);
 }

@@ -1,6 +1,6 @@
 # Spec 06 — Scripts + Safe Broadcast
 
-**Status:** 📋 · **Depends on:** 02 (exec), 01 · **Spec owner:** core + frontend
+**Status:** ✅ backend in (frontend UI pending) · **Depends on:** 02 (exec), 01 · **Spec owner:** core + frontend
 
 ## 1. Overview
 
@@ -61,6 +61,9 @@ fan-out.
 ## 5. Bridge API
 
 ### `oars.scripts.list` → `{ok, scripts}` · `oars.scripts.save` `{script}` → `{ok, script}` · `oars.scripts.delete` `{id}` → `{ok}`
+- Save is an upsert by id (the core generates ids for creates); edits
+  preserve `created_at`, `run_count`, and `last_run_at`. Body > 64 KB,
+  duplicate/invalid variables, and bad tags/colors are rejected.
 ### `oars.scripts.run` `{server_id, script_id, vars: {name: {value, secret}}}` → `{ok, channel}`
 - Each placeholder must occupy a shell word by itself. Placeholders inside
   quotes, redirections, command names, assignments, or shell syntax are
@@ -68,12 +71,34 @@ fan-out.
   literal and tests the resulting command with `bash -n` before execution.
   Multiline values are not supported in v1. Scripts are user-authored code;
   this rule only prevents a variable value from adding shell syntax.
+- Mid-word placeholders ARE valid (`tail -f /var/log/{{service}}/error.log`
+  is the spec's own example): the quoted value merges into the word safely.
+  Rejected contexts: inside quotes/backticks/`$(…)`/`${…}`/comments, at
+  command-name position, adjacent to `=`, or touching `$`, quotes, braces,
+  or backslash. A placeholder that follows a redirection operator is a
+  redirection target and is rejected.
+- `bash -n` runs on the server (exit 127 = bash unavailable); a missing
+  variable blocks the run with `missing variable: X` (no partial
+  substitution). The command is never executed when the check fails.
+- Runs bump `run_count`/`last_run_at` and write an audit entry
+  (`scripts.run`) with the variable names and the redacted command —
+  secret values are masked as `***` and never written.
 ### `oars.scripts.broadcast` `{script_id, server_ids[], vars}` → `{ok, run_id}`
-### `oars.scripts.broadcastPoll` `{run_id, cursors?}` → per-server status/output deltas
+- Duplicate server ids are deduped; the expansion happens once; every
+  server is audited (`scripts.broadcast`, one entry per server). At most
+  four servers run at a time; polling starts queued work as slots free.
+### `oars.scripts.broadcastPoll` `{run_id, cursors: {server_id: cursor}}` → per-server status/output deltas
 - Streams are keyed by server id and channel. Each caller returns its own
   absolute cursor map under the spec 02 protocol; polling one broadcast view
-  cannot drain another view.
+  cannot drain another view. Response: `{ok, run_id, script_name, canceled,
+  done, servers:[{server_id, status, exit, error, cursor, gap, eof, data}]}`
+  with status ∈ queued | running | done | failed | canceled | skipped
+  (skipped = unreachable at start, reported not dropped). Terminal runs
+  stay readable for a bounded history.
 ### `oars.scripts.broadcastCancel` `{run_id}`
+- Queued servers never start; running channels are closed and reported
+  `canceled` with "cancel requested" — closing a channel does not prove
+  the remote process died.
 
 ## 6. Zig core design
 
@@ -124,11 +149,15 @@ fan-out.
 
 ## 12. Acceptance criteria
 
-- [ ] Script CRUD + run with variables works end-to-end.
-- [ ] Variable injection attempts are neutralized (tested).
+- [x] Script CRUD + run with variables works end-to-end.
+- [x] Variable injection attempts are neutralized (tested against the
+      live container: a value containing `'; touch …` stays a literal
+      argument).
 - [ ] Broadcast shows a per-server expansion preview, confirms, streams
-      side-by-side, and reports per-server results.
-- [ ] Audit entries written for every run.
+      side-by-side, and reports per-server results (backend done; the
+      preview/confirm UI is frontend).
+- [x] Audit entries written for every run (redacted command, variable
+      names; secret values never written — verified).
 
 ## 13. Research & References
 
@@ -165,3 +194,29 @@ fan-out.
 
 Sources: GNU Bash manual (quoting, invocation), POSIX shell command
 language (opengroup), rclone docs (quoting section).
+
+### Corrections / verified in the implementation
+
+- **The word rule is an adjacency rule, not an isolation rule.** The
+  spec's own example body is `tail -f /var/log/{{service}}/error.log`,
+  where the placeholder sits inside a path word — so placeholders may
+  border ordinary word characters, and the single-quoted value merges
+  into the word (quotes are removed last by the shell; the value can
+  never add syntax). Rejected contexts: quoting, command substitutions,
+  parameter expansions, comments, command-name position, assignments
+  (`=` on either side), redirection targets, and adjacency to `$`, quotes,
+  backslash, or braces.
+- **`bash` is not preinstalled on the alpine dev container** — added to
+  `scripts/dev-sshd/Dockerfile` (the `bash -n` check needs it).
+- **`std.json.ObjectMap` fields break the Zig 0.16 static parser**
+  (`defaultValue()` comptime error) — the vars/cursors maps parse as
+  `std.json.Value` and are read via `.object`.
+- **Broadcasts bump `run_count`/`last_run_at` too** (a broadcast is a
+  run).
+- **Status transitions must fire once**: a done server keeps being polled
+  (late cursors still drain retained data), so the `running → done`
+  transition is guarded.
+- **The poll response serializes `data` before freeing the polls** —
+  `ChannelPoll.deinit` owns the data buffer; writing after the frees
+  emitted DebugAllocator's 0xAA fill (caught by the container test's
+  UTF-8 check).
