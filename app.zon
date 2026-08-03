@@ -1,0 +1,32 @@
+.{
+    .id = "dev.native_sdk.oars",
+    .name = "oars",
+    .display_name = "Oars",
+    .version = "0.1.0",
+    .icons = .{"assets/icon.png"},
+    .platforms = .{ "macos", "linux" },
+    .permissions = .{ "dialog", "credentials" },
+    .capabilities = .{ "webview", "dialog", "credentials" },
+    .frontend = .{
+        .dist = "frontend/dist",
+        .entry = "index.html",
+        .spa_fallback = true,
+        .dev = .{
+            .url = "http://127.0.0.1:5173/",
+            .command = .{ "npm", "--prefix", "frontend", "run", "dev", "--", "--host", "127.0.0.1" },
+            .ready_path = "/",
+            .timeout_ms = 30000,
+        },
+    },
+    .security = .{
+        .navigation = .{
+            .allowed_origins = .{ "zero://app", "zero://inline", "http://127.0.0.1:5173" },
+            .external_links = .{ .action = "deny" },
+        },
+    },
+    .web_engine = "system",
+    .cef = .{ .dir = "third_party/cef/macos", .auto_install = false },
+    .windows = .{
+        .{ .label = "main", .title = "Oars", .width = 1280, .height = 820, .min_width = 960, .min_height = 600, .restore_state = true },
+    },
+}

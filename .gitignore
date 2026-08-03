@@ -1,0 +1,82 @@
+# --- Zig ------------------------------------------------------------------
+.zig-cache/
+zig-out/
+# Project-local package store if third-party Zig deps are ever fetched
+# beside the build (same entry the native repo uses).
+zig-pkg/
+# CLI-generated build graph for zero-config apps (`native init` writes
+# this entry into new apps' .gitignore) — unused while Oars has its own
+# build.zig, ignored in case the zero-config mode is ever used.
+.native/
+
+# --- C / native build artifacts --------------------------------------------
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.dSYM/
+
+# --- Native SDK -------------------------------------------------------------
+# CEF is a large binary dependency fetched per-platform (app.zon points at
+# third_party/cef/<platform>); the vendored libssh2/mbedTLS SOURCES in
+# third_party/ are required by the build and must stay committed.
+third_party/cef/
+.zig-cache/native-sdk-automation/
+
+# --- Node / frontend ---------------------------------------------------------
+frontend/node_modules/
+frontend/dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm/
+.pnpm-store/
+
+# --- Secrets & local state ---------------------------------------------------
+# Oars stores servers.json in the OS app-data dir and secrets in the
+# Keychain; nothing secret should ever live in the repo. Guard anyway.
+.env
+.env.*
+!.env.example
+**/servers.json
+# Private keys — never commit these, even as test fixtures.
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*.pem
+*.ppk
+
+# --- OS ----------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+desktop.ini
+*~
+
+# --- Editors / IDE -------------------------------------------------------------
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*.swn
+*.sublime-project
+*.sublime-workspace
+
+# --- Logs / profiling / coverage ---------------------------------------------
+*.log
+*.profraw
+*.profdata
+coverage/
+*.gcov
+callgrind.*
+perf.data*
