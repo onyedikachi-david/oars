@@ -273,3 +273,13 @@ printf '%%BEGIN_PS%%\n'; (ps -eo pid=,comm=,%cpu=,%mem= --sort=-%cpu 2>/dev/null
 
 Sources: kernel docs (proc.html), GNU coreutils manual (df/nproc),
 procps-ng ps(1), GNU findutils find(1), systemd journalctl(1), PM2 docs.
+
+**Correction (verified live in the container, spec 04 session):** the monitor
+poll response must be a FLAT payload — `{"ok":true,"ts":…,"cpu":…}` — the
+draft's nested-object shape (`{"ok":true,{…}}`) is invalid JSON and the SDK
+rejects it (`Bridge command returned invalid JSON`). This shipped unnoticed
+because the env-gated integration tests were never actually compiled (Zig 0.16
+drops test blocks from unused imports); `comptime { _ = integration; }` in
+`src/main.zig` now forces their collection. Also: the marker lines in the
+probe/scan commands must use `%%` escapes (`printf '%%BEGIN_STAT%%\n'`);
+busybox printf errors on `%B`-style directives and prints nothing.

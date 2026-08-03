@@ -113,7 +113,9 @@ is bounded only by the kernel SYN timeout (~75 s on macOS) — see §13.
 ### `oars.ssh.resize` `{server_id, cols, rows}` → `{ok}`
 - Implemented: the worker calls `libssh2_channel_request_pty_size_ex` on the
   live shell channel and surfaces a failed resize as an explicit session
-  error (verified live with `stty size` — §11).
+  error (verified live in the container with `stty size` — §11). Note that
+  `stty size` prints "rows cols": after resize(cols=100, rows=40) it reads
+  "40 100".
 ### `oars.ssh.trust` `{server_id, accept}` → `{ok}`
 
 ## 6. Zig core design
@@ -196,10 +198,12 @@ connecting → needs_trust → authenticating → ready → closed
 - Integration (dockerized sshd, `scripts/dev-sshd.sh` + env-gated tests in
   `src/integration.zig`, driven by `scripts/integration-test.sh`):
   password auth → trust → shell echo round-trip → exec `echo hi` exit 0 →
-  exec `exit 3` exit 3 → resize verified with `stty size` in the shell →
+  exec `exit 3` exit 3 → resize verified with `stty size` in the shell
+  (prints "rows cols", so resize(100×40) reads "40 100") →
   duplicate-connect idempotence → disconnect; ed25519 key auth with
   passphrase; changed host key rejected with both fingerprints; disconnect
-  during `needs_trust` returns promptly. **Container pass: green 2026-08-03.**
+  during `needs_trust` returns promptly. **Container pass: green 2026-08-03**
+  (spec 04 session — the suite actually ran; see HANDOVER §13.1).
 - Manual (frontend): typing latency, overflow toast, mirrored tabs, reconnect.
 
 ## 12. Acceptance criteria

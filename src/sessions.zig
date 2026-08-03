@@ -12,6 +12,7 @@ const servers = @import("servers.zig");
 const openssh = @import("openssh.zig");
 const monitor = @import("monitor.zig");
 const audit = @import("audit.zig");
+const logs = @import("logs.zig");
 
 /// Blocking acquire on std.atomic.Mutex (spinlock) — 0.16's atomic.Mutex
 /// only exposes tryLock. Sections are short (buffer/cursor updates), so
@@ -43,11 +44,14 @@ pub const Status = enum(u8) {
 pub const ChannelKind = enum(u8) {
     shell,
     exec,
+    /// Follow channel (spec 04): a long-lived tail stream.
+    log,
 
     pub fn jsonName(self: ChannelKind) []const u8 {
         return switch (self) {
             .shell => "shell",
             .exec => "exec",
+            .log => "log",
         };
     }
 };
@@ -177,15 +181,75 @@ pub const ChannelEntry = struct {
 
 const Op = union(enum) {
     exec: struct { id: u32, command: []const u8 },
+    follow: struct { id: u32, command: []const u8 },
     resize: struct { cols: c_int, rows: c_int },
     close,
     close_channel: struct { id: u32 },
+    clear: struct { path: []const u8, expected: ClearExpected, outcome: *ClearOutcome },
+};
+
+pub const ClearExpected = struct {
+    size: u64,
+    mtime: u64,
+    mode: u32,
+};
+
+/// Completion record for the clear op: the worker writes it (under its
+/// mutex), the bridge handler waits on it (bounded). The path is validated
+/// by the handler before the op is queued.
+pub const ClearOutcome = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    done: bool = false,
+    ok: bool = false,
+    msg_buf: [256]u8 = undefined,
+    msg_len: usize = 0,
+    before_size: u64 = 0,
+    after_size: u64 = 0,
+
+    pub fn set(self: *ClearOutcome, ok: bool, msg: []const u8) void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        self.ok = ok;
+        const n = @min(msg.len, self.msg_buf.len - 1);
+        @memcpy(self.msg_buf[0..n], msg[0..n]);
+        self.msg_len = n;
+        self.done = true;
+    }
+
+    pub fn message(self: *ClearOutcome) []const u8 {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.msg_buf[0..self.msg_len];
+    }
+
+    pub fn isDone(self: *ClearOutcome) bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.done;
+    }
+
+    /// Spins until done or the deadline passes (the handler must never
+    /// block the main thread indefinitely).
+    pub fn wait(self: *ClearOutcome, io: std.Io, deadline_ns: i128) void {
+        while (true) {
+            lockSpin(&self.mutex);
+            const done = self.done;
+            self.mutex.unlock();
+            if (done) return;
+            if (std.Io.Timestamp.now(io, .real).nanoseconds >= deadline_ns) return;
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch return;
+        }
+    }
 };
 
 const TrustState = struct {
     mutex: std.atomic.Mutex = .unlocked,
     pending: bool = false,
+    /// Canonical fingerprint (`SHA256:` + unpadded base64, 50 bytes). The
+    /// buffer is sized for the legacy 64-hex form so comparisons can reuse
+    /// it; only `fingerprint_len` bytes are ever meaningful.
     fingerprint: [64]u8 = undefined,
+    fingerprint_len: usize = 0,
     decided: bool = false,
     accept: bool = false,
 };
@@ -234,6 +298,8 @@ pub const Session = struct {
     /// Set by dropCaches so the next completed probe writes the after
     /// snapshot audit entry (before/after contract, spec 03 §6).
     monitor_drop_pending: std.atomic.Value(bool) = .init(false),
+    /// Per-session log scan cache (spec 04 §4: 60 s freshness).
+    logs_cache: logs.ScanCache = .{},
 
     pub fn setError(self: *Session, msg: []const u8) void {
         lockSpin(&self.error_mutex);
@@ -259,7 +325,7 @@ pub const Session = struct {
         lockSpin(&self.trust.mutex);
         defer self.trust.mutex.unlock();
         if (!self.trust.pending) return "";
-        return &self.trust.fingerprint;
+        return self.trust.fingerprint[0..self.trust.fingerprint_len];
     }
 };
 
@@ -414,6 +480,69 @@ pub const Manager = struct {
         return id;
     }
 
+    /// Queues a follow exec (spec 04): a long-lived tail whose channel is
+    /// reported with kind `log` and stopped via closeChannel.
+    pub fn follow(self: *Manager, server_id: []const u8, command: []const u8) !u32 {
+        const session = self.get(server_id) orelse return error.NoSession;
+        if (session.status.load(.acquire) != .ready) return error.NotReady;
+        const id = session.next_channel_id.fetchAdd(1, .monotonic);
+        const owned = try self.allocator.dupe(u8, command);
+        errdefer self.allocator.free(owned);
+        lockSpin(&session.ops_mutex);
+        defer session.ops_mutex.unlock();
+        try session.ops.append(self.allocator, .{ .follow = .{ .id = id, .command = owned } });
+        return id;
+    }
+
+    /// Queues the identity-bound SFTP truncate (spec 04 clear). The
+    /// outcome record is written by the worker; the caller waits on it
+    /// with a deadline. The path is duplicated here.
+    pub fn clearLog(self: *Manager, server_id: []const u8, path: []const u8, expected: ClearExpected, outcome: *ClearOutcome) !void {
+        const session = self.get(server_id) orelse return error.NoSession;
+        if (session.status.load(.acquire) != .ready) return error.NotReady;
+        const owned = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned);
+        lockSpin(&session.ops_mutex);
+        defer session.ops_mutex.unlock();
+        try session.ops.append(self.allocator, .{ .clear = .{ .path = owned, .expected = expected, .outcome = outcome } });
+    }
+
+    /// Runs an exec to completion (EOF) with bounded output and a deadline.
+    /// Used by handlers whose contract is a synchronous result (logs
+    /// scan/read). The output is owned by the caller.
+    pub fn execWait(self: *Manager, server_id: []const u8, command: []const u8, max_bytes: usize, timeout_ns: i128) !ExecOutcome {
+        const channel = try self.exec(server_id, command);
+        const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + timeout_ns;
+        var out = ExecOutcome{ .output = .empty };
+        errdefer out.deinit(self.allocator);
+        var cursor: u64 = 0;
+        while (true) {
+            const polls = try self.pollChannels(server_id, &.{.{ .id = channel, .pos = cursor }}, false, 64 * 1024, 64 * 1024);
+            for (polls) |*poll| {
+                if (poll.id != channel) continue;
+                if (!out.limited) {
+                    if (out.output.items.len + poll.data.len > max_bytes) out.limited = true;
+                    if (!out.limited) out.output.appendSlice(self.allocator, poll.data) catch return error.OutOfMemory;
+                }
+                cursor = poll.cursor;
+                if (poll.eof) {
+                    out.exit = poll.exit_status orelse 0;
+                    for (polls) |*p| p.deinit(self.allocator);
+                    self.allocator.free(polls);
+                    return out;
+                }
+            }
+            for (polls) |*poll| poll.deinit(self.allocator);
+            self.allocator.free(polls);
+            if (std.Io.Timestamp.now(self.io, .real).nanoseconds >= deadline) {
+                // The deadline cut the response: honest partial output.
+                out.limited = true;
+                return out;
+            }
+            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(10), .awake) catch return out;
+        }
+    }
+
     /// Queues an explicit channel close (spec 04's `oars.ssh.closeChannel`):
     /// the worker sends EOF, closes the raw channel, and frees the entry.
     /// The shell channel (id 0) is never closed this way.
@@ -455,7 +584,7 @@ pub const Manager = struct {
         session.trust.accept = accept;
         session.trust.decided = true;
         const fp: ?[]const u8 = if (accept)
-            try self.allocator.dupe(u8, &session.trust.fingerprint)
+            try self.allocator.dupe(u8, session.trust.fingerprint[0..session.trust.fingerprint_len])
         else
             null;
         session.trust.mutex.unlock();
@@ -463,10 +592,13 @@ pub const Manager = struct {
         if (fp) |f| {
             lockSpin(&self.mutex);
             defer self.mutex.unlock();
-            var s = session.server;
-            if (s.host_fingerprint) |old| self.allocator.free(old);
-            s.host_fingerprint = f;
-            try self.store.upsert(self.io, s);
+            // The session's server copy takes ownership of the fingerprint
+            // (freed with it in disconnect); upsert duplicates it for the
+            // store. Freeing through the copy alone would leave
+            // session.server.host_fingerprint dangling.
+            if (session.server.host_fingerprint) |old| self.allocator.free(old);
+            session.server.host_fingerprint = f;
+            try self.store.upsert(self.io, session.server);
         }
     }
 
@@ -573,6 +705,22 @@ pub const Cursor = struct {
     pos: u64,
 };
 
+/// Bounded synchronous exec result (spec 04 read/scan).
+pub const ExecOutcome = struct {
+    output: std.ArrayList(u8) = .empty,
+    exit: i32 = 0,
+    /// True when the byte cap or the deadline cut the output.
+    limited: bool = false,
+
+    pub fn toOwnedSlice(self: *ExecOutcome, allocator: std.mem.Allocator) ![]u8 {
+        return self.output.toOwnedSlice(allocator);
+    }
+
+    pub fn deinit(self: *ExecOutcome, allocator: std.mem.Allocator) void {
+        self.output.deinit(allocator);
+    }
+};
+
 pub const ChannelPoll = struct {
     id: u32,
     kind: ChannelKind,
@@ -637,7 +785,8 @@ fn workerMain(session: *Session) void {
     if (session.server.host_fingerprint == null) {
         lockSpin(&session.trust.mutex);
         session.trust.pending = true;
-        @memcpy(&session.trust.fingerprint, fingerprint);
+        @memcpy(session.trust.fingerprint[0..fingerprint.len], fingerprint);
+        session.trust.fingerprint_len = fingerprint.len;
         session.trust.decided = false;
         session.trust.mutex.unlock();
         session.status.store(.needs_trust, .release);
@@ -807,13 +956,18 @@ fn workerMain(session: *Session) void {
     raw_shell.requestPty(io, 120, 32) catch {};
     raw_shell.setEnv(io, "TERM", "xterm-256color") catch {};
     raw_shell.shell(io) catch {
+        raw_shell.close(io);
         session.status.store(.@"error", .release);
         session.setError("failed to start shell");
         return;
     };
-    const shell_stream = allocator.create(Stream) catch return;
+    const shell_stream = allocator.create(Stream) catch {
+        raw_shell.close(io);
+        return;
+    };
     shell_stream.* = Stream.init(allocator);
     const shell_entry = allocator.create(ChannelEntry) catch {
+        raw_shell.close(io);
         allocator.destroy(shell_stream);
         return;
     };
@@ -872,6 +1026,14 @@ fn workerMain(session: *Session) void {
             const entry = session.channels.items[i];
             session.channels_mutex.unlock();
 
+            // Closed channels must never be read again: `raw.close` freed
+            // the libssh2 channel (its session pointer is nulled), and a
+            // second read would dereference freed memory.
+            if (entry.raw_closed) {
+                i += 1;
+                continue;
+            }
+
             switch (entry.raw.read(&read_buf)) {
                 .eof => {
                     if (!entry.eof_seen) {
@@ -903,7 +1065,7 @@ fn workerMain(session: *Session) void {
                             allocator.destroy(entry);
                             continue;
                         }
-                    } else if (entry.kind == .exec) {
+                    } else if (entry.kind == .exec or entry.kind == .log) {
                         evictCompletedExecs(session);
                     }
                     i += 1;
@@ -958,12 +1120,12 @@ fn evictCompletedExecs(session: *Session) void {
     defer session.channels_mutex.unlock();
     var completed: usize = 0;
     for (session.channels.items) |e| {
-        if (e.kind == .exec and e.eof_seen and !e.internal) completed += 1;
+        if ((e.kind == .exec or e.kind == .log) and e.eof_seen and !e.internal) completed += 1;
     }
     while (completed > max_completed_execs) {
         var found: ?usize = null;
         for (session.channels.items, 0..) |e, i| {
-            if (e.kind == .exec and e.eof_seen and !e.internal) {
+            if ((e.kind == .exec or e.kind == .log) and e.eof_seen and !e.internal) {
                 found = i;
                 break;
             }
@@ -1121,35 +1283,199 @@ fn processOps(session: *Session) void {
                 allocator.destroy(entry.stream);
                 allocator.destroy(entry);
             },
-            .exec => |e| {
-                const raw = session.transport.openChannel(session.io) catch {
-                    allocator.free(e.command);
-                    continue;
-                };
-                raw.exec(session.io, e.command) catch {
-                    raw.close(session.io);
-                    allocator.free(e.command);
-                    continue;
-                };
-                const stream = allocator.create(Stream) catch {
-                    raw.close(session.io);
-                    allocator.free(e.command);
-                    continue;
-                };
-                stream.* = Stream.init(allocator);
-                const entry = allocator.create(ChannelEntry) catch {
-                    allocator.destroy(stream);
-                    raw.close(session.io);
-                    allocator.free(e.command);
-                    continue;
-                };
-                entry.* = .{ .id = e.id, .kind = .exec, .command = e.command, .stream = stream, .raw = raw };
-                lockSpin(&session.channels_mutex);
-                session.channels.append(allocator, entry) catch {};
-                session.channels_mutex.unlock();
-            },
+            .exec => |e| tryOpenChannel(session, e.id, .exec, e.command),
+            .follow => |f| tryOpenChannel(session, f.id, .log, f.command),
+            .clear => |cl| clearLogFile(session, cl.path, cl.expected, cl.outcome),
         }
     }
+}
+
+/// Shared exec-channel creation for one-shot execs and follow channels.
+fn tryOpenChannel(session: *Session, id: u32, kind: ChannelKind, command: []const u8) void {
+    const allocator = session.allocator;
+    const raw = session.transport.openChannel(session.io) catch {
+        allocator.free(command);
+        return;
+    };
+    raw.exec(session.io, command) catch {
+        raw.close(session.io);
+        allocator.free(command);
+        return;
+    };
+    const stream = allocator.create(Stream) catch {
+        raw.close(session.io);
+        allocator.free(command);
+        return;
+    };
+    stream.* = Stream.init(allocator);
+    const entry = allocator.create(ChannelEntry) catch {
+        allocator.destroy(stream);
+        raw.close(session.io);
+        allocator.free(command);
+        return;
+    };
+    entry.* = .{ .id = id, .kind = kind, .command = command, .stream = stream, .raw = raw };
+    lockSpin(&session.channels_mutex);
+    session.channels.append(allocator, entry) catch {
+        session.channels_mutex.unlock();
+        allocator.destroy(entry);
+        allocator.destroy(stream);
+        raw.close(session.io);
+        allocator.free(command);
+        return;
+    };
+    session.channels_mutex.unlock();
+}
+
+/// Bounded EAGAIN wait for SFTP calls (deadline + stop-aware). Returns
+/// false when the caller should give up.
+fn sftpRetry(session: *Session, deadline: i128) bool {
+    if (std.Io.Timestamp.now(session.io, .real).nanoseconds >= deadline) return false;
+    if (session.stop_flag.load(.acquire)) return false;
+    std.Io.sleep(session.io, std.Io.Duration.fromMilliseconds(10), .awake) catch return false;
+    return true;
+}
+
+fn matchesExpected(attrs: ssh.c.LIBSSH2_SFTP_ATTRIBUTES, expected: ClearExpected) bool {
+    return attrs.filesize == expected.size and
+        attrs.mtime == expected.mtime and
+        (attrs.permissions & 0o7777) == expected.mode;
+}
+
+/// Identity-bound truncate (spec 04 clear): lstat → reject symlinks and
+/// non-regular files → open WITHOUT truncation → fstat the handle → compare
+/// size/mtime/mode against the preview (conflict stops with an explicit
+/// error) → set the handle's size to zero → audit before/after. The path
+/// bytes go to libssh2 directly (SFTP, no shell). Runs on the worker: the
+/// libssh2 session is not thread-safe.
+fn clearLogFile(session: *Session, path: []const u8, expected: ClearExpected, outcome: *ClearOutcome) void {
+    const allocator = session.allocator;
+    defer allocator.free(path);
+    const deadline = std.Io.Timestamp.now(session.io, .real).nanoseconds + 15 * std.time.ns_per_s;
+
+    const sftp = session.transport.sftpInit(session.io) catch {
+        outcome.set(false, "sftp unavailable");
+        return;
+    };
+    const path_z = allocator.dupeZ(u8, path) catch {
+        outcome.set(false, "out of memory");
+        return;
+    };
+    defer allocator.free(path_z);
+
+    var attrs: ssh.c.LIBSSH2_SFTP_ATTRIBUTES = undefined;
+    while (true) {
+        const rc = ssh.c.libssh2_sftp_lstat(sftp, path_z.ptr, &attrs);
+        if (rc == 0) break;
+        if (rc != ssh.c.LIBSSH2_ERROR_EAGAIN) {
+            var msg_buf: [256]u8 = undefined;
+            outcome.set(false, sftpFail(session, "lstat failed", &msg_buf));
+            return;
+        }
+        if (!sftpRetry(session, deadline)) {
+            outcome.set(false, "timed out");
+            return;
+        }
+    }
+    const kind = attrs.permissions & ssh.c.LIBSSH2_SFTP_S_IFMT;
+    if (kind == ssh.c.LIBSSH2_SFTP_S_IFLNK) {
+        outcome.set(false, "refusing to clear a symlink");
+        return;
+    }
+    if (kind != ssh.c.LIBSSH2_SFTP_S_IFREG) {
+        outcome.set(false, "not a regular file");
+        return;
+    }
+    if (!matchesExpected(attrs, expected)) {
+        outcome.set(false, "file changed since preview; re-scan before clearing");
+        return;
+    }
+
+    var handle: *ssh.c.LIBSSH2_SFTP_HANDLE = undefined;
+    while (true) {
+        if (ssh.c.libssh2_sftp_open_ex(
+            sftp,
+            path_z.ptr,
+            @intCast(path.len),
+            ssh.c.LIBSSH2_FXF_READ | ssh.c.LIBSSH2_FXF_WRITE,
+            0,
+            ssh.c.LIBSSH2_SFTP_OPENFILE,
+        )) |h| {
+            handle = h;
+            break;
+        }
+        const rc = ssh.c.libssh2_session_last_errno(session.transport.raw);
+        if (rc == ssh.c.LIBSSH2_ERROR_EAGAIN) {
+            if (!sftpRetry(session, deadline)) {
+                outcome.set(false, "timed out");
+                return;
+            }
+            continue;
+        }
+        var msg_buf: [256]u8 = undefined;
+        outcome.set(false, sftpFail(session, "open failed", &msg_buf));
+        return;
+    }
+    defer _ = ssh.c.libssh2_sftp_close_handle(handle);
+
+    // The identity check is repeated against the OPEN HANDLE, binding the
+    // preview to the object that actually gets truncated.
+    while (true) {
+        const rc = ssh.c.libssh2_sftp_fstat(handle, &attrs);
+        if (rc == 0) break;
+        if (rc != ssh.c.LIBSSH2_ERROR_EAGAIN) {
+            var msg_buf: [256]u8 = undefined;
+            outcome.set(false, sftpFail(session, "fstat failed", &msg_buf));
+            return;
+        }
+        if (!sftpRetry(session, deadline)) {
+            outcome.set(false, "timed out");
+            return;
+        }
+    }
+    if (!matchesExpected(attrs, expected)) {
+        outcome.set(false, "file changed since preview; re-scan before clearing");
+        return;
+    }
+    const before = attrs.filesize;
+
+    var set_attrs: ssh.c.LIBSSH2_SFTP_ATTRIBUTES = .{ .flags = ssh.c.LIBSSH2_SFTP_ATTR_SIZE, .filesize = 0 };
+    while (true) {
+        const rc = ssh.c.libssh2_sftp_fsetstat(handle, &set_attrs);
+        if (rc == 0) break;
+        if (rc != ssh.c.LIBSSH2_ERROR_EAGAIN) {
+            var msg_buf: [256]u8 = undefined;
+            outcome.set(false, sftpFail(session, "truncate failed", &msg_buf));
+            return;
+        }
+        if (!sftpRetry(session, deadline)) {
+            outcome.set(false, "timed out");
+            return;
+        }
+    }
+
+    var detail_buf: [256]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "before_size={d} after_size=0", .{before}) catch "logs.clear";
+    session.audit.append(session.io, .{
+        .ts = @intCast(std.Io.Timestamp.now(session.io, .real).nanoseconds),
+        .action = "logs.clear",
+        .server_id = session.server.id,
+        .detail = detail,
+    }) catch {};
+
+    lockSpin(&outcome.mutex);
+    outcome.ok = true;
+    outcome.before_size = before;
+    outcome.after_size = 0;
+    outcome.done = true;
+    outcome.mutex.unlock();
+}
+
+/// Prefix + libssh2's own error text, into `buf`.
+fn sftpFail(session: *Session, prefix: []const u8, buf: []u8) []const u8 {
+    var msg_buf: [256]u8 = undefined;
+    const msg = session.transport.lastErrorMessage(&msg_buf);
+    return std.fmt.bufPrint(buf, "{s}: {s}", .{ prefix, msg }) catch prefix;
 }
 
 /// Surfaces a key-auth failure to the frontend with libssh2's own
@@ -1165,24 +1491,30 @@ fn reportKeyAuthError(session: *Session, error_buf: []u8, err: ssh.Error) void {
 fn sessionDone(session: *Session) void {
     lockSpin(&session.ops_mutex);
     for (session.ops.items) |op| {
-        if (op == .exec) session.allocator.free(op.exec.command);
+        switch (op) {
+            .exec => |e| session.allocator.free(e.command),
+            .follow => |f| session.allocator.free(f.command),
+            .clear => |cl| session.allocator.free(cl.path),
+            else => {},
+        }
     }
-    session.ops.clearRetainingCapacity();
+    session.ops.deinit(session.allocator);
     session.ops_mutex.unlock();
 
     lockSpin(&session.channels_mutex);
     for (session.channels.items) |entry| {
         if (!entry.raw_closed) entry.raw.close(session.io);
         entry.stdin_queue.deinit(session.allocator);
-        if (entry.kind == .exec) session.allocator.free(entry.command);
+        if (entry.kind == .exec or entry.kind == .log) session.allocator.free(entry.command);
         entry.stream.deinit(session.allocator);
         session.allocator.destroy(entry.stream);
         session.allocator.destroy(entry);
     }
-    session.channels.clearRetainingCapacity();
+    session.channels.deinit(session.allocator);
     session.channels_mutex.unlock();
 
     session.monitor_cache.deinit(session.allocator);
+    session.logs_cache.deinit(session.allocator);
     session.transport.disconnect(session.io);
     const status = session.status.load(.acquire);
     if (status != .@"error" and status != .closed) session.status.store(.closed, .release);

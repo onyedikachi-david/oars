@@ -9,6 +9,7 @@ const std = @import("std");
 
 pub const c = @cImport({
     @cInclude("libssh2.h");
+    @cInclude("libssh2_sftp.h");
 });
 
 pub const Error = error{
@@ -80,6 +81,9 @@ pub const Session = struct {
     /// The in-flight cancelable DNS lookup, published so a disconnect on
     /// another thread can cancel it (see connect).
     dns_future: std.atomic.Value(?*std.Io.Future(anyerror!void)) = .init(null),
+    /// Lazily initialized SFTP subsystem (spec 04 clear; spec 05 owns the
+    /// rest). Only ever touched by the session worker.
+    sftp: ?*c.LIBSSH2_SFTP = null,
 
     pub fn init(allocator: std.mem.Allocator) Error!Session {
         return .{ .allocator = allocator, .raw = undefined, .socket = undefined };
@@ -344,6 +348,32 @@ pub const Session = struct {
     /// Test-only alias so probes can drive the callback directly.
     pub const testSignCallback = ed25519SignCallback;
 
+    /// Lazily initializes the SFTP subsystem (worker thread only; the
+    /// libssh2 session is not thread-safe).
+    pub fn sftpInit(self: *Session, io: std.Io) Error!*c.LIBSSH2_SFTP {
+        if (self.sftp) |s| return s;
+        const deadline = deadlineFromNow(io, handshake_timeout_ms);
+        while (true) {
+            if (c.libssh2_sftp_init(self.raw)) |sftp| {
+                self.sftp = sftp;
+                return sftp;
+            }
+            const rc = c.libssh2_session_last_errno(self.raw);
+            if (!isEagain(rc)) return error.Protocol;
+            try checkDeadline(io, deadline);
+            try self.checkStop();
+            try sleep(io);
+        }
+    }
+
+    /// Releases the SFTP subsystem. Idempotent.
+    pub fn sftpShutdown(self: *Session) void {
+        if (self.sftp) |s| {
+            _ = c.libssh2_sftp_shutdown(s);
+            self.sftp = null;
+        }
+    }
+
     pub fn keepaliveConfig(self: *Session) void {
         _ = c.libssh2_keepalive_config(self.raw, 0, 30);
     }
@@ -405,6 +435,7 @@ pub const Session = struct {
     /// safe to call twice.
     pub fn disconnect(self: *Session, io: std.Io) void {
         if (self.session_open) {
+            self.sftpShutdown();
             _ = c.libssh2_session_disconnect_ex(self.raw, c.LIBSSH2_ERROR_NONE, "oars: bye", "oars: bye");
             _ = c.libssh2_session_free(self.raw);
             self.session_open = false;
@@ -576,12 +607,15 @@ pub const Channel = struct {
         return c.libssh2_channel_get_exit_status(self.raw);
     }
 
-    /// Closes and frees the channel (idempotent).
+    /// Closes and frees the libssh2 channel and destroys the handle.
+    /// Call exactly once per open channel (entry teardown is guarded by
+    /// `raw_closed`); the handle must not be touched afterwards.
     pub fn close(self: *Channel, io: std.Io) void {
         _ = c.libssh2_channel_close(self.raw);
         _ = c.libssh2_channel_wait_closed(self.raw);
         _ = c.libssh2_channel_free(self.raw);
         _ = io;
+        self.allocator.destroy(self);
     }
 };
 

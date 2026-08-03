@@ -1,6 +1,6 @@
 # Spec 04 — Log Management
 
-**Status:** 📋 · **Depends on:** 02 (exec/follow) · **Spec owner:** core + frontend
+**Status:** ✅ backend in (frontend UI pending) · **Depends on:** 02 (exec/follow) · **Spec owner:** core + frontend
 
 ## 1. Overview
 
@@ -48,30 +48,39 @@ path guessing.
 ```json
 {"ok":true,"sources":[
   {"path":"/var/log/nginx/access.log","group":"web","name":"Nginx · access",
-   "size":472000,"mtime_epoch":1754000000,"age_sec":92,"readable":true},
+   "size":472000,"mtime_epoch":1754000000,"age_sec":92,"mode":420,"readable":true},
   {"path":"/var/log/auth.log","group":"system","name":"auth.log",
-   "size":1.2e6,"mtime_epoch":1754000034,"age_sec":58,"readable":false}
-]}
+   "size":1200000,"mtime_epoch":1754000034,"age_sec":58,"mode":384,"readable":false}
+],"partial":false,"reason":""}
 ```
-- Scan implementation (exec, cached 60 s):
+- Scan implementation (one exec, cached 60 s per session): `%BEGIN_DATE%`
+  carries the remote clock (ages are computed against it, never the local
+  workstation clock); `%BEGIN_SCAN%` carries NUL-delimited records
+  (`path\0size\0mtime\0mode\0`). Markers use `%%` escapes — busybox printf
+  errors on `%B`-style directives and prints nothing (verified live), and
+  `%%` works on both busybox and GNU.
+- GNU `find -printf` form, and the busybox `-print0` + `stat` fallback,
+  joined with `||` (not `;`) so a find without `-printf` fails over instead
+  of emitting two streams. The trailing `printf '\0'` makes an empty tree
+  parse as zero records rather than degrading to the bare-path fallback:
 ```
-find /var/log -maxdepth 3 -type f -printf '%p\0%s\0%T@\0' 2>/dev/null
+printf '%%BEGIN_DATE%%\n'; date +%s; printf '%%BEGIN_SCAN%%\n'; find <roots> -maxdepth 3 -type f -printf '%p\0%s\0%T@\0%m\0' 2>/dev/null || find <roots> -maxdepth 3 -type f -print0 2>/dev/null | while IFS= read -r -d '' p; do printf '%s\0' "$p"; (stat -c '%s %Y %a' "$p" 2>/dev/null || printf '0 0 0\n') | tr ' \n' '\000\000'; done; printf '\0'
 ```
-The probe also reads remote `date +%s`. The parser handles the NUL-delimited
-records before it builds JSON. This keeps
-spaces and newlines in file names from corrupting record boundaries. The scan
-also includes known non-`.log` files such as syslog and distro-specific auth
-logs, PM2 paths from `pm2 jlist`, and user-added paths. Grouping:
-`nginx|apache` → web; `pm2|out|err` under app dirs → runtime; syslog/auth/kern → system; else custom.
-- GNU `find -printf` is capability-detected. On BusyBox or another find without
-  `-printf`, use `find ... -print0` and obtain size and modification time with a
-  detected `stat` format. If neither safe NUL-delimited path works, list only
-  configured and known fixed paths and report partial discovery.
-- Cap discovery by entry count and output bytes. Return `partial:true` with a
-  reason when permissions, capability limits, or bounds prevent a complete
-  scan. Compute `age_sec` from the remote clock and clamp future mtimes to zero
+  Roots = `/var/log` + user-added paths (shell-quoted). This keeps spaces
+  and newlines in file names from corrupting record boundaries. The scan
+  also includes known non-`.log` files such as syslog and distro-specific
+  auth logs, PM2 paths from user-added `pm2 jlist` output, and user-added
+  paths. Grouping: `nginx|apache` → web; `pm2` or `-out.log`/`-err.log`
+  under app dirs → runtime; syslog/auth/kern → system; else custom.
+- Cap discovery by entry count (500) and output bytes (1 MB); the response
+  carries `partial:true` with a reason when bounds prevent a complete scan.
+  Compute `age_sec` from the remote clock and clamp future mtimes to zero
   rather than mixing remote mtimes with the local workstation clock.
-- Readability probe: `test -r <path>` per source (batched; only for top-level scan results).
+- Readability probe: one batched exec of `test -r <path> && echo 1 || echo 0;`
+  per source (first 100 paths), mapped in order; unreadable → `readable:false`
+  (root bypasses DAC, so chmod-000 files still read `true` on root sessions).
+- `mode` is the permission bits (0o644 etc.); the frontend echoes it back in
+  `oars.logs.clear`'s `expected` as the identity preview.
 
 ### `oars.logs.read` `{server_id, path, lines}` → `{ok, path, lines: [...], limited}`
 - `tail -n <lines>` (lines ∈ {200,500,1000,5000}); file size cap 64 MB read.
@@ -80,10 +89,10 @@ logs, PM2 paths from `pm2 jlist`, and user-added paths. Grouping:
   truncated.
 
 ### `oars.logs.follow` `{server_id, path}` → `{ok, channel}`
-- Prefer `tail -n 100 --follow=name --retry <quoted-path>` so the viewer follows
-  the new file after normal log rotation. Detect support first and fall back to
-  descriptor follow with a clear "reopen after rotation" state. Output streams
-  via `oars.ssh.poll` (channel kind `log`).
+- `tail -n 100 -F <quoted-path>` (name-follow with retry) so the viewer follows
+  the new file after normal log rotation; `-F` works on both GNU and busybox
+  (verified live), so no capability fallback is needed. Output streams via
+  `oars.ssh.poll` (channel kind `log`) and stops via `oars.ssh.closeChannel`.
 - Add `oars.ssh.closeChannel` `{server_id, channel}` to the bridge (worker: send EOF, close, free).
 
 ### `oars.logs.clear` `{server_id, path, expected:{size,mtime,mode}}` → `{ok}`
@@ -139,17 +148,29 @@ logs, PM2 paths from `pm2 jlist`, and user-added paths. Grouping:
 ## 11. Testing
 
 - Unit: grouping rules, NUL-delimited fixture parses, remote-clock age math,
-  scan bounds, path validation, and clear identity conflicts.
-- Integration: create logs in the sshd container (nginx-style + PM2-style), scan → read → follow → write more lines → verify stream; clear → verify truncated; unreadable file (chmod 000) → verify failure surface.
-- Manual: 5k-line search, download, rotation behavior.
+  scan bounds, path validation, scan-cache freshness/invalidation, source-store
+  persistence/dedupe, shell-quote round-trip through a real `/bin/sh`, and the
+  scan command's shape (`%%`-escaped markers, `||`-joined fallback).
+- Integration (container, `scripts/integration-test.sh`): create logs in the
+  sshd container (nginx-style + PM2-style), `addSource` the tree, scan →
+  verify grouping/stamps/readability → read → missing-file failure → follow →
+  append a line → verify the stream (kind `log`) → clear with a STALE preview
+  → conflict refused → re-scan (addSource invalidates the cache) → clear with
+  the fresh preview → verify truncated + audit entry → closeChannel.
+- Manual (pending UI): 5k-line search, download, rotation behavior.
 
 ## 12. Acceptance criteria
 
-- [ ] Scan groups real log layouts and stamps size/last-write correctly.
-- [ ] Read/follow/search/clear/download all work against the test container.
-- [ ] Unreadable files produce explicit errors, never hangs.
-- [ ] Manual paths persist across sessions.
-- [ ] Parser/validator tests green.
+- [x] Scan groups real log layouts and stamps size/last-write correctly
+      (verified against the busybox container; the GNU `-printf` form is
+      documented from findutils and shares the identical record format).
+- [x] Read/follow/clear work against the test container; download is deferred
+      to spec 05's SFTP transfer (never streamed through the JSON bridge).
+- [x] Unreadable/missing files produce explicit errors, never hangs (root
+      bypasses DAC, so `chmod 000` still reads as readable on root sessions;
+      the readability mapping itself is unit-tested).
+- [x] Manual paths persist across sessions (`logs.json` per server).
+- [x] Parser/validator tests green.
 
 ## 13. Research & References
 
@@ -167,33 +188,44 @@ documented under `%Ak`-style directives). `2>/dev/null` suppresses
   encoding. The `.log` filter was also widened so files such as `syslog` are
   not omitted. GNU documents `-printf`; it is not a POSIX `find` option, so the
   body now requires capability detection and a `-print0` plus `stat` fallback.
+  **Correction (verified live, busybox 1.36 / alpine):** busybox `printf`
+  errors on `%B`-style directives and prints nothing, so the marker lines must
+  be emitted with `%%` escapes (`printf '%%BEGIN_DATE%%\n'`), which both
+  busybox and GNU printf render as `%BEGIN_DATE%`. busybox `stat -c '%s %Y %a'`
+  ends each record with a newline, so the fallback maps both spaces and the
+  newline to NUL (`tr ' \n' '\000\000'`); a vanished file mid-scan falls back
+  to `0 0 0` so a single race cannot fail the whole scan. GNU and busybox find
+  are joined with `||` so a find without `-printf` fails over instead of
+  emitting two streams; the trailing `printf '\0'` makes an empty tree parse
+  as zero records.
 - **`tail` read/follow** — verified against the GNU coreutils manual
-  (`https://www.gnu.org/software/coreutils/manual/html_node/tail-invocation.html`):
+  (`https://www.gnu.org/software/coreutils/manual/html_node/tail-invocation.html`)
+  and live on busybox:
   - `-n num` outputs the last num lines (spec: 200/500/1k/5k).
-  - `-f`/`--follow=how`: **default is `--follow=descriptor`** — "If
-    you'd like to continue to track the end of a growing file even after
-    it has been unlinked, use `--follow=descriptor`. This is the default
-    behavior" — this is exactly the rotation behavior spec §10 relies on
-    ("follow keeps the open fd"). `--follow=name` + `--retry` (`-F`)
-    is the rotation-following alternative (we re-scan instead, and note
-    the inode change).
+  - `-F` (`--follow=name` + `--retry`) works on both GNU and busybox
+    (verified live), so the follow uses it directly; the descriptor-follow
+    fallback in the draft was dropped. Without inotify, tail polls every
+    1 s (`--sleep-interval`), which bounds our follow latency.
   - Truncation: "if the tracked file is determined to have shrunk, tail
     prints a message saying the file has been truncated and resumes
-    tracking from the start" — our `truncated: true` re-read handles
-    the same race from the client side.
-  - inotify-based follow is prompt; without inotify tail polls every
-    1 s (`--sleep-interval`), which bounds our follow latency.
+    tracking from the start" — the viewer re-reads to handle the same
+    race from the client side.
 - **Clear** — GNU `truncate` can set a file to zero, but a pathname-only
   command cannot bind the confirmation preview to the object later opened.
   The target therefore uses the vendored libssh2 SFTP handle APIs described in
-  spec 05: `lstat`, open without truncation, `fstat`, compare available
-  attributes, and set the size on that handle. SFTP v3 has no inode/device
-  field, so §5 states the remaining race limit instead of claiming a stable
-  file identity.
+  spec 05: `lstat`, reject symlinks/non-regular files, open WITHOUT
+  truncation, `fstat` the handle, compare size/mtime/mode against the preview
+  (a mismatch stops with a conflict), and set the size on that handle. The
+  identity check is repeated against the OPEN handle. SFTP v3 has no
+  inode/device field, so §5 states the remaining race limit instead of
+  claiming a stable file identity. Verified live: a stale preview is refused;
+  a fresh preview truncates and audits `before_size`/`after_size`.
 - **PM2 log paths** — `pm2 jlist` JSON includes per-process log file
   paths (`pm_out_log_path`/`pm_err_log_path`); PM2 docs
   (`https://pm2.keymetrics.io/docs/usage/process-management/`, spec 03
-  §13) confirm jlist as the machine interface.
+  §13) confirm jlist as the machine interface. `pm2 jlist` itself is not
+  invoked by the scan (no pm2 in the test container); PM2 paths arrive as
+  user-added sources.
 - **Readability probe** — `test -r <path>` is POSIX sh's documented
   readability check (`test(1)`, `-r` flag); run batched via exec.
 - **Download chunking** — bridge payload limit enforced at SDK

@@ -16,6 +16,7 @@ const ssh = @import("ssh.zig");
 const servers = @import("servers.zig");
 const sessions = @import("sessions.zig");
 const audit = @import("audit.zig");
+const logs = @import("logs.zig");
 const bridge = @import("bridge.zig");
 
 /// Reads an environment variable from the process environment. The raw
@@ -30,6 +31,12 @@ fn getEnv(name: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, raw[0..eq], name)) return raw[eq + 1 ..];
     }
     return null;
+}
+
+/// Test sleep: std.Thread.sleep does not exist in 0.16 — sleeps go
+/// through the Io clock.
+fn testSleep(ms: i64) void {
+    std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(ms), .awake) catch {};
 }
 
 const TestEnv = struct {
@@ -62,9 +69,11 @@ const TestRig = struct {
     dir_buf: [128]u8 = undefined,
     path_buf: [512]u8 = undefined,
     audit_path_buf: [512]u8 = undefined,
+    logs_path_buf: [512]u8 = undefined,
     dir_name: []const u8,
     store: servers.Store,
     audit_store: audit.Store,
+    logs_store: logs.SourceStore,
     manager: sessions.Manager,
     ctx: bridge.Context,
     dispatcher: native_sdk.BridgeDispatcher,
@@ -76,10 +85,12 @@ const TestRig = struct {
         self.dir_name = try std.fmt.bufPrint(&self.dir_buf, "oars-itest-{s}-{d}", .{ tag, now });
         const store_path = try std.fmt.bufPrint(&self.path_buf, "/tmp/{s}/servers.json", .{self.dir_name});
         const audit_path = try std.fmt.bufPrint(&self.audit_path_buf, "/tmp/{s}/audit.jsonl", .{self.dir_name});
+        const logs_path = try std.fmt.bufPrint(&self.logs_path_buf, "/tmp/{s}/logs.json", .{self.dir_name});
         self.store = .{ .allocator = std.testing.allocator, .path = store_path };
         self.audit_store = .{ .allocator = std.testing.allocator, .path = audit_path };
+        self.logs_store = .{ .allocator = std.testing.allocator, .path = logs_path };
         self.manager = sessions.Manager.init(std.testing.allocator, io, &self.store, &self.audit_store, null);
-        self.ctx = .{ .allocator = std.testing.allocator, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store };
+        self.ctx = .{ .allocator = std.testing.allocator, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store };
         self.dispatcher = self.ctx.dispatcher();
     }
 
@@ -108,9 +119,12 @@ fn waitForStatus(
     while (true) {
         const info = try manager.sessionSnapshot(server_id);
         if (info.status == want) return;
-        if (info.status == .@"error") return error.TestUnexpectedResult;
+        if (info.status == .@"error") {
+            std.debug.print("TEST session error: {s}\n", .{info.@"error"});
+            return error.TestUnexpectedResult;
+        }
         if (std.Io.Timestamp.now(std.testing.io, .real).nanoseconds >= deadline) return error.TestUnexpectedResult;
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        testSleep(50);
     }
 }
 
@@ -134,7 +148,7 @@ fn shellEchoRoundTrip(manager: *sessions.Manager, server_id: []const u8, marker:
         for (polls) |*poll| poll.deinit(std.testing.allocator);
         std.testing.allocator.free(polls);
         if (std.mem.indexOf(u8, acc.items, marker) != null) return;
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        testSleep(50);
     }
     return error.TestUnexpectedResult;
 }
@@ -157,7 +171,7 @@ fn shellReadUntil(manager: *sessions.Manager, server_id: []const u8, command: []
         for (polls) |*poll| poll.deinit(std.testing.allocator);
         std.testing.allocator.free(polls);
         if (std.mem.indexOf(u8, acc.items, want) != null) return;
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        testSleep(50);
     }
     return error.TestUnexpectedResult;
 }
@@ -190,7 +204,7 @@ fn execWait(manager: *sessions.Manager, server_id: []const u8, command: []const 
             }
             return;
         }
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        testSleep(50);
     }
     return error.TestUnexpectedResult;
 }
@@ -207,7 +221,7 @@ test "integration: password auth, trust, shell, exec, resize, disconnect" {
     defer rig.deinit();
     const io = std.testing.io;
 
-    var server = servers.Server{
+    const server = servers.Server{
         .id = "itest-password",
         .name = "dev-sshd",
         .host = env.host,
@@ -215,7 +229,6 @@ test "integration: password auth, trust, shell, exec, resize, disconnect" {
         .user = env.user,
         .auth_method = .password,
     };
-    defer server.deinit(std.testing.allocator);
     try rig.store.upsert(io, server);
 
     _ = try rig.manager.connect(server, env.password, null);
@@ -241,10 +254,11 @@ test "integration: password auth, trust, shell, exec, resize, disconnect" {
     try execWait(&rig.manager, "itest-password", "exit 3", 3, "");
 
     // Resize must take effect on the shell PTY: verify with `stty size`
-    // running inside the shell (spec 02 §12).
+    // running inside the shell (spec 02 §12). `stty size` prints
+    // "rows cols" — resize(cols=100, rows=40) must read "40 100".
     try rig.manager.resize("itest-password", 100, 40);
     try shellEchoRoundTrip(&rig.manager, "itest-password", "oars-resize-7");
-    try shellReadUntil(&rig.manager, "itest-password", "stty size\n", "100 40");
+    try shellReadUntil(&rig.manager, "itest-password", "stty size\n", "40 100");
     try waitForStatus(&rig.manager, "itest-password", .ready, 5 * std.time.ns_per_s);
 
     // Duplicate connect is an idempotent no-op failure at the manager level
@@ -267,7 +281,7 @@ test "integration: ed25519 key auth with passphrase" {
     defer rig.deinit();
     const io = std.testing.io;
 
-    var server = servers.Server{
+    const server = servers.Server{
         .id = "itest-key",
         .name = "dev-sshd",
         .host = env.host,
@@ -277,7 +291,6 @@ test "integration: ed25519 key auth with passphrase" {
         .key_path = env.key_path,
         .key_has_passphrase = true,
     };
-    defer server.deinit(std.testing.allocator);
     try rig.store.upsert(io, server);
 
     _ = try rig.manager.connect(server, null, env.passphrase);
@@ -303,7 +316,7 @@ test "integration: changed host key is rejected with both fingerprints" {
 
     // A deliberately wrong canonical fingerprint: the worker must hard-fail
     // before auth with an explicit message carrying both values.
-    var server = servers.Server{
+    const server = servers.Server{
         .id = "itest-changed",
         .name = "dev-sshd",
         .host = env.host,
@@ -312,7 +325,6 @@ test "integration: changed host key is rejected with both fingerprints" {
         .auth_method = .password,
         .host_fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     };
-    defer server.deinit(std.testing.allocator);
     try rig.store.upsert(io, server);
 
     _ = try rig.manager.connect(server, env.password, null);
@@ -325,7 +337,7 @@ test "integration: changed host key is rejected with both fingerprints" {
             break;
         }
         if (std.Io.Timestamp.now(std.testing.io, .real).nanoseconds >= deadline) return error.TestUnexpectedResult;
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        testSleep(50);
     }
     rig.manager.disconnect("itest-changed");
 }
@@ -341,7 +353,7 @@ test "integration: disconnect during needs_trust returns promptly" {
     defer rig.deinit();
     const io = std.testing.io;
 
-    var server = servers.Server{
+    const server = servers.Server{
         .id = "itest-disc",
         .name = "dev-sshd",
         .host = env.host,
@@ -349,7 +361,6 @@ test "integration: disconnect during needs_trust returns promptly" {
         .user = env.user,
         .auth_method = .password,
     };
-    defer server.deinit(std.testing.allocator);
     try rig.store.upsert(io, server);
 
     _ = try rig.manager.connect(server, env.password, null);
@@ -379,7 +390,7 @@ test "integration: monitor probes, cleanup plans, and drop-caches audits" {
     rig.manager.monitor_interval_ns = 200 * std.time.ns_per_ms;
     rig.manager.monitor_liveness_ns = 150 * std.time.ns_per_ms;
 
-    var server = servers.Server{
+    const server = servers.Server{
         .id = "itest-mon",
         .name = "dev-sshd",
         .host = env.host,
@@ -387,7 +398,6 @@ test "integration: monitor probes, cleanup plans, and drop-caches audits" {
         .user = env.user,
         .auth_method = .password,
     };
-    defer server.deinit(std.testing.allocator);
     try rig.store.upsert(io, server);
     _ = try rig.manager.connect(server, env.password, null);
     try waitForStatus(&rig.manager, "itest-mon", .needs_trust, 20 * std.time.ns_per_s);
@@ -396,36 +406,39 @@ test "integration: monitor probes, cleanup plans, and drop-caches audits" {
 
     // Before any monitor activity the cache must be empty: no poll -> no
     // probe traffic (spec 03 acceptance).
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    testSleep(500);
     const session = rig.manager.get("itest-mon").?;
     session.monitor_cache.lock();
     const idle_empty = session.monitor_cache.current() == null;
     session.monitor_cache.unlock();
     try std.testing.expect(idle_empty);
 
-    // Polling enqueues probes; wait for the first real snapshot.
+    // Polling enqueues probes; wait for the first real snapshot. The
+    // dispatcher wraps handler output under "result".
     const PollResp = struct {
-        ok: bool,
-        ts: i64 = 0,
-        probe_error: ?[]const u8 = null,
-        cpu: struct {
-            utilization_pct: ?f32 = null,
-            cpu_warming: bool = false,
-            load_1: f32 = 0,
-            uptime_sec: u64 = 0,
-            cores: u32 = 0,
-        } = .{},
-        mem: struct {
-            used_bytes: u64 = 0,
-            total_bytes: u64 = 0,
-            available_bytes: u64 = 0,
-        } = .{},
-        disk: struct {
-            used_bytes: u64 = 0,
-            total_bytes: u64 = 0,
-            available_bytes: u64 = 0,
-        } = .{},
-        processes: []const struct { pid: u32 } = &.{},
+        result: struct {
+            ok: bool,
+            ts: i64 = 0,
+            probe_error: ?[]const u8 = null,
+            cpu: struct {
+                utilization_pct: ?f32 = null,
+                cpu_warming: bool = false,
+                load_1: f32 = 0,
+                uptime_sec: u64 = 0,
+                cores: u32 = 0,
+            } = .{},
+            mem: struct {
+                used_bytes: u64 = 0,
+                total_bytes: u64 = 0,
+                available_bytes: u64 = 0,
+            } = .{},
+            disk: struct {
+                used_bytes: u64 = 0,
+                total_bytes: u64 = 0,
+                available_bytes: u64 = 0,
+            } = .{},
+            processes: []const struct { pid: u32 } = &.{},
+        },
     };
 
     var first_ts: i64 = 0;
@@ -440,21 +453,22 @@ test "integration: monitor probes, cleanup plans, and drop-caches audits" {
             .allocate = .alloc_always,
         });
         defer parsed.deinit();
-        if (parsed.value.ts > 0) {
+        const snap = parsed.value.result;
+        if (snap.ts > 0) {
             // The busybox ps fallback yields null cpu/mem per row, but the
             // probe itself must not have failed.
-            try std.testing.expect(parsed.value.probe_error == null);
-            try std.testing.expect(parsed.value.cpu.cores >= 1);
-            try std.testing.expect(parsed.value.cpu.uptime_sec > 0);
-            try std.testing.expect(parsed.value.mem.total_bytes > 0);
-            try std.testing.expect(parsed.value.mem.available_bytes > 0);
-            try std.testing.expect(parsed.value.disk.total_bytes > 0);
-            try std.testing.expect(parsed.value.processes.len >= 1);
-            first_ts = parsed.value.ts;
-            warming_seen = parsed.value.cpu.cpu_warming;
+            try std.testing.expect(snap.probe_error == null);
+            try std.testing.expect(snap.cpu.cores >= 1);
+            try std.testing.expect(snap.cpu.uptime_sec > 0);
+            try std.testing.expect(snap.mem.total_bytes > 0);
+            try std.testing.expect(snap.mem.available_bytes > 0);
+            try std.testing.expect(snap.disk.total_bytes > 0);
+            try std.testing.expect(snap.processes.len >= 1);
+            first_ts = snap.ts;
+            warming_seen = snap.cpu.cpu_warming;
             break;
         }
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        testSleep(100);
     }
     try std.testing.expect(first_ts > 0);
 
@@ -475,37 +489,23 @@ test "integration: monitor probes, cleanup plans, and drop-caches audits" {
             .allocate = .alloc_always,
         });
         defer parsed.deinit();
-        if (parsed.value.ts > first_ts and parsed.value.cpu.utilization_pct != null) {
+        if (parsed.value.result.ts > first_ts and parsed.value.result.cpu.utilization_pct != null) {
             util_seen = true;
             break;
         }
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        testSleep(100);
     }
     try std.testing.expect(util_seen);
 
-    // Stop polling: the liveness window elapses and the snapshot freezes
-    // (no new probes, no new ts).
-    const frozen_ts = blk: {
-        const response = rig.dispatch(
-            \\{"id":"3","command":"oars.monitor.poll","payload":{"server_id":"itest-mon"}}
-        );
-        const parsed = try std.json.parseFromSlice(PollResp, std.testing.allocator, response, .{
-            .ignore_unknown_fields = true,
-            .allocate = .alloc_always,
-        });
-        defer parsed.deinit();
-        break :blk parsed.value.ts;
-    };
-    std.Thread.sleep(600 * std.time.ns_per_ms);
-    const after_idle = rig.dispatch(
-        \\{"id":"4","command":"oars.monitor.poll","payload":{"server_id":"itest-mon"}}
-    );
-    const parsed_idle = try std.json.parseFromSlice(PollResp, std.testing.allocator, after_idle, .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_always,
-    });
-    defer parsed_idle.deinit();
-    try std.testing.expectEqual(frozen_ts, parsed_idle.value.ts);
+    // Stop polling: once the liveness window elapses the worker must not
+    // start new probes (spec 03 §6: a session with no monitor view
+    // generates no probe traffic). The probe clock is the honest signal —
+    // a stale-cache poll enqueues a probe itself, so snapshot-ts
+    // comparisons would race the refresh the poll just triggered.
+    testSleep(400); // outlive the 150 ms liveness window + one probe RTT
+    const probe_clock = session.monitor_last_probe_ns.load(.acquire);
+    testSleep(400);
+    try std.testing.expectEqual(probe_clock, session.monitor_last_probe_ns.load(.acquire));
 
     // Manual refresh forces a probe even without a poll cadence.
     _ = rig.dispatch(
@@ -514,19 +514,11 @@ test "integration: monitor probes, cleanup plans, and drop-caches audits" {
     const force_deadline = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds + 10 * std.time.ns_per_s;
     var forced = false;
     while (std.Io.Timestamp.now(std.testing.io, .real).nanoseconds < force_deadline) {
-        const response = rig.dispatch(
-            \\{"id":"6","command":"oars.monitor.poll","payload":{"server_id":"itest-mon"}}
-        );
-        const parsed = try std.json.parseFromSlice(PollResp, std.testing.allocator, response, .{
-            .ignore_unknown_fields = true,
-            .allocate = .alloc_always,
-        });
-        defer parsed.deinit();
-        if (parsed.value.ts > frozen_ts) {
+        if (session.monitor_last_probe_ns.load(.acquire) > probe_clock) {
             forced = true;
             break;
         }
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        testSleep(100);
     }
     try std.testing.expect(forced);
 
@@ -569,7 +561,7 @@ test "integration: monitor probes, cleanup plans, and drop-caches audits" {
                 break;
             }
         }
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        testSleep(100);
     }
     const final_audit = try std.Io.Dir.cwd().readFileAlloc(io, rig.audit_store.path, std.testing.allocator, .limited(256 * 1024));
     defer std.testing.allocator.free(final_audit);
@@ -580,4 +572,284 @@ test "integration: monitor probes, cleanup plans, and drop-caches audits" {
     try std.testing.expect(std.mem.indexOf(u8, final_audit, "monitor.drop_caches.after") != null);
 
     rig.manager.disconnect("itest-mon");
+}
+
+test "integration: logs scan, read, follow, clear, and addSource" {
+    const env = TestEnv.load();
+    if (!env.active) return;
+
+    ssh.initGlobal();
+
+    var rig: TestRig = undefined;
+    try rig.init("logs");
+    defer rig.deinit();
+    const io = std.testing.io;
+
+    const server = servers.Server{
+        .id = "itest-logs",
+        .name = "dev-sshd",
+        .host = env.host,
+        .port = env.port,
+        .user = env.user,
+        .auth_method = .password,
+    };
+    try rig.store.upsert(io, server);
+    _ = try rig.manager.connect(server, env.password, null);
+    try waitForStatus(&rig.manager, "itest-logs", .needs_trust, 20 * std.time.ns_per_s);
+    try rig.manager.trust("itest-logs", true);
+    try waitForStatus(&rig.manager, "itest-logs", .ready, 20 * std.time.ns_per_s);
+
+    // A small log tree the scan picks up through a user-added root.
+    try execWait(&rig.manager, "itest-logs", "mkdir -p /tmp/oars-logs/nginx /tmp/oars-logs/pm2; " ++
+        "seq 1 5 > /tmp/oars-logs/nginx/access.log; " ++
+        "printf 'api started\\n' > /tmp/oars-logs/pm2/api-out.log", 0, "");
+
+    // addSource persists the path and feeds the scan roots.
+    const added = rig.dispatch(
+        \\{"id":"1","command":"oars.logs.addSource","payload":{"server_id":"itest-logs","path":"/tmp/oars-logs"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, added, "\"ok\":true") != null);
+
+    // Scan: grouping, size/mtime/mode stamps, readability probe.
+    const ScanSource = struct {
+        path: []const u8,
+        group: []const u8,
+        name: []const u8,
+        size: u64,
+        mtime_epoch: u64,
+        age_sec: u64,
+        mode: u32,
+        readable: bool,
+    };
+    // The dispatcher wraps handler output under "result".
+    const ScanResp = struct {
+        result: struct {
+            ok: bool,
+            sources: []const ScanSource = &.{},
+            partial: bool = false,
+            reason: []const u8 = "",
+        },
+    };
+    const scan_response = rig.dispatch(
+        \\{"id":"2","command":"oars.logs.scan","payload":{"server_id":"itest-logs"}}
+    );
+    const scan_parsed = try std.json.parseFromSlice(ScanResp, std.testing.allocator, scan_response, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer scan_parsed.deinit();
+    try std.testing.expect(scan_parsed.value.result.ok);
+    try std.testing.expect(!scan_parsed.value.result.partial);
+
+    var nginx_index: ?usize = null;
+    var pm2_index: ?usize = null;
+    for (scan_parsed.value.result.sources, 0..) |s, i| {
+        if (std.mem.eql(u8, s.path, "/tmp/oars-logs/nginx/access.log")) nginx_index = i;
+        if (std.mem.eql(u8, s.path, "/tmp/oars-logs/pm2/api-out.log")) pm2_index = i;
+    }
+    try std.testing.expect(nginx_index != null);
+    try std.testing.expect(pm2_index != null);
+    const nginx = scan_parsed.value.result.sources[nginx_index.?];
+    try std.testing.expectEqualStrings("web", nginx.group);
+    try std.testing.expectEqualStrings("Nginx · access", nginx.name);
+    try std.testing.expectEqual(@as(u64, 10), nginx.size);
+    try std.testing.expectEqual(@as(u32, 0o644), nginx.mode);
+    try std.testing.expect(nginx.readable);
+    try std.testing.expect(nginx.mtime_epoch > 0);
+    const pm2 = scan_parsed.value.result.sources[pm2_index.?];
+    try std.testing.expectEqualStrings("runtime", pm2.group);
+    try std.testing.expectEqual(@as(u64, 12), pm2.size);
+
+    // Read: last lines with the exact contract.
+    const ReadResp = struct {
+        result: struct {
+            ok: bool,
+            path: []const u8,
+            lines: []const []const u8 = &.{},
+            limited: bool = false,
+        },
+    };
+    const read_response = rig.dispatch(
+        \\{"id":"3","command":"oars.logs.read","payload":{"server_id":"itest-logs","path":"/tmp/oars-logs/nginx/access.log","lines":200}}
+    );
+    const read_parsed = try std.json.parseFromSlice(ReadResp, std.testing.allocator, read_response, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer read_parsed.deinit();
+    try std.testing.expect(read_parsed.value.result.ok);
+    try std.testing.expectEqualStrings("/tmp/oars-logs/nginx/access.log", read_parsed.value.result.path);
+    try std.testing.expectEqual(@as(usize, 5), read_parsed.value.result.lines.len);
+    try std.testing.expectEqualStrings("1", read_parsed.value.result.lines[0]);
+    try std.testing.expectEqualStrings("5", read_parsed.value.result.lines[4]);
+    try std.testing.expect(!read_parsed.value.result.limited);
+
+    // Missing file: explicit failure surface, never a hang or fake success.
+    const missing = rig.dispatch(
+        \\{"id":"4","command":"oars.logs.read","payload":{"server_id":"itest-logs","path":"/tmp/oars-logs/nope.log","lines":200}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, missing, "file is missing or unreadable") != null);
+
+    // Follow: a long-lived log channel; appended lines stream through it.
+    const follow_response = rig.dispatch(
+        \\{"id":"5","command":"oars.logs.follow","payload":{"server_id":"itest-logs","path":"/tmp/oars-logs/nginx/access.log"}}
+    );
+    const FollowResp = struct { result: struct { ok: bool, channel: u32 } };
+    const follow_parsed = try std.json.parseFromSlice(FollowResp, std.testing.allocator, follow_response, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer follow_parsed.deinit();
+    try std.testing.expect(follow_parsed.value.result.ok);
+    const follow_channel = follow_parsed.value.result.channel;
+
+    try execWait(&rig.manager, "itest-logs", "echo 6 >> /tmp/oars-logs/nginx/access.log", 0, "");
+
+    const PollResp = struct {
+        result: struct {
+            ok: bool,
+            channels: []const struct {
+                id: u32,
+                kind: []const u8,
+                data: []const u8 = "",
+            } = &.{},
+        },
+    };
+    const poll_deadline = std.Io.Timestamp.now(io, .real).nanoseconds + 15 * std.time.ns_per_s;
+    var follow_seen = false;
+    var kind_is_log = false;
+    while (std.Io.Timestamp.now(io, .real).nanoseconds < poll_deadline) {
+        var poll_buf: [512]u8 = undefined;
+        var poll_writer = std.Io.Writer.fixed(&poll_buf);
+        std.json.Stringify.value(.{
+            .id = "6",
+            .command = "oars.ssh.poll",
+            .payload = .{
+                .server_id = "itest-logs",
+                .cursors = .{.{ .channel = follow_channel, .cursor = 0 }},
+            },
+        }, .{}, &poll_writer) catch unreachable;
+        const poll_response = rig.dispatch(poll_writer.buffered());
+        const poll_parsed = try std.json.parseFromSlice(PollResp, std.testing.allocator, poll_response, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        });
+        defer poll_parsed.deinit();
+        for (poll_parsed.value.result.channels) |ch| {
+            if (ch.id == follow_channel) {
+                kind_is_log = std.mem.eql(u8, ch.kind, "log");
+                if (std.mem.indexOf(u8, ch.data, "6\n") != null) follow_seen = true;
+            }
+        }
+        if (follow_seen and kind_is_log) break;
+        testSleep(200);
+    }
+    try std.testing.expect(follow_seen);
+    try std.testing.expect(kind_is_log);
+
+    // Clear with the STALE preview: the file changed since the scan (the
+    // follow appended a line), so the identity check must refuse.
+    var clear_buf: [1024]u8 = undefined;
+    var clear_writer = std.Io.Writer.fixed(&clear_buf);
+    std.json.Stringify.value(.{
+        .id = "7",
+        .command = "oars.logs.clear",
+        .payload = .{
+            .server_id = "itest-logs",
+            .path = "/tmp/oars-logs/nginx/access.log",
+            .expected = .{ .size = @as(u64, 10), .mtime = nginx.mtime_epoch, .mode = nginx.mode },
+        },
+    }, .{}, &clear_writer) catch unreachable;
+    const conflict = rig.dispatch(clear_writer.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, conflict, "file changed since preview") != null);
+
+    // Re-scan after the change: addSource (even a duplicate) invalidates
+    // the 60 s cache so the fresh preview carries the new size.
+    _ = rig.dispatch(
+        \\{"id":"8","command":"oars.logs.addSource","payload":{"server_id":"itest-logs","path":"/tmp/oars-logs"}}
+    );
+    const rescan_response = rig.dispatch(
+        \\{"id":"9","command":"oars.logs.scan","payload":{"server_id":"itest-logs"}}
+    );
+    const rescan_parsed = try std.json.parseFromSlice(ScanResp, std.testing.allocator, rescan_response, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer rescan_parsed.deinit();
+    var fresh: ?ScanSource = null;
+    for (rescan_parsed.value.result.sources) |s| {
+        if (std.mem.eql(u8, s.path, "/tmp/oars-logs/nginx/access.log")) fresh = s;
+    }
+    try std.testing.expect(fresh != null);
+    try std.testing.expectEqual(@as(u64, 12), fresh.?.size);
+
+    // Clear with the fresh preview: identity matches, the file is truncated
+    // to zero and the before/after sizes are audited.
+    var clear2_buf: [1024]u8 = undefined;
+    var clear2_writer = std.Io.Writer.fixed(&clear2_buf);
+    std.json.Stringify.value(.{
+        .id = "10",
+        .command = "oars.logs.clear",
+        .payload = .{
+            .server_id = "itest-logs",
+            .path = "/tmp/oars-logs/nginx/access.log",
+            .expected = .{ .size = fresh.?.size, .mtime = fresh.?.mtime_epoch, .mode = fresh.?.mode },
+        },
+    }, .{}, &clear2_writer) catch unreachable;
+    const cleared = rig.dispatch(clear2_writer.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, cleared, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cleared, "\"before_size\":12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cleared, "\"after_size\":0") != null);
+
+    // The file is now empty: a read returns zero lines, not an error.
+    const empty_response = rig.dispatch(
+        \\{"id":"11","command":"oars.logs.read","payload":{"server_id":"itest-logs","path":"/tmp/oars-logs/nginx/access.log","lines":200}}
+    );
+    const empty_parsed = try std.json.parseFromSlice(ReadResp, std.testing.allocator, empty_response, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer empty_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty_parsed.value.result.lines.len);
+
+    // The clear was audited with the exact before/after sizes.
+    const audit_content = try std.Io.Dir.cwd().readFileAlloc(io, rig.audit_store.path, std.testing.allocator, .limited(256 * 1024));
+    defer std.testing.allocator.free(audit_content);
+    try std.testing.expect(std.mem.indexOf(u8, audit_content, "logs.clear") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_content, "before_size=12 after_size=0") != null);
+
+    // closeChannel ends the follow stream and removes the channel.
+    var close_buf: [512]u8 = undefined;
+    var close_writer = std.Io.Writer.fixed(&close_buf);
+    std.json.Stringify.value(.{
+        .id = "12",
+        .command = "oars.ssh.closeChannel",
+        .payload = .{ .server_id = "itest-logs", .channel = follow_channel },
+    }, .{}, &close_writer) catch unreachable;
+    const closed = rig.dispatch(close_writer.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, closed, "\"ok\":true") != null);
+
+    // The close is queued for the worker (10 ms loop): the channel must
+    // disappear from polls shortly after.
+    const gone_deadline = std.Io.Timestamp.now(io, .real).nanoseconds + 5 * std.time.ns_per_s;
+    var channel_gone = false;
+    while (std.Io.Timestamp.now(io, .real).nanoseconds < gone_deadline) {
+        const after_close = rig.dispatch(
+            \\{"id":"13","command":"oars.ssh.poll","payload":{"server_id":"itest-logs"}}
+        );
+        const close_parsed = try std.json.parseFromSlice(PollResp, std.testing.allocator, after_close, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        });
+        defer close_parsed.deinit();
+        channel_gone = true;
+        for (close_parsed.value.result.channels) |ch| {
+            if (ch.id == follow_channel) channel_gone = false;
+        }
+        if (channel_gone) break;
+        testSleep(50);
+    }
+    try std.testing.expect(channel_gone);
+
+    rig.manager.disconnect("itest-logs");
 }

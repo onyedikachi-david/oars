@@ -6,7 +6,16 @@ const sessions = @import("sessions.zig");
 const ssh = @import("ssh.zig");
 const bridge = @import("bridge.zig");
 const audit = @import("audit.zig");
+const logs = @import("logs.zig");
 const integration = @import("integration.zig");
+
+// Zig 0.16 only collects test blocks from files that are actually
+// analyzed, and an unused import is never analyzed — so the env-gated
+// container tests would silently drop out of `zig build test` without
+// this reference.
+comptime {
+    _ = integration;
+}
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -32,10 +41,12 @@ const App = struct {
     env_map: *std.process.Environ.Map,
     store: servers.Store,
     audit_store: audit.Store,
+    logs_store: logs.SourceStore,
     manager: sessions.Manager,
     bridge_ctx: bridge.Context,
     store_path_buf: [2048]u8 = undefined,
     audit_path_buf: [2048]u8 = undefined,
+    logs_path_buf: [2048]u8 = undefined,
     data_dir_buf: [1024]u8 = undefined,
     fallback_dir_buf: [1024]u8 = undefined,
 
@@ -71,8 +82,14 @@ const App = struct {
             &self.audit_path_buf,
             &.{ base, "audit.jsonl" },
         ) catch unreachable;
+        const logs_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.logs_path_buf,
+            &.{ base, "logs.json" },
+        ) catch unreachable;
         self.store = .{ .allocator = self.allocator, .path = store_path };
         self.audit_store = .{ .allocator = self.allocator, .path = audit_path };
+        self.logs_store = .{ .allocator = self.allocator, .path = logs_path };
 
         self.manager = sessions.Manager.init(self.allocator, self.io, &self.store, &self.audit_store, self.env_map.get("HOME"));
         self.bridge_ctx = .{
@@ -81,6 +98,7 @@ const App = struct {
             .store = &self.store,
             .manager = &self.manager,
             .audit = &self.audit_store,
+            .logs = &self.logs_store,
         };
     }
 
@@ -149,9 +167,12 @@ test "servers.save round trips through the bridge dispatcher" {
     var audit_buf: [512]u8 = undefined;
     const audit_path = std.fmt.bufPrint(&audit_buf, "/tmp/{s}/audit.jsonl", .{dir_name}) catch unreachable;
     var audit_store = audit.Store{ .allocator = store_alloc, .path = audit_path };
+    var logs_buf: [512]u8 = undefined;
+    const logs_path = std.fmt.bufPrint(&logs_buf, "/tmp/{s}/logs.json", .{dir_name}) catch unreachable;
+    var logs_store = logs.SourceStore{ .allocator = store_alloc, .path = logs_path };
     var manager = sessions.Manager.init(store_alloc, io, &store, &audit_store, null);
     defer manager.deinit();
-    var ctx = bridge.Context{ .allocator = store_alloc, .io = io, .store = &store, .manager = &manager, .audit = &audit_store };
+    var ctx = bridge.Context{ .allocator = store_alloc, .io = io, .store = &store, .manager = &manager, .audit = &audit_store, .logs = &logs_store };
     var dispatcher = ctx.dispatcher();
     var output: [64 * 1024]u8 = undefined;
 
@@ -215,6 +236,7 @@ const TestApp = struct {
     arena: std.heap.ArenaAllocator,
     store: servers.Store,
     audit_store: audit.Store,
+    logs_store: logs.SourceStore,
     manager: sessions.Manager,
     ctx: bridge.Context,
     dispatcher: native_sdk.BridgeDispatcher,
@@ -222,6 +244,7 @@ const TestApp = struct {
     dir_buf: [128]u8 = undefined,
     path_buf: [512]u8 = undefined,
     audit_path_buf: [512]u8 = undefined,
+    logs_path_buf: [512]u8 = undefined,
     dir_name: []const u8,
 
     fn init(self: *TestApp) !void {
@@ -232,11 +255,13 @@ const TestApp = struct {
         self.dir_name = try std.fmt.bufPrint(&self.dir_buf, "oars-test-{d}", .{now});
         const store_path = try std.fmt.bufPrint(&self.path_buf, "/tmp/{s}/servers.json", .{self.dir_name});
         const audit_path = try std.fmt.bufPrint(&self.audit_path_buf, "/tmp/{s}/audit.jsonl", .{self.dir_name});
+        const logs_path = try std.fmt.bufPrint(&self.logs_path_buf, "/tmp/{s}/logs.json", .{self.dir_name});
         const store_alloc = self.arena.allocator();
         self.store = .{ .allocator = store_alloc, .path = store_path };
         self.audit_store = .{ .allocator = store_alloc, .path = audit_path };
+        self.logs_store = .{ .allocator = store_alloc, .path = logs_path };
         self.manager = sessions.Manager.init(store_alloc, io, &self.store, &self.audit_store, null);
-        self.ctx = .{ .allocator = store_alloc, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store };
+        self.ctx = .{ .allocator = store_alloc, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store };
         self.dispatcher = self.ctx.dispatcher();
     }
 
@@ -379,4 +404,110 @@ test "servers.list reports quarantine recovery when the store is corrupt" {
         \\{"id":"4","command":"oars.servers.list","payload":{}}
     );
     try std.testing.expect(std.mem.indexOf(u8, list_again, "\"recovery_error\"") == null);
+}
+
+// --- spec 04 bridge tests --------------------------------------------------
+
+test "logs.addSource validates, persists, and dedupes through the dispatcher" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    const ok = app.dispatch(
+        \\{"id":"1","command":"oars.logs.addSource","payload":{"server_id":"s1","path":"/var/log/custom.log"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, ok, "\"ok\":true") != null);
+
+    // Whitespace is trimmed before validation and persistence.
+    const trimmed = app.dispatch(
+        \\{"id":"2","command":"oars.logs.addSource","payload":{"server_id":"s1","path":"  /var/log/trimmed.log  "}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, trimmed, "\"ok\":true") != null);
+
+    // Duplicates are dropped, not appended twice.
+    const dup = app.dispatch(
+        \\{"id":"3","command":"oars.logs.addSource","payload":{"server_id":"s1","path":"/var/log/custom.log"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, dup, "\"ok\":true") != null);
+
+    const relative = app.dispatch(
+        \\{"id":"4","command":"oars.logs.addSource","payload":{"server_id":"s1","path":"var/log/x.log"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, relative, "path must be absolute") != null);
+
+    const trailing = app.dispatch(
+        \\{"id":"5","command":"oars.logs.addSource","payload":{"server_id":"s1","path":"/var/log/"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, trailing, "must not end with '/'") != null);
+
+    const control = app.dispatch(
+        \\{"id":"6","command":"oars.logs.addSource","payload":{"server_id":"s1","path":"/var/log/a\nb.log"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, control, "control characters") != null);
+
+    // Persisted per server, deduped, trimmed.
+    const alloc = app.arena.allocator();
+    const paths = try app.logs_store.pathsFor(std.testing.io, "s1");
+    defer {
+        for (paths) |p| alloc.free(p);
+        alloc.free(paths);
+    }
+    try std.testing.expectEqual(@as(usize, 2), paths.len);
+    try std.testing.expectEqualStrings("/var/log/custom.log", paths[0]);
+    try std.testing.expectEqualStrings("/var/log/trimmed.log", paths[1]);
+
+    const s2 = try app.logs_store.pathsFor(std.testing.io, "s2");
+    defer {
+        for (s2) |p| alloc.free(p);
+        alloc.free(s2);
+    }
+    try std.testing.expectEqual(@as(usize, 0), s2.len);
+}
+
+test "logs scan/read/follow/clear require a session and validate payloads" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // No live session: every network handler says so explicitly.
+    const scan = app.dispatch(
+        \\{"id":"1","command":"oars.logs.scan","payload":{"server_id":"ghost"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, scan, "not connected") != null);
+
+    const read = app.dispatch(
+        \\{"id":"2","command":"oars.logs.read","payload":{"server_id":"ghost","path":"/var/log/app.log","lines":200}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, read, "not connected") != null);
+
+    const follow = app.dispatch(
+        \\{"id":"3","command":"oars.logs.follow","payload":{"server_id":"ghost","path":"/var/log/app.log"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, follow, "not connected") != null);
+
+    const clear = app.dispatch(
+        \\{"id":"4","command":"oars.logs.clear","payload":{"server_id":"ghost","path":"/var/log/app.log","expected":{"size":10,"mtime":100,"mode":420}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, clear, "not connected") != null);
+
+    // Payload validation happens before the session lookup.
+    const bad_lines = app.dispatch(
+        \\{"id":"5","command":"oars.logs.read","payload":{"server_id":"ghost","path":"/var/log/app.log","lines":300}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_lines, "line count must be 200, 500, 1000, or 5000") != null);
+
+    const bad_path = app.dispatch(
+        \\{"id":"6","command":"oars.logs.follow","payload":{"server_id":"ghost","path":"relative.log"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_path, "path must be absolute") != null);
+
+    const clear_bad_path = app.dispatch(
+        \\{"id":"7","command":"oars.logs.clear","payload":{"server_id":"ghost","path":"/var/log/","expected":{"size":1,"mtime":2,"mode":420}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, clear_bad_path, "must not end with '/'") != null);
+
+    const scan_bad_payload = app.dispatch(
+        \\{"id":"8","command":"oars.logs.scan","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, scan_bad_payload, "invalid payload") != null);
 }

@@ -471,3 +471,91 @@ after snapshot when the forced probe lands. Busybox `ps` (verified live)
 can't emit CPU%/Mem%, so the fallback is `ps -eo pid,comm` and the payload
 carries nulls. Container pass green: idle → no probe, warming → utilization
 delta, snapshot freeze, forced refresh, cleanup + audit trail.
+
+---
+
+## 13. Session handover — 2026-08-03 (session 3): spec 04 logs backend + the integration suite was never running
+
+### 13.1 The discovery that changes every past claim
+
+`zig build test` had been green through specs 01–03 with the container
+"passing" — but **the env-gated integration tests were never compiled, so
+never run**. Zig 0.16 collects test blocks only from files that are actually
+analyzed, and `const integration = @import("integration.zig")` in `main.zig`
+was never *used*, so the file was never analyzed. Proof: once forced to
+compile (`comptime { _ = integration; }`), HEAD crashed or failed everywhere
+(the fixes in §13.2). The fix is in `src/main.zig`; keep it. Any future
+feature test module needs the same reference.
+
+Also learned: `zig build` run steps are content-cached and env vars are NOT
+part of the cache key — an env-less run is replayed for later env-ful runs.
+Bust the run cache (change a source file) when switching env; use
+`--summary all` to see the real test count and runtime.
+
+### 13.2 What landed (spec 04) and what was fixed
+
+**Spec 04 backend:** `src/logs.zig` (NUL-record parser, grouping, display
+names, path validation, readability mapping, `logs.json` source store,
+60 s scan cache), `src/shellquote.zig` (POSIX single-quote with a real
+`/bin/sh` round-trip test), bridge handlers `oars.logs.{scan,read,follow,
+clear,addSource}`, session-worker support (`Op.follow`/`Op.clear`, follow
+channels with kind `log`, `execWait`, identity-bound SFTP truncate in
+`clearLogFile` with conflict refusal + audit, `ScanCache` per session,
+`ssh.Session.sftpInit/sftpShutdown`). Verified live against the container:
+scan (busybox `-print0`+`stat` fallback), read, follow + appended lines,
+clear conflict → re-scan → fresh clear + audit, closeChannel. See spec 04
+§11–13 for the verified command strings.
+
+**Pre-existing rot exposed by the now-running integration suite (fixed):**
+- `@memcpy(&trust.fingerprint, fp)` panicked: the buffer is 64 bytes (legacy
+  hex) but canonical fingerprints are 50 (`SHA256:` base64). Now length-aware
+  (`fingerprint_len`).
+- `handleMonitorPoll` emitted invalid JSON (`{"ok":true,{…}}` — the SDK
+  rejects it) — now a flat payload per spec 03 §5.
+- `Manager.trust` duped the fingerprint but left `session.server`'s old
+  pointer dangling and leaked — the session copy now owns it; `upsert`
+  duplicates for the store.
+- Worker re-read closed channels: `libssh2_channel_free` nulls the channel's
+  session pointer, and the read loop hit every channel each pass → segfault
+  on exec/follow EOF. Closed entries are now skipped (`raw_closed`).
+- `Channel.close` leaked the Zig handle — it now destroys it (safe: all
+  teardown paths are `raw_closed`-guarded).
+- ops/channels lists leaked on teardown (`clearRetainingCapacity` → `deinit`);
+  shell-setup error paths close the channel.
+- The stty resize assertion expected `100 40` — busybox prints `40 100`
+  (rows cols) and its `stty` has no `size` command at all (verified live:
+  busybox 1.36 stty supports only `-a`/`-g`/settings); the test now asserts
+  the busybox order. Spec 02 §12 note added.
+- Test rig: integration tests freed literal-backed `Server` structs
+  (`defer server.deinit` → bus error) — removed; the manager copies.
+
+### 13.3 New pitfalls (extend §7)
+
+24. **Zig 0.16 drops tests from unused imports.** An import that nothing
+    references is never analyzed, and its test blocks silently disappear
+    from `zig build test`. Force collection: `comptime { _ = integration; }`.
+25. **`zig build` run steps cache by content, not environment.** A run done
+    without `OARS_TEST_SSH_*` is replayed with the env set. Bust the cache
+    (touch a source) or read the `--summary all` runtime — a 1 s "pass" is
+    a skip.
+26. **`std.Thread.sleep` does not exist in 0.16.** Use
+    `std.Io.sleep(io, std.Io.Duration.fromMilliseconds(n), .awake)`.
+27. **busybox printf rejects `%B`-style directives** (prints nothing +
+    "invalid format" to stderr). Markers must use `%%` escapes — this also
+    affected the spec-03 probe command (fixed, see spec 03 §13).
+28. **busybox `stty` has no `size` command** and `-a` prints no rows/cols.
+    Resize verification must use the busybox `rows cols` order or a
+    different mechanism; do not assert `stty size` output.
+29. **A green `zig build test` proves nothing about env-gated tests.**
+    Verify by forcing the run (content change) and reading the runtime;
+    the integration tests are in the binary only because of pitfall 24's
+    fix.
+
+### 13.4 Next
+
+Spec 05 (File Manager / SFTP) backend — the SFTP subsystem now initializes
+in the session (`sftpInit`), and spec 04's `clearLogFile` is the working
+pattern for identity-bound SFTP handles. Keep the spec-04 convention: every
+new feature module imported by `main.zig` must be referenced (pitfall 24),
+and every new integration test must be observed running with the container
+up (pitfall 25).

@@ -12,10 +12,12 @@ const sessions = @import("sessions.zig");
 const monitor = @import("monitor.zig");
 const audit = @import("audit.zig");
 const json = @import("json.zig");
+const logs = @import("logs.zig");
+const shellquote = @import("shellquote.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 16;
+const handler_count = 21;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -23,6 +25,7 @@ pub const Context = struct {
     store: *servers.Store,
     manager: *sessions.Manager,
     audit: *audit.Store,
+    logs: *logs.SourceStore,
     handlers: [handler_count]native_sdk.BridgeHandler = undefined,
     policies: [handler_count]native_sdk.BridgeCommandPolicy = undefined,
 
@@ -44,6 +47,11 @@ pub const Context = struct {
             .{ .name = "oars.monitor.cleanDiskEstimate", .context = self, .invoke_fn = handleMonitorCleanDiskEstimate },
             .{ .name = "oars.monitor.cleanDisk", .context = self, .invoke_fn = handleMonitorCleanDisk },
             .{ .name = "oars.monitor.dropCaches", .context = self, .invoke_fn = handleMonitorDropCaches },
+            .{ .name = "oars.logs.scan", .context = self, .invoke_fn = handleLogsScan },
+            .{ .name = "oars.logs.read", .context = self, .invoke_fn = handleLogsRead },
+            .{ .name = "oars.logs.follow", .context = self, .invoke_fn = handleLogsFollow },
+            .{ .name = "oars.logs.clear", .context = self, .invoke_fn = handleLogsClear },
+            .{ .name = "oars.logs.addSource", .context = self, .invoke_fn = handleLogsAddSource },
         };
         self.policies = .{
             .{ .name = "oars.servers.list", .origins = &allowed_origins },
@@ -62,6 +70,11 @@ pub const Context = struct {
             .{ .name = "oars.monitor.cleanDiskEstimate", .origins = &allowed_origins },
             .{ .name = "oars.monitor.cleanDisk", .origins = &allowed_origins },
             .{ .name = "oars.monitor.dropCaches", .origins = &allowed_origins },
+            .{ .name = "oars.logs.scan", .origins = &allowed_origins },
+            .{ .name = "oars.logs.read", .origins = &allowed_origins },
+            .{ .name = "oars.logs.follow", .origins = &allowed_origins },
+            .{ .name = "oars.logs.clear", .origins = &allowed_origins },
+            .{ .name = "oars.logs.addSource", .origins = &allowed_origins },
         };
         return .{
             .policy = .{ .enabled = true, .commands = &self.policies },
@@ -598,8 +611,17 @@ fn handleMonitorPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocati
     defer session.monitor_cache.unlock();
     const snap = session.monitor_cache.current() orelse &monitor_empty_snapshot;
     var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,") catch return output[0..0];
-    std.json.Stringify.value(snap.*, .{}, &writer) catch return output[0..0];
+    // Spec 03 §5: the snapshot fields are the payload, flat with `ok`.
+    const payload = .{
+        .ok = true,
+        .ts = snap.ts,
+        .cpu = snap.cpu,
+        .mem = snap.mem,
+        .disk = snap.disk,
+        .processes = snap.processes,
+        .probe_error = snap.probe_error,
+    };
+    std.json.Stringify.value(payload, .{}, &writer) catch return output[0..0];
     return writer.buffered();
 }
 
@@ -746,4 +768,385 @@ fn handleMonitorDropCaches(context: *anyopaque, invocation: native_sdk.bridge.In
     var writer = std.Io.Writer.fixed(output);
     writer.print("{{\"ok\":true,\"channel\":{d}}}", .{channel_id}) catch return output[0..0];
     return writer.buffered();
+}
+
+// --- logs (spec 04) --------------------------------------------------------
+
+const LogsIdPayload = struct {
+    server_id: []const u8,
+};
+
+const LogsPathPayload = struct {
+    server_id: []const u8,
+    path: []const u8,
+};
+
+const logs_scan_timeout_ns = 15 * std.time.ns_per_s;
+const logs_read_timeout_ns = 10 * std.time.ns_per_s;
+const logs_clear_wait_ns = 20 * std.time.ns_per_s;
+/// Read byte cap: the SDK result buffer is 1 MB and escaped JSON needs
+/// headroom, so a full 5,000-line response cannot exceed this (spec 04 §5).
+const logs_read_byte_cap: usize = 160 * 1024;
+const logs_scan_cmd_cap: usize = 256 * 1024;
+const logs_readability_cmd_cap: usize = 128 * 1024;
+
+/// The scan is ONE exec, marker-delimited like the monitor probe:
+/// `%BEGIN_DATE%` carries the remote clock (ages are computed against it,
+/// never the local workstation clock) and `%BEGIN_SCAN%` carries NUL-
+/// delimited records (`path\0size\0mtime\0mode\0`). Markers are emitted
+/// with `%%` escapes — busybox printf errors on `%B`-style directives, so
+/// a bare `%BEGIN_X%` format prints nothing (verified live); `%%` works on
+/// both busybox and GNU. The GNU `find -printf` form and the busybox
+/// `-print0` + `stat` fallback are joined with `||` (not `;`): a find
+/// without `-printf` fails over instead of emitting two streams. The
+/// trailing `printf '\0'` makes an empty tree parse as zero records
+/// instead of degrading to the bare-path fallback.
+const logs_scan_prefix = "printf '%%BEGIN_DATE%%\\n'; date +%s; printf '%%BEGIN_SCAN%%\\n'; find ";
+const logs_scan_middle = " -maxdepth 3 -type f -printf '%p\\0%s\\0%T@\\0%m\\0' 2>/dev/null || find ";
+const logs_scan_suffix = " -maxdepth 3 -type f -print0 2>/dev/null | while IFS= read -r -d '' p; do printf '%s\\0' \"$p\"; (stat -c '%s %Y %a' \"$p\" 2>/dev/null || printf '0 0 0\\n') | tr ' \\n' '\\000\\000'; done; printf '\\0'";
+
+const logs_empty_result = logs.ScanResult{};
+
+/// Serializes a scan result. The caller must own `result` (or hold the
+/// cache lock) for the duration. Returns an empty slice only on a
+/// response-budget failure (the caller turns that into an explicit error).
+fn writeScanResult(output: []u8, result: *const logs.ScanResult) []const u8 {
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"sources\":[") catch return output[0..0];
+    for (result.entries, 0..) |entry, i| {
+        if (i > 0) writer.writeAll(",") catch return output[0..0];
+        writer.writeAll("{\"path\":") catch return output[0..0];
+        json.writeJsonString(&writer, entry.path) catch return output[0..0];
+        writer.writeAll(",\"group\":") catch return output[0..0];
+        json.writeJsonString(&writer, entry.group) catch return output[0..0];
+        writer.writeAll(",\"name\":") catch return output[0..0];
+        json.writeJsonString(&writer, entry.name) catch return output[0..0];
+        writer.print(",\"size\":{d},\"mtime_epoch\":{d},\"age_sec\":{d},\"mode\":{d},\"readable\":{s}", .{
+            entry.size,                              entry.mtime_epoch, entry.age_sec, entry.mode,
+            if (entry.readable) "true" else "false",
+        }) catch return output[0..0];
+        writer.writeAll("}") catch return output[0..0];
+    }
+    writer.print("],\"partial\":{s},\"reason\":", .{if (result.partial) "true" else "false"}) catch return output[0..0];
+    json.writeJsonString(&writer, result.reason) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+/// Scans documented log locations (spec 04 §5): one exec, cached per
+/// session for 60 s; the cache serves repeats without network traffic.
+fn handleLogsScan(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(LogsIdPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const server_id = parsed.value.server_id;
+
+    const session = self.manager.get(server_id) orelse {
+        return respondError(output, "not connected");
+    };
+    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
+
+    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+
+    // Serve the 60 s cache when fresh (spec 04 §4). The result strings are
+    // owned by the cache, so serialization happens under its lock.
+    session.logs_cache.lock();
+    if (session.logs_cache.fresh(now)) {
+        const cached = session.logs_cache.get() orelse &logs_empty_result;
+        const written = writeScanResult(output, cached);
+        session.logs_cache.unlock();
+        return written;
+    }
+    session.logs_cache.unlock();
+
+    // Fresh scan. Roots = the documented /var/log tree + user-added paths
+    // (spec 04 §5: the scan includes user-added sources).
+    const added = self.logs.pathsFor(self.io, server_id) catch {
+        return respondError(output, "failed to load log sources");
+    };
+    defer {
+        for (added) |p| self.allocator.free(p);
+        self.allocator.free(added);
+    }
+
+    var roots: std.ArrayList(u8) = .empty;
+    defer roots.deinit(self.allocator);
+    roots.appendSlice(self.allocator, "'/var/log'") catch {
+        return respondError(output, "out of memory");
+    };
+    for (added) |p| {
+        const qlen = shellquote.quotedLen(p);
+        if (roots.items.len + qlen + 1 > logs_scan_cmd_cap) break;
+        roots.append(self.allocator, ' ') catch {
+            return respondError(output, "out of memory");
+        };
+        var scratch: [64 * 1024]u8 = undefined;
+        if (qlen > scratch.len) break;
+        roots.appendSlice(self.allocator, shellquote.quoteAppend(&scratch, p)) catch {
+            return respondError(output, "out of memory");
+        };
+    }
+
+    var cmd_buf: [logs_scan_cmd_cap]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&cmd_buf, "{s}{s}{s}{s}{s}", .{
+        logs_scan_prefix, roots.items, logs_scan_middle, roots.items, logs_scan_suffix,
+    }) catch {
+        return respondError(output, "scan roots too large");
+    };
+
+    var outcome = self.manager.execWait(server_id, cmd, logs.max_scan_bytes, logs_scan_timeout_ns) catch |err| {
+        return respondError(output, switch (err) {
+            error.NoSession => "not connected",
+            error.NotReady => "session not ready",
+            else => "scan failed",
+        });
+    };
+    defer outcome.output.deinit(self.allocator);
+    if (outcome.limited) return respondError(output, "scan output exceeded the capture cap");
+    if (outcome.exit != 0) return respondError(output, "scan command failed");
+    if (outcome.output.items.len == 0) return respondError(output, "scan returned no output");
+
+    var result_owned = false;
+    var result = logs.parseScanOutput(self.allocator, outcome.output.items) catch {
+        return respondError(output, "scan output could not be parsed");
+    };
+    defer if (!result_owned) result.deinit(self.allocator);
+
+    // Batched readability probe (spec 04 §5: `test -r` per source; only
+    // the first max_probe_paths entries, paths that fit the command
+    // budget). Unprobed entries stay readable:false — honest, never a lie.
+    var probe_buf: [logs_readability_cmd_cap]u8 = undefined;
+    var probe_len: usize = 0;
+    var probed: usize = 0;
+    for (result.entries, 0..) |entry, i| {
+        if (i >= logs.max_probe_paths) break;
+        const qlen = shellquote.quotedLen(entry.path);
+        if (qlen > probe_buf.len or probe_len + qlen + 40 > probe_buf.len) break;
+        const head = std.fmt.bufPrint(probe_buf[probe_len..], "test -r ", .{}) catch break;
+        probe_len += head.len;
+        const q = shellquote.quoteAppend(probe_buf[probe_len..], entry.path);
+        probe_len += q.len;
+        const tail = std.fmt.bufPrint(probe_buf[probe_len..], " && echo 1 || echo 0; ", .{}) catch break;
+        probe_len += tail.len;
+        probed += 1;
+    }
+    if (probed > 0) {
+        var probe_outcome = self.manager.execWait(server_id, probe_buf[0..probe_len], 64 * 1024, logs_read_timeout_ns) catch |err| {
+            return respondError(output, switch (err) {
+                error.NoSession => "not connected",
+                error.NotReady => "session not ready",
+                else => "readability probe failed",
+            });
+        };
+        defer probe_outcome.output.deinit(self.allocator);
+        logs.applyReadability(result.entries[0..probed], probe_outcome.output.items);
+    }
+
+    const written = writeScanResult(output, &result);
+    if (written.len == 0) return respondError(output, "scan results too large");
+    // The cache takes ownership of `result` from here on.
+    session.logs_cache.store(self.allocator, result, now);
+    result_owned = true;
+    return written;
+}
+
+const LogsReadPayload = struct {
+    server_id: []const u8,
+    path: []const u8,
+    lines: u32 = 200,
+};
+
+const allowed_log_read_lines = [_]u32{ 200, 500, 1000, 5000 };
+
+/// Validates a log path for the path-taking handlers; returns the error
+/// response on failure, null on success.
+fn validateLogPath(payload_path: []const u8, output: []u8) ?[]const u8 {
+    logs.validatePath(payload_path) catch |err| {
+        return respondError(output, switch (err) {
+            error.RelativePath => "path must be absolute",
+            error.InvalidChar => "path contains control characters",
+            error.TrailingSlash => "path must not end with '/'",
+        });
+    };
+    return null;
+}
+
+/// Reads the last N lines of a log (spec 04 §5: `tail -n <lines>`, lines ∈
+/// {200, 500, 1000, 5000}); the byte cap sets `limited` honestly.
+fn handleLogsRead(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(LogsReadPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+
+    if (validateLogPath(payload.path, output)) |err_response| return err_response;
+    var allowed = false;
+    for (allowed_log_read_lines) |l| {
+        if (payload.lines == l) {
+            allowed = true;
+            break;
+        }
+    }
+    if (!allowed) return respondError(output, "line count must be 200, 500, 1000, or 5000");
+
+    var cmd_buf: [64 * 1024]u8 = undefined;
+    const qlen = shellquote.quotedLen(payload.path);
+    if (qlen > cmd_buf.len or qlen + 32 > cmd_buf.len) return respondError(output, "path too long");
+    const head = std.fmt.bufPrint(&cmd_buf, "tail -n {d} ", .{payload.lines}) catch unreachable;
+    const q = shellquote.quoteAppend(cmd_buf[head.len..], payload.path);
+
+    var outcome = self.manager.execWait(payload.server_id, cmd_buf[0 .. head.len + q.len], logs_read_byte_cap, logs_read_timeout_ns) catch |err| {
+        return respondError(output, switch (err) {
+            error.NoSession => "not connected",
+            error.NotReady => "session not ready",
+            else => "read failed",
+        });
+    };
+    defer outcome.output.deinit(self.allocator);
+    if (outcome.exit != 0) return respondError(output, "file is missing or unreadable");
+
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"path\":") catch return output[0..0];
+    json.writeJsonString(&writer, payload.path) catch return output[0..0];
+    writer.writeAll(",\"lines\":[") catch return output[0..0];
+    // Split on newlines; a trailing newline's empty remainder is not a line,
+    // but empty lines in the middle of the file are preserved.
+    const text = outcome.output.items;
+    var start: usize = 0;
+    var first = true;
+    while (std.mem.indexOfScalarPos(u8, text, start, '\n')) |nl| {
+        if (!first) writer.writeAll(",") catch return output[0..0];
+        first = false;
+        json.writeJsonString(&writer, text[start..nl]) catch return output[0..0];
+        start = nl + 1;
+    }
+    if (start < text.len) {
+        if (!first) writer.writeAll(",") catch return output[0..0];
+        json.writeJsonString(&writer, text[start..]) catch return output[0..0];
+    }
+    writer.writeAll("],\"limited\":") catch return output[0..0];
+    writer.writeAll(if (outcome.limited) "true" else "false") catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+/// Starts a follow channel (spec 04 §5: `tail -n 100 -F` — name-follow with
+/// retry, so normal rotation reopens the new file; verified on both GNU and
+/// busybox). Output streams via oars.ssh.poll with kind `log`.
+fn handleLogsFollow(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(LogsPathPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+
+    if (validateLogPath(payload.path, output)) |err_response| return err_response;
+
+    var cmd_buf: [64 * 1024]u8 = undefined;
+    const qlen = shellquote.quotedLen(payload.path);
+    if (qlen > cmd_buf.len or qlen + 32 > cmd_buf.len) return respondError(output, "path too long");
+    const head = std.fmt.bufPrint(&cmd_buf, "tail -n 100 -F ", .{}) catch unreachable;
+    const q = shellquote.quoteAppend(cmd_buf[head.len..], payload.path);
+    const channel_id = self.manager.follow(payload.server_id, cmd_buf[0 .. head.len + q.len]) catch |err| {
+        return respondError(output, switch (err) {
+            error.NoSession => "not connected",
+            error.NotReady => "session not ready",
+            else => "follow failed",
+        });
+    };
+    var writer = std.Io.Writer.fixed(output);
+    writer.print("{{\"ok\":true,\"channel\":{d}}}", .{channel_id}) catch return output[0..0];
+    return writer.buffered();
+}
+
+const LogsClearPayload = struct {
+    server_id: []const u8,
+    path: []const u8,
+    expected: struct {
+        size: u64,
+        mtime: u64,
+        mode: u32,
+    },
+};
+
+/// Identity-bound truncate (spec 04 §5): the worker SFTP-lstats the path,
+/// rejects symlinks/non-regular files, opens WITHOUT truncation, fstats the
+/// handle, compares size/mtime/mode against the preview (a mismatch stops
+/// with a conflict), and only then sets the size to zero. The audit entry
+/// is written by the worker. The handler waits on the outcome with a
+/// deadline — the op may not run if the session dies first.
+fn handleLogsClear(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(LogsClearPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+
+    if (validateLogPath(payload.path, output)) |err_response| return err_response;
+
+    var outcome: sessions.ClearOutcome = .{};
+    self.manager.clearLog(payload.server_id, payload.path, .{
+        .size = payload.expected.size,
+        .mtime = payload.expected.mtime,
+        .mode = payload.expected.mode,
+    }, &outcome) catch |err| {
+        return respondError(output, switch (err) {
+            error.NoSession => "not connected",
+            error.NotReady => "session not ready",
+            else => "clear failed",
+        });
+    };
+    const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + logs_clear_wait_ns;
+    outcome.wait(self.io, deadline);
+    if (!outcome.isDone()) return respondError(output, "timed out waiting for the server");
+    if (!outcome.ok) return respondError(output, outcome.message());
+
+    var writer = std.Io.Writer.fixed(output);
+    writer.print("{{\"ok\":true,\"before_size\":{d},\"after_size\":{d}}}", .{ outcome.before_size, outcome.after_size }) catch return output[0..0];
+    return writer.buffered();
+}
+
+/// Persists a user-added log path per server (spec 04 §5). Adding a source
+/// invalidates the scan cache so the next scan picks it up.
+fn handleLogsAddSource(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(LogsPathPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+
+    const path = std.mem.trim(u8, payload.path, " \t\r\n");
+    if (validateLogPath(path, output)) |err_response| return err_response;
+
+    self.logs.addSource(self.io, payload.server_id, path) catch {
+        return respondError(output, "failed to save log source");
+    };
+    if (self.manager.get(payload.server_id)) |session| {
+        session.logs_cache.invalidate(self.allocator);
+    }
+    return ok_json;
+}
+
+// --- tests -----------------------------------------------------------------
+
+test "logs scan command is marker-escaped for busybox and GNU printf" {
+    // busybox printf errors on bare %B-style directives and prints nothing
+    // (verified live); `%%` escapes work on both busybox and GNU. The find
+    // `-printf` directives are a separate format and keep single %.
+    try std.testing.expect(std.mem.indexOf(u8, logs_scan_prefix, "%%BEGIN_DATE%%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, logs_scan_prefix, "%%BEGIN_SCAN%%") != null);
+    // The busybox fallback exists and is joined with `||` (not `;`): a find
+    // without -printf fails over instead of emitting two streams.
+    try std.testing.expect(std.mem.indexOf(u8, logs_scan_middle, "|| find") != null);
+    try std.testing.expect(std.mem.indexOf(u8, logs_scan_middle, "; find") == null);
+    try std.testing.expect(std.mem.indexOf(u8, logs_scan_suffix, "-print0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, logs_scan_suffix, "stat -c") != null);
+    try std.testing.expect(std.mem.indexOf(u8, logs_scan_suffix, "|| printf '0 0 0") != null);
 }
