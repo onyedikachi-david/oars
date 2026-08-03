@@ -5,8 +5,9 @@
 ## 1. Overview
 
 A token-driven appearance system: light and dark themes, accent choice,
-and terminal color schemes. UI polish that CtrlOps (dark-only, fixed
-accent) doesn't offer. Design rule from the product brief: **no teal/green
+and terminal color schemes. The comparison target's current public docs do not
+state a theme contract, so this is an Oars product choice, not a verified
+competitor gap. Design rule from the product brief: **no teal/green
 in the UI palette** — the accent family is blue; amber = pending/warning;
 red = error. (Terminal ANSI palette keeps standard green because it
 renders the remote server's content, not our UI.)
@@ -15,8 +16,11 @@ renders the remote server's content, not our UI.)
 
 **Goals**
 - Theme: Dark (default) / Light; accent: Blue (default) / Violet / Amber / Rose.
-- Terminal schemes: Oars Dark, One Dark, Solarized (dark+light), plain ANSI.
-- All colors via CSS custom properties; `prefers-color-scheme` honored at first launch.
+- Terminal schemes: Oars Dark, One Dark, Solarized, and plain ANSI. Solarized
+  selects its dark or light palette to match the chosen app theme.
+- All colors use CSS custom properties. On first launch,
+  `prefers-color-scheme` can choose the initial Dark or Light value; after that,
+  the explicit user choice is authoritative.
 - Persist per-user; apply instantly without reload.
 
 **Non-goals**
@@ -31,7 +35,7 @@ renders the remote server's content, not our UI.)
 ## 4. UI/UX
 
 ### 4.1 Settings (⌘, → Appearance)
-- Theme radio (Dark/Light/System), accent swatches (4), terminal scheme select with live preview (mini xterm sample).
+- Theme radio (Dark/Light), accent swatches (4), terminal scheme select with live preview (mini xterm sample).
 - Changes apply immediately; terminal tabs re-theme in place (xterm `options.theme` update without reconnect — supported by xterm.js).
 
 ### 4.2 Token set (index.css `:root` + `[data-theme="light"]`)
@@ -65,8 +69,9 @@ None.
 
 ## 8. Security
 
-- N/A (no server interaction). Contrast: both themes meet WCAG AA for
-  body text (token pairs chosen accordingly; checked in CI lint later).
+- N/A (no server interaction). Normal text must meet 4.5:1 and large text
+  3:1 under WCAG 2.2 SC 1.4.3. UI component boundaries and meaningful
+  graphics must meet 3:1 under SC 1.4.11.
 
 ## 9. Performance
 
@@ -74,18 +79,21 @@ None.
 
 ## 10. Edge cases
 
-- System theme changes at runtime → live-follow when "System" selected (`matchMedia` listener).
+- The OS theme changes after first launch → keep the user's stored choice. A
+  future System mode needs an explicit product decision; it is not implied by
+  reading `prefers-color-scheme` once.
 - Terminal scheme with unreadable colors on light bg → schemes define bg+fg pairs together (never mixed).
 - Accent contrast on buttons → accent-strong on dark, darker accent on light (token pair, not single value).
 
 ## 11. Testing
 
 - Manual: switch all combos; verify terminal in-place re-theme; verify status colors unchanged across themes.
-- Lint (later): grep for stray hex colors outside the token block.
+- Lint (later): parse CSS and reject color declarations outside approved token
+  definitions. A text grep is not a reliable CSS validator.
 
 ## 12. Acceptance criteria
 
-- [ ] Dark/Light + 4 accents + 4 terminal schemes all work and persist.
+- [ ] Dark/Light + 4 accents + 4 terminal schemes work and persist.
 - [ ] No UI color outside the token set (except terminal ANSI).
 - [ ] Status vocabulary (amber/blue/red) identical in both themes.
 - [ ] Theme switch never interrupts sessions.
@@ -100,14 +108,17 @@ None.
   recreating the Terminal instance (no reconnect, no data loss). This
   is the documented mechanism the spec's "apply instantly without
   reload" depends on.
-- **Contrast (WCAG AA)** — the spec's AA claim maps to WCAG 2.1 SC
-  1.4.3 (Contrast Minimum): 4.5:1 for body text, 3:1 for large text
-  and UI components (`https://www.w3.org/WAI/WCAG21/Understanding/contrast-minimum.html`).
-  Token pairs are chosen to meet 4.5:1 for `--text` on `--bg` in both
-  themes; the CI lint (grep for stray hex) keeps it enforceable.
-- **`prefers-color-scheme`** — CSS media query, honored at first
-  launch per spec; runtime switching uses `matchMedia` change events
-  (both documented in the CSS spec / MDN).
+- **Contrast (WCAG AA)** — WCAG 2.2 SC 1.4.3 sets 4.5:1 for normal text
+  and 3:1 for large text. UI component and meaningful graphical-object
+  contrast is covered separately by SC 1.4.11 at 3:1. The earlier text
+  incorrectly put UI components under SC 1.4.3
+  (`https://www.w3.org/WAI/WCAG22/Understanding/contrast-minimum.html` and
+  `https://www.w3.org/WAI/WCAG22/Understanding/non-text-contrast.html`).
+  Token contrast must be tested;
+  a planned grep is not proof that the current palette passes.
+- **`prefers-color-scheme`** — the CSS media query supplies the initial choice
+  only. The prior review invented a persistent System mode that the product
+  contract did not request, so it was removed.
 - **Scheme palette data** — terminal schemes (One Dark, Solarized) are
   conventional ANSI-16 palettes; stored as JSON in localStorage;
   xterm's `theme` object maps ANSI indexes 0–15 + `background`/
@@ -116,4 +127,4 @@ None.
   palette keeps standard green because it renders remote content, not
   app UI.
 
-Sources: xterm 5.3.0 typings, WCAG 2.1 SC 1.4.3, CSS media queries.
+Sources: xterm 5.3.0 typings, WCAG 2.2 SC 1.4.3 and 1.4.11, CSS media queries.

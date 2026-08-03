@@ -5,7 +5,7 @@
 ## 1. Overview
 
 Two connection superpowers for real fleets: authenticate through the
-user's **SSH agent** (so keys with passphrases never need re-entry), and
+user's **SSH agent** (so an already-unlocked key can be reused), and
 reach servers **behind bastions** (jump hosts) by chaining tunnels. Both
 reuse machinery we already have: libssh2 agent support for the former,
 the direct-tcpip tunnel from spec 12 for the latter.
@@ -13,9 +13,13 @@ the direct-tcpip tunnel from spec 12 for the latter.
 ## 2. Goals / non-goals
 
 **Goals**
-- Agent auth: use keys held by the local ssh-agent (via `SSH_AUTH_SOCK` / `~/.ssh/agent.sock`), with agent identity list in the connect dialog.
-- Agent forwarding (remote agent access) via `libssh2_channel_direct_streamlocal_ex` (later refinement).
-- Jump hosts: `Server.jump_server_id` → connect to the jump first, then tunnel `target:22` through it and run the session over the tunnel.
+- Agent auth: use keys held by the local ssh-agent through `SSH_AUTH_SOCK` or
+  an explicit user-selected socket, with an identity list in the connect
+  dialog.
+- Agent forwarding through libssh2's auth-agent request plus an explicit proxy
+  from accepted auth-agent channels to the configured local agent socket.
+- Jump hosts: `Server.via_server_id` → connect to the jump first, then tunnel
+  `target:22` through it and run the target session over the tunnel.
 - Jump chains (jump → jump → target) up to depth 3.
 
 **Non-goals**
@@ -32,7 +36,9 @@ the direct-tcpip tunnel from spec 12 for the latter.
 ## 4. UI/UX
 
 ### 4.1 Connect dialog additions (server modal + connect flow)
-- Auth method gains a third option: **SSH agent** (shows agent identities from `oars.agent.list`; default = first identity).
+- Auth method gains a third option: **SSH agent** (shows agent identities from
+  `oars.agent.list`; default = Automatic, which tries agent identities in
+  order, with an optional exact identity selection).
 - Server modal gains: **Jump host** select (other servers) — "connect via" with depth indicator (jump → target).
 
 ### 4.2 Status
@@ -42,20 +48,39 @@ the direct-tcpip tunnel from spec 12 for the latter.
 
 ### `oars.agent.list` → `{ok, identities:[{type, fingerprint_sha256, comment}]}`
 - Via `SSH_AUTH_SOCK` (macOS: ssh-agent or Keychain-agent path); missing agent → `{ok, identities: [], error:"no agent"}` (not a failure).
-### `oars.agent.forward` `{server_id, on: bool}` → toggles `AgentForwarding` on the session
-- Implemented via `libssh2_channel_request_auth_agent(channel)` on the
-  shell channel (`auth-agent-req@openssh.com` — the API is confirmed
-  present in libssh2 1.11.1, see §13); toggling requires the remote
-  `sshd` to permit agent forwarding (`AllowAgentForwarding`; the
-  session user's key may also carry `no-agent-forwarding` — see §13).
+### `oars.agent.forward` `{server_id, on: bool}` → enables forwarding for a new shell channel
+- `libssh2_channel_request_auth_agent(channel)` requests forwarding. Oars must
+  also register the libssh2 auth-agent callback, accept each incoming
+  `auth-agent@openssh.com` channel, and proxy its bytes to the selected local
+  agent socket. The request alone does not complete that data path.
+- Forwarding is set when a shell channel is created. Turning it off closes the
+  forwarding-capable shell and opens a new shell without the request; it is not
+  a simple live toggle on an existing remote listener.
 - Audited when enabled; failure surfaces as "agent forwarding
   refused" with the sshd policy hint, toggle returns to off.
 ### `oars.ssh.connect` gains `{auth_method:"agent"}` and `{via_server_id?}` (jump chain)
 
 ## 6. Zig core design
 
-- **Agent auth** (`src/agent.zig`): libssh2 agent API (`libssh2_agent_init`, `libssh2_agent_list_identities`, `libssh2_agent_userauth`); socket path resolution (env `SSH_AUTH_SOCK`, fallback `~/.ssh/agent.sock`, macOS `$TMPDIR/ssh-*/agent.*` scan); auth happens on the session worker like other methods.
-- **Jump hosts** (reuses spec 12 tunnel): connect to jump server (recursively, depth ≤ 3) → on its session worker, open `direct_tcpip(jump, target_host, 22, …)` → bridge to a local `127.0.0.1:0` listener → the *target* session's worker connects `std.Io.net` to that local port and hands the fd to libssh2. Chain lifecycle: target session holds the tunnel; disconnecting the jump tears down dependents (cascade close with clear status).
+- **Agent auth** (`src/agent.zig`): libssh2 agent API
+  (`libssh2_agent_init`, `libssh2_agent_connect`,
+  `libssh2_agent_list_identities`, `libssh2_agent_userauth`). Use
+  `SSH_AUTH_SOCK` or an explicit user-selected socket path. Do not scan
+  `$TMPDIR` for sockets: stale or attacker-created paths can select the wrong
+  agent.
+- **Agent forwarding proxy:** register `LIBSSH2_CALLBACK_AUTHAGENT`, queue
+  accepted channels to the session worker, connect only to the already
+  validated local agent socket, and copy bounded protocol frames in both
+  directions. `libssh2_channel_direct_streamlocal_ex` opens a remote Unix
+  socket and is not the agent-forwarding mechanism.
+- **Jump hosts** (reuses spec 12 tunnel): connect to the jump server
+  recursively (depth ≤ 3), then open `direct_tcpip` to the target. Bridge the
+  channel to an owner-only local Unix socket on macOS/Linux. If a platform must
+  use `127.0.0.1:0`, require a random one-use capability handshake before any
+  SSH bytes pass, so an unrelated local process cannot claim the listener. The
+  target worker connects through that authenticated local hop and gives the
+  resulting stream to libssh2. The target holds the tunnel reference;
+  disconnecting a jump cascades a clear close state to dependants.
 - `Session` gains `via: ?*Session` (owned ref) + `depth`; the manager builds the chain graph and validates cycles.
 
 ## 7. Data model
@@ -65,21 +90,30 @@ the direct-tcpip tunnel from spec 12 for the latter.
 
 ## 8. Security
 
-- Agent auth means the private key never touches Oars at all — best-case posture; document it as such.
+- Agent auth leaves private-key operations in the selected agent. Oars receives
+  public identities and signatures, but it does not read the private key.
+- Validate that the selected agent path is a Unix socket owned by the current
+  user before connecting. A locked key or an agent key constrained with
+  confirmation can still require OS/user interaction; Oars does not bypass it.
 - Jump hosts: credentials for the jump are the user's own; traffic to the target is double-encrypted (target SSH inside jump SSH).
 - Forwarding is opt-in per session (toggle), audited when enabled.
 - Chain cycle detection prevents self-referential jumps.
 
 ## 9. Performance
 
-- Chain connect = sum of hops (each ≤ 20 s timeout); local tunnel hop adds < 1 ms latency.
+- Chain connect is bounded per hop after DNS/TCP cancellation is fixed in spec
+  02. Measure added latency; do not promise a sub-millisecond tunnel cost.
 
 ## 10. Edge cases
 
-- Agent socket missing/stale → explicit error with "start ssh-agent / ssh-add" hint.
+- Agent socket missing/stale → explicit error with `ssh-agent` / `ssh-add` hint
+  and an option to select a socket. No directory scan fallback.
+- Agent key is locked or confirmation-constrained → surface the agent result
+  and let the OS agent complete its normal approval flow where available.
 - Jump host down → target session error says which hop failed ("bastion unreachable").
 - Cycle in config (A via B via A) → validation error at save time.
-- Agent has multiple identities → picker defaults to first; wrong identity → auth fails with agent error text.
+- Agent has multiple identities → Automatic tries them in agent order; an
+  exact selection tries only that fingerprint and surfaces its auth error.
 - Jump host's own auth is password → works (its session is a normal session).
 
 ## 11. Testing
@@ -102,18 +136,18 @@ the direct-tcpip tunnel from spec 12 for the latter.
   `libssh2_agent_list_identities` L1372, `libssh2_agent_userauth`
   L1400 (agent-initiated public-key auth: the private key never
   touches Oars — matches §8's "best-case posture").
-- **Agent forwarding — RESOLVED (was "pending: verify").**
+- **Agent forwarding request — API verified, proxy still required.**
   `libssh2_channel_request_auth_agent(LIBSSH2_CHANNEL *)` is confirmed
   in `libssh2.h` (declared immediately before
   `libssh2_channel_request_pty_ex`, L879–886 region) **and used by
   libssh2's own upstream code**: `example/ssh2_agent_forwarding.c`
   L212–216 (loop on `LIBSSH2_ERROR_EAGAIN`) and
   `tests/test_agent_forward_ok.c` L47–51, both vendored in
-  `third_party/libssh2/`. This sends the
-  `auth-agent-req@openssh.com` channel request — the same request
-  OpenSSH's `ssh -A` makes (see below). The spec's fallback branch is
-  no longer needed; implement via this API and surface sshd-policy
-  refusals as errors.
+  `third_party/libssh2/`. This sends the request, but vendored
+  `packet.c` only accepts an incoming agent channel when
+  `session->authagent` is registered and then calls that callback. The spec now
+  includes the required local-socket proxy instead of treating the request as
+  a complete implementation.
 - **SSH agent environment** — `SSH_AUTH_SOCK` "identifies the path of
   a Unix-domain socket used to communicate with the agent" (OpenSSH
   `ssh(1)` ENVIRONMENT section, `https://man.openbsd.org/ssh.1`);
@@ -138,13 +172,10 @@ the direct-tcpip tunnel from spec 12 for the latter.
   the convenience macro L852) — the same tunnel primitive spec 12
   uses; traffic to the target is double-encrypted (target SSH inside
   jump SSH, §8).
-- **macOS agent discovery** — macOS runs an ssh-agent-backed
-  `SSH_AUTH_SOCK` for the user session (and offers Keychain-backed
-  keys via `ssh-add --apple-use-keychain`); scanning `$TMPDIR/ssh-*`
-  is the standard fallback when `SSH_AUTH_SOCK` is unset. The spec's
-  resolution order (env → `~/.ssh/agent.sock` → `$TMPDIR` scan)
-  matches ssh-agent's own documented socket locations
-  (ssh-agent(1)).
+- **Agent discovery correction** — `SSH_AUTH_SOCK` identifies the agent socket.
+  A path can also be selected explicitly. OpenSSH documentation does not make
+  arbitrary `$TMPDIR/ssh-*` scanning an authentication rule, and such a scan
+  can select a stale or hostile socket, so it was removed.
 - **Cycle detection** — `Server.via_server_id` graph: reject cycles at
   save (a via-chain must be a DAG); this is plain graph validation,
   no external reference needed.

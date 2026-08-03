@@ -46,6 +46,9 @@ yarn-error.log*
 !.env.example
 **/servers.json
 # Private keys — never commit these, even as test fixtures.
+# The dev-sshd helper generates one at runtime and copies it out here.
+scripts/.dev-sshd-key
+scripts/.dev-sshd.env
 id_rsa
 id_dsa
 id_ecdsa

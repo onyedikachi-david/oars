@@ -13,7 +13,8 @@ CtrlOps's form-and-mouse-heavy UI.
 
 **Goals**
 - Global palette: open server, run script, jump to tab, invoke actions (add server, scan logs, offboard…), search history.
-- Keyboard model: `⌘K` toggle, arrows, enter, escape, `>`-prefixed command mode, `/` server-list filter, `⌘1..9` tab switching.
+- Keyboard model: platform-specific palette shortcut, arrows, enter, escape,
+  `>`-prefixed command mode, `/` server-list filter, and tab switching.
 - Recents + fuzzy ranking; palette state preserved per session.
 - Actions registry: every feature registers palette entries declaratively.
 
@@ -39,27 +40,30 @@ CtrlOps's form-and-mouse-heavy UI.
 ### 4.2 Command mode
 - Prefix `>` filters to actions only; `@` filters servers; `#` filters scripts; `/` filters history entries (spec 15) with a "re-run" action.
 
-### 4.3 Keyboard map (global)
-| Chord | Action |
-|---|---|
-| `⌘K` | toggle palette |
-| `⌘1`–`⌘9` | switch to tab N |
-| `⌘W` | close current tab |
-| `⌘T` | new terminal tab (current server or picker) |
-| `⌘⇧T` | re-open last closed tab |
-| `/` | filter server list (sidebar focus) |
-| `⌘,` | settings (provider, themes, alerts) |
-| `⌘E` | open file manager tab for current server |
-| `⌘L` | focus log search |
-| `esc` | close palette/dialogs; `shift+esc` in terminal sends real escape |
+### 4.3 Keyboard map
+
+Linux and Windows do not map every Command shortcut to Ctrl because Ctrl+W,
+Ctrl+T, Ctrl+K, and Ctrl+L are shell-editing inputs.
+
+| Action | macOS | Linux/Windows |
+|---|---|---|
+| Toggle palette | `⌘K` | `Ctrl+Shift+P` |
+| Switch to tab 1–9 | `⌘1`–`⌘9` | `Alt+1`–`Alt+9` |
+| Close current tab | `⌘W` | `Ctrl+Shift+W` |
+| New terminal tab | `⌘T` | `Ctrl+Shift+T` |
+| Re-open last closed tab | `⌘⇧T` | `Ctrl+Shift+R` |
+| Filter server list while the sidebar has focus | `/` | `/` |
+| Settings | `⌘,` | `Ctrl+,` |
+| File manager for current server | `⌘E` | `Ctrl+Shift+E` |
+| Focus log search outside the terminal | `⌘L` | `Ctrl+Shift+L` |
+
+Escape closes the top app overlay when one is open. Otherwise, a focused
+terminal receives Escape unchanged.
 
 ## 5. Bridge API
 
-The palette is a **frontend registry** — no new bridge surface. Actions
-call existing commands. The only new piece:
-
-### `oars.palette.recents` → client-side localStorage (no bridge needed)
-(Registry is in code; see §6.)
+The palette is a **frontend registry** with no new bridge surface. Actions call
+existing commands. Recents are frontend state, not an `oars.*` command.
 
 ## 6. Zig core design
 
@@ -85,14 +89,17 @@ keeps coupling one-way.
 ## 10. Edge cases
 
 - No servers yet → palette still lists actions (add server) — empty states everywhere.
-- Terminal focused: `⌘K` must not be swallowed by xterm (global keydown on window, `metaKey` checks).
+- Terminal focused: use xterm's custom key handler to reserve only documented
+  app shortcuts. Do not intercept Ctrl+K on Linux or Windows because shells use
+  it for line editing.
 - Palette open while a dialog is open → dialogs win (palette suppressed).
 - Long script list → `#` prefix + fuzzy covers it.
 
 ## 11. Testing
 
 - Unit: ranking order fixtures, command-mode parsing, double-enter guard.
-- Manual: every chord above on macOS; palette with 200+ synthetic entries.
+- Manual: every chord above on macOS, Linux, and Windows, including terminal
+  focus; palette with 200+ synthetic entries.
 
 ## 12. Acceptance criteria
 
@@ -120,10 +127,10 @@ keeps coupling one-way.
 - **Fuzzy ranking** — client-side substring/prefix scoring; no external
   dependency (no fuse.js etc. — kept dependency-free per project
   convention).
-- **`⌘L` vs terminal** — in the terminal, `⌘L` clears the viewport
-  client-side (xterm's documented `clear()` is client-only; scrollback
-  lives in xterm's buffer, per xterm.js docs) — consistent with spec
-  02 §4.3; when the logs view is focused, `⌘L` focuses log search.
+- **Shortcut correction** — `⌘K` opens the palette everywhere on macOS.
+  Linux and Windows use `Ctrl+Shift+P`, and their other app shortcuts avoid
+  common Ctrl-based shell editing inputs. Log-search shortcuts apply only
+  outside terminal focus.
 
 Sources: xterm.js typings (`frontend/node_modules/xterm/typings/xterm.d.ts`),
 internal design decisions.

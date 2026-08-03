@@ -2,14 +2,17 @@
 
 One spec file per product feature. These are the working contracts for
 implementation: bridge payloads, UI states, Zig-side design, security
-bounds, and acceptance criteria. Where a feature already exists (marked
-`✅ core in`), the spec documents the current behavior plus planned
-improvements; everything else is the design to build against.
+bounds, and acceptance criteria. The body of each spec defines the target
+product. A gap in the current code must not remove or narrow that target.
+Each status describes verified code in this checkout. `Partial` means that
+some code exists, but at least one required behavior is missing. `📋` means
+Planned: the file is an implementation contract, not a claim that the feature
+already exists.
 
 | # | Spec | Status |
 |---|------|--------|
-| 01 | [Multi-Server Management](01-multi-server.md) | ✅ core in (groups pending) |
-| 02 | [Terminal (SSH)](02-terminal.md) | ✅ core in (history pending) |
+| 01 | [Multi-Server Management](01-multi-server.md) | Partial: core CRUD and UI exist |
+| 02 | [Terminal (SSH)](02-terminal.md) | Partial: shell and exec exist; mirrored cursors and resize are not yet implemented |
 | 03 | [Infra Monitoring](03-monitoring.md) | 📋 |
 | 04 | [Log Management](04-logs.md) | 📋 |
 | 05 | [File Manager (SFTP)](05-file-manager.md) | 📋 |
@@ -19,7 +22,7 @@ improvements; everything else is the design to build against.
 | 09 | [Access Management](09-access.md) | 📋 |
 | 10 | [Backups](10-backups.md) | 📋 |
 | 11 | [AI Terminal](11-ai-terminal.md) | 📋 |
-| 12 | [Remote Desktop (VNC)](12-vnc.md) | 📋 (research done) |
+| 12 | [Remote Desktop (VNC)](12-vnc.md) | 📋 (packaged macOS WebView transport verified; implementation planned) |
 | 13 | [Command Palette & Keyboard UX](13-command-palette.md) | 📋 (Oars+) |
 | 14 | [Server Groups & Fleet Views](14-groups.md) | 📋 (Oars+) |
 | 15 | [Command History & Audit](15-history.md) | 📋 (Oars+) |
@@ -48,19 +51,34 @@ improvements; everything else is the design to build against.
 
 ## Cross-cutting conventions
 
-- **Streams:** all streaming output uses the cursor-delta protocol
-  established for `oars.ssh.poll` (per-channel buffer, cursor, `dropped`
-  counter, `rewind`). New streaming features reuse it.
-- **Secrets:** passwords, passphrases, API keys, and bucket keys live in
-  the OS Keychain via `native-sdk.credentials.*`, keyed per owner
-  (`<server_id>`, `vnc:<server_id>`, `ai:<provider>`…). Config files
-  never contain secrets.
+- **Implementation truth:** a module name in a planned spec is a proposed
+  file. It is not proof that the file exists. A feature becomes complete only
+  after its acceptance checks pass against the current checkout.
+- **Streams:** all streaming output uses the non-destructive cursor-delta
+  protocol established for `oars.ssh.poll`. Each consumer supplies its own
+  absolute per-channel cursor; `dropped` reports that consumer's gap and
+  `rewind` starts it at retained-buffer start. New streaming features reuse it.
+- **Secrets:** passwords, passphrases, API keys, and bucket keys persist locally
+  in the OS Keychain via `native-sdk.credentials.*`, keyed per owner
+  (`<server_id>`, `vnc:<server_id>`, `ai:<provider>`…). Local app config files
+  never contain them. A feature that must copy a secret elsewhere, such as a
+  server-side rclone config for unattended cron, must state the destination,
+  protection, and approval in its own contract.
 - **Dangerous actions:** anything that mutates a server is approval-gated;
   destructive operations additionally require type-to-confirm or an
-  explicit destructive warning. Every executed command is appended to the
-  audit history (spec 15).
+  explicit destructive warning. Every executed command goes to command
+  history; every mutating product action also gets an audit entry (spec 15).
 - **Errors:** bridge handlers return `{"ok":false,"error":"human message"}`
   for user-facing failures; the framework rejects on transport errors.
+- **Remote commands:** SSH exec accepts one shell command string. It does not
+  carry an argv array. Any value from a user, server profile, file path,
+  domain, or model must go through one shared POSIX-shell quoting function, or
+  through a protocol such as SFTP that does not invoke a shell. A spec must
+  not call a command "argv-safe" unless a real argv transport exists.
+- **Cancellation:** closing an SSH channel stops Oars from using that channel.
+  It does not prove that the remote process stopped. A feature that needs a
+  hard stop must start and track a remote process group, send a signal, and
+  verify termination.
 - **Research rule:** no spec claim is written from memory. Commands,
   flags, formats, and APIs are verified against primary sources (RFCs,
   GNU/OpenBSD man pages, official project docs) and the vendored/installed
@@ -71,3 +89,12 @@ improvements; everything else is the design to build against.
   noVNC scaling API).
 - **Threading:** one worker thread per SSH session owns all libssh2 calls;
   the runtime main thread never blocks on the network (spec 02, §6).
+
+## Verification baseline
+
+This set was reviewed on 2026-08-03 against the current Zig and React source,
+the vendored libssh2 and mbedTLS headers, installed frontend packages, current
+official OpenAI API schema, Node.js release schedule, Linux kernel guidance,
+OWASP guidance, rclone documentation, and CtrlOps public docs and changelog.
+External product facts can change. Recheck them before using a competitor
+claim or version list to make a product decision.

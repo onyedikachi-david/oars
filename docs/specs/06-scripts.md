@@ -7,8 +7,10 @@
 A personal library of shell commands with `{{variable}}` templating, run
 with one click on the server you're looking at. **Oars+ differentiator:**
 safe broadcast — run one script across a *selection* of servers with a
-per-server dry-run summary and a single confirmed execution, side-by-side
-streams. (CtrlOps explicitly refuses fan-out; we do it with guardrails.)
+per-server expansion preview and a single confirmed execution, side-by-side
+streams. This is an Oars design choice; current public CtrlOps docs do not
+provide enough evidence for the earlier claim that it explicitly refuses
+fan-out.
 
 ## 2. Goals / non-goals
 
@@ -16,7 +18,9 @@ streams. (CtrlOps explicitly refuses fan-out; we do it with guardrails.)
 - CRUD scripts: name, description, tags, color, body with `{{var}}` placeholders.
 - Run on current server; run-time variable prompts; live output in a pane.
 - Run counts + last-run stamps per script; search + tag filter.
-- Safe broadcast: select servers → dry-run summary → confirm → parallel streams with per-server exit codes.
+- Safe broadcast: select servers → expansion preview → confirm → bounded
+  parallel streams with per-server exit codes. The preview does not execute the
+  command and must not be called a dry run.
 - Approve-then-save from the AI terminal (spec 11) and from history (spec 15).
 
 **Non-goals**
@@ -33,12 +37,19 @@ streams. (CtrlOps explicitly refuses fan-out; we do it with guardrails.)
 ### 4.1 Scripts panel (accessible from a tab header action + ⌘K)
 - Left: script list — color chip · name · tags · run count / last-run ("no runs yet").
 - Search box filters name+description+tags.
-- Editor (modal or right pane): name, description, tags, color picker (6 swatches), command textarea with `{{` autocomplete of known variables; live variable detection count ("1 line · 2 vars").
-- Run flow: Run → variable prompt dialog (per var, prefilled with last value) → output pane streams (header: script name · server · exit code).
+- Editor (modal or right pane): name, description, tags, color picker (6
+  swatches), command textarea with `{{` autocomplete, and a detected-variable
+  table. Each variable has a label and `Secret value` default. The flag
+  controls masked input, storage, history, and audit; name matching can only
+  suggest it.
+- Run flow: Run → variable prompt dialog (per var, prefilled from this app
+  session only) → output pane streams (header: script name · server · exit
+  code). Values are not persisted between launches in v1.
 
 ### 4.2 Safe broadcast flow
 1. From a script: **Run on multiple servers…** → selection sheet (server list with checkboxes + groups).
-2. Dry-run summary: for each server, the **expanded command** (variables substituted) — read-only preview.
+2. Expansion preview: for each server, show the exact command text that Oars
+   will submit. This is not proof that the remote shell will accept it.
 3. Confirm ("Run on N servers") — scripts tagged destructive require an extra confirm ("These are marked destructive").
 4. Execution: streams side-by-side (each server a column/row with its own output + status); per-server exit codes; summary line "6/6 succeeded" / "db-02 failed (exit 2)".
 5. Cancel stops remaining queued servers (running ones finish or are killed via channel close).
@@ -50,36 +61,55 @@ streams. (CtrlOps explicitly refuses fan-out; we do it with guardrails.)
 ## 5. Bridge API
 
 ### `oars.scripts.list` → `{ok, scripts}` · `oars.scripts.save` `{script}` → `{ok, script}` · `oars.scripts.delete` `{id}` → `{ok}`
-### `oars.scripts.run` `{server_id, script_id, vars: {name: value}}` → `{ok, channel}`
-- Expands `{{name}}` → value (validated: no newlines in values unless multi-line allowed flag), execs on the session worker channel; output via `oars.ssh.poll`; exit code from channel.
-- Script body executed via the shell: `bash -c '<body with vars>'` — values are **argument-quoted** (single-quote escaping) to prevent injection via variables; scripts are the user's own code, but variables must not break out.
+### `oars.scripts.run` `{server_id, script_id, vars: {name: {value, secret}}}` → `{ok, channel}`
+- Each placeholder must occupy a shell word by itself. Placeholders inside
+  quotes, redirections, command names, assignments, or shell syntax are
+  rejected. Oars replaces each valid placeholder with a single-quoted shell
+  literal and tests the resulting command with `bash -n` before execution.
+  Multiline values are not supported in v1. Scripts are user-authored code;
+  this rule only prevents a variable value from adding shell syntax.
 ### `oars.scripts.broadcast` `{script_id, server_ids[], vars}` → `{ok, run_id}`
-### `oars.scripts.broadcastPoll` `{run_id}` → per-server status/output deltas (streams keyed by server_id, same cursor protocol; a `RunState` record lives in the manager)
+### `oars.scripts.broadcastPoll` `{run_id, cursors?}` → per-server status/output deltas
+- Streams are keyed by server id and channel. Each caller returns its own
+  absolute cursor map under the spec 02 protocol; polling one broadcast view
+  cannot drain another view.
 ### `oars.scripts.broadcastCancel` `{run_id}`
 
 ## 6. Zig core design
 
 - `src/scripts.zig` — Script model + store (`<data>/scripts.json`), template expansion (`expandTemplate` with `{{name}}` scan — pure, unit-tested), quoting helper.
-- Broadcast runner: `BroadcastRun {id, script, servers[], per_server: {channel, stream, status}}` in a manager map; each server's exec goes through its own session worker (fan-out is *ours*, not the server's); a lightweight coordinator thread just aggregates statuses (or poll-driven from the frontend — v1: poll-driven, no extra thread).
+- Broadcast runner: `BroadcastRun {id, script, servers[], per_server:
+  {channel, stream, status}}` in a manager map. Run at most four servers at a
+  time by default. Polling starts queued work as slots become free.
 
 ## 7. Data model
 
-- `<data>/scripts.json`: `[{id, name, description, tags[], color, body, created_at, updated_at, run_count, last_run_at}]`.
-- Last-used variable values per script (client-side localStorage, not persisted to disk config).
+- `<data>/scripts.json`: `[{id, name, description, tags[], color, body,
+  variables:[{name,label,secret_default}], created_at, updated_at, run_count,
+  last_run_at}]`. It stores variable definitions, never run-time values.
+- Last-used variable values live only in frontend memory for the current app
+  session. Oars does not put arbitrary command values in localStorage.
 
 ## 8. Security
 
-- Scripts are user-authored; variables are escaped/quoted; broadcast is two-step (dry-run + confirm); destructive-tagged scripts add a second confirm; every broadcast/run writes an audit entry (spec 15) with the expanded command.
+- Scripts are user-authored; variables follow the word-only rule; broadcast is
+  preview + confirm; destructive-tagged scripts add a second confirm. Audit
+  stores a redacted command and structured variable names. Values marked
+  secret are never written to history.
 - Scripts run as the SSH user — no privilege elevation beyond the session.
 
 ## 9. Performance
 
 - Broadcast streams are read per-server with the poll budget; N servers = N channel streams, all worker-side (no new threads per server).
-- Dry-run expansion is instant (client-side render of expanded text).
+- Expansion preview is client-side and should complete within one frame for a
+  normal script library.
 
 ## 10. Edge cases
 
 - Server unreachable during broadcast → marked `skipped (unreachable)`, reported, not silently dropped.
+- Cancel stops queued starts and closes active channels. The result is
+  `cancel requested` until Oars can verify remote process termination; channel
+  close alone is not a kill guarantee.
 - Duplicate server selection → deduped.
 - Variable referenced but not provided → run blocked with "missing variable: X" (no partial substitution).
 - Script > 64 KB → rejected at save.
@@ -87,15 +117,17 @@ streams. (CtrlOps explicitly refuses fan-out; we do it with guardrails.)
 
 ## 11. Testing
 
-- Unit: template expansion (nested braces, missing vars, quoting/injection attempts), store round-trip.
+- Unit: template lexer boundaries, nested braces, missing variables,
+  quoting/injection attempts, secret metadata, and store round-trip.
 - Integration: run script on container; broadcast to 2 containers; verify exit codes and cancel behavior.
-- Manual: destructive double-confirm, dry-run preview accuracy.
+- Manual: destructive double-confirm, expansion-preview accuracy.
 
 ## 12. Acceptance criteria
 
 - [ ] Script CRUD + run with variables works end-to-end.
 - [ ] Variable injection attempts are neutralized (tested).
-- [ ] Broadcast shows per-server dry-run, confirms, streams side-by-side, reports per-server results.
+- [ ] Broadcast shows a per-server expansion preview, confirms, streams
+      side-by-side, and reports per-server results.
 - [ ] Audit entries written for every run.
 
 ## 13. Research & References
@@ -110,6 +142,9 @@ streams. (CtrlOps explicitly refuses fan-out; we do it with guardrails.)
   this rule. This is the same quoting the POSIX shell command language
   specifies for single-quoted strings
   (`https://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html#tag_18_02`).
+  **Correction:** quoting a value is not enough when a placeholder can appear
+  inside existing shell syntax. The contract now limits placeholders to whole
+  shell words and rejects ambiguous contexts before expansion.
 - **`bash -c '<script>'`** — executing a script via `bash -c` is the
   documented Bash invocation mode (`bash -c string` processes the
   string as commands; Bash manual §6.1 "Bash Invocation"). The command

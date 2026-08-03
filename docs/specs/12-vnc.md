@@ -1,6 +1,8 @@
 # Spec 12 — Remote Desktop (VNC over SSH)
 
-**Status:** 📋 (research complete) · **Depends on:** 02 (session worker), new `src/ws.zig` · **Spec owner:** core
+**Status:** 📋 (protocol and packaged macOS WebView transport research verified
+2026-08-03; implementation planned) · **Depends on:** 02 (session worker), new
+`src/ws.zig` · **Spec owner:** core
 
 ## 1. Overview
 
@@ -32,9 +34,16 @@ approval-gated.
 
 ### 4.1 Remote tab
 - Toolbar: display/port selector (`:0` 5900 · `:1` 5901 · custom) · Connect/Disconnect · Scale (fit / 100%) · Ctrl+Alt+Del · clipboard paste button · status.
-- Canvas fills the tab; click to focus keyboard; keyboard shortcuts pass through to the remote (browser chords like `⌘L` are intercepted by noVNC config). Fit scaling = `rfb.scaleViewport = true`; 100% = `false` (resize-session behavior via `rfb.resizeSession`).
+- The noVNC target element fills the tab; noVNC creates and owns its display
+  canvas. Click focuses the remote. Oars keeps app-reserved shortcuts local and
+  forwards the remaining keys. Fit scaling uses
+  `rfb.scaleViewport = true`; 100% uses `false`. `resizeSession` is a separate
+  opt-in because it asks the VNC server to change framebuffer size.
 - States: `idle` → `starting tunnel` → `connecting (ws)` → `auth (VNC password)` → `connected` / `failed(reason)`.
 - VNC password prompt on `credentialsrequired` (once per session; "remember" stores in Keychain).
+- If the negotiated scheme is legacy VNC Authentication, explain that only the
+  first eight password characters participate. Do not show that warning for a
+  stronger negotiated scheme.
 - Setup helper card (when probe finds nothing): suggested command block + Approve/Run + Cancel (exact same approval-card pattern as spec 11).
 
 ### 4.2 Fingerprint/trust
@@ -42,21 +51,48 @@ approval-gated.
 
 ## 5. Bridge API
 
-### `oars.vnc.start` `{server_id, host?, port?}` → `{ok, ws_port, token}`
+### `oars.vnc.start` `{server_id, host?, port?}` → `{ok, tunnel_id, ws_port, token}`
 - Defaults: `host = "127.0.0.1"` (the server's own loopback — where x11vnc listens), `port = 5900 + display`.
-- Worker opens `libssh2_channel_direct_tcpip_ex(session, host, port, "127.0.0.1", 0)` and binds a listener on `127.0.0.1:0`; returns the ephemeral port + random token (32 hex chars).
+- Worker opens `libssh2_channel_direct_tcpip_ex(session, host, port,
+  "127.0.0.1", 0)` and binds a listener on `127.0.0.1:0`; returns the
+  ephemeral port, a random lifecycle id, and an independent 128-bit URL token
+  from the OS cryptographic random source.
 - Tunnel auto-destroys after 15 s if no WebSocket connection arrives; always destroyed on `stop`/disconnect.
-### `oars.vnc.stop` `{server_id, ws_port}` → `{ok}`
+### `oars.vnc.stop` `{server_id, tunnel_id}` → `{ok}`
 ### `oars.vnc.probe` `{server_id}` → `{ok, x11vnc: bool, tigervnc: bool, listening:[{port, process?}]}`
 - Exec: `command -v x11vnc tigervncserver Xvnc; ss -tlnp 2>/dev/null | grep -E ':59[0-9][0-9]'`.
-### `oars.vnc.setup` `{server_id, display?}` → approval-gated exec of the suggested install command (see §6); audit entry.
-### `oars.vnc.poll` `{server_id, ws_port}` → `{ok, state: listening|connected|closed, bytes_up, bytes_down, error?}` (stats for the tab footer)
+### `oars.vnc.setup` `{server_id, display?}` → approval-gated exec of a tested OS-adapter plan; audit entry.
+- Detect the distribution, package manager, display ownership, init system, and
+  VNC implementation. Unknown targets get manual guidance rather than a guessed
+  install or service command.
+### `oars.vnc.poll` `{server_id, tunnel_id}` → `{ok, state: listening|connected|closed, bytes_up, bytes_down, error?}` (stats for the tab footer)
 
 ## 6. Zig core design
 
-### `src/ws.zig` — minimal RFC 6455 server (~250 lines)
-- Upgrade: read HTTP request head; validate method GET, `Upgrade: websocket`, `Sec-WebSocket-Key`; **validate `Origin`** against `zero://app` / `http://127.0.0.1:5173`; **validate URL path** `/vnc/<token>`; respond `101` with `Sec-WebSocket-Accept = base64(sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))`.
-- Frames: parse client frames (FIN/opcode, mask flag + key, 7/16/64-bit lengths), unmask payload; server frames unmasked; opcodes: binary/text (→ bytes to channel), ping → pong, close → reply + teardown; fragmentation (continuation frames) reassembled.
+### `src/ws.zig` — bounded RFC 6455 server
+- Upgrade: read at most 16 KB of HTTP/1.1 request headers within the handshake
+  timeout. Require `GET`, `Host`, `Upgrade: websocket`, a `Connection` value
+  containing `Upgrade`, `Sec-WebSocket-Version: 13`, and a valid
+  `Sec-WebSocket-Key` that decodes to 16 bytes. Header names and HTTP token
+  values are case-insensitive. Accept the measured packaged origin
+  `zero://app` and the configured development origin
+  `http://127.0.0.1:5173`; reject every other `Origin`. Validate the
+  unguessable URL path
+  `/vnc/<token>`. Respond `101` with `Sec-WebSocket-Accept =
+  base64(sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))`. Require the
+  client to offer the `binary` subprotocol and select it in the response.
+  Decline `permessage-deflate` and every other extension by omitting
+  `Sec-WebSocket-Extensions`; the frame codec does not implement extension
+  semantics, so all RSV bits must remain zero.
+- Frames: parse client frames (FIN/opcode, mask flag + key, 7/16/64-bit
+  lengths), unmask payload; server frames unmasked; binary data forwards to the
+  SSH channel; ping gets pong; close gets close. Reject non-zero RSV bits,
+  unmasked client frames, invalid opcodes, fragmented control frames, control
+  payloads over 125 bytes, non-minimal length encodings, and 64-bit lengths
+  whose high bit is set. Text data is not part of this VNC bridge and closes
+  with unsupported-data status. Enforce an 8 MB frame/message limit and a 16 MB
+  connection-buffer limit. Stream complete binary fragments when possible
+  instead of requiring unbounded message reassembly.
 - Codec is pure (encode/decode on slices) — unit-testable without sockets.
 
 ### Worker-loop tunnel support (in `sessions.zig`)
@@ -66,7 +102,13 @@ approval-gated.
 - `ws_sock` is a plain TCP fd (std.Io.net.Stream) — reads non-blocking via the same loop discipline.
 
 ### Frontend
-- `VncTab.tsx`: `new RFB(canvas, ws://127.0.0.1:<port>/vnc/<token>, {credentials: {password}, wsProtocols: ["binary"]})`; event wiring (`connect`, `disconnect`, `credentialsrequired`, `securityfailure`, `desktopname`, `clipboard`); scaling via the `scaleViewport`/`resizeSession` properties (**not** a `setScale` method — see §13); `rfb.sendCtrlAltDel()`; clipboard: `rfb.clipboardPasteFrom(text)` + `clipboard` event → write to system clipboard via `native-sdk.clipboard.writeText`.
+- `VncTab.tsx`: `new RFB(target,
+  ws://127.0.0.1:<port>/vnc/<token>, {credentials: {password},
+  wsProtocols: ["binary"]})`; the constructor starts the connection. Later
+  credential prompts use `rfb.sendCredentials({password})`. Public controls are
+  `disconnect()`, `sendCtrlAltDel()`, `clipboardPasteFrom(text)`, and the
+  `scaleViewport`/`resizeSession` properties. There is no public `connect()`,
+  `setScale()`, or writable `credentials` property in installed noVNC 1.7.0.
 - Password: prompt → `vault.set("vnc:" + server_id, pw)` when "remember" checked.
 
 ## 7. Data model
@@ -75,14 +117,31 @@ approval-gated.
 
 ## 8. Security
 
-- Listener binds 127.0.0.1 only; Origin + token validation (a hostile local webpage cannot ride the tunnel); 15 s idle timeout; tunnel dies with the session.
-- VNC auth: noVNC handles the DES challenge with the supplied password; password never crosses the bridge (stays in the frontend → noVNC).
-- Traffic encrypted end-to-end by SSH; loopback segment is localhost-only.
+- Listener binds 127.0.0.1 only; Origin + token validation reduce local
+  cross-site access; 15 s idle timeout; tunnel dies with the session. The
+  packaged macOS WKWebView was measured directly on 2026-08-03: the document
+  URL is `zero://app/index.html`, `location.origin` is `zero://app`, the page is
+  a secure context, and its WebSocket request sends `Origin: zero://app`. The
+  static policy source `connect-src 'self' ws://127.0.0.1:*` allowed that
+  loopback handshake. The complete application CSP can add the HTTPS provider
+  and loopback HTTP sources required by spec 11, but VNC requires only this
+  measured loopback WebSocket source. Development uses the configured
+  `http://127.0.0.1:5173` origin.
+- VNC auth: noVNC handles the negotiated authentication scheme with the
+  supplied password. A remembered password crosses the credential bridge once
+  from Keychain into frontend memory, then goes to noVNC. It is never written
+  to app configuration, logs, or tunnel messages outside the VNC protocol.
+- Traffic is encrypted between Oars and the SSH server. The short remote
+  loopback segment between sshd and the VNC server is local plaintext, and
+  legacy VNC authentication remains weak. The setup helper binds VNC to remote
+  loopback and always configures authentication.
 - Setup helper is approval-gated and audited (installing software on the server).
 
 ## 9. Performance
 
-- WebSocket frames ≤ 64 KB; bridge is zero-copy-ish (single copy into frame buffer). Target: smooth 60 fps at 1080p with tight encoding; verify against a local VNC server; degradation path = lower scale (client-side) — no protocol changes needed.
+- WebSocket frames and buffered messages use the bounds in §6. Set a
+  latency and frame-rate target only after tests with common VNC encodings,
+  WKWebView, and a 100 ms network path. Do not promise 60 fps before measuring.
 - Stats (`bytes_up/down`) counters per tunnel for the footer.
 
 ## 10. Edge cases
@@ -91,7 +150,9 @@ approval-gated.
 - Remote VNC unreachable (channel open fails) → tunnel reports error; UI shows "no VNC server on <host>:<port> — try the setup helper".
 - WebSocket never connects → 15 s auto-teardown; `poll` reports closed.
 - Tab closed mid-session → `oars.vnc.stop`; session disconnect cleans all tunnels.
-- noVNC focus/keyboard quirks in WKWebView → capture key events on the canvas; verify `⌘` chords don't reach the remote (config `noVNC keyboard intercept`).
+- noVNC focus/keyboard behavior in WKWebView → verify app-reserved shortcuts
+  and remote modifier keys in a packaged build. There is no generic "noVNC
+  keyboard intercept" setting to cite.
 
 ## 11. Testing
 
@@ -102,8 +163,13 @@ approval-gated.
 ## 12. Acceptance criteria
 
 - [ ] VNC session renders and accepts input against a real x11vnc in the test container.
-- [ ] WS server rejects bad Origin/token; idle tunnels self-destruct.
-- [ ] VNC password flows from Keychain → noVNC, never via bridge.
+- [ ] The implementation preserves the measured packaged contract:
+      `Origin: zero://app`, the `binary` subprotocol, no negotiated extensions,
+      and a CSP that permits only the required loopback WebSocket source. The
+      WS server rejects bad Origin/token and idle tunnels self-destruct.
+- [ ] A remembered VNC password crosses the credential bridge once into
+      frontend memory and then reaches noVNC. It never enters config, logs,
+      audit, telemetry, or the VNC tunnel outside protocol authentication.
 - [ ] Setup helper installs x11vnc only after approval + audit.
 - [ ] Codec/handshake unit tests green.
 
@@ -131,8 +197,8 @@ approval-gated.
     masked. Control frames ≤ 125 bytes and MUST NOT be fragmented
     §5.5; ping MUST be answered with pong (echoing payload) §5.5.2/3;
     close handshake §5.5.1 + status codes §7.4 (1000/1001/1002/1003/
-    1009/1011…). §10.4 mandates implementation limits on frame sizes
-    — our 64 KB cap is compliant.
+    1009/1011…). §10.4 mandates implementation limits on frame and message
+    sizes; the contract uses 8 MB per frame/message and 16 MB per connection.
   - The 15 s idle teardown and token-path check follow §10.7
     ("incorrect path or origin… the endpoint MAY drop the TCP
     connection").
@@ -159,14 +225,34 @@ approval-gated.
     noVNC API; use `rfb.scaleViewport = true/false` (+ `resizeSession`
     for session resizing).
   - Methods: `sendCtrlAltDel()` L439, `clipboardPasteFrom(text)` L500.
+  - `sendCredentials(creds)` is the public method for credentials supplied
+    after `credentialsrequired`. The constructor initiates connection; only
+    `disconnect()` is public. Earlier roadmap text naming `connect()` and a
+    writable `credentials` field was corrected.
   - Events: `connect` (L930), `disconnect` (L944),
     `credentialsrequired` (L1653, incl. the RSA-AES variant at L2005 —
     noVNC supports RSA-AES auth, not only legacy DES),
     `securityfailure` (L1630/2132), `desktopname` (L704),
     `clipboard` (L2346/2484).
   - `wsProtocols: ["binary"]` is passed to the WebSocket open (L555)
-    as a subprotocol request — our WS server should accept it
-    (or ignore it, which RFC 6455 permits).
+    as a subprotocol request. The bridge selects `binary` in the upgrade
+    response so the negotiated protocol is explicit.
+- **Packaged macOS WKWebView measurement (2026-08-03)** — built the real
+  frontend with `npm run build`, launched the Native SDK application with
+  `zig build run -Dautomation=true`, and connected it to a local handshake
+  capture server:
+  - Runtime values were `location.href = zero://app/index.html`,
+    `location.origin = zero://app`, and `isSecureContext = true`.
+  - The upgrade request sent `Origin: zero://app`,
+    `Sec-WebSocket-Protocol: binary`,
+    `Sec-WebSocket-Extensions: permessage-deflate`,
+    `Sec-Fetch-Site: cross-site`, and `Sec-WebSocket-Version: 13`.
+  - A second packaged run added the exact static policy source
+    `connect-src 'self' ws://127.0.0.1:*`; the upgrade request reached the
+    loopback server. This proves the required VNC connection source works in
+    the packaged WebView. The server must select `binary` and must omit
+    `Sec-WebSocket-Extensions` because the bridge does not implement
+    per-message compression.
 - **x11vnc 0.9.16** — verified against the man page
   (`https://manpages.ubuntu.com/manpages/noble/en/man1/x11vnc.1.html`):
   - Typical usage `x11vnc -display :0`; listens on 5900+display

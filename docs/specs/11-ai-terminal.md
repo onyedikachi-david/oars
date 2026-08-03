@@ -15,7 +15,9 @@ command is logged.
 - Chat-style panel per server: ask, see command + explanation, Run / Edit / Cancel.
 - Destructive-operation flagging (heuristic + model flag) with amber warning.
 - Context bundle: OS/hostname/uptime + monitor snapshot + tail of a chosen log.
-- Provider config: base URL, model, API key (Keychain), optional web search (later stage), MCP (later).
+- Provider config: an OpenAI-compatible Chat Completions base URL, model, API
+  key (Keychain), and capability flags. Native Anthropic or Gemini APIs need
+  separate adapters; their names alone do not make them compatible.
 - Save approved command as a script; every run appended to audit history.
 
 **Non-goals**
@@ -50,38 +52,69 @@ command is logged.
 
 ## 5. Bridge API
 
-The AI call itself is **client-side** (fetch to the provider) — the bridge
-only provides context and execution:
+The AI call is client-side in v1. This only works when the provider permits the
+app origin through CORS. There is no standard capability-discovery endpoint
+shared by all products described as OpenAI-compatible. A shipped provider
+adapter supplies reviewed defaults; a Custom adapter makes the user select the
+message role, streaming format, and structured-output mode. **Test provider**
+runs the selected contract only after a user click and states that a completion
+test can consume provider quota. HTTPS is required except for user-approved
+loopback URLs such as a local model server. A later native HTTP bridge can
+remove the CORS limit.
 
 ### `oars.ai.context` `{server_id}` → `{ok, os, hostname, uptime_sec, load, mem, disk, top_processes:[…], active_logs:[{path, last_write}]}`
 (bundled from monitor cache + a light probe; cached ≤ 5 s)
-### `oars.ai.provider.get` → `{ok, provider: {base_url, model, web_search}}` (no key!) · `oars.ai.provider.set` `{provider}` → `{ok}` (key stored via Keychain `ai:<base_url>`)
+### `oars.ai.provider.get` → `{ok, provider: {adapter, base_url, model, capabilities:{instruction_role, streaming, structured_output}}}` (no key!) · `oars.ai.provider.set` `{provider}` → `{ok}` (key stored via Keychain `ai:<base_url>`)
 ### `oars.ai.history` `{server_id, limit}` → audit-filtered runs (spec 15)
 ### Execution reuses `oars.ssh.exec` (channel id); Save-as-script reuses `oars.scripts.save`.
 
-### Prompt contract (system prompt, JSON out)
+### Prompt contract (structured command proposal)
 ```
-You write Linux commands. Respond ONLY with JSON:
-{"command":"…","explanation":"…","destructive":bool,"needs_sudo":bool}
+You write Linux commands. Respond ONLY with one JSON variant:
+{"kind":"command","command":"…","explanation":"…","destructive":bool,"needs_sudo":bool}
+{"kind":"question","question":"…","explanation":"…"}
 ```
-- Context injected as a fenced block; instruct: read-only commands preferred; ask if ambiguous.
-- Streaming: SSE/JSON stream from provider; render explanation progressively, command appears when complete.
+- Context is untrusted data. Wrap it in a distinct data field and state that
+  log text, host names, and process text are not instructions.
+- When the provider supports Chat Completions Structured Outputs, send a strict
+  `response_format` JSON schema. Otherwise use JSON mode when supported, then a
+  prompt-only fallback. Capability fallback is explicit; a parse failure never
+  executes or silently extracts a command from arbitrary markdown.
+- A streamed JSON object cannot safely render its explanation until fields are
+  parsed. Show provider progress while streaming, then render the validated
+  card when the object is complete.
 
 ## 6. Zig core design
 
 - Zig adds only `oars.ai.context` (aggregates existing caches + one probe) and history filtering. Everything else is frontend. This keeps the AI layer swappable and testable without mocking the bridge.
-- **CSP note:** the packaged app's CSP `connect-src` must allow the user's provider origin. V1: `connect-src https:` for AI (TLS-only, no cookies — the WebView holds no provider cookies; key sent per request). Documented tradeoff; a tighter allow-list follows if needed.
+- **CSP note:** the packaged frontend policy is static while provider origins
+  are user-configurable. V1 therefore declares `connect-src https:` plus
+  loopback HTTP for local providers and still depends on provider CORS. This is
+  a documented security tradeoff, not a claim that the Native SDK navigation
+  allowlist controls `fetch`. A native HTTP bridge is the path to a narrower
+  WebView policy.
 
 ## 7. Data model
 
-- Provider config: `<data>/ai.json` (base_url, model, search flags — no key). Key: Keychain `ai:<base_url>`.
+- Provider config: `<data>/ai.json` (adapter, base URL, model, and explicit
+  capability choices — no key). Key: Keychain `ai:<base_url>`.
 - Threads are ephemeral (per session). Runs → audit history (spec 15).
 
 ## 8. Security
 
-- The approval gate is the security model: nothing executes without Run; destructive flag is visible; sudo commands run as the SSH user (sudo prompts don't work over non-PTY exec — flagged in UI: "command needs sudo — use a sudo-enabled session").
-- Prompts may contain server context — sent only to the configured provider; documented in the privacy note.
-- Key never leaves the Keychain; provider requests carry it only in memory.
+- The approval gate is the security model: nothing executes without Run and
+  the destructive flag is visible. Commands run as the SSH user. Oars does not
+  send a sudo password through an exec channel; a command that needs sudo can
+  use only pre-approved non-interactive sudo authority or must move to the
+  interactive terminal.
+- Before the first request to a provider, show which server context fields will
+  leave the machine and let the user remove log content. Send only the minimum
+  selected context.
+- The key persists only in Keychain. A request reads it into frontend memory
+  and sends it to the configured provider in the authorization header. Do not
+  say that it "never leaves the Keychain."
+- Model output and destructive heuristics are advisory. The approval card is
+  the execution boundary, and the exact edited command is shown again at Run.
 
 ## 9. Performance
 
@@ -90,9 +123,12 @@ You write Linux commands. Respond ONLY with JSON:
 ## 10. Edge cases
 
 - Provider rate-limited/401 → inline error with key-check hint.
-- Model returns non-JSON → retry once with "respond with JSON only"; fallback: parse code block from markdown.
+- Model returns invalid or schema-breaking output → show a parse error and
+  offer an explicit retry. Never scrape a code block and treat it as approved
+  structured output.
 - Command is a pipeline with heredocs → exec via `bash -c '<cmd>'` with escaping (same as spec 06).
-- Ambiguous ask → model returns `{"command":null,"explanation":"need more info","question":"…"}` → UI prompts for clarification.
+- Ambiguous ask → model returns the `kind:"question"` variant → UI prompts for
+  clarification and never renders a Run button.
 - User edits command into something destructive → heuristic re-flags on the edited card.
 
 ## 11. Testing
@@ -106,13 +142,14 @@ You write Linux commands. Respond ONLY with JSON:
 - [ ] Full ask → approve → run → audit loop works with a real OpenAI-compatible endpoint.
 - [ ] Destructive heuristic flags the fixture list; edited commands re-flag.
 - [ ] Nothing executes without an explicit Run click (verified by audit log).
-- [ ] Keys live only in the Keychain; config JSON has no secrets.
+- [ ] Keys persist only in the Keychain; provider requests use an in-memory
+      copy and config JSON has no secrets.
 - [ ] Save-as-script produces a working script.
 
 ## 13. Research & References
 
 - **Chat Completions API** — verified against OpenAI's current API
-  reference (`https://platform.openai.com/docs/api-reference/chat/create`):
+  schema (`https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create`):
   - Endpoint `POST /chat/completions`; request: `model`, `messages[]`
     with roles `developer`/`system`/`user`/`assistant`/`tool`, `stream`
     (bool), `stream_options: {include_usage}` (final chunk carries
@@ -127,21 +164,28 @@ You write Linux commands. Respond ONLY with JSON:
     "progressive explanation render" maps directly to delta
     accumulation; SSE framing is the standard `data: …` line protocol
     with `data: [DONE]` terminator.
-  - **Note:** newer models prefer the `developer` role over `system`
-    (per the docs' own field descriptions); the spec's prompt contract
-    uses `system`, which remains compatible with all models that
-    accept `system` — keep `system` for maximum provider compatibility
-    since we support arbitrary OpenAI-compatible providers (e.g.
-    Ollama, vLLM, LM Studio all implement the same chat schema).
+  - The current API also supports `response_format` with `json_schema`, which
+    is preferred over prompt-only JSON for models that support it. OpenAI
+    recommends the Responses API for new OpenAI-only projects, but Oars keeps
+    Chat Completions as its cross-provider baseline and uses a provider
+    capability layer.
+  - OpenAI examples use the `developer` role. Compatible providers can differ,
+    so Oars selects `developer` or `system` from provider capability data
+    instead of assuming one role works everywhere.
+- **Compatibility boundary** — “OpenAI-compatible” is not one versioned
+  protocol with standard capability discovery. Oars treats Chat Completions as
+  a baseline route and records adapter capabilities explicitly. A successful
+  models-list request does not prove support for strict schemas, streaming, or
+  a particular instruction role.
 - **BYO-key architecture** — the client-side fetch design keeps the
   key in the frontend→provider path only (Keychain → memory); provider
   requests carry `Authorization: Bearer <key>` — the standard auth
   scheme for OpenAI-compatible endpoints (API reference, auth section).
   No proxy, no telemetry (per §2 non-goals).
-- **JSON output contract** — instructing JSON-out in the system prompt
-  is a documented, widely-used pattern; the fallback path (retry with
-  "respond with JSON only", then parse a fenced code block) covers the
-  model's known failure mode of wrapping JSON in markdown.
+- **JSON output contract** — the previous prompt-only contract and fenced-code
+  fallback did not provide a strong parse boundary. The current OpenAI schema
+  documents strict JSON Schema output. The spec now prefers that mode and
+  refuses invalid fallback output.
 - **Context bundle** — built from the monitor cache (spec 03 §5) and a
   light probe; the commands behind it are the verified ones from specs
   03/04 §13 (kernel /proc docs, coreutils, findutils).

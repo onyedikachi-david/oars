@@ -1,6 +1,6 @@
 # Spec 14 — Server Groups & Fleet Views
 
-**Status:** 📋 · **Depends on:** 01, 03 · **Spec owner:** frontend (grouping), core (group store)
+**Status:** 📋 · **Depends on:** 01, 03 · **Spec owner:** frontend (grouping), core (server store)
 
 ## 1. Overview
 
@@ -11,7 +11,8 @@ group-level status rollup and a monitoring grid across the whole group —
 ## 2. Goals / non-goals
 
 **Goals**
-- Groups: named folders for servers (nested one level), plus free-form tags.
+- Groups: named folders nested one level, plus free-form tags. A server has one
+  folder path and any number of tags.
 - Sidebar: groups collapsible, group headers show connected/error counts.
 - Group view: status rollup + mini monitoring grid (CPU/mem/disk per server).
 - Group-scoped actions: open all, run script (broadcast preselected), scan logs across the group.
@@ -38,22 +39,31 @@ group-level status rollup and a monitoring grid across the whole group —
 - Card click → open server tab; group toolbar: "Run script…" (opens broadcast with the group preselected), "Scan logs" (per-server log scan summaries), "Refresh".
 
 ### 4.3 Tags
-- Server modal gets a tags input (comma-separated); tag chips in the sidebar footer filter the list (click chip → filter).
+- The server modal has a tags input with normalized, deduplicated values. Tag
+  chips in the sidebar filter the server list. Tags persist in the canonical
+  `Server.tags` field, so export/import and every app window see the same data.
 
 ## 5. Bridge API
 
-### `oars.groups.list` → `{ok, groups:[{id, name, server_ids:[]}]}`
-### `oars.groups.save` `{group}` → `{ok}` (create/rename/move membership — membership stored as server_ids array; Server.group field kept as the source of truth in v1, groups derived from it; choose one: **v1 = derive from Server.group string**, so groups.list is client-side. Bridge only needed when groups get metadata — defer.)
-- **Decision (v1):** `Server.group` (single string, already in the model) is the source of truth. `oars.groups.*` is deferred until groups need descriptions/order; the frontend derives group headers + counts from `servers.list`. Tags live client-side in localStorage (v1), promoted to the model if they prove useful.
+No new bridge API in v1. `Server.group` and `Server.tags` are the source of
+truth, and the frontend derives group headers, counts, and tag filters from
+`servers.list`. A one-level nested group is stored as `parent/child`; each
+segment cannot contain `/`, and the full value can contain at most one `/`.
+Rename or delete updates every matching server
+profile through `oars.servers.save` and reports partial failures. Add
+`oars.groups.*` only when groups gain independent metadata.
 ### Group-scoped actions reuse existing commands (broadcast `server_ids[]` from the group membership; monitor poll per server).
 
 ## 6. Zig core design
 
-- Only the existing `group` field on `Server` (spec 01). No new module in v1.
+- The existing Server store gains `tags: []const []const u8` beside `group`.
+  Validation trims tags, rejects empty or control-character values, compares
+  tags case-insensitively for deduplication, and preserves the user's casing.
+  No new module is needed in v1.
 
 ## 7. Data model
 
-- `servers.json` gains `group` values; no new files. Tags in localStorage until promoted.
+- `servers.json` stores `group` and `tags`; no new files.
 
 ## 8. Security
 
@@ -66,17 +76,24 @@ group-level status rollup and a monitoring grid across the whole group —
 ## 10. Edge cases
 
 - Group deleted with servers in it → servers become Ungrouped (never deleted).
-- Server with group string but group filtered away → treated as Ungrouped; group resurrected on next list (derived — no orphan state).
-- Same server in two "groups" via tags → groups are folders (exclusive), tags are inclusive; UI makes the distinction in tooltips.
+- A saved non-empty group path always produces its group header. There is no
+  independent group record that can become orphaned, and an empty group does
+  not persist in v1.
+- A server has one exclusive group path and any number of inclusive tags. The
+  UI names these concepts directly and never presents a tag as a folder.
 
 ## 11. Testing
 
-- Manual: drag-move, collapsible state persistence (localStorage), group view grid, broadcast preselection.
-- Unit: derived grouping logic (client-side) — group counts, ungrouped fallback.
+- Manual: drag-move, collapsible state persistence, tag editing/filtering,
+  group view grid, and broadcast preselection.
+- Unit: derived grouping logic, one-level path validation, tag normalization and
+  deduplication, group counts, and ungrouped fallback.
 
 ## 12. Acceptance criteria
 
 - [ ] Group assignment persists and survives restart (via Server.group).
+- [ ] Tags persist in `Server.tags`, survive restart and export/import, and
+      filter the sidebar without becoming a second source of truth.
 - [ ] Group header shows live connected/error counts.
 - [ ] Group view renders monitor grid at ≤ 5 s staleness.
 - [ ] Deleting a group never deletes servers.
@@ -92,9 +109,9 @@ group-level status rollup and a monitoring grid across the whole group —
   (`MonitorCache`, probe-on-demand with refresh-if-stale, §6) so a
   group view polls the same cached snapshots; 5 s refresh is a UI
   cadence, not a probe cadence (idle cost bounded per spec 03 §9).
-- **Folder-vs-tag semantics** — folders are exclusive, tags inclusive:
-  a common UX convention in fleet tools; no external standard to cite
-  (product decision recorded here so the UI copy stays consistent).
+- **Tags persistence correction** — the earlier localStorage plan created a
+  second source of truth that export/import could not carry. The planned tags
+  feature remains, but `Server.tags` is now canonical.
 - **Drag-and-drop persistence** — client-side only until the group
   store exists; moving a server between groups writes
   `oars.servers.save` (spec 01 §5) with the new `group` value.
