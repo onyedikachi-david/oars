@@ -67,6 +67,15 @@ Linus Torvalds would judge a kernel patch.** Concretely:
   `.gitignore` written (with user approval). Key auth, trust flow and the
   interactive shell were verified live against a real server on the same
   date (§11); password auth and exec still need their container pass.
+- **Stage 1 truth gaps — landed 2026-08-03 (session 2):** real PTY resize
+  (verified with `stty size` in the container), per-tab poll cursors
+  (non-destructive stream reads), `SHA256:` base64 fingerprints with hex
+  migration, idempotent connect, cancelable DNS + stop-aware loops,
+  owner-only store permissions, corrupt-file quarantine, save semantics,
+  tags/via validation. The dockerized sshd container pass is green
+  (`scripts/dev-sshd.sh` + `scripts/integration-test.sh`). The one
+  documented limit: the std Io has no non-blocking TCP connect, so a
+  dead-IP connect is kernel-bounded (~75 s on macOS).
 - **Implementation order (ROADMAP §4):** Stage 2 (specs 03 + 04) →
   Stage 3 (spec 12) → Stage 4 (spec 05) → Stage 5 (specs 06 + 07) →
   Stage 6 (specs 09 + 08 + 10) → Stage 7 (spec 11) → Stage 8 (specs 13,
@@ -383,10 +392,68 @@ key): handshake, host-key trust, decrypt, sign, shell — all green.
 
 ### 11.5 Still open for Stage 1 sign-off
 
-- Password-auth path untested live (no password server at hand) — cover
-  it in the dockerized sshd pass with exec (spec 02 §11).
+- ~~Password-auth path untested live~~ **Done 2026-08-03 (session 2):** the
+  dockerized sshd pass covers password auth, key auth, trust, shell
+  round-trip, exec exit codes, `stty size` resize verification, duplicate
+  connect, changed host keys, and prompt disconnect (spec 02 §11).
 - Reconnect-after-error now works via frontend disconnect-first; a
   backend-side recycle of errored sessions would be belt-and-braces but
   is not required.
-- `docs/specs/02-terminal.md` status line predates this session's live
-  verification — update when the container pass lands.
+- The remaining documented limit is the kernel-bounded TCP connect
+  (std Io TODO); see spec 02 §13.
+
+---
+
+## 12. Session handover — 2026-08-03 (session 2): Stage 1 truth gaps + container pass
+
+### 12.1 What landed (commits `051a917`, and the spec 02 commit)
+
+**Spec 01 backend** (`051a917`): `tags` + `via_server_id` model fields with
+save-time chain validation (existing refs, no self-links, depth ≤ 3, no
+cycles); save semantics (created_at preserved, fingerprint kept only while
+host+port are unchanged, trailing-slash host and port 0 rejected, tags
+normalized); 0600 store permissions with permissive-file tightening; corrupt
+store quarantine to `servers.json.corrupt-<ts>` with `recovery_error` in
+`oars.servers.list`. Fixed two pre-existing leaks (upsert copies,
+loadParsed's eager empty parse).
+
+**Spec 02 backend:** per-tab poll cursors (`oars.ssh.poll` takes
+`cursors:[{channel,cursor}]`; `Stream.readAt`/`view` are non-destructive);
+exec channels survive EOF until drained (bounded to 64 completed); real PTY
+resize with failure surfacing; `SHA256:` base64 fingerprints with legacy-hex
+compare + migration; idempotent connect returning live status;
+`oars.ssh.closeChannel`; libssh2 global init once (thread-safe guard);
+cancelable DNS via `Io.concurrent` future + stop-aware deadline loops;
+Store gained a mutex (the worker now writes during fingerprint migration).
+
+### 12.2 New pitfalls (extend §7)
+
+17. **`ArenaAllocator.allocator()` captures the arena's address.** Returning a
+    struct that embeds an arena (or a pointer into it) by value from an init
+    function leaves dangling pointers (poisoned allocator vtable → segfault
+    in `rawAlloc`). Init in place: `var app: T = undefined; try app.init();`.
+18. **`std.json` static parse of `std.json.ObjectMap` fields is unsupported**
+    (its `[*]u8` metadata trips `@compileError`). Use plain structs/arrays
+    for payload fields.
+19. **`std.once` does not exist in 0.16.** Implement once-guards with an
+    atomic + spinlock. `libssh2_init`'s counter is not thread-safe, so a
+    once-guard is required before worker threads start.
+20. **Discarding an error union needs `catch {}`, not `_ =`** (0.16
+    "error union is discarded").
+21. **`std.Io.net.IpAddress.resolve` handles only IP literals** — hostnames
+    fail with `ParseFailed`. Hostname resolution must go through
+    `HostName.lookup` (async, io-thread-backed, cancelable via
+    `Io.concurrent` futures). This was a real bug: hostname servers could
+    never connect.
+22. **There is no non-blocking/timeout TCP connect in std.Io**
+    (`netConnectIpPosix` panics on `options.timeout`). Dead-IP connects are
+    kernel-bounded; document rather than fight it.
+23. **Exec output was lost on EOF:** the old eof branch freed exec streams
+    immediately (its comment claimed otherwise), racing the frontend's
+    drain. Entries now persist until teardown/eviction.
+
+### 12.3 Next
+
+Spec 03 (Infra Monitoring) backend: `/proc/stat` CPU delta utilization,
+probe-on-demand cache, itemized cleanup plans, drop-caches diagnostic,
+audit store (`audit.jsonl`, spec 15 shape).

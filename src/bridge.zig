@@ -12,7 +12,7 @@ const sessions = @import("sessions.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 10;
+const handler_count = 11;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -31,6 +31,7 @@ pub const Context = struct {
             .{ .name = "oars.ssh.disconnect", .context = self, .invoke_fn = handleSshDisconnect },
             .{ .name = "oars.ssh.input", .context = self, .invoke_fn = handleSshInput },
             .{ .name = "oars.ssh.exec", .context = self, .invoke_fn = handleSshExec },
+            .{ .name = "oars.ssh.closeChannel", .context = self, .invoke_fn = handleSshCloseChannel },
             .{ .name = "oars.ssh.resize", .context = self, .invoke_fn = handleSshResize },
             .{ .name = "oars.ssh.trust", .context = self, .invoke_fn = handleSshTrust },
             .{ .name = "oars.ssh.poll", .context = self, .invoke_fn = handleSshPoll },
@@ -43,6 +44,7 @@ pub const Context = struct {
             .{ .name = "oars.ssh.disconnect", .origins = &allowed_origins },
             .{ .name = "oars.ssh.input", .origins = &allowed_origins },
             .{ .name = "oars.ssh.exec", .origins = &allowed_origins },
+            .{ .name = "oars.ssh.closeChannel", .origins = &allowed_origins },
             .{ .name = "oars.ssh.resize", .origins = &allowed_origins },
             .{ .name = "oars.ssh.trust", .origins = &allowed_origins },
             .{ .name = "oars.ssh.poll", .origins = &allowed_origins },
@@ -340,10 +342,17 @@ fn handleSshConnect(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
     }
 
     _ = self.manager.connect(server, payload.password, payload.passphrase) catch |err| {
-        return respondError(output, switch (err) {
-            error.AlreadyConnected => "already connected",
-            else => "failed to start connection",
-        });
+        if (err == error.AlreadyConnected) {
+            // Idempotent connect (spec 02 §5): success carrying the live
+            // session status, never a text-coupled error.
+            if (self.manager.get(server.id)) |existing| {
+                var writer = std.Io.Writer.fixed(output);
+                writer.print("{{\"ok\":true,\"status\":\"{s}\"}}", .{existing.status.load(.acquire).jsonName()}) catch return output[0..0];
+                return writer.buffered();
+            }
+            return ok_json;
+        }
+        return respondError(output, "failed to start connection");
     };
     return ok_json;
 }
@@ -406,6 +415,29 @@ fn handleSshExec(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
     return writer.buffered();
 }
 
+const CloseChannelPayload = struct {
+    server_id: []const u8,
+    channel: u32,
+};
+
+/// Explicit channel close (spec 04 follow channels; spec 02 §5): the worker
+/// sends EOF, closes the raw channel, and frees the entry.
+fn handleSshCloseChannel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(CloseChannelPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    self.manager.closeChannel(parsed.value.server_id, parsed.value.channel) catch |err| {
+        return respondError(output, switch (err) {
+            error.NoSession => "not connected",
+            error.InvalidChannel => "cannot close the shell channel",
+            else => "close failed",
+        });
+    };
+    return ok_json;
+}
+
 const ResizePayload = struct {
     server_id: []const u8,
     cols: u16,
@@ -450,7 +482,15 @@ fn handleSshTrust(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
 
 const PollPayload = struct {
     server_id: []const u8,
+    /// Per-channel absolute cursors for the requesting tab (spec 02 §5),
+    /// e.g. [{"channel":0,"cursor":1200}].
+    cursors: ?[]const PollCursor = null,
     rewind: bool = false,
+};
+
+const PollCursor = struct {
+    channel: u32,
+    cursor: u64,
 };
 
 const poll_data_budget: usize = 384 * 1024;
@@ -464,25 +504,37 @@ fn handleSshPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
     defer parsed.deinit();
 
     const info = self.manager.sessionSnapshot(parsed.value.server_id) catch {
-        return "{\"ok\":true,\"status\":\"closed\",\"channels\":[]}";
+        return "{\"ok\":true,\"status\":\"closed\",\"error\":\"\",\"trust\":{\"pending\":false},\"channels\":[]}";
     };
 
-    // On rewind, reset every stream cursor so a freshly opened terminal
-    // replays the session's existing output.
-    if (parsed.value.rewind) self.manager.rewindAll(parsed.value.server_id) catch {};
+    // The requesting tab's cursors: channel id -> absolute position.
+    var cursors: std.ArrayList(sessions.Cursor) = .empty;
+    defer cursors.deinit(self.allocator);
+    if (parsed.value.cursors) |incoming| {
+        for (incoming) |c| {
+            cursors.append(self.allocator, .{ .id = c.channel, .pos = c.cursor }) catch continue;
+        }
+    }
 
-    const infos = self.manager.channelInfos(parsed.value.server_id) catch {
-        return "{\"ok\":true,\"status\":\"closed\",\"channels\":[]}";
+    const polls = self.manager.pollChannels(
+        parsed.value.server_id,
+        cursors.items,
+        parsed.value.rewind,
+        poll_data_budget,
+        poll_channel_budget,
+    ) catch {
+        return "{\"ok\":true,\"status\":\"closed\",\"error\":\"\",\"trust\":{\"pending\":false},\"channels\":[]}";
     };
-    defer self.allocator.free(infos);
+    defer {
+        for (polls) |*p| p.deinit(self.allocator);
+        self.allocator.free(polls);
+    }
 
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":true,\"status\":") catch return output[0..0];
     writeJsonString(&writer, info.status.jsonName()) catch return output[0..0];
-    if (info.status == .@"error") {
-        writer.writeAll(",\"error\":") catch return output[0..0];
-        writeJsonString(&writer, info.@"error") catch return output[0..0];
-    }
+    writer.writeAll(",\"error\":") catch return output[0..0];
+    writeJsonString(&writer, info.@"error") catch return output[0..0];
     writer.writeAll(",\"trust\":{") catch return output[0..0];
     if (info.trust_pending) {
         writer.writeAll("\"pending\":true,\"fingerprint\":") catch return output[0..0];
@@ -492,10 +544,8 @@ fn handleSshPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
     }
     writer.writeAll("},\"channels\":[") catch return output[0..0];
 
-    var data_budget = poll_data_budget;
     var first = true;
-    var data_buf: [32 * 1024]u8 = undefined;
-    for (infos) |ch| {
+    for (polls) |ch| {
         if (!first) writer.writeAll(",") catch return output[0..0];
         first = false;
         writer.print("{{\"id\":{d},\"kind\":", .{ch.id}) catch return output[0..0];
@@ -503,7 +553,7 @@ fn handleSshPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
         writer.writeAll(",\"command\":") catch return output[0..0];
         writeJsonString(&writer, ch.command) catch return output[0..0];
         writer.print(",\"cursor\":{d},\"dropped\":{d},\"pending\":{d},\"eof\":{s},\"exit\":", .{
-            ch.cursor, ch.dropped, ch.pending, if (ch.eof) "true" else "false",
+            ch.cursor, ch.gap, ch.pending, if (ch.eof) "true" else "false",
         }) catch return output[0..0];
         if (ch.exit_status) |status| {
             writer.print("{d}", .{status}) catch return output[0..0];
@@ -511,24 +561,8 @@ fn handleSshPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
             writer.writeAll("null") catch return output[0..0];
         }
         writer.writeAll(",\"data\":") catch return output[0..0];
-
-        // Read available bytes up to the per-channel and total budgets.
-        const budget = @min(poll_channel_budget, data_budget);
-        if (budget > 0 and ch.pending > 0) {
-            var read_total: usize = 0;
-            while (read_total < budget) {
-                const chunk = @min(data_buf.len, budget - read_total);
-                const n = self.manager.readChannel(parsed.value.server_id, ch.id, data_buf[0..chunk]) catch break;
-                if (n == 0) break;
-                read_total += n;
-            }
-            writeJsonString(&writer, data_buf[0..read_total]) catch return output[0..0];
-            data_budget = data_budget - @min(read_total, data_budget);
-        } else {
-            writer.writeAll("\"\"") catch return output[0..0];
-        }
+        writeJsonString(&writer, ch.data) catch return output[0..0];
         writer.writeAll("}") catch return output[0..0];
-        if (data_budget == 0) break;
     }
     writer.writeAll("]}") catch return output[0..0];
     return writer.buffered();

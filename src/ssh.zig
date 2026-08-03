@@ -24,6 +24,25 @@ const poll_interval_ms = 10;
 const handshake_timeout_ms = 15_000;
 const auth_timeout_ms = 20_000;
 
+/// Process-wide libssh2 init. libssh2's own counter is not thread-safe
+/// (global.c increments it without a lock), so it must run once before any
+/// worker thread can touch the library (spec 02 §6).
+var init_global_done: std.atomic.Value(bool) = .init(false);
+var init_global_mutex: std.atomic.Mutex = .unlocked;
+
+fn lockSpin(m: *std.atomic.Mutex) void {
+    while (!m.tryLock()) std.atomic.spinLoopHint();
+}
+
+pub fn initGlobal() void {
+    if (init_global_done.load(.acquire)) return;
+    lockSpin(&init_global_mutex);
+    defer init_global_mutex.unlock();
+    if (init_global_done.load(.acquire)) return;
+    _ = c.libssh2_init(0);
+    init_global_done.store(true, .release);
+}
+
 fn isEagain(rc: c_int) bool {
     return rc == c.LIBSSH2_ERROR_EAGAIN;
 }
@@ -54,18 +73,85 @@ pub const Session = struct {
     socket: std.posix.fd_t,
     socket_open: bool = false,
     session_open: bool = false,
+    /// Optional stop signal: checked by every deadline loop so a disconnect
+    /// stays responsive while DNS, handshake, or auth is in progress.
+    stop_fn: ?*const fn (?*anyopaque) bool = null,
+    stop_ctx: ?*anyopaque = null,
+    /// The in-flight cancelable DNS lookup, published so a disconnect on
+    /// another thread can cancel it (see connect).
+    dns_future: std.atomic.Value(?*std.Io.Future(anyerror!void)) = .init(null),
 
     pub fn init(allocator: std.mem.Allocator) Error!Session {
-        if (c.libssh2_init(0) != 0) return error.Protocol;
         return .{ .allocator = allocator, .raw = undefined, .socket = undefined };
     }
 
-    /// Resolves `host`, connects the TCP socket and runs the transport
-    /// handshake with a deadline. Blocking connect is acceptable here
-    /// (worker thread); the handshake itself is non-blocking. On failure
-    /// the caller must still call `disconnect` to release partial state.
+    pub fn setStop(self: *Session, f: ?*const fn (?*anyopaque) bool, ctx: ?*anyopaque) void {
+        self.stop_fn = f;
+        self.stop_ctx = ctx;
+    }
+
+    fn checkStop(self: *const Session) Error!void {
+        if (self.stop_fn) |f| if (f(self.stop_ctx)) return error.Canceled;
+    }
+
+    /// Cancels the in-flight DNS lookup from another thread (called by
+    /// disconnect before joining the worker).
+    pub fn cancelConnect(self: *Session, io: std.Io) void {
+        if (self.dns_future.load(.acquire)) |future| future.cancel(io) catch {};
+    }
+
+    /// Resolves `host` to an address. Literal IPs parse directly; hostnames
+    /// are looked up on the io's thread pool as a cancelable future so a
+    /// disconnect never waits on a slow resolver.
+    fn resolveAddress(self: *Session, io: std.Io, host: []const u8, port: u16) Error!std.Io.net.IpAddress {
+        if (std.Io.net.IpAddress.parse(host, port)) |addr| return addr else |_| {}
+
+        const name = std.Io.net.HostName.init(host) catch return error.ConnectionFailed;
+        var queue_buf: [8]std.Io.net.HostName.LookupResult = undefined;
+        var queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&queue_buf);
+
+        const Lookup = struct {
+            name: std.Io.net.HostName,
+            io: std.Io,
+            queue: *std.Io.Queue(std.Io.net.HostName.LookupResult),
+            port: u16,
+
+            fn run(l: *const @This()) anyerror!void {
+                try std.Io.net.HostName.lookup(l.name, l.io, l.queue, .{ .port = l.port });
+            }
+        };
+        var lookup = Lookup{ .name = name, .io = io, .queue = &queue, .port = port };
+        var future = std.Io.concurrent(io, Lookup.run, .{&lookup}) catch return error.ConnectionFailed;
+        self.dns_future.store(&future, .release);
+        defer self.dns_future.store(null, .release);
+
+        // Close the cancel window: if a disconnect raced ahead of the store
+        // above, the stop signal is already set — cancel and leave now.
+        self.checkStop() catch {
+            future.cancel(io) catch {};
+            return error.Canceled;
+        };
+        const result = future.await(io);
+        if (result) |_| {} else |_| return error.ConnectionFailed;
+
+        var results: [8]std.Io.net.HostName.LookupResult = undefined;
+        const n = queue.get(io, &results, 0) catch 0;
+        for (results[0..n]) |r| {
+            switch (r) {
+                .address => |addr| return addr,
+                else => {},
+            }
+        }
+        return error.ConnectionFailed;
+    }
+
+    /// Connects the TCP socket and runs the transport handshake with a
+    /// deadline. Blocking connect is acceptable here (worker thread); the
+    /// handshake itself is non-blocking. On failure the caller must still
+    /// call `disconnect` to release partial state.
     pub fn connect(self: *Session, io: std.Io, host: []const u8, port: u16) Error!void {
-        const addr = std.Io.net.IpAddress.resolve(io, host, port) catch return error.ConnectionFailed;
+        const addr = try self.resolveAddress(io, host, port);
+        self.checkStop() catch return error.Canceled;
         const stream = std.Io.net.IpAddress.connect(&addr, io, .{
             .mode = .stream,
             .protocol = .tcp,
@@ -88,11 +174,14 @@ pub const Session = struct {
                 return error.Protocol;
             }
             try checkDeadline(io, deadline);
+            try self.checkStop();
             try sleep(io);
         }
     }
 
     /// SHA-256 fingerprint of the server host key, hex-encoded (64 chars).
+    /// Legacy format: kept for comparing (and migrating) pre-2026 records;
+    /// new records use hostKeyFingerprint.
     pub fn hostKeySha256Hex(self: *Session, out: []u8) Error![]const u8 {
         const hash = c.libssh2_hostkey_hash(self.raw, c.LIBSSH2_HOSTKEY_HASH_SHA256);
         if (hash == null) return error.Protocol;
@@ -104,6 +193,24 @@ pub const Session = struct {
             out[i * 2 + 1] = hex[bytes[i] & 0xf];
         }
         return out[0..64];
+    }
+
+    /// Canonical OpenSSH fingerprint: `SHA256:` + unpadded base64 of the
+    /// SHA-256 host key hash (spec 02 §4.2). `out` must hold 50 bytes.
+    pub fn hostKeyFingerprint(self: *Session, out: []u8) Error![]const u8 {
+        const hash = c.libssh2_hostkey_hash(self.raw, c.LIBSSH2_HOSTKEY_HASH_SHA256);
+        if (hash == null) return error.Protocol;
+        return fingerprintFromHash(hash[0..32].*, out);
+    }
+
+    /// Pure encoding helper (unit-testable): `SHA256:` + unpadded base64.
+    pub fn fingerprintFromHash(hash: [32]u8, out: []u8) []const u8 {
+        const prefix = "SHA256:";
+        const encoded = std.base64.standard_no_pad.Encoder.calcSize(32);
+        const total = prefix.len + encoded;
+        @memcpy(out[0..prefix.len], prefix);
+        _ = std.base64.standard_no_pad.Encoder.encode(out[prefix.len..total], &hash);
+        return out[0..total];
     }
 
     pub fn authPassword(self: *Session, io: std.Io, user: []const u8, password: []const u8) Error!void {
@@ -120,6 +227,7 @@ pub const Session = struct {
             if (rc == 0) return;
             if (isEagain(rc)) {
                 try checkDeadline(io, deadline);
+                try self.checkStop();
                 try sleep(io);
                 continue;
             }
@@ -165,6 +273,7 @@ pub const Session = struct {
             if (rc == 0) return;
             if (isEagain(rc)) {
                 try checkDeadline(io, deadline);
+                try self.checkStop();
                 try sleep(io);
                 continue;
             }
@@ -198,6 +307,7 @@ pub const Session = struct {
             if (rc == 0) return;
             if (isEagain(rc)) {
                 try checkDeadline(io, deadline);
+                try self.checkStop();
                 try sleep(io);
                 continue;
             }
@@ -262,12 +372,18 @@ pub const Session = struct {
             );
             if (raw != null) {
                 const ch = self.allocator.create(Channel) catch return error.NoChannel;
-                ch.* = .{ .raw = raw.?, .allocator = self.allocator };
+                ch.* = .{
+                    .raw = raw.?,
+                    .allocator = self.allocator,
+                    .stop_fn = self.stop_fn,
+                    .stop_ctx = self.stop_ctx,
+                };
                 return ch;
             }
             const rc = c.libssh2_session_last_errno(self.raw);
             if (!isEagain(rc)) return error.NoChannel;
             try checkDeadline(io, deadline);
+            try self.checkStop();
             try sleep(io);
         }
     }
@@ -307,6 +423,14 @@ pub const Session = struct {
 pub const Channel = struct {
     raw: *c.LIBSSH2_CHANNEL,
     allocator: std.mem.Allocator,
+    /// Stop signal inherited from the owning session so channel deadline
+    /// loops stay disconnect-responsive too.
+    stop_fn: ?*const fn (?*anyopaque) bool = null,
+    stop_ctx: ?*anyopaque = null,
+
+    fn checkStop(self: *const Channel) Error!void {
+        if (self.stop_fn) |f| if (f(self.stop_ctx)) return error.Canceled;
+    }
 
     pub fn requestPty(self: *Channel, io: std.Io, cols: c_int, rows: c_int) Error!void {
         const deadline = deadlineFromNow(io, handshake_timeout_ms);
@@ -325,6 +449,7 @@ pub const Channel = struct {
             if (rc == 0) return;
             if (isEagain(rc)) {
                 try checkDeadline(io, deadline);
+                try self.checkStop();
                 try sleep(io);
                 continue;
             }
@@ -345,6 +470,7 @@ pub const Channel = struct {
             if (rc == 0) return;
             if (isEagain(rc)) {
                 try checkDeadline(io, deadline);
+                try self.checkStop();
                 try sleep(io);
                 continue;
             }
@@ -352,11 +478,21 @@ pub const Channel = struct {
         }
     }
 
+    /// Requests a new PTY size on the live channel (spec 02 §5: resize is
+    /// implemented and reports failure — it is not a no-op).
     pub fn resizePty(self: *Channel, io: std.Io, cols: c_int, rows: c_int) Error!void {
-        _ = self;
-        _ = io;
-        _ = cols;
-        _ = rows;
+        const deadline = deadlineFromNow(io, handshake_timeout_ms);
+        while (true) {
+            const rc = c.libssh2_channel_request_pty_size_ex(self.raw, cols, rows, 0, 0);
+            if (rc == 0) return;
+            if (isEagain(rc)) {
+                try checkDeadline(io, deadline);
+                try self.checkStop();
+                try sleep(io);
+                continue;
+            }
+            return error.Protocol;
+        }
     }
 
     pub fn shell(self: *Channel, io: std.Io) Error!void {
@@ -369,6 +505,7 @@ pub const Channel = struct {
             if (rc == 0) return;
             if (isEagain(rc)) {
                 try checkDeadline(io, deadline);
+                try self.checkStop();
                 try sleep(io);
                 continue;
             }
@@ -384,6 +521,7 @@ pub const Channel = struct {
             if (rc == 0) return;
             if (isEagain(rc)) {
                 try checkDeadline(io, deadline);
+                try self.checkStop();
                 try sleep(io);
                 continue;
             }
@@ -446,3 +584,23 @@ pub const Channel = struct {
         _ = io;
     }
 };
+
+// --- tests ---------------------------------------------------------------
+
+test "fingerprint is SHA256 base64 without padding" {
+    // SHA-256 of the empty string, encoded with the standard unpadded
+    // base64 alphabet (the OpenSSH canonical form).
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("", &digest, .{});
+    var buf: [64]u8 = undefined;
+    const fp = Session.fingerprintFromHash(digest, &buf);
+    try std.testing.expectEqualStrings("SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU", fp);
+}
+
+test "fingerprint buffer fits the trust dialog budget" {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("oars", &digest, .{});
+    var buf: [64]u8 = undefined;
+    const fp = Session.fingerprintFromHash(digest, &buf);
+    try std.testing.expectEqual(@as(usize, 50), fp.len);
+}

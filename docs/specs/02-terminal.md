@@ -1,8 +1,10 @@
 # Spec 02 — Terminal (SSH)
 
-**Status:** Partial (shell, exec, trust, single-reader polling, and Keychain
-auth exist; independent poll cursors, PTY resize, and bounded cancellation are
-not yet implemented) · **Depends on:** 01 · **Spec owner:** core
+**Status:** Partial (shell, exec, trust, Keychain auth, per-tab poll cursors,
+PTY resize, canonical fingerprints, idempotent connect, and stop-aware
+cancellation landed 2026-08-03; the container pass is green — see §11; the
+kernel-bounded TCP connect remains a documented std limit; exec/trust UI and
+mirrored-tab frontend verification pending) · **Depends on:** 01 · **Spec owner:** core
 
 ## 1. Overview
 
@@ -65,17 +67,19 @@ keystrokes back.
 ## 5. Bridge API
 
 ### `oars.ssh.connect` `{server_id, password?, passphrase?}` → `{ok}`
-- Starts a worker thread; connection proceeds asynchronously. The target API is
-  idempotent and returns the existing session status when a connection already
-  exists. The current handler instead returns a user-facing error and the
-  frontend special-cases its text; this remains a compatibility gap.
+- Starts a worker thread; connection proceeds asynchronously. Idempotent:
+  when a connection already exists the handler returns `{ok:true, status}`
+  with the live session status instead of an error.
 
 ### `oars.ssh.disconnect` `{server_id}` → `{ok}`
 
-The current handler joins the worker synchronously. It has no proven 100 ms
-bound because DNS and TCP connect are not cancellation-aware. Before this API
-is complete, disconnect must request stop and keep the UI responsive while
-worker cleanup finishes.
+Requests stop, cancels any in-flight DNS lookup, and joins the worker. DNS,
+handshake, auth, and channel ops are stop-aware (the worker checks the stop
+signal between every phase and inside every deadline loop), so a disconnect
+returns promptly while those are in progress. The one remaining unbounded
+phase is the TCP connect itself: the std Io has no non-blocking connect
+(`netConnectIpPosix` panics on `options.timeout`), so connecting to a dead IP
+is bounded only by the kernel SYN timeout (~75 s on macOS) — see §13.
 
 ### `oars.ssh.poll` `{server_id, cursors?, rewind?}` → poll result
 ```json
@@ -85,22 +89,31 @@ worker cleanup finishes.
  ]}
 ```
 - Each tab keeps the last returned absolute `cursor` for each channel and sends
-  those values in `cursors` on its next poll. The core does not advance a
-  session-wide read cursor.
-- `data` contains bytes after the requesting tab's cursor. `rewind:true` ignores
-  supplied cursors and replays each retained channel from its buffer start for
-  a fresh or explicitly rewound tab.
+  those values in `cursors` on its next poll
+  (`[{"channel":0,"cursor":1200}, …]`). Reads are non-destructive: the core
+  never advances a session-wide cursor, so mirrored tabs consume the same
+  retained bytes independently.
+- `data` contains bytes after the requesting tab's cursor, and the response
+  `cursor` is one past the bytes actually delivered (poll budgets may cut a
+  delta short; the next poll resumes there).
+- `rewind:true` ignores supplied cursors and replays each retained channel
+  from its buffer start for a fresh or explicitly rewound tab.
 - If a requested cursor precedes the retained buffer, polling starts at the
   buffer start and reports the number of bytes missed in `dropped` for that
   response.
+- `error` is always present (empty string unless the session is in the error
+  state).
 - Poll cadence: 80 ms. Budget: 384 KB data / poll, 256 KB / channel.
 
 ### `oars.ssh.input` `{server_id, data}` → `{ok}` (shell stdin)
 ### `oars.ssh.exec` `{server_id, command}` → `{ok, channel}` (channel id carries output)
+### `oars.ssh.closeChannel` `{server_id, channel}` → `{ok}`
+- Explicit close for follow channels (spec 04): the worker sends EOF, closes
+  the raw channel, and frees the entry. The shell channel (id 0) is rejected.
 ### `oars.ssh.resize` `{server_id, cols, rows}` → `{ok}`
-- Current gap: `Channel.resizePty` in `src/ssh.zig` is a no-op. The handler must
-  call `libssh2_channel_request_pty_size_ex` and report failure before resize is
-  considered implemented.
+- Implemented: the worker calls `libssh2_channel_request_pty_size_ex` on the
+  live shell channel and surfaces a failed resize as an explicit session
+  error (verified live with `stty size` — §11).
 ### `oars.ssh.trust` `{server_id, accept}` → `{ok}`
 
 ## 6. Zig core design
@@ -120,12 +133,17 @@ connecting → needs_trust → authenticating → ready → closed
 - Run loop: drain stdin queue → write channel; process ops (exec/resize/close); read every channel; keepalive every 30 s; 10 ms sleep.
 
 ### 6.2 Channel model
-- `ChannelEntry {id, kind (shell|exec), stream, raw, stdin_queue, eof_seen}`.
-- Exec channels: no PTY; on EOF capture `exit_status`, keep stream alive until drained, then free.
+- `ChannelEntry {id, kind (shell|exec), stream, raw, stdin_queue, eof_seen, raw_closed}`.
+- Exec channels: no PTY; on EOF capture `exit_status`, close and free the raw
+  channel, and keep the entry + stream alive so the frontend can drain the
+  output through polls. Completed execs are bounded (the 64 oldest are
+  retained; older ones are evicted) so a stopped frontend cannot accumulate
+  unbounded channel metadata. `closeChannel` frees an entry mid-stream.
 - One worker thread owns all libssh2 calls for a session. Calls that use the
   same `LIBSSH2_SESSION` must be serialized, including retries after
   `LIBSSH2_ERROR_EAGAIN`; bridge handlers only touch spin-locked buffers.
-  Process-wide `libssh2_init` runs once before worker threads start.
+  Process-wide `libssh2_init` runs once before worker threads start
+  (`ssh.initGlobal`, a thread-safe once-guard).
 
 ### 6.3 Streams (shared with main thread)
 - `Stream {data: ArrayList(u8), start_abs, end_abs, eof, exit_status, max_bytes=4MB}`.
@@ -135,10 +153,9 @@ connecting → needs_trust → authenticating → ready → closed
 - Overflow drops the oldest bytes and advances `start_abs`. A reader whose
   cursor is behind `start_abs` receives a per-response `dropped` count and
   continues from `start_abs`.
-- This is the target stream model. The current `Stream.readAvailable` advances
-  one shared cursor, so two current consumers would drain each other's deltas.
-  Mirrored tabs are not complete until that field is replaced by caller-supplied
-  cursors and the bridge tests in §11 pass.
+- Implemented: `Stream.readAt`/`Stream.view` replace the old single-reader
+  `readAvailable` cursor; `oars.ssh.poll` carries per-tab cursors (array form,
+  §5).
 
 ## 7. Data model & persistence
 
@@ -173,27 +190,45 @@ connecting → needs_trust → authenticating → ready → closed
 
 ## 11. Testing
 
-- Unit: Stream cursor/overflow (exists); status machine transitions via injected handlers where feasible.
-- Integration (dockerized sshd): full connect → trust → password auth → shell echo round-trip → exec `echo hi` exit 0 → exec `exit 3` exit 3 → resize → disconnect. Script: `scripts/dev-sshd.sh`.
-- Manual: typing latency, resize, overflow toast, reconnect.
+- Unit: Stream overflow/positions, non-destructive multi-reader semantics, and
+  per-consumer view math (`src/sessions.zig`); canonical fingerprint encoding
+  (`src/ssh.zig`); store + bridge suites (spec 01).
+- Integration (dockerized sshd, `scripts/dev-sshd.sh` + env-gated tests in
+  `src/integration.zig`, driven by `scripts/integration-test.sh`):
+  password auth → trust → shell echo round-trip → exec `echo hi` exit 0 →
+  exec `exit 3` exit 3 → resize verified with `stty size` in the shell →
+  duplicate-connect idempotence → disconnect; ed25519 key auth with
+  passphrase; changed host key rejected with both fingerprints; disconnect
+  during `needs_trust` returns promptly. **Container pass: green 2026-08-03.**
+- Manual (frontend): typing latency, overflow toast, mirrored tabs, reconnect.
 
 ## 12. Acceptance criteria
 
-- [ ] Interactive shell works end-to-end against a live sshd (key + password auth).
-- [ ] Host-key trust persists and detects changed keys.
-- [ ] Exec channels return correct exit codes and stream output.
-- [ ] Typing latency under load stays below 250 ms round trip.
-- [ ] No hangs: dead server surfaces an error within 20 s.
-- [ ] Resize changes the remote PTY size and is verified with `stty size`.
-- [ ] Disconnect remains responsive while DNS, TCP connect, handshake, or auth
-      is in progress.
-- [ ] Duplicate connect is an idempotent success and does not depend on matching
-      an error-message string in the frontend.
-- [ ] Two tabs for the same server share one SSH session, replay retained output
-      on the second tab, and then receive identical new output independently.
-- [ ] A slow mirrored tab reports its own dropped-byte gap after buffer overflow
-      without changing the output seen by another tab.
-- [ ] All existing tests pass (`zig build test`).
+- [x] Interactive shell works end-to-end against a live sshd (key + password
+      auth) — container pass 2026-08-03.
+- [x] Host-key trust persists and detects changed keys (old + new
+      fingerprints in the error; canonical `SHA256:` form stored).
+- [x] Exec channels return correct exit codes and stream output (channel
+      output survives EOF until drained).
+- [ ] Typing latency under load stays below 250 ms round trip — manual
+      measurement pending (frontend).
+- [ ] No hangs: dead server surfaces an error within 20 s — handshake/auth
+      deadlines exist (15 s/20 s) and are stop-aware; a live dead-server pass
+      needs a TCP-accepting non-SSH listener, not yet in the container.
+- [x] Resize changes the remote PTY size and is verified with `stty size`.
+- [x] Disconnect remains responsive while DNS, handshake, or auth is in
+      progress (cancelable DNS + stop-aware loops; verified for the trust
+      phase; the kernel-bounded TCP connect remains a documented std limit).
+- [x] Duplicate connect is an idempotent success carrying the live status.
+- [ ] Two tabs for the same server share one SSH session, replay retained
+      output on the second tab, and then receive identical new output
+      independently — backend contract implemented and unit-tested; the
+      frontend tab wiring is pending.
+- [ ] A slow mirrored tab reports its own dropped-byte gap after buffer
+      overflow without changing the output seen by another tab — unit-tested
+      at the stream level (`Stream.view`); frontend verification pending.
+- [x] All existing tests pass (`zig build test`) — 21 tests, container pass
+      green.
 
 ## 13. Research & References
 
@@ -223,6 +258,11 @@ connecting → needs_trust → authenticating → ready → closed
   OpenSSH displays base64 without padding after `SHA256:`. The target contract
   now requires the canonical form and a verified migration for saved hex
   values.
+  **Landed 2026-08-03:** `hostKeyFingerprint` emits `SHA256:` + unpadded
+  base64; stored legacy 64-hex records still compare and are migrated to the
+  canonical form once the same key verifies (store write happens under the
+  new store mutex, since the worker now writes during migration); a changed
+  key fails with both fingerprints in the message.
 - **Bridge/stream protocol** — see spec 01 §13: dispatch wraps raw JSON
   (`bridge/root.zig` L142–163); the frontend polls because the SDK bridge
   is invoke/response only (no native→JS push). **Current gap:** the installed
@@ -239,6 +279,22 @@ connecting → needs_trust → authenticating → ready → closed
   **Correction:** PTY creation is implemented, but resize is not. The current
   `resizePty` body discards all arguments. The spec now marks this feature as
   partial and requires a live `stty size` check.
+  **Landed 2026-08-03:** `Channel.resizePty` calls
+  `libssh2_channel_request_pty_size_ex` with the standard deadline loop and
+  reports failure; the worker surfaces a failed resize as an explicit session
+  error. Verified live against the dev-sshd container with `stty size` in the
+  shell (100×40).
+- **Cancellation and disconnect bounds** — 0.16's `std.Io` has no
+  non-blocking connect: `netConnectIpPosix` in `std/Io/Threaded.zig` calls
+  `connect(2)` directly and panics on `options.timeout` ("TODO implement
+  netConnectIpPosix with timeout"), so a dead-IP connect is bounded only by
+  the kernel SYN timeout. DNS, by contrast, is cancelable: `HostName.lookup`
+  runs on the io's thread pool (`netLookup`, `std/Io/Threaded.zig` L13465)
+  and `Io.concurrent` futures expose `cancel`, which `disconnect` uses to
+  abort an in-flight lookup before joining the worker. The worker also
+  registers a stop callback (`ssh.Session.setStop`) checked inside every
+  deadline loop, so handshake/auth/channel waits return within one poll
+  interval of a disconnect request.
 - **Keepalive** — SSH-level keepalive via channel ping/EOF checks is a
   client-side reliability feature; libssh2 offers
   `libssh2_keepalive_config`/`libssh2_keepalive_send` (libssh2.h) for

@@ -5,6 +5,7 @@ const servers = @import("servers.zig");
 const sessions = @import("sessions.zig");
 const ssh = @import("ssh.zig");
 const bridge = @import("bridge.zig");
+const integration = @import("integration.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -37,6 +38,10 @@ const App = struct {
         self.allocator = process.gpa;
         self.io = process.io;
         self.env_map = process.environ_map;
+
+        // libssh2's own init counter is not thread-safe; run it once before
+        // any session worker can touch the library (spec 02 §6).
+        ssh.initGlobal();
 
         var data_dir_buf: [1024]u8 = undefined;
         const data_dir = native_sdk.app_dirs.resolveOne(

@@ -50,17 +50,19 @@ pub const ChannelKind = enum(u8) {
     }
 };
 
-/// Bounded output stream with cursor-based consumption.
+/// Bounded output stream with non-destructive reads.
 /// Written by the session worker, read by bridge handlers; all access
-/// under a spinlock (sections are short, no Io needed).
+/// under a spinlock (sections are short, no Io needed). Every consumer
+/// supplies its own absolute cursor: reads never advance stream state, so
+/// mirrored tabs drain the same retained bytes independently (spec 02 §6.3).
 pub const Stream = struct {
     mutex: std.atomic.Mutex = .unlocked,
     allocator: std.mem.Allocator,
     data: std.ArrayList(u8) = .empty,
     /// Absolute position of data[0] in the logical stream.
     start_abs: u64 = 0,
-    /// Next byte the frontend has not consumed (absolute).
-    cursor: u64 = 0,
+    /// Absolute position one past the last byte in `data`.
+    end_abs: u64 = 0,
     /// Bytes discarded because the buffer cap was hit before delivery.
     dropped: u64 = 0,
     eof: bool = false,
@@ -90,30 +92,57 @@ pub const Stream = struct {
                 self.data.items.len -= drop;
                 self.start_abs += drop;
                 self.dropped += @intCast(drop);
-                if (self.cursor < self.start_abs) self.cursor = self.start_abs;
             }
         }
         try self.data.appendSlice(self.allocator, bytes);
+        self.end_abs += bytes.len;
     }
 
-    /// Copies up to out.len undelivered bytes into out, advancing the
-    /// cursor. Returns bytes copied.
-    pub fn readAvailable(self: *Stream, out: []u8) usize {
+    /// Absolute position of the oldest retained byte.
+    pub fn start(self: *Stream) u64 {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        const avail_start: usize = @intCast(self.cursor -| self.start_abs);
-        if (avail_start >= self.data.items.len) return 0;
-        const avail = self.data.items.len - avail_start;
+        return self.start_abs;
+    }
+
+    /// Non-destructive read: copies up to out.len retained bytes starting
+    /// at absolute position `from` (clamped to the retained window).
+    /// Returns bytes copied; no cursor advances.
+    pub fn readAt(self: *Stream, from: u64, out: []u8) usize {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const rel = from -| self.start_abs;
+        if (rel >= self.data.items.len) return 0;
+        const avail = self.data.items.len - rel;
         const n = @min(avail, out.len);
-        @memcpy(out[0..n], self.data.items[avail_start .. avail_start + n]);
-        self.cursor += n;
+        @memcpy(out[0..n], self.data.items[rel .. rel + n]);
         return n;
     }
 
-    pub const Snapshot = struct {
-        cursor: u64,
-        dropped: u64,
+    pub const View = struct {
+        /// Bytes this consumer missed because the buffer cap dropped them
+        /// before its cursor (0 for a consumer at/after the retained start).
+        gap: u64,
+        /// Absolute position to read from (max of cursor and retained start).
+        from: u64,
+        /// Bytes available to this consumer right now.
         pending: u64,
+    };
+
+    /// Consumer view from absolute cursor `from` (spec 02 §5: each poll
+    /// reports the requesting tab's own gap).
+    pub fn view(self: *Stream, from: u64) View {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const read_from = @max(from, self.start_abs);
+        return .{
+            .gap = self.start_abs -| from,
+            .from = read_from,
+            .pending = self.end_abs - read_from,
+        };
+    }
+
+    pub const Snapshot = struct {
         eof: bool,
         exit_status: ?i32,
     };
@@ -121,15 +150,7 @@ pub const Stream = struct {
     pub fn snapshot(self: *Stream) Snapshot {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        const consumed: usize = @intCast(self.cursor -| self.start_abs);
-        const pending = self.data.items.len - @min(consumed, self.data.items.len);
-        return .{
-            .cursor = self.cursor,
-            .dropped = self.dropped,
-            .pending = pending,
-            .eof = self.eof,
-            .exit_status = self.exit_status,
-        };
+        return .{ .eof = self.eof, .exit_status = self.exit_status };
     }
 };
 
@@ -137,19 +158,23 @@ pub const ChannelEntry = struct {
     id: u32,
     kind: ChannelKind,
     /// Exec command text; allocated by the manager, freed at session
-    /// teardown (never mid-session, so concurrent polls can read it).
+    /// teardown (or when the completed exec is evicted).
     command: []const u8 = "",
     stream: *Stream,
     raw: *ssh.Channel,
     stdin_mutex: std.atomic.Mutex = .unlocked,
     stdin_queue: std.ArrayList(u8) = .empty,
     eof_seen: bool = false,
+    /// Set once the raw libssh2 channel is closed and freed; session
+    /// teardown must not close it again.
+    raw_closed: bool = false,
 };
 
 const Op = union(enum) {
     exec: struct { id: u32, command: []const u8 },
     resize: struct { cols: c_int, rows: c_int },
     close,
+    close_channel: struct { id: u32 },
 };
 
 const TrustState = struct {
@@ -169,6 +194,7 @@ pub const Session = struct {
     threaded: std.Io.Threaded,
     io: std.Io,
     transport: ssh.Session,
+    store: *servers.Store,
     status: std.atomic.Value(Status) = .init(.connecting),
     error_mutex: std.atomic.Mutex = .unlocked,
     error_msg: [error_buf_len]u8 = undefined,
@@ -274,6 +300,7 @@ pub const Manager = struct {
             .threaded = std.Io.Threaded.init(self.allocator, .{}),
             .io = undefined,
             .transport = try ssh.Session.init(self.allocator),
+            .store = self.store,
             .started_at_ns = std.Io.Timestamp.now(self.io, .real).nanoseconds,
         };
         errdefer {
@@ -297,8 +324,12 @@ pub const Manager = struct {
         return session;
     }
 
-    /// Signals a session to stop, joins its worker thread, then frees
-    /// all session memory. Safe to call when no session exists.
+    /// Signals a session to stop, cancels any in-flight DNS lookup, joins
+    /// its worker thread, then frees all session memory. Safe to call when
+    /// no session exists. The join stays bounded because the worker checks
+    /// the stop signal between every connect phase and inside every deadline
+    /// loop; only the kernel-bounded TCP connect itself can extend it (the
+    /// std Io has no non-blocking connect — spec 02 §5).
     pub fn disconnect(self: *Manager, server_id: []const u8) void {
         lockSpin(&self.mutex);
         const entry = self.sessions.getEntry(server_id) orelse {
@@ -308,6 +339,7 @@ pub const Manager = struct {
         const key = entry.key_ptr.*;
         const session = entry.value_ptr.*;
         session.stop_flag.store(true, .release);
+        session.transport.cancelConnect(session.io);
         if (session.worker) |thread| thread.join();
         _ = self.sessions.remove(server_id);
         self.mutex.unlock();
@@ -352,6 +384,17 @@ pub const Manager = struct {
         defer session.ops_mutex.unlock();
         try session.ops.append(self.allocator, .{ .exec = .{ .id = id, .command = owned } });
         return id;
+    }
+
+    /// Queues an explicit channel close (spec 04's `oars.ssh.closeChannel`):
+    /// the worker sends EOF, closes the raw channel, and frees the entry.
+    /// The shell channel (id 0) is never closed this way.
+    pub fn closeChannel(self: *Manager, server_id: []const u8, channel_id: u32) !void {
+        const session = self.get(server_id) orelse return error.NoSession;
+        if (channel_id == 0) return error.InvalidChannel;
+        lockSpin(&session.ops_mutex);
+        defer session.ops_mutex.unlock();
+        try session.ops.append(self.allocator, .{ .close_channel = .{ .id = channel_id } });
     }
 
     pub fn resize(self: *Manager, server_id: []const u8, cols: u16, rows: u16) !void {
@@ -399,49 +442,73 @@ pub const Manager = struct {
         }
     }
 
-    pub fn channelInfos(self: *Manager, server_id: []const u8) ![]ChannelInfo {
+    /// Snapshot of every channel for one poll. The command text is copied
+    /// (entries may be evicted or closed while the poll serializes), and
+    /// each channel's data is copied up to the budgets. Cursors are
+    /// per-consumer: `cursors` carries the requesting tab's absolute
+    /// positions; `rewind` replays from the retained buffer start.
+    pub fn pollChannels(
+        self: *Manager,
+        server_id: []const u8,
+        cursors: []const Cursor,
+        rewind: bool,
+        data_budget: usize,
+        channel_budget: usize,
+    ) ![]ChannelPoll {
         const session = self.get(server_id) orelse return error.NoSession;
+        const allocator = self.allocator;
+        var out: std.ArrayList(ChannelPoll) = .empty;
+        errdefer {
+            for (out.items) |*poll| poll.deinit(allocator);
+            out.deinit(allocator);
+        }
         lockSpin(&session.channels_mutex);
         defer session.channels_mutex.unlock();
-        var out: std.ArrayList(ChannelInfo) = .empty;
-        defer out.deinit(self.allocator);
+        var budget = data_budget;
         for (session.channels.items) |entry| {
+            const requested: u64 = if (rewind) 0 else cursorFor(cursors, entry.id) orelse 0;
+            const view = entry.stream.view(requested);
+            const take = @min(view.pending, @as(u64, @min(channel_budget, budget)));
+            var data: []u8 = &.{};
+            if (take > 0) {
+                data = allocator.alloc(u8, @intCast(take)) catch continue;
+                const got = entry.stream.readAt(view.from, data);
+                data = data[0..got];
+            }
+            var command: []u8 = &.{};
+            if (entry.command.len > 0) {
+                command = allocator.dupe(u8, entry.command) catch {
+                    allocator.free(data);
+                    continue;
+                };
+            }
             const snap = entry.stream.snapshot();
-            try out.append(self.allocator, .{
+            out.append(allocator, .{
                 .id = entry.id,
                 .kind = entry.kind,
-                .command = entry.command,
-                .cursor = snap.cursor,
-                .dropped = snap.dropped,
-                .pending = snap.pending,
+                .command = command,
                 .eof = snap.eof,
                 .exit_status = snap.exit_status,
-            });
+                .gap = view.gap,
+                .cursor = view.from + data.len,
+                .pending = view.pending,
+                .data = data,
+            }) catch {
+                allocator.free(data);
+                allocator.free(command);
+                continue;
+            };
+            budget = budget -| @min(budget, data.len);
+            if (budget == 0) break;
         }
-        return out.toOwnedSlice(self.allocator);
+        return out.toOwnedSlice(allocator);
     }
 
-    pub fn readChannel(self: *Manager, server_id: []const u8, channel_id: u32, out: []u8) !usize {
-        const session = self.get(server_id) orelse return error.NoSession;
-        lockSpin(&session.channels_mutex);
-        defer session.channels_mutex.unlock();
-        for (session.channels.items) |entry| {
-            if (entry.id == channel_id) return entry.stream.readAvailable(out);
+    fn cursorFor(cursors: []const Cursor, id: u32) ?u64 {
+        for (cursors) |c| {
+            if (c.id == id) return c.pos;
         }
-        return 0;
-    }
-
-    /// Resets every stream cursor to the oldest available byte so a
-    /// freshly opened view replays the session's existing output.
-    pub fn rewindAll(self: *Manager, server_id: []const u8) !void {
-        const session = self.get(server_id) orelse return error.NoSession;
-        lockSpin(&session.channels_mutex);
-        defer session.channels_mutex.unlock();
-        for (session.channels.items) |entry| {
-            lockSpin(&entry.stream.mutex);
-            entry.stream.cursor = entry.stream.start_abs;
-            entry.stream.mutex.unlock();
-        }
+        return null;
     }
 
     pub fn sessionSnapshot(self: *Manager, server_id: []const u8) !SessionInfo {
@@ -456,15 +523,32 @@ pub const Manager = struct {
     }
 };
 
-pub const ChannelInfo = struct {
+pub const Cursor = struct {
+    id: u32,
+    pos: u64,
+};
+
+pub const ChannelPoll = struct {
     id: u32,
     kind: ChannelKind,
-    command: []const u8,
-    cursor: u64,
-    dropped: u64,
-    pending: u64,
+    /// Owned copy of the command text (entries can be evicted or closed
+    /// while the poll response is being serialized).
+    command: []u8,
     eof: bool,
     exit_status: ?i32,
+    /// Bytes this consumer missed (its cursor preceded the retained start).
+    gap: u64,
+    /// The consumer's next cursor: one past the bytes delivered below.
+    cursor: u64,
+    /// Bytes available to this consumer at snapshot time.
+    pending: u64,
+    /// Owned copy of the delivered delta bytes.
+    data: []u8,
+
+    pub fn deinit(self: *ChannelPoll, allocator: std.mem.Allocator) void {
+        allocator.free(self.command);
+        allocator.free(self.data);
+    }
 };
 
 pub const SessionInfo = struct {
@@ -480,17 +564,27 @@ fn workerMain(session: *Session) void {
     const allocator = session.allocator;
     var error_buf: [256]u8 = undefined;
 
+    // The stop flag doubles as the cancellation signal for every deadline
+    // loop inside the transport (DNS, handshake, auth, channel ops).
+    session.transport.setStop(workerStop, session);
+
     // --- connect + handshake -------------------------------------------
     session.transport.connect(io, session.server.host, session.server.port) catch |err| {
         session.status.store(.@"error", .release);
+        if (err == error.Canceled) {
+            session.status.store(.closed, .release);
+            return;
+        }
         session.setError(std.fmt.bufPrint(&error_buf, "connect failed: {s}", .{@errorName(err)}) catch "connect failed");
         return;
     };
     session.transport.keepaliveConfig();
 
     // --- host key verification -----------------------------------------
+    // Canonical form is `SHA256:<base64>` (spec 02 §4.2); legacy 64-hex
+    // records still compare and migrate once the same key verifies.
     var fp_buf: [64]u8 = undefined;
-    const fingerprint = session.transport.hostKeySha256Hex(&fp_buf) catch {
+    const fingerprint = session.transport.hostKeyFingerprint(&fp_buf) catch {
         session.status.store(.@"error", .release);
         session.setError("host key unavailable");
         return;
@@ -517,10 +611,42 @@ fn workerMain(session: *Session) void {
             }
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake) catch return;
         }
-    } else if (!std.mem.eql(u8, session.server.host_fingerprint.?, fingerprint)) {
-        session.status.store(.@"error", .release);
-        session.setError("host key changed since last connection; remove the saved fingerprint to re-trust");
-        return;
+    } else {
+        const stored = session.server.host_fingerprint.?;
+        var hex_buf: [64]u8 = undefined;
+        const hex_fingerprint = session.transport.hostKeySha256Hex(&hex_buf) catch {
+            session.status.store(.@"error", .release);
+            session.setError("host key unavailable");
+            return;
+        };
+        const matches = if (std.mem.startsWith(u8, stored, "SHA256:"))
+            std.mem.eql(u8, stored, fingerprint)
+        else
+            std.mem.eql(u8, stored, hex_fingerprint);
+        if (!matches) {
+            // Spec 02 §4.2: a changed key fails with both fingerprints.
+            session.status.store(.@"error", .release);
+            session.setError(std.fmt.bufPrint(
+                &error_buf,
+                "host key changed since last connection (old: {s}, new: {s}); re-trust by editing the server and verifying the new key",
+                .{ stored, fingerprint },
+            ) catch "host key changed since last connection");
+            return;
+        }
+        // Legacy hex records migrate to the canonical form once the same
+        // key verifies (spec 01 §12). The shallow copy shares all strings
+        // with session.server except the fingerprint, so nothing dangles if
+        // the write fails — a failed migration is cosmetic only (the key
+        // just verified, so the security property already holds).
+        if (!std.mem.startsWith(u8, stored, "SHA256:")) {
+            const canonical = allocator.dupe(u8, fingerprint) catch return;
+            var migrated = session.server;
+            migrated.host_fingerprint = canonical;
+            session.store.upsert(io, migrated) catch {
+                allocator.free(canonical);
+                return;
+            };
+        }
     }
 
     // --- authentication -------------------------------------------------
@@ -710,22 +836,16 @@ fn workerMain(session: *Session) void {
                         entry.stream.exit_status = entry.raw.exitStatus();
                         entry.stream.mutex.unlock();
                         entry.raw.sendEof();
-                    }
-                    if (entry.kind == .exec) {
-                        // Finished: free the raw channel, keep the stream
-                        // alive so the frontend can drain pending bytes.
-                        lockSpin(&session.channels_mutex);
-                        const still = i < session.channels.items.len and session.channels.items[i] == entry;
-                        if (still) _ = session.channels.orderedRemove(i);
-                        session.channels_mutex.unlock();
-                        if (still) {
-                            entry.stdin_queue.deinit(allocator);
+                        if (entry.kind == .exec) {
+                            // Exec output must survive for the frontend to
+                            // drain through polls: release the raw channel
+                            // but keep entry + stream until session teardown
+                            // (bounded by evictCompletedExecs).
                             entry.raw.close(session.io);
-                            allocator.destroy(entry);
-                            allocator.destroy(entry.stream);
-                            continue; // next item shifted into slot i
+                            entry.raw_closed = true;
                         }
                     }
+                    if (entry.kind == .exec) evictCompletedExecs(session);
                     i += 1;
                 },
                 .data => |n| {
@@ -751,6 +871,39 @@ fn workerMain(session: *Session) void {
     }
 }
 
+/// Bounded retention of completed exec channels. A stopped or slow frontend
+/// must not let a session accumulate unbounded channel metadata, so once the
+/// cap is exceeded the oldest completed exec is evicted (its undrained bytes
+/// with it — the frontend has had many polls to drain it by then).
+const max_completed_execs = 64;
+
+fn evictCompletedExecs(session: *Session) void {
+    lockSpin(&session.channels_mutex);
+    defer session.channels_mutex.unlock();
+    var completed: usize = 0;
+    for (session.channels.items) |e| {
+        if (e.kind == .exec and e.eof_seen) completed += 1;
+    }
+    while (completed > max_completed_execs) {
+        var found: ?usize = null;
+        for (session.channels.items, 0..) |e, i| {
+            if (e.kind == .exec and e.eof_seen) {
+                found = i;
+                break;
+            }
+        }
+        const i = found orelse break;
+        const entry = session.channels.items[i];
+        _ = session.channels.orderedRemove(i);
+        entry.stdin_queue.deinit(session.allocator);
+        session.allocator.free(entry.command);
+        entry.stream.deinit(session.allocator);
+        session.allocator.destroy(entry.stream);
+        session.allocator.destroy(entry);
+        completed -= 1;
+    }
+}
+
 fn processOps(session: *Session) void {
     const allocator = session.allocator;
     while (true) {
@@ -765,8 +918,41 @@ fn processOps(session: *Session) void {
             .close => session.stop_flag.store(true, .release),
             .resize => |r| {
                 if (session.shell) |shell| {
-                    _ = ssh.c.libssh2_channel_request_pty_size_ex(shell.raw.raw, r.cols, r.rows, 0, 0);
+                    // A failed resize leaves the remote PTY at the wrong
+                    // size, so it is surfaced as an explicit error (spec
+                    // 02 §5) rather than silently ignored.
+                    shell.raw.resizePty(session.io, r.cols, r.rows) catch {
+                        session.status.store(.@"error", .release);
+                        session.setError("PTY resize failed");
+                    };
                 }
+            },
+            .close_channel => |cc| {
+                lockSpin(&session.channels_mutex);
+                var found: ?usize = null;
+                for (session.channels.items, 0..) |e, i| {
+                    if (e.id == cc.id) {
+                        found = i;
+                        break;
+                    }
+                }
+                const i = found orelse {
+                    session.channels_mutex.unlock();
+                    continue;
+                };
+                const entry = session.channels.items[i];
+                _ = session.channels.orderedRemove(i);
+                session.channels_mutex.unlock();
+
+                if (!entry.raw_closed) {
+                    entry.raw.sendEof();
+                    entry.raw.close(session.io);
+                }
+                entry.stdin_queue.deinit(allocator);
+                allocator.free(entry.command);
+                entry.stream.deinit(allocator);
+                allocator.destroy(entry.stream);
+                allocator.destroy(entry);
             },
             .exec => |e| {
                 const raw = session.transport.openChannel(session.io) catch {
@@ -819,7 +1005,7 @@ fn sessionDone(session: *Session) void {
 
     lockSpin(&session.channels_mutex);
     for (session.channels.items) |entry| {
-        entry.raw.close(session.io);
+        if (!entry.raw_closed) entry.raw.close(session.io);
         entry.stdin_queue.deinit(session.allocator);
         if (entry.kind == .exec) session.allocator.free(entry.command);
         entry.stream.deinit(session.allocator);
@@ -834,15 +1020,20 @@ fn sessionDone(session: *Session) void {
     if (status != .@"error" and status != .closed) session.status.store(.closed, .release);
 }
 
+/// Stop signal for the transport's deadline loops: disconnect sets the
+/// session stop flag, and every loop checks it between iterations.
+fn workerStop(ctx: ?*anyopaque) bool {
+    const session: *Session = @ptrCast(@alignCast(ctx));
+    return session.stop_flag.load(.acquire);
+}
+
 // --- tests ---------------------------------------------------------------
 
-test "stream cursor semantics with overflow" {
+test "stream overflow drops oldest and tracks absolute positions" {
     const allocator = std.testing.allocator;
     var stream = Stream.init(allocator);
     stream.max_bytes = 1024;
     defer stream.deinit(allocator);
-
-    var out: [2048]u8 = undefined;
 
     // Push 3000 bytes through a 1024 cap => at least 1976 dropped.
     var chunk: [300]u8 = undefined;
@@ -850,18 +1041,61 @@ test "stream cursor semantics with overflow" {
     var i: usize = 0;
     while (i < 10) : (i += 1) try stream.append(&chunk);
     try std.testing.expect(stream.dropped >= 1976);
+    // start_abs advanced past the dropped bytes; end_abs is the total.
+    try std.testing.expectEqual(@as(u64, 3000), stream.end_abs);
+    try std.testing.expect(stream.start_abs == 3000 - stream.data.items.len);
+    try std.testing.expectEqual(@as(usize, 1024), stream.data.items.len);
+}
 
-    const n = stream.readAvailable(&out);
-    try std.testing.expectEqual(@as(usize, 1024), n);
-    // Cursor is absolute: 1976 dropped + 1024 delivered.
-    try std.testing.expectEqual(@as(u64, 3000), stream.cursor);
+test "stream reads are non-destructive: two consumers read the same bytes" {
+    const allocator = std.testing.allocator;
+    var stream = Stream.init(allocator);
+    defer stream.deinit(allocator);
+    try stream.append("abcdef");
 
-    // After a drop the cursor rewinds to the oldest retained byte, so
-    // the reader re-delivers from the buffer start.
-    try stream.append("tail");
-    const n2 = stream.readAvailable(&out);
-    try std.testing.expectEqual(@as(usize, 4), n2);
-    try std.testing.expectEqualStrings("tail", out[0..4]);
+    var a: [8]u8 = undefined;
+    var b: [8]u8 = undefined;
+    // Two tabs at the same cursor both get the full retained window.
+    try std.testing.expectEqual(@as(usize, 6), stream.readAt(0, &a));
+    try std.testing.expectEqual(@as(usize, 6), stream.readAt(0, &b));
+    try std.testing.expectEqualStrings("abcdef", a[0..6]);
+    try std.testing.expectEqualStrings("abcdef", b[0..6]);
+
+    // A consumer a few bytes behind starts there and reads the tail.
+    try std.testing.expectEqual(@as(usize, 3), stream.readAt(3, &a));
+    try std.testing.expectEqualStrings("def", a[0..3]);
+    // Reading past the end yields nothing, never an error.
+    try std.testing.expectEqual(@as(usize, 0), stream.readAt(99, &a));
+}
+
+test "stream view reports each consumer's own gap and pending" {
+    const allocator = std.testing.allocator;
+    var stream = Stream.init(allocator);
+    stream.max_bytes = 1024;
+    defer stream.deinit(allocator);
+
+    var chunk: [300]u8 = undefined;
+    @memset(&chunk, 'a');
+    var i: usize = 0;
+    while (i < 10) : (i += 1) try stream.append(&chunk);
+    const start = stream.start();
+
+    // A fresh tab (cursor 0) missed the dropped bytes: gap = start_abs.
+    const fresh = stream.view(0);
+    try std.testing.expectEqual(start, fresh.gap);
+    try std.testing.expectEqual(start, fresh.from);
+    try std.testing.expectEqual(@as(u64, 1024), fresh.pending);
+
+    // A tab that consumed everything has no gap and nothing pending.
+    const caught_up = stream.view(stream.end_abs);
+    try std.testing.expectEqual(@as(u64, 0), caught_up.gap);
+    try std.testing.expectEqual(@as(u64, 0), caught_up.pending);
+
+    // A tab inside the retained window reads from its own position.
+    const mid = stream.view(start + 400);
+    try std.testing.expectEqual(@as(u64, 0), mid.gap);
+    try std.testing.expectEqual(start + 400, mid.from);
+    try std.testing.expectEqual(@as(u64, 624), mid.pending);
 }
 
 test "stream eof and exit status snapshot" {
@@ -876,7 +1110,6 @@ test "stream eof and exit status snapshot" {
     const snap = stream.snapshot();
     try std.testing.expect(snap.eof);
     try std.testing.expectEqual(@as(?i32, 7), snap.exit_status);
-    try std.testing.expectEqual(@as(u64, 5), snap.pending);
 }
 
 test "status json names are stable" {

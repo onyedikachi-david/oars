@@ -7,6 +7,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// Blocking acquire on std.atomic.Mutex (spinlock) — 0.16's atomic.Mutex
+/// only exposes tryLock. Sections are short (file operations), so spinning
+/// is appropriate.
+fn lockSpin(m: *std.atomic.Mutex) void {
+    while (!m.tryLock()) std.atomic.spinLoopHint();
+}
+
 pub const AuthMethod = enum {
     password,
     key,
@@ -128,6 +135,9 @@ pub const Store = struct {
     allocator: std.mem.Allocator,
     /// Full path to servers.json inside the app data directory.
     path: []const u8,
+    /// Serializes read-modify-write cycles: the session worker migrates
+    /// legacy fingerprints while the bridge thread saves/list/upserts.
+    mutex: std.atomic.Mutex = .unlocked,
 
     /// A parsed server list plus the file content it references.
     /// std.json parses strings with `.alloc_if_needed`, so string fields
@@ -152,6 +162,12 @@ pub const Store = struct {
     /// damage is visible and recoverable, and the store continues with an
     /// empty list (spec 01 §10).
     pub fn loadParsed(self: *Store, io: std.Io) !Loaded {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.loadParsedLocked(io);
+    }
+
+    fn loadParsedLocked(self: *Store, io: std.Io) !Loaded {
         const cwd = std.Io.Dir.cwd();
         const content = cwd.readFileAlloc(io, self.path, self.allocator, .limited(4 * 1024 * 1024)) catch return emptyLoaded(self.allocator);
         const parsed = std.json.parseFromSlice([]Server, self.allocator, content, .{}) catch {
@@ -189,7 +205,8 @@ pub const Store = struct {
     /// Persists the whole list. Creates the data directory on demand, and
     /// writes with owner-only permissions (0600 on POSIX). An existing
     /// permissive file is tightened before the write (spec 01 §8).
-    pub fn save(self: *Store, io: std.Io, servers: []const Server) !void {
+    /// Callers hold the store mutex.
+    fn saveLocked(self: *Store, io: std.Io, servers: []const Server) !void {
         const cwd = std.Io.Dir.cwd();
         if (std.fs.path.dirname(self.path)) |dir| try cwd.createDirPath(io, dir);
         self.tightenPermissions(io);
@@ -218,7 +235,9 @@ pub const Store = struct {
 
     /// Convenience: returns a deep copy of the server with `id`, or null.
     pub fn find(self: *Store, io: std.Io, id: []const u8) !?Server {
-        var loaded = try self.loadParsed(io);
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        var loaded = try self.loadParsedLocked(io);
         defer loaded.deinit(self.allocator);
         for (loaded.parsed.value) |s| {
             if (std.mem.eql(u8, s.id, id)) return try s.copy(self.allocator);
@@ -230,7 +249,9 @@ pub const Store = struct {
     /// caller keeps ownership of the argument. The copy is serialized and
     /// then released: the saved list only owns what the file buffer owns.
     pub fn upsert(self: *Store, io: std.Io, server: Server) !void {
-        var loaded = try self.loadParsed(io);
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        var loaded = try self.loadParsedLocked(io);
         defer loaded.deinit(self.allocator);
         for (loaded.parsed.value) |*existing| {
             if (std.mem.eql(u8, existing.id, server.id)) {
@@ -240,7 +261,7 @@ pub const Store = struct {
                     c.deinit(self.allocator);
                 }
                 existing.* = copy;
-                return self.save(io, loaded.parsed.value);
+                return self.saveLocked(io, loaded.parsed.value);
             }
         }
         const list = try self.allocator.alloc(Server, loaded.parsed.value.len + 1);
@@ -252,18 +273,20 @@ pub const Store = struct {
             c.deinit(self.allocator);
         }
         list[loaded.parsed.value.len] = copy;
-        try self.save(io, list);
+        try self.saveLocked(io, list);
     }
 
     pub fn delete(self: *Store, io: std.Io, id: []const u8) !void {
-        var loaded = try self.loadParsed(io);
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        var loaded = try self.loadParsedLocked(io);
         defer loaded.deinit(self.allocator);
         var kept: std.ArrayList(Server) = .empty;
         defer kept.deinit(self.allocator);
         for (loaded.parsed.value) |s| {
             if (!std.mem.eql(u8, s.id, id)) try kept.append(self.allocator, s);
         }
-        try self.save(io, kept.items);
+        try self.saveLocked(io, kept.items);
     }
 };
 
