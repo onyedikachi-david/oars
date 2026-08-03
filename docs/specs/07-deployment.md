@@ -78,7 +78,7 @@ App model:
   4. pm2: `pm2 start <start> --name <app>` or `pm2 restart <app>` when it exists
   5. nginx: write site config via SFTP (temp + rename), `nginx -t`, symlink to `sites-enabled`, `systemctl reload nginx`
   6. certbot: `certbot --nginx -d <d1> -d <d2> --non-interactive --agree-tos -m <user>@<host>` (v1 requires root/appropriate user; failure surfaced with guidance)
-- Node install helper (step 1.5, implicit): detect missing version (`node -v`), then `curl -fsSL https://deb.nodesource.com/setup_<major>.x | bash - && apt-get install -y nodejs` — approval-gated within the deploy flow (deploy already confirmed; the install is part of it — documented in the confirm text).
+- Node install helper (step 1.5, implicit): detect missing version (`node -v`), then the **current documented NodeSource flow** (not the legacy pipe-to-bash form): `curl -fsSL https://deb.nodesource.com/setup_<major>.x -o nodesource_setup.sh` → `sudo -E bash nodesource_setup.sh` (or `bash nodesource_setup.sh` as root) → `sudo apt install -y nodejs` — approval-gated within the deploy flow (deploy already confirmed; the install is part of it — documented in the confirm text). See §13 for the citation and supported distro/version matrix.
 - Secrets: env vars are written to `<folder>/.env` via SFTP before install/build (never echoed in step output; masked in logs).
 
 ## 7. Data model
@@ -118,3 +118,73 @@ App model:
 - [ ] Secret env vars never appear in output, history, or JSON.
 - [ ] DNS pre-check prevents certbot failure for missing records.
 - [ ] Interrupted deploys resume cleanly.
+
+## 13. Research & References
+
+- **PM2** — verified against PM2's official docs
+  (`https://pm2.keymetrics.io/docs/usage/process-management/`):
+  `pm2 start api.js` and `pm2 start "npm run start"` (starting shell
+  commands is supported), `pm2 restart <name>`, `pm2 stop <name>`,
+  `pm2 delete <name>`, `pm2 list`. "Start with PM2" = `pm2 start
+  <start> --name <app>` is the documented form; re-deploy uses
+  `pm2 restart <app>`.
+- **nginx** — verified against nginx's official Beginner's Guide
+  (`https://nginx.org/en/docs/beginners_guide.html`):
+  - `nginx -s reload` — "checks the syntax validity of the new
+    configuration file and tries to apply the configuration…
+    Otherwise, the master process rolls back the changes and continues
+    to work with the old configuration" — so a reload is safe after
+    `nginx -t` (the documented config test, `nginx -t`, is also what
+    the certbot nginx plugin uses for `configtest`).
+  - The `sites-available` → `sites-enabled` symlink convention is the
+    Debian/Ubuntu packaging layout (Debian wiki: Nginx page,
+    `https://wiki.debian.org/Nginx`); nginx itself documents
+    `include`-ing config directories and `server` blocks with
+    `proxy_pass` to a local app port (Beginner's Guide "Setting Up a
+    Simple Proxy Server") — which is how our site config serves the
+    PM2 app (`proxy_pass http://127.0.0.1:<app_port>`).
+  - Write-then-rename (temp + rename) for site configs is our standard
+    atomic-write pattern (same as spec 08/05).
+- **certbot** — verified against the official Certbot docs
+  (`https://certbot.eff.org/docs/using.html`):
+  - The nginx plugin is both an authenticator **and** installer
+    (table "Plugins"): `certbot --nginx` automates obtaining and
+    installing a certificate with Nginx, using the http-01 challenge
+    on port 80 — this is why the spec requires port 80 reachable and
+    the domain's A record pointing at the server.
+  - Non-interactive automation flags: `-n/--non-interactive`,
+    `--agree-tos`, `-m EMAIL` (documented under "Certbot
+    command-line options"); multiple domains via repeated `-d`.
+  - Certificates land in `/etc/letsencrypt/live/<cert-name>/`
+    (`fullchain.pem`, `privkey.pem` 0600); automatic renewal runs
+    `certbot renew` (safe to run on a schedule; only renews
+    near-expiry certs, exit 0 when nothing to do).
+  - **Correction:** as of Certbot 2.0.0 the default key type for new
+    certificates is ECDSA (P-256), not RSA — irrelevant to our flow
+    (we never touch key types) but noted so tests don't assume RSA.
+- **NodeSource install** — verified against the official
+  nodesource/distributions docs (DEV_README.md,
+  `https://github.com/nodesource/distributions`): **correction** — the
+  current documented flow is NOT `curl … | bash -`; it is:
+  ```
+  curl -fsSL https://deb.nodesource.com/setup_22.x -o nodesource_setup.sh
+  sudo -E bash nodesource_setup.sh
+  sudo apt install -y nodejs
+  ```
+  (`-E` preserves the environment; the script adds the apt source).
+  The spec's pipe form is the legacy pattern and is deprecated in the
+  docs — update the step builder to download-then-execute (argv-based
+  with a fixed URL per major version; supported: Ubuntu Focal/Jammy/
+  Noble and Debian 10/11/12 for Node 18/20/22 — verified in the
+  supported-versions tables).
+- **`git clone`/`pull --ff-only`** — standard git semantics (git
+  docs: `git clone`, `git pull --ff-only` refuses non-fast-forward
+  merges, which the spec surfaces as a step failure); no external
+  dependency beyond git being installed.
+- **DNS pre-check** — `dig +short <domain>` is the documented dig
+  short-output mode (BIND 9 man page). Fail-early before certbot is
+  cheaper than a failed http-01.
+
+Sources: pm2.keymetrics.io docs, nginx.org beginner's guide, Debian wiki
+Nginx, certbot.eff.org using.html, nodesource/distributions DEV_README,
+git(1), dig(1).

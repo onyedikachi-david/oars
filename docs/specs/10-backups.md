@@ -65,7 +65,8 @@ Job model:
 
 ## 6. Zig core design
 
-- `src/backup.zig` — Job model + store (`<data>/backups.json`), rclone config generation (INI written via SFTP to `~/.config/rclone/rclone.conf` — append/merge section), crontab management (read `crontab -l`, add/remove line by job id marker `# oars:job:<id>`, write back via `crontab -`), run state machine (exec `rclone <transfer> <src> <dst> --progress --stats-one-line` on a channel; parse stats; per-run record), install helpers.
+- `src/backup.zig` — Job model + store (`<data>/backups.json`), rclone config generation (INI written via SFTP to `~/.config/rclone/rclone.conf` — append/merge section), crontab management (read `crontab -l`, add/remove line by job id marker `# oars:job:<id>`, validate with `crontab -T -` before installing, write back via `crontab -`), run state machine (exec `rclone <transfer> <src> <dst> --progress --stats-one-line --error-on-no-transfer` on a channel; parse stats; per-run record), install helpers.
+  - `--error-on-no-transfer` makes rclone exit 9 when zero files were transferred (see §13) — the run record uses this for the amber "0 files — check source path" state instead of guessing from stats.
 - Local-destination jobs bypass rclone: SFTP download stream (spec 05 machinery) with progress.
 - Command construction is argv-based (rclone flags; paths validated); user paths are single argv elements.
 
@@ -108,3 +109,61 @@ Job model:
 - [ ] Crontab entries are idempotent (re-save doesn't duplicate).
 - [ ] Zero-file runs are visually distinguished from success.
 - [ ] Secrets never appear in JSON, logs, or audit.
+
+## 13. Research & References
+
+- **rclone semantics** — verified against official rclone docs
+  (`https://rclone.org/docs/` and
+  `https://rclone.org/commands/rclone_copy/`):
+  - `copy` transfers files that differ (size + modtime, or MD5SUM)
+    and never deletes destination extras; `sync` "make[s] source and
+    dest identical, modifying destination only" — matches the
+    Transfer-type choice in the job model.
+  - `rclone lsd` lists directories/buckets — the right Test Connection
+    probe (`rclone lsd <remote>:` fails loudly on bad credentials).
+  - `-P/--progress` shows real-time stats; `--stats-one-line`
+    condenses them to one line; `--stats` sets the interval (default
+    1m) — the run state machine parses this output for
+    bytes/files/speed/ETA. The spec's example line format matches the
+    documented stats output style (binary units, e.g. `1.2 GiB`).
+  - **Zero-file detection improvement:** rclone exits 9 when no files
+    were transferred **only with `--error-on-no-transfer`**
+    (documented under the flag: "allow rclone to return exit code 9 if
+    no files were transferred") — the run command should add this
+    flag so the spec's "0 files — check source path" amber state is
+    programmatic, not heuristic.
+  - `--dry-run` for trial runs (used by Test Connection variants).
+- **rclone config file** — documented format: basic INI at
+  `~/.config/rclone/rclone.conf` (Unix), `[section]` header per remote,
+  `key = value` entries, required `type` key, comments `;` or `#`,
+  passwords stored in obscured form; the file "will typically contain
+  login information, and should therefore have restricted permissions"
+  (rclone writes temp+rename itself) — validates spec §8's chmod 600
+  and the merge-section write strategy (append a new `[oars-<job_id>]`
+  section; never rewrite other sections).
+- **crontab** — verified against cronie crontab(1)/crontab(5) man pages
+  (`https://man7.org/linux/man-pages/man1/crontab.1.html`,
+  `https://man7.org/linux/man-pages/man5/crontab.5.html`):
+  - `crontab -l` prints the current table to stdout; `crontab -`
+    installs a new table from stdin (both used by the crontab
+    management in §6).
+  - Five time fields (minute 0–59, hour 0–23, day-of-month 1–31,
+    month 1–12, day-of-week 0–7); `#` comments only at line start
+    (our `# oars:job:<id>` marker lines are safe); commands run via
+    `/bin/sh` or `$SHELL`; cron checks every minute; `%` in a command
+    becomes newline (must escape `%` in rclone invocations — worth a
+    parser test); the crontab file must end in a newline.
+  - **Improvement:** crontab(1) `-T` tests syntax without installing
+    — run `crontab -T` (or `crontab -T -`) before installing to fail
+    loudly client-side on malformed expressions.
+- **S3-compatible providers** — AWS S3, Cloudflare R2 (S3-compatible
+  endpoint), Backblaze B2, Wasabi, MinIO, DigitalOcean Spaces are all
+  rclone-supported backends (documented backend list,
+  `https://rclone.org/docs/#configure`); endpoint+region semantics
+  come from each backend's rclone docs page.
+- **Storage classes** — S3 storage classes (Standard/Glacier/Deep
+  Archive) are AWS S3 concepts (AWS docs); passed through as rclone
+  `--s3-storage-class` where the backend supports it.
+
+Sources: rclone docs (usage, copy, flags), cronie crontab(1)/(5),
+rclone backend list.

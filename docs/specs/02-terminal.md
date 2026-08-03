@@ -136,3 +136,46 @@ connecting → needs_trust → authenticating → ready → closed
 - [ ] Typing latency under load stays below 250 ms round trip.
 - [ ] No hangs: dead server surfaces an error within 20 s.
 - [ ] All existing tests pass (`zig build test`).
+
+## 13. Research & References
+
+- **Session state machine** — implemented in `src/sessions.zig`: `Status`
+  enum L21 (connecting/needs_trust/authenticating/ready/closed/error),
+  `ChannelKind` L41, `Stream` (cursor-delta buffer) L56–66 with `append`
+  L80, `readAvailable` L99, `snapshot` L119, `ChannelEntry` L136,
+  `Session` L165, `Manager` L221 with `connect` L253, `disconnect` L300
+  (joins the worker thread), `input` L333, `exec` L343, `resize` L355.
+  One worker thread per session owns all libssh2 calls (libssh2 is not
+  thread-safe — per its own docs/FAQ); bridge handlers only touch
+  spin-locked buffers.
+- **Host-key verification APIs** — verified in
+  `third_party/libssh2/include/libssh2.h`: `libssh2_session_handshake`
+  L672 (replaces deprecated `libssh2_session_startup`, L669),
+  `libssh2_session_hostkey` L687, `libssh2_hostkey_hash` L684 with
+  `LIBSSH2_HOSTKEY_HASH_SHA256` defined at L498–501. SHA-256 fingerprints
+  are the modern default (OpenSSH shows `SHA256:…` fingerprints since
+  6.8; `ssh-keygen -l` uses them by default — see ssh(1) VERIFYING HOST
+  KEYS, `https://man.openbsd.org/ssh.1`, which also documents the
+  `-E` flag to select the hash algorithm).
+- **Bridge/stream protocol** — see spec 01 §13: dispatch wraps raw JSON
+  (`bridge/root.zig` L142–163); the frontend polls because the SDK bridge
+  is invoke/response only (no native→JS push).
+- **PTY + TERM=xterm-256color + resize** — libssh2 request_pty_ex is
+  invoked via `libssh2_channel_request_pty_ex` (libssh2.h L879+);
+  terminal resize semantics (SIGWINCH, cols/rows) are the client-side
+  contract of the SSH session protocol (RFC 4254 §6.2, "Requesting a
+  Pseudo-Terminal"). xterm-256color is the conventional TERM for
+  modern xterm.js rendering (frontend uses xterm.js 5.3.0 — see spec 16
+  §13).
+- **Keepalive** — SSH-level keepalive via channel ping/EOF checks is a
+  client-side reliability feature; libssh2 offers
+  `libssh2_keepalive_config`/`libssh2_keepalive_send` (libssh2.h) for
+  the transport-level variant. Our 30 s loop-level keepalive is
+  documented behavior in this spec, verified to compile in
+  `src/sessions.zig`.
+- **Poll cadence math** — 80 ms poll ⇒ ~12.5 Hz; the budget (384 KB per
+  poll, 256 KB per channel, 4 MB stream cap) is enforced in
+  `src/sessions.zig` `Stream.max_bytes` (L68).
+
+Sources: `src/sessions.zig`, `src/ssh.zig`, `third_party/libssh2/include/libssh2.h`;
+RFC 4254 (ssh connection protocol); https://man.openbsd.org/ssh.1.

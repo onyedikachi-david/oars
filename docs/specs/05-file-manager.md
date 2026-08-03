@@ -115,3 +115,49 @@ in the drawer; cancel stops the loop and deletes the partial file.
 - [ ] Editor saves atomically (no truncation on failure).
 - [ ] Transfers show progress and can be cancelled cleanly.
 - [ ] All mutations are confirm-gated and audited.
+
+## 13. Research & References
+
+- **libssh2 SFTP API** — verified against the vendored header
+  `third_party/libssh2/include/libssh2_sftp.h`: `libssh2_sftp_init`
+  L221, `libssh2_sftp_open_ex` L230 (with `LIBSSH2_SFTP_OPENDIR` flag
+  L67 and the `libssh2_sftp_open`/`libssh2_sftp_opendir` macros L235–242),
+  `libssh2_sftp_read` L255, `libssh2_sftp_readdir_ex` L258 (with
+  `libssh2_sftp_readdir` macro L263), `libssh2_sftp_write` L267,
+  `libssh2_sftp_fstat_ex` L283, `libssh2_sftp_rename_ex` L292 (default
+  macro combines RENAME_OVERWRITE|ATOMIC|NATIVE — flags defined L70–73),
+  `libssh2_sftp_unlink_ex` L315, `libssh2_sftp_shutdown` L222. The
+  remaining ops (`mkdir`, `rmdir`, `chmod`, `stat`) are in the same
+  header — the wrapper in `src/sftp.zig` calls these directly. SFTP
+  itself is an SSH subsystem (RFC 4254 §6.5; the wire protocol is
+  defined by the IETF draft-ietf-secsh-filexfer).
+- **SFTP semantics** — rename across filesystems fails server-side with
+  a cross-device error (SFTP status codes; the spec's copy+delete
+  fallback is the standard remedy). Atomic editor saves via
+  temp-file+rename are the same pattern sshd itself uses for
+  authorized_keys updates (spec 08 §13).
+- **`unzip`** — verified against the Info-ZIP unzip(1) man page
+  (`https://manpages.ubuntu.com/manpages/noble/en/man1/unzip.1.html`):
+  - `-d exdir` extracts to an arbitrary directory ✓.
+  - **Correction/additions:** Info-ZIP unzip ≥ 5.50 strips `../` parent
+    components from entry names **by default** ("For security reasons,
+    unzip normally removes 'parent dir' path components ('../') from the
+    names of extracted files", disabled only by `-:`), so the spec's
+    entry-scan is defense-in-depth on top of unzip's own guard. Never
+    pass `-:`; never pass `-K` (restores SUID/SGID bits, "cleared for
+    security reasons" by default). Exit codes: 0 ok, 11 no matching
+    files, 50 disk full — surface these to the user.
+- **`du -sb`** — GNU coreutils `du` with `--block-size=1`/`-b` (bytes)
+  and `-s` (summarize) per the coreutils manual
+  (`https://www.gnu.org/software/coreutils/manual/html_node/du-invocation.html`).
+- **`zip -r`** — Info-ZIP zip(1) recursive flag (same source family as
+  unzip; `zip -r` documented in `man zip`).
+- **Chunk payloads** — 64 KB binary → base64 ≈ 87 KB JSON, under the
+  SDK bridge's payload limit (`bridge/root.zig` L144,
+  `payload_too_large`; the SDK example/docs use the same style).
+- **Non-UTF8 names** — SFTP returns raw bytes; libssh2 gives byte
+  strings (no decoding) — display escaping is client-side, bytes
+  preserved (per §10).
+
+Sources: `third_party/libssh2/include/libssh2_sftp.h`, Info-ZIP unzip(1),
+GNU coreutils du(1), SDK bridge/root.zig.

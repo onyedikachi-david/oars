@@ -101,3 +101,61 @@ generate keys and GitHub deploy keys. The fleet-wide view is spec 09.
 - [ ] Read-only role provably restricts shell (tested over SSH).
 - [ ] Fingerprints match `ssh-keygen -lf` output.
 - [ ] All mutations audited.
+
+## 13. Research & References
+
+- **authorized_keys format** — verified against the authoritative
+  OpenSSH `sshd(8)` man page (`https://man.openbsd.org/sshd.8`, section
+  AUTHORIZED_KEYS FILE FORMAT): "Each line of the file contains one key
+  (empty lines and lines starting with a '#' are ignored as comments).
+  Public keys consist of the following space-separated fields: options,
+  keytype, base64-encoded key, comment. The options field is optional."
+  Supported key types include `ssh-ed25519`, `ssh-rsa`,
+  `ecdsa-sha2-nistp256/384/521` (and FIDO `sk-*` variants). Options are
+  comma-separated with **no spaces except within double quotes**
+  (matching our parser's split rule); documented options include
+  `no-port-forwarding`, `from="pattern-list"`, `command="…"`,
+  `restrict`, `permitopen`, `expiry-time`. Lines can be several hundred
+  bytes long; sshd enforces a minimum RSA modulus of 1024 bits.
+- **File permissions** — `~/.ssh/authorized_keys` recommended
+  permissions are read/write for the user and not accessible by others
+  (i.e. 0600); under `StrictModes`, sshd refuses the file if the file,
+  `~/.ssh`, or the home directory are group/world-writable (sshd(8)
+  FILES section). This validates the spec's `chmod 600/700` discipline
+  — a 0644 file would silently stop working on real servers.
+- **Fingerprints** — `ssh-keygen -l -f <keyfile>` prints the SHA-256
+  fingerprint by default (ssh(1), VERIFYING HOST KEYS;
+  `https://man.openbsd.org/ssh.1`); our SHA-256 fingerprint must match
+  that output byte-for-byte for the acceptance criterion.
+- **rbash (restricted shell)** — verified against the GNU Bash manual
+  §6.10 The Restricted Shell
+  (`https://www.gnu.org/software/bash/manual/html_node/The-Restricted-Shell.html`):
+  started as `rbash` or with `-r`; restrictions include: `cd` builtin
+  disabled; cannot set/unset `SHELL`, `PATH`, `HISTFILE`, `ENV`,
+  `BASH_ENV`; command names containing slashes rejected; output
+  redirection `>`, `>|`, `<>`, `>&`, `&>`, `>>` disabled; `exec`
+  disabled; cannot leave restricted mode (`set +r` / `shopt -u
+  restricted_shell`). The manual also states the restricted shell
+  "should be accompanied by setting PATH to a value that allows
+  execution of only a few verified commands" — exactly what spec §4.2
+  does via `.bash_profile` (`export PATH=$HOME/bin`). Note the manual's
+  caveat that rbash is "only one component of a useful restricted
+  environment" — the spec's read-only role is best-effort, documented
+  as such.
+- **Ed25519** — `ssh-ed25519` is a first-class OpenSSH key type
+  (sshd(8) list above); key generation is available locally in Zig's
+  std (`std.crypto.sign.Ed25519`) — verified present in this project's
+  Zig 0.16 std; the existing `src/openssh.zig` module already parses
+  the openssh-key-v1 PEM container (magic, cipher, kdf fields at L72–82)
+  and decodes ed25519 seeds — a strong base for `generate` without
+  shelling out, though v1 still shells to `ssh-keygen` for format
+  correctness as the spec states.
+- **Deploy keys** — GitHub's documented deploy-key model: an SSH key
+  pair added to a repo with read/write or read-only access; public half
+  pasted at repo Settings → Deploy keys (GitHub docs,
+  `https://docs.github.com/en/authentication/connecting-to-github-with-ssh/managing-deploy-keys`).
+  The spec's "shown once, never persisted" matches GitHub's advice to
+  protect deploy keys as secrets.
+
+Sources: OpenBSD sshd(8), ssh(1), GNU Bash manual §6.10, GitHub deploy
+keys docs, `src/openssh.zig`, Zig std crypto.

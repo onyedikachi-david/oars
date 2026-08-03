@@ -97,3 +97,36 @@ streams. (CtrlOps explicitly refuses fan-out; we do it with guardrails.)
 - [ ] Variable injection attempts are neutralized (tested).
 - [ ] Broadcast shows per-server dry-run, confirms, streams side-by-side, reports per-server results.
 - [ ] Audit entries written for every run.
+
+## 13. Research & References
+
+- **Single-quote quoting** — verified in the GNU Bash manual §3.1.2.2
+  (`https://www.gnu.org/software/bash/manual/html_node/Single-Quotes.html`):
+  "Enclosing characters in single quotes preserves the literal value of
+  each character within the quotes. A single quote may not occur
+  between single quotes, even when preceded by a backslash." Hence the
+  standard escape for a literal quote is `'\''` (close, escape, reopen)
+  — the spec's "argument-quoted (single-quote escaping)" claim maps to
+  this rule. This is the same quoting the POSIX shell command language
+  specifies for single-quoted strings
+  (`https://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html#tag_18_02`).
+- **`bash -c '<script>'`** — executing a script via `bash -c` is the
+  documented Bash invocation mode (`bash -c string` processes the
+  string as commands; Bash manual §6.1 "Bash Invocation"). The command
+  string is the user's own script (trusted author); only the
+  `{{variable}}` values are untrusted and must be single-quote-escaped
+  as above. This is the same escaping discipline x11vnc-style wrappers
+  and the rclone docs recommend for shell arguments
+  ("Use single quotes `'` by default…" — rclone docs,
+  `https://rclone.org/docs/#quoting-and-the-shell`).
+- **Broadcast fan-out** — each server's exec runs through its own
+  session worker (spec 02 §6); no server-side fan-out tools are used
+  (CtrlOps-style broadcast tools are server-side daemons — ours is
+  client-orchestrated by design, stated in §1).
+- **Destructive-tag double-confirm** — product guardrail; no external
+  reference needed.
+- **Audit** — every run appends to the audit store (spec 15 §5); the
+  bridge-side record hooks are specified there.
+
+Sources: GNU Bash manual (quoting, invocation), POSIX shell command
+language (opengroup), rclone docs (quoting section).

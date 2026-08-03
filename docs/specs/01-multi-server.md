@@ -125,3 +125,43 @@ creates a session tab. Nothing about the fleet leaves the machine.
 - [ ] Deleting a server disconnects its session and closes its tabs.
 - [ ] Sidebar shows live status dots for all servers with sessions.
 - [ ] `zig build test` passes with store/bridge coverage.
+
+## 13. Research & References
+
+Every claim below was verified against the installed code (this repo and the
+installed Native SDK) rather than assumed.
+
+- **Store model & JSON persistence** — implemented in `src/servers.zig`:
+  `Server` model at L27 (deep-copy `copy()` L45, `deinit()` L62), `Store`
+  at L75, corruption-tolerant `loadParsed()` at L94 (treats malformed JSON
+  as "start fresh"), `save()` at L119 (creates the data dir on demand),
+  `upsert()`/`delete()` at L133/L149, `makeId()` (timestamp-hex ids) at
+  L174. The `Loaded` struct (L83) keeps the raw file buffer alive because
+  Zig 0.16 `std.json` parses strings with `.alloc_if_needed` (strings may
+  point into the input buffer) — this design decision is required by the
+  std.json semantics, not a style choice.
+- **Bridge protocol (invoke/response, no native→JS push)** — verified in
+  the installed SDK at
+  `node_modules/@native-sdk/cli/src/bridge/root.zig`: `Handler` with
+  `invoke_fn` (L86), `Dispatcher.dispatch` (L142) rejects
+  `payload_too_large` (L144), `invalid_request` (L148),
+  `permission_denied` (L152), `unknown_command` (L156), wraps handler
+  results via `writeSuccessResponse` (L163, L223) and failures via
+  `writeErrorResponse` (L160–161, L237). Handlers must return **raw
+  result JSON** — double-wrapping causes the alias bug documented in
+  ROADMAP §3. Our dispatcher is wired in `src/bridge.zig` L17–27 and
+  `src/main.zig` L96–115 (bridge + builtin policies + allowed origins).
+- **Origin gating** — `src/main.zig` `security.navigation.allowed_origins`
+  (`zero://app`, `http://127.0.0.1:5173`); the dispatcher-level
+  permission-denied test exists in `src/main.zig` (test at L119–160,
+  asserts `https://evil.example` is denied).
+- **Keychain for secrets** — the SDK's builtin `native-sdk.credentials.*`
+  bridge commands require the `credentials` permission in `app.zon` and a
+  matching entry in the `builtin_policies` table in `src/main.zig`
+  (verified in our `app.zon`; both sides are required — see ROADMAP §3).
+- **Unlimited servers / no cloud** — product decision, not a technical
+  claim; nothing external to cite.
+
+Sources: `src/servers.zig`, `src/bridge.zig`, `src/main.zig`, `app.zon`;
+SDK: `src/bridge/root.zig` (installed at
+`~/.nvm/versions/node/v24.18.0/lib/node_modules/@native-sdk/cli`).

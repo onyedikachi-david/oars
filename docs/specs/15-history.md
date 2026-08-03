@@ -89,3 +89,35 @@ broadcasts, deploys, key changes, backups, AI approvals). This is the
 - [ ] Every mutating feature (06–12) writes an audit entry.
 - [ ] History search + replay work from the palette.
 - [ ] Clear requires type-to-confirm.
+
+## 13. Research & References
+
+- **Capture scope (app-initiated only)** — verified limitation: an SSH
+  exec channel carries opaque bytes; libssh2 exposes no "command
+  line" hook for interactive shells, and parsing shell input client-
+  side is unreliable (prompt detection, line editing, multiline
+  input). The spec's v1 decision (record exec/script/deploy/AI
+  commands only) is the honest engineering choice; interactive shell
+  history remains in xterm scrollback (client-side).
+- **Redaction** — mask-at-write with known secret values + pattern
+  pass (`(PASSWORD|TOKEN|SECRET|KEY)=…`, `--password …`, `-p …`):
+  standard secret-scrubbing practice; no external standard, but the
+  masking pass is unit-tested with fixtures. The known limitation
+  (values that change later keep old masks — masked at write) is
+  documented in §10 and is the same tradeoff log-scrubbing tools
+  accept.
+- **Ring-bounded JSON stores** — bounded ring files (2,000 history /
+  5,000 audit) avoid unbounded disk growth; append + periodic
+  compaction is a standard pattern for small local stores. fsync on
+  audit writes keeps the "logged for audit" promise honest (an
+  fsync'd append survives a crash — POSIX fsync semantics,
+  `https://pubs.opengroup.org/onlinepubs/9699919799/functions/fsync.html`).
+- **No keystroke recording** — per §2 non-goals; this is also the
+  privacy stance (a local ops tool should not store everything the
+  user types, only commands the app executes).
+- **Replay** — re-running a stored command reuses `oars.ssh.exec`
+  (spec 02 §5) and records a new history entry (chainable); confirm
+  required because the environment may have changed since the entry
+  was captured.
+
+Sources: POSIX fsync(2), spec 02 §5, internal design decisions.

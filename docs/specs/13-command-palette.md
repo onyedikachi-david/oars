@@ -100,3 +100,30 @@ keeps coupling one-way.
 - [ ] Keyboard map works in terminal focus without conflicts.
 - [ ] Danger double-enter guard verified.
 - [ ] Fuzzy ranking feels right on realistic names.
+
+## 13. Research & References
+
+- **`⌘K` palette as an app-shell pattern** — the palette-over-app
+  pattern (fuzzy search over commands/objects, `>` command mode) is a
+  well-established desktop convention (VS Code Command Palette,
+  Raycast, Linear); no external protocol to cite — the registry design
+  is internal.
+- **Keyboard conflicts with xterm.js** — global key handling must
+  intercept `metaKey` chords before xterm's keydown handler. xterm.js
+  documents its `attachCustomKeyEventHandler` hook for exactly this
+  (filtering/replacing key events before terminal processing) —
+  verified in the installed typings
+  `frontend/node_modules/xterm/typings/xterm.d.ts`
+  (`attachCustomKeyEventHandler` is part of the public `Terminal`
+  API). The palette listens on `window` with `metaKey` checks so the
+  terminal never sees `⌘K`.
+- **Fuzzy ranking** — client-side substring/prefix scoring; no external
+  dependency (no fuse.js etc. — kept dependency-free per project
+  convention).
+- **`⌘L` vs terminal** — in the terminal, `⌘L` clears the viewport
+  client-side (xterm's documented `clear()` is client-only; scrollback
+  lives in xterm's buffer, per xterm.js docs) — consistent with spec
+  02 §4.3; when the logs view is focused, `⌘L` focuses log search.
+
+Sources: xterm.js typings (`frontend/node_modules/xterm/typings/xterm.d.ts`),
+internal design decisions.

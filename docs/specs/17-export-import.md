@@ -49,7 +49,7 @@ mbedTLS) and **plain JSON** (no secrets, for sharing/review).
 
 - `src/vault.zig`:
   - **Payload model:** `{version:1, exported_at, servers[], scripts[], backup_jobs[], ai_provider{}, history[], audit[], groups_derived}` — secrets stripped by construction (Keychain values are never exported; placeholders `{"password":"<keychain>"}` mark what to re-enter).
-  - **Encryption:** password → PBKDF2-HMAC-SHA256 (mbedTLS, 210k iterations — OWASP current) → AES-256-GCM (mbedTLS), random 12-byte IV per export, file format: magic `OARSVAULT1`, IV, ciphertext, tag (header in plaintext, no metadata inside).
+  - **Encryption:** password → PBKDF2-HMAC-SHA256 (mbedTLS, **600,000 iterations — OWASP's current recommendation**, see §13) → AES-256-GCM (mbedTLS), random 12-byte IV per export, file format: magic `OARSVAULT1`, IV, ciphertext, tag (header in plaintext, no metadata inside).
   - **Import:** parse+decrypt (streaming for large audits), validate against `Payload` schema (strict: unknown fields ignored with a warning list), merge by id with conflict reporting, atomic write-back per store (same temp+rename discipline as spec 08).
 - mbedTLS is already linked for libssh2 — `pk_*`/`gcm`/`pbkdf2` APIs available; wrap in `src/crypto.zig` with unit tests against known vectors.
 
@@ -87,3 +87,48 @@ mbedTLS) and **plain JSON** (no secrets, for sharing/review).
 - [ ] Import previews conflicts and never overwrites silently.
 - [ ] Wrong password / tampered file → explicit error, no partial writes.
 - [ ] Crypto unit tests green against known vectors.
+
+## 13. Research & References
+
+- **PBKDF2 iteration count — CORRECTED.** The spec previously said
+  "210k iterations — OWASP current". The OWASP Password Storage Cheat
+  Sheet (fetched 2026-08-03,
+  `https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html`)
+  currently recommends **PBKDF2-HMAC-SHA256: 600,000 iterations**
+  ("If FIPS-140 compliance is required, use PBKDF2 with a work factor
+  of 600,000 or more and set with an internal hash function of
+  HMAC-SHA-256"). The cheat sheet also advises a hash should take
+  under one second on the target hardware. **Action: use 600,000
+  iterations** (with a test-vector fixture at a smaller iteration
+  count for speed, plus one full-cost timing test). The KDF itself is
+  standardized by RFC 8018 (PKCS #5 v2.1,
+  `https://www.rfc-editor.org/rfc/rfc8018`).
+- **AES-256-GCM** — authenticated encryption per NIST SP 800-38D
+  (`https://csrc.nist.gov/pubs/sp/800/38d/final`); 12-byte IV is the
+  recommended default (96-bit, SP 800-38D §8.2). GCM's auth tag is
+  what makes "wrong password or corrupt file" a single explicit error
+  (decrypt+verify fails atomically — no partial plaintext).
+- **mbedTLS APIs** — verified in the vendored headers:
+  - `mbedtls_pkcs5_pbkdf2_hmac_ext(md_type, password, plen, salt,
+    slen, iteration_count, key_length, output)` —
+    `third_party/mbedtls/include/mbedtls/pkcs5.h` L149–153 (the old
+    `mbedtls_pkcs5_pbkdf2_hmac` is deprecated, L173–180).
+  - GCM: `mbedtls_gcm_setkey(ctx, cipher, key, keybits)` (gcm.h
+    L110–113), `mbedtls_gcm_crypt_and_tag(…)` (L166–176, encrypts and
+    writes the tag), `mbedtls_gcm_auth_decrypt(…)` (L211–220,
+    authenticates then decrypts).
+  - mbedTLS is already linked for libssh2 (build.zig
+    `buildVendoredLibraries`) — no new dependency.
+- **Key-derivation test vectors** — PBKDF2-HMAC-SHA256 vectors from
+  RFC 7914 §11 (the scrypt RFC's PBKDF2 appendix) and the NIST CAVP
+  suite; AES-GCM vectors from NIST SP 800-38D Appendix B / the
+  GCM spec's test cases.
+- **File format** — magic+version header (`OARSVAULT1`) in plaintext,
+  IV + ciphertext + tag after: the standard envelope pattern; version
+  prefix means future formats fail loudly (§8). Secrets are excluded
+  by construction (Keychain is per-OS and never exported — the
+  Keychain API itself provides no portable export, so placeholders
+  are the only honest option).
+
+Sources: OWASP Password Storage Cheat Sheet (2026), RFC 8018, NIST SP
+800-38D, RFC 7914 §11, `third_party/mbedtls/include/mbedtls/{pkcs5,gcm}.h`.

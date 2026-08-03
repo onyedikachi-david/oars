@@ -89,3 +89,31 @@ None.
 - [ ] No UI color outside the token set (except terminal ANSI).
 - [ ] Status vocabulary (amber/blue/red) identical in both themes.
 - [ ] Theme switch never interrupts sessions.
+
+## 13. Research & References
+
+- **xterm.js live re-theme** — verified against the installed typings
+  `frontend/node_modules/xterm/typings/xterm.d.ts` (package `xterm`
+  5.3.0): `ITerminalOptions.theme?: ITheme` (L246) and `options` is
+  the live terminal options object — assigning
+  `term.options.theme = {…}` re-themes the terminal in place without
+  recreating the Terminal instance (no reconnect, no data loss). This
+  is the documented mechanism the spec's "apply instantly without
+  reload" depends on.
+- **Contrast (WCAG AA)** — the spec's AA claim maps to WCAG 2.1 SC
+  1.4.3 (Contrast Minimum): 4.5:1 for body text, 3:1 for large text
+  and UI components (`https://www.w3.org/WAI/WCAG21/Understanding/contrast-minimum.html`).
+  Token pairs are chosen to meet 4.5:1 for `--text` on `--bg` in both
+  themes; the CI lint (grep for stray hex) keeps it enforceable.
+- **`prefers-color-scheme`** — CSS media query, honored at first
+  launch per spec; runtime switching uses `matchMedia` change events
+  (both documented in the CSS spec / MDN).
+- **Scheme palette data** — terminal schemes (One Dark, Solarized) are
+  conventional ANSI-16 palettes; stored as JSON in localStorage;
+  xterm's `theme` object maps ANSI indexes 0–15 + `background`/
+  `foreground` (per xterm typings `ITheme`).
+- **No teal/green** — product constraint (spec §1); the terminal ANSI
+  palette keeps standard green because it renders remote content, not
+  app UI.
+
+Sources: xterm 5.3.0 typings, WCAG 2.1 SC 1.4.3, CSS media queries.

@@ -41,6 +41,10 @@ improvements; everything else is the design to build against.
 10. **Edge cases** — the failure modes that must be handled
 11. **Testing** — unit, integration, and acceptance checks
 12. **Acceptance criteria** — the definition of done
+13. **Research & References** — every external claim cited to a primary
+    source (URL and/or local file with line refs), and any corrections
+    the research forced on the draft. Required for every spec; a spec
+    without references is unfinished.
 
 ## Cross-cutting conventions
 
@@ -57,5 +61,13 @@ improvements; everything else is the design to build against.
   audit history (spec 15).
 - **Errors:** bridge handlers return `{"ok":false,"error":"human message"}`
   for user-facing failures; the framework rejects on transport errors.
+- **Research rule:** no spec claim is written from memory. Commands,
+  flags, formats, and APIs are verified against primary sources (RFCs,
+  GNU/OpenBSD man pages, official project docs) and the vendored/installed
+  code (`third_party/`, `frontend/node_modules/`, the Native SDK), then
+  cited in §13 with URLs and line refs. When research contradicts the
+  draft, the spec body is corrected and the correction is noted in §13
+  (e.g. spec 17's PBKDF2 count, spec 18's agent-forwarding API, spec 12's
+  noVNC scaling API).
 - **Threading:** one worker thread per SSH session owns all libssh2 calls;
   the runtime main thread never blocks on the network (spec 02, §6).

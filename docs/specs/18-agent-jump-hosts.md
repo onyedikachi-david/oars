@@ -42,7 +42,14 @@ the direct-tcpip tunnel from spec 12 for the latter.
 
 ### `oars.agent.list` → `{ok, identities:[{type, fingerprint_sha256, comment}]}`
 - Via `SSH_AUTH_SOCK` (macOS: ssh-agent or Keychain-agent path); missing agent → `{ok, identities: [], error:"no agent"}` (not a failure).
-### `oars.agent.forward` `{server_id, on: bool}` → toggles `AgentForwarding` on the session (request via channel `auth-agent-req@openssh.com` — libssh2 exposes `libssh2_channel_forward_agent`? — pending: implement via `libssh2_channel_request_auth_agent`? Verify at build; else shell `ssh -A`-style not available — **fallback:** mark unsupported in this build if libssh2 lacks the API, surface as disabled toggle).
+### `oars.agent.forward` `{server_id, on: bool}` → toggles `AgentForwarding` on the session
+- Implemented via `libssh2_channel_request_auth_agent(channel)` on the
+  shell channel (`auth-agent-req@openssh.com` — the API is confirmed
+  present in libssh2 1.11.1, see §13); toggling requires the remote
+  `sshd` to permit agent forwarding (`AllowAgentForwarding`; the
+  session user's key may also carry `no-agent-forwarding` — see §13).
+- Audited when enabled; failure surfaces as "agent forwarding
+  refused" with the sshd policy hint, toggle returns to off.
 ### `oars.ssh.connect` gains `{auth_method:"agent"}` and `{via_server_id?}` (jump chain)
 
 ## 6. Zig core design
@@ -87,3 +94,60 @@ the direct-tcpip tunnel from spec 12 for the latter.
 - [ ] Cycle configs are rejected at save.
 - [ ] Jump failure reports the failing hop.
 - [ ] Forwarding toggle is opt-in, audited, and degrades gracefully when unsupported.
+
+## 13. Research & References
+
+- **libssh2 agent API** — verified against the vendored header
+  `third_party/libssh2/include/libssh2.h`: `libssh2_agent_init` L1352,
+  `libssh2_agent_list_identities` L1372, `libssh2_agent_userauth`
+  L1400 (agent-initiated public-key auth: the private key never
+  touches Oars — matches §8's "best-case posture").
+- **Agent forwarding — RESOLVED (was "pending: verify").**
+  `libssh2_channel_request_auth_agent(LIBSSH2_CHANNEL *)` is confirmed
+  in `libssh2.h` (declared immediately before
+  `libssh2_channel_request_pty_ex`, L879–886 region) **and used by
+  libssh2's own upstream code**: `example/ssh2_agent_forwarding.c`
+  L212–216 (loop on `LIBSSH2_ERROR_EAGAIN`) and
+  `tests/test_agent_forward_ok.c` L47–51, both vendored in
+  `third_party/libssh2/`. This sends the
+  `auth-agent-req@openssh.com` channel request — the same request
+  OpenSSH's `ssh -A` makes (see below). The spec's fallback branch is
+  no longer needed; implement via this API and surface sshd-policy
+  refusals as errors.
+- **SSH agent environment** — `SSH_AUTH_SOCK` "identifies the path of
+  a Unix-domain socket used to communicate with the agent" (OpenSSH
+  `ssh(1)` ENVIRONMENT section, `https://man.openbsd.org/ssh.1`);
+  `ssh-add -L` prints agent-held public keys (`ssh-add(1)`, same
+  manpage family) — the identity list for the connect dialog.
+- **Agent forwarding semantics & caution** — `ssh -A` "enables
+  forwarding of connections from an authentication agent"; the man
+  page's warning is the exact rationale for §8's opt-in toggle:
+  "Users with the ability to bypass file permissions on the remote
+  host… can access the local agent through the forwarded connection…
+  they can perform operations on the keys that enable them to
+  authenticate using the identities loaded into the agent. A safer
+  alternative may be to use a jump host (see -J)." Server-side
+  gating: `AllowAgentForwarding` (sshd_config(5)) and the
+  `no-agent-forwarding` authorized_keys option (sshd(8), spec 08 §13).
+- **Jump hosts** — `ssh -J destination` "connect to the target host by
+  first making an ssh connection to the jump host… Multiple jump hops
+  may be specified separated by comma characters" (ssh(1), `-J`
+  option) — the CLI analog of our chain design (depth ≤ 3 matches the
+  documented comma-separated multi-hop model). Our implementation
+  reuses `libssh2_channel_direct_tcpip_ex` (libssh2.h L850–854, with
+  the convenience macro L852) — the same tunnel primitive spec 12
+  uses; traffic to the target is double-encrypted (target SSH inside
+  jump SSH, §8).
+- **macOS agent discovery** — macOS runs an ssh-agent-backed
+  `SSH_AUTH_SOCK` for the user session (and offers Keychain-backed
+  keys via `ssh-add --apple-use-keychain`); scanning `$TMPDIR/ssh-*`
+  is the standard fallback when `SSH_AUTH_SOCK` is unset. The spec's
+  resolution order (env → `~/.ssh/agent.sock` → `$TMPDIR` scan)
+  matches ssh-agent's own documented socket locations
+  (ssh-agent(1)).
+- **Cycle detection** — `Server.via_server_id` graph: reject cycles at
+  save (a via-chain must be a DAG); this is plain graph validation,
+  no external reference needed.
+
+Sources: `third_party/libssh2/include/libssh2.h`, OpenBSD ssh(1)/sshd(8),
+ssh-agent(1), spec 12 §13.

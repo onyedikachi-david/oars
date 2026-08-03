@@ -108,3 +108,48 @@ You write Linux commands. Respond ONLY with JSON:
 - [ ] Nothing executes without an explicit Run click (verified by audit log).
 - [ ] Keys live only in the Keychain; config JSON has no secrets.
 - [ ] Save-as-script produces a working script.
+
+## 13. Research & References
+
+- **Chat Completions API** — verified against OpenAI's current API
+  reference (`https://platform.openai.com/docs/api-reference/chat/create`):
+  - Endpoint `POST /chat/completions`; request: `model`, `messages[]`
+    with roles `developer`/`system`/`user`/`assistant`/`tool`, `stream`
+    (bool), `stream_options: {include_usage}` (final chunk carries
+    token usage before `data: [DONE]`), `temperature`, `tools`/
+    `tool_choice` (unused in v1 — no tool-use per §2).
+  - Response: `choices[].message` (`content`, `role`),
+    `finish_reason` ∈ {stop, length, tool_calls, content_filter,
+    function_call}, `usage` (`prompt_tokens`,
+    `completion_tokens`, `total_tokens`).
+  - Streaming: chunks are `object: "chat.completion.chunk"` with
+    `choices[].delta` (`content` string fragments) — the spec's
+    "progressive explanation render" maps directly to delta
+    accumulation; SSE framing is the standard `data: …` line protocol
+    with `data: [DONE]` terminator.
+  - **Note:** newer models prefer the `developer` role over `system`
+    (per the docs' own field descriptions); the spec's prompt contract
+    uses `system`, which remains compatible with all models that
+    accept `system` — keep `system` for maximum provider compatibility
+    since we support arbitrary OpenAI-compatible providers (e.g.
+    Ollama, vLLM, LM Studio all implement the same chat schema).
+- **BYO-key architecture** — the client-side fetch design keeps the
+  key in the frontend→provider path only (Keychain → memory); provider
+  requests carry `Authorization: Bearer <key>` — the standard auth
+  scheme for OpenAI-compatible endpoints (API reference, auth section).
+  No proxy, no telemetry (per §2 non-goals).
+- **JSON output contract** — instructing JSON-out in the system prompt
+  is a documented, widely-used pattern; the fallback path (retry with
+  "respond with JSON only", then parse a fenced code block) covers the
+  model's known failure mode of wrapping JSON in markdown.
+- **Context bundle** — built from the monitor cache (spec 03 §5) and a
+  light probe; the commands behind it are the verified ones from specs
+  03/04 §13 (kernel /proc docs, coreutils, findutils).
+- **CSP/connect-src** — the packaged WebView's CSP must allow
+  `connect-src https:` for the provider origin; TLS-only + per-request
+  key (no cookies held by the WebView for the provider) is the
+  documented tradeoff in §6.
+
+Sources: OpenAI API reference (chat/create), the OpenAI-compatible
+provider ecosystem (Ollama/vLLM implement the same schema),
+specs 03/04 §13.

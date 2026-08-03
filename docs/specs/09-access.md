@@ -102,3 +102,42 @@ key everywhere, export the audit.
 - [ ] Onboard installs keys with per-server roles.
 - [ ] Unreachable servers are flagged, never silent.
 - [ ] Export produces correct CSV/JSON; all mutations audited.
+
+## 13. Research & References
+
+- **authorized_keys parsing** — see spec 08 §13: format, options
+  grammar, and permission rules verified against OpenBSD `sshd(8)`
+  (`https://man.openbsd.org/sshd.8`, AUTHORIZED_KEYS FILE FORMAT).
+  The identity key is the comment field; keys without comments are
+  grouped by fingerprint — consistent with sshd treating the comment
+  as "not used for anything (but may be convenient…)" (a comment is
+  not required, so unnamed keys are a real case, not a corner fantasy).
+- **Sudo probe** — `sudo -n true` verified against sudo(8)
+  (`https://man7.org/linux/man-pages/man8/sudo.8.html`): `-n`,
+  `--non-interactive` — "Avoid prompting the user for input of any
+  kind. If a password is required for the command to run, sudo will
+  display an error message and exit." So exit 0 ⇒ passwordless sudo
+  works right now; non-zero ⇒ cannot confirm (shown as `unknown`,
+  never guessed). Note sudo's credential cache (5 min per terminal,
+  sudoers default) means a cached credential could make the probe pass
+  even when a password would otherwise be needed — the spec's
+  `sudo: true|false|unknown` vocabulary with `unknown` on failure is
+  the honest presentation of that ambiguity.
+- **`id -Gn`** — GNU coreutils `id` with `-G` (supplementary groups,
+  plus primary with `-n` name form) verified in the coreutils manual
+  (`https://www.gnu.org/software/coreutils/manual/html_node/id-invocation.html`).
+  Group membership is a secondary signal; sudo result takes precedence.
+- **Offboard/onboard/rotate mechanics** — all three are
+  read-modify-write of `authorized_keys` via the atomic writer from
+  spec 08 (temp + rename, 0600); idempotency is guaranteed by
+  fingerprint-keyed matching (same key on two lines is removed once —
+  the writer is line-preserving except matches).
+- **CSV export** — RFC 4180 comma-separated values (fields with
+  commas/quotes/newlines quoted) — cite RFC 4180
+  (`https://www.rfc-editor.org/rfc/rfc4180`); JSON export is
+  std.json-serialized.
+- **Snapshot semantics** — scanning is by design point-in-time (per
+  §2 non-goals); no continuous monitoring claim is made.
+
+Sources: OpenBSD sshd(8), sudo(8) man7, GNU coreutils id(1), RFC 4180,
+spec 08 §13.

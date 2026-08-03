@@ -80,3 +80,23 @@ group-level status rollup and a monitoring grid across the whole group —
 - [ ] Group header shows live connected/error counts.
 - [ ] Group view renders monitor grid at ≤ 5 s staleness.
 - [ ] Deleting a group never deletes servers.
+
+## 13. Research & References
+
+- **Data model decision** — v1 derives groups from `Server.group` (a
+  single string field, already in the model — `src/servers.zig` L27,
+  see spec 01 §13). This is a deliberate product decision: no new
+  store until groups need metadata (order, description). The bridge
+  surface stays zero: `servers.list` already returns `group`.
+- **Monitor grid staleness** — reuses the spec 03 snapshot cache
+  (`MonitorCache`, probe-on-demand with refresh-if-stale, §6) so a
+  group view polls the same cached snapshots; 5 s refresh is a UI
+  cadence, not a probe cadence (idle cost bounded per spec 03 §9).
+- **Folder-vs-tag semantics** — folders are exclusive, tags inclusive:
+  a common UX convention in fleet tools; no external standard to cite
+  (product decision recorded here so the UI copy stays consistent).
+- **Drag-and-drop persistence** — client-side only until the group
+  store exists; moving a server between groups writes
+  `oars.servers.save` (spec 01 §5) with the new `group` value.
+
+Sources: `src/servers.zig`, spec 01 §13, spec 03 §13.

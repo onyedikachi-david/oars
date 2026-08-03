@@ -110,3 +110,58 @@ df -kP /; ps -eo pid=,comm=,%cpu=,%mem= --sort=-%cpu | head -n 11
 - [ ] Clear cache and clean disk run only after confirm and write audit entries.
 - [ ] Idle servers consume no probe traffic (no poll → no exec).
 - [ ] PM2 list/restart/stop work against a container running PM2.
+
+## 13. Research & References
+
+- **`/proc` sources** — verified against the Linux kernel documentation
+  (`https://www.kernel.org/doc/html/latest/filesystems/proc.html`):
+  - `/proc/loadavg` = "Load average of last 1, 5 & 15 minutes; number of
+    processes currently runnable (running or on ready queue); total
+    number of processes in system; last pid created. … separated by a
+    slash ('/')… Example: `0.61 0.61 0.55 3/828 22084`". This matches
+    our probe's parse of the first three fields as 1/5/15-min load.
+  - `/proc/meminfo` = memory utilization; fields `MemTotal`, `MemFree`,
+    `MemAvailable` ("an estimate of how much memory is available for
+    starting new applications, without swapping" — the right value for
+    our "available" gauge), `SwapTotal`, `SwapFree`. Units are kB.
+  - `/proc/uptime` = "wall clock since boot, combined idle time of all
+    cpus" (seconds).
+  - Containers without `/proc` are a real failure mode the spec handles
+    via `probe_error`.
+- **`nproc`** — GNU coreutils (manual:
+  `https://www.gnu.org/software/coreutils/manual/html_node/nproc-invocation.html`),
+  prints the number of processing units available to the current process
+  (respects taskset/affinity).
+- **`df -kP`** — verified in the GNU coreutils manual
+  (`https://www.gnu.org/software/coreutils/manual/html_node/df-invocation.html`):
+  `-k` prints sizes in 1024-byte blocks; `-P` selects the POSIX output
+  format (each file system on exactly one line, POSIX headers). Both
+  flags exist on GNU df; busybox `df` supports `-kP` too (busybox
+  applet docs) — the parser tolerates both.
+- **`ps`** — verified against the procps-ng man page
+  (`https://man7.org/linux/man-pages/man1/ps.1.html`): `-e` selects all
+  processes; `-o` user-defined format with keywords `pid`, `comm`
+  (executable name), `%cpu`/`pcpu` (cputime/realtime ratio), `%mem`/
+  `pmem` (RSS/total ratio); `--sort` takes `[+|-]key` where key is a
+  format specifier (e.g. `--sort=-%cpu`). `comm` vs `args`: comm is the
+  executable name only — matches our "process" column. Busybox `ps`
+  lacks `--sort` and `-o %cpu` variations — the fallback path in §6 is
+  verified as necessary (busybox ps supports `-o` with limited fields
+  and no GNU-style sorting).
+- **Clean-disk commands** — `find … -delete` (implies `-depth`, fails to
+  remove non-empty dirs) verified in the GNU findutils man page
+  (`https://man7.org/linux/man-pages/man1/find.1.html`, ACTIONS /
+  -delete); `journalctl --vacuum-time=3d` is systemd-journald's
+  documented vacuum flag (`https://www.freedesktop.org/software/systemd/man/latest/journalctl.html`);
+  `apt-get clean` is the documented apt cache cleaner
+  (`https://manpages.debian.org/apt-get`). All three targets are fixed
+  strings — no user input interpolation (per §8).
+- **PM2 jlist/actions** — `pm2 list`/`pm2 restart <name>`/`pm2 stop
+  <name>` verified in PM2's official docs
+  (`https://pm2.keymetrics.io/docs/usage/process-management/`); `pm2
+  jlist` (JSON output for programmatic use) is the documented machine
+  interface in the PM2 CLI reference
+  (`https://pm2.keymetrics.io/docs/usage/pm2-doc-single-page/`).
+
+Sources: kernel docs (proc.html), GNU coreutils manual (df/nproc),
+procps-ng ps(1), GNU findutils find(1), systemd journalctl(1), PM2 docs.

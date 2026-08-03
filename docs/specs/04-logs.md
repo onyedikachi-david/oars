@@ -118,3 +118,48 @@ plus PM2 log paths from `pm2 jlist`, plus user-added paths. Grouping:
 - [ ] Unreadable files produce explicit errors, never hangs.
 - [ ] Manual paths persist across sessions.
 - [ ] Parser/validator tests green.
+
+## 13. Research & References
+
+- **Scan command** — `find /var/log -maxdepth 3 -type f -name '*.log'
+  -printf '%p %s %T@\n'` verified against the GNU findutils man page
+  (`https://man7.org/linux/man-pages/man1/find.1.html`): `-maxdepth`
+  (descend at most N levels), `-type f` (regular files), `-name`
+  (basename shell-pattern match), `-printf format` with directives `%p`
+  (file's name), `%s` (size in bytes), `%T@` (last modification time as
+  seconds since epoch **with fractional part** — the `@` form is
+documented under `%Ak`-style directives). `2>/dev/null` suppresses
+  permission errors; unreadable dirs simply yield fewer rows.
+- **`tail` read/follow** — verified against the GNU coreutils manual
+  (`https://www.gnu.org/software/coreutils/manual/html_node/tail-invocation.html`):
+  - `-n num` outputs the last num lines (spec: 200/500/1k/5k).
+  - `-f`/`--follow=how`: **default is `--follow=descriptor`** — "If
+    you'd like to continue to track the end of a growing file even after
+    it has been unlinked, use `--follow=descriptor`. This is the default
+    behavior" — this is exactly the rotation behavior spec §10 relies on
+    ("follow keeps the open fd"). `--follow=name` + `--retry` (`-F`)
+    is the rotation-following alternative (we re-scan instead, and note
+    the inode change).
+  - Truncation: "if the tracked file is determined to have shrunk, tail
+    prints a message saying the file has been truncated and resumes
+    tracking from the start" — our `truncated: true` re-read handles
+    the same race from the client side.
+  - inotify-based follow is prompt; without inotify tail polls every
+    1 s (`--sleep-interval`), which bounds our follow latency.
+- **Clear** — `truncate -s 0 <path>` verified in the GNU coreutils
+  manual (`https://www.gnu.org/software/coreutils/manual/html_node/truncate-invocation.html`):
+  "If a file is larger than the specified size, the extra data is lost"
+  and `-c/--no-create` avoids creating a file if the path is wrong.
+  Use `truncate -c -s 0` to avoid accidentally creating a new log file.
+- **PM2 log paths** — `pm2 jlist` JSON includes per-process log file
+  paths (`pm_out_log_path`/`pm_err_log_path`); PM2 docs
+  (`https://pm2.keymetrics.io/docs/usage/process-management/`, spec 03
+  §13) confirm jlist as the machine interface.
+- **Readability probe** — `test -r <path>` is POSIX sh's documented
+  readability check (`test(1)`, `-r` flag); run batched via exec.
+- **Download chunking** — bridge payload limit enforced at SDK
+  `bridge/root.zig` L144 (`payload_too_large`); 64 KB base64 chunks
+  (≈87 KB) stay well under the 1 MB budget (see spec 05 §13).
+
+Sources: GNU findutils find(1), GNU coreutils manual (tail, truncate),
+PM2 docs, SDK bridge/root.zig.
