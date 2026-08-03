@@ -164,3 +164,198 @@ test "servers.save round trips through the bridge dispatcher" {
 test "app name is configured" {
     try std.testing.expectEqualStrings("oars", "oars");
 }
+
+// --- spec 01 bridge tests --------------------------------------------------
+
+const SaveResponse = struct {
+    // The dispatcher wraps handler output under "result".
+    result: struct {
+        ok: bool,
+        server: struct {
+            id: []const u8,
+            created_at: i64,
+            host_fingerprint: ?[]const u8 = null,
+            tags: [][]const u8 = &.{},
+            via_server_id: ?[]const u8 = null,
+        },
+    },
+};
+
+fn parseSaveResponse(allocator: std.mem.Allocator, response: []const u8) !std.json.Parsed(SaveResponse) {
+    // alloc_always so parsed strings never alias the dispatcher's output
+    // buffer, which the next dispatch overwrites.
+    return std.json.parseFromSlice(SaveResponse, allocator, response, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+}
+
+/// A disposable app: arena-backed store (store strings live for the app
+/// lifetime), a session manager with no live sessions, and a dispatcher.
+/// init() must run in place (not return a copy): ArenaAllocator.allocator()
+/// captures the arena's address, and the context holds it.
+const TestApp = struct {
+    arena: std.heap.ArenaAllocator,
+    store: servers.Store,
+    manager: sessions.Manager,
+    ctx: bridge.Context,
+    dispatcher: native_sdk.BridgeDispatcher,
+    output: [64 * 1024]u8 = undefined,
+    dir_buf: [128]u8 = undefined,
+    path_buf: [512]u8 = undefined,
+    dir_name: []const u8,
+
+    fn init(self: *TestApp) !void {
+        self.arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        errdefer self.arena.deinit();
+        const io = std.testing.io;
+        const now = std.Io.Timestamp.now(io, .real).nanoseconds;
+        self.dir_name = try std.fmt.bufPrint(&self.dir_buf, "oars-test-{d}", .{now});
+        const store_path = try std.fmt.bufPrint(&self.path_buf, "/tmp/{s}/servers.json", .{self.dir_name});
+        const store_alloc = self.arena.allocator();
+        self.store = .{ .allocator = store_alloc, .path = store_path };
+        self.manager = sessions.Manager.init(store_alloc, io, &self.store, null);
+        self.ctx = .{ .allocator = store_alloc, .io = io, .store = &self.store, .manager = &self.manager };
+        self.dispatcher = self.ctx.dispatcher();
+    }
+
+    fn deinit(self: *TestApp) void {
+        self.manager.deinit();
+        self.arena.deinit();
+        std.Io.Dir.cwd().deleteTree(std.testing.io, self.dir_name) catch {};
+    }
+
+    /// Returns a slice into `self.output`; the caller must read or parse
+    /// it before the next dispatch call.
+    fn dispatch(self: *TestApp, request: []const u8) []const u8 {
+        return self.dispatcher.dispatch(request, .{ .origin = "zero://app" }, &self.output);
+    }
+};
+
+test "servers.save preserves created_at and fingerprint by endpoint rule" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+    const store_alloc = app.arena.allocator();
+
+    const first = app.dispatch(
+        \\{"id":"1","command":"oars.servers.save","payload":{"id":"fp1","name":"prod","host":"1.2.3.4","port":22,"user":"root","auth_method":"password"}}
+    );
+    var first_parsed = try parseSaveResponse(store_alloc, first);
+    defer first_parsed.deinit();
+    const created_at = first_parsed.value.result.server.created_at;
+
+    // A successful trust stores the fingerprint in the config; editing the
+    // profile afterwards must not silently clear it while the endpoint is
+    // unchanged.
+    const existing = servers.Server{
+        .id = "fp1",
+        .name = "prod",
+        .host = "1.2.3.4",
+        .port = 22,
+        .user = "root",
+        .host_fingerprint = "SHA256:deadbeef",
+        .created_at = created_at,
+    };
+    try app.store.upsert(std.testing.io, existing);
+
+    const edit_same_endpoint = app.dispatch(
+        \\{"id":"2","command":"oars.servers.save","payload":{"id":"fp1","name":"renamed","host":"1.2.3.4","port":22,"user":"root","auth_method":"password"}}
+    );
+    var same_parsed = try parseSaveResponse(store_alloc, edit_same_endpoint);
+    defer same_parsed.deinit();
+    try std.testing.expectEqual(created_at, same_parsed.value.result.server.created_at);
+    try std.testing.expectEqualStrings("SHA256:deadbeef", same_parsed.value.result.server.host_fingerprint.?);
+
+    // Changing the endpoint clears the fingerprint but still preserves
+    // created_at.
+    const edit_new_port = app.dispatch(
+        \\{"id":"3","command":"oars.servers.save","payload":{"id":"fp1","name":"renamed","host":"1.2.3.4","port":2222,"user":"root","auth_method":"password"}}
+    );
+    var port_parsed = try parseSaveResponse(store_alloc, edit_new_port);
+    defer port_parsed.deinit();
+    try std.testing.expectEqual(created_at, port_parsed.value.result.server.created_at);
+    try std.testing.expect(port_parsed.value.result.server.host_fingerprint == null);
+}
+
+test "servers.save normalizes tags and validates host, port, and via chains" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+    const store_alloc = app.arena.allocator();
+
+    const tagged = app.dispatch(
+        \\{"id":"1","command":"oars.servers.save","payload":{"id":"t1","name":"prod","host":"1.2.3.4","user":"root","auth_method":"password","tags":[" web ","api","web",""]}}
+    );
+    var tagged_parsed = try parseSaveResponse(store_alloc, tagged);
+    defer tagged_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), tagged_parsed.value.result.server.tags.len);
+    try std.testing.expectEqualStrings("web", tagged_parsed.value.result.server.tags[0]);
+    try std.testing.expectEqualStrings("api", tagged_parsed.value.result.server.tags[1]);
+
+    // Trailing slash in a host is rejected, not stripped.
+    const bad_host = app.dispatch(
+        \\{"id":"2","command":"oars.servers.save","payload":{"id":"t2","name":"x","host":"1.2.3.4/","user":"root","auth_method":"password"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_host, "must not end with '/'") != null);
+
+    // Port 0 is rejected, never clamped.
+    const bad_port = app.dispatch(
+        \\{"id":"3","command":"oars.servers.save","payload":{"id":"t3","name":"x","host":"1.2.3.4","port":0,"user":"root","auth_method":"password"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_port, "port must be between 1 and 65535") != null);
+
+    // Jump host must exist.
+    const missing_via = app.dispatch(
+        \\{"id":"4","command":"oars.servers.save","payload":{"id":"a","name":"a","host":"1.1.1.1","user":"root","auth_method":"password","via_server_id":"nope"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, missing_via, "jump host does not exist") != null);
+
+    // A valid chain saves; then a cycle is rejected.
+    const save_b = app.dispatch(
+        \\{"id":"5","command":"oars.servers.save","payload":{"id":"b","name":"b","host":"2.2.2.2","user":"root","auth_method":"password"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, save_b, "\"ok\":true") != null);
+    const save_a_via_b = app.dispatch(
+        \\{"id":"6","command":"oars.servers.save","payload":{"id":"a","name":"a","host":"1.1.1.1","user":"root","auth_method":"password","via_server_id":"b"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, save_a_via_b, "\"ok\":true") != null);
+    const cycle = app.dispatch(
+        \\{"id":"7","command":"oars.servers.save","payload":{"id":"b","name":"b","host":"2.2.2.2","user":"root","auth_method":"password","via_server_id":"a"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, cycle, "contains a cycle") != null);
+
+    const self_link = app.dispatch(
+        \\{"id":"8","command":"oars.servers.save","payload":{"id":"c","name":"c","host":"3.3.3.3","user":"root","auth_method":"password","via_server_id":"c"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, self_link, "cannot connect via itself") != null);
+}
+
+test "servers.list reports quarantine recovery when the store is corrupt" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // Build a healthy store first, then corrupt the file behind the
+    // store's back — quarantine only applies to an existing store.
+    _ = app.dispatch(
+        \\{"id":"1","command":"oars.servers.save","payload":{"id":"s1","name":"prod","host":"1.2.3.4","user":"root","auth_method":"password"}}
+    );
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = app.store.path, .data = "{corrupt" });
+
+    const list_response = app.dispatch(
+        \\{"id":"2","command":"oars.servers.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, list_response, "\"recovery_error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_response, "corrupt-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_response, "\"servers\":[]") != null);
+
+    // A save afterwards starts a fresh store and clears the recovery state.
+    _ = app.dispatch(
+        \\{"id":"3","command":"oars.servers.save","payload":{"id":"s2","name":"prod","host":"1.2.3.4","user":"root","auth_method":"password"}}
+    );
+    const list_again = app.dispatch(
+        \\{"id":"4","command":"oars.servers.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, list_again, "\"recovery_error\"") == null);
+}

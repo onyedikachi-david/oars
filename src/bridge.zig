@@ -107,6 +107,12 @@ fn handleServersList(context: *anyopaque, invocation: native_sdk.bridge.Invocati
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":true,\"servers\":") catch return output[0..0];
     std.json.Stringify.value(loaded.parsed.value, .{}, &writer) catch return output[0..0];
+    if (loaded.quarantined) |q| {
+        var msg_buf: [640]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "servers.json was unreadable and was moved to {s}; the server list starts fresh", .{q}) catch "servers.json was unreadable and was moved aside";
+        writer.writeAll(",\"recovery_error\":") catch return output[0..0];
+        writeJsonString(&writer, msg) catch return output[0..0];
+    }
     writer.writeAll("}") catch return output[0..0];
     return writer.buffered();
 }
@@ -121,6 +127,8 @@ const SavePayload = struct {
     key_path: ?[]const u8 = null,
     key_has_passphrase: bool = false,
     group: ?[]const u8 = null,
+    tags: ?[][]const u8 = null,
+    via_server_id: ?[]const u8 = null,
 };
 
 fn handleServersSave(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
@@ -134,6 +142,13 @@ fn handleServersSave(context: *anyopaque, invocation: native_sdk.bridge.Invocati
     const auth_method = servers.AuthMethod.fromJsonName(payload.auth_method) orelse {
         return respondError(output, "unknown auth method");
     };
+
+    // Host names are trimmed; a trailing slash is not part of an SSH host
+    // and is rejected rather than silently stripped (spec 01 §10).
+    const host = std.mem.trim(u8, payload.host, " \t\r\n");
+    if (host.len == 0) return respondError(output, "host is required");
+    if (host[host.len - 1] == '/') return respondError(output, "host must not end with '/'");
+    if (payload.port == 0) return respondError(output, "port must be between 1 and 65535");
 
     const key_path = std.mem.trim(u8, payload.key_path orelse "", " \t\r\n");
     if (auth_method == .key) {
@@ -153,6 +168,28 @@ fn handleServersSave(context: *anyopaque, invocation: native_sdk.bridge.Invocati
         };
     }
 
+    // Tags are normalized: trimmed, empties dropped, duplicates removed.
+    var tags: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (tags.items) |t| self.allocator.free(t);
+        tags.deinit(self.allocator);
+    }
+    if (payload.tags) |incoming| {
+        for (incoming) |raw| {
+            const tag = std.mem.trim(u8, raw, " \t\r\n");
+            if (tag.len == 0) continue;
+            var dup = false;
+            for (tags.items) |existing| {
+                if (std.mem.eql(u8, existing, tag)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            tags.append(self.allocator, self.allocator.dupe(u8, tag) catch return respondError(output, "out of memory")) catch return respondError(output, "out of memory");
+        }
+    }
+
     const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
     var owned_id: ?[]const u8 = null;
     defer if (owned_id) |o| self.allocator.free(o);
@@ -163,18 +200,52 @@ fn handleServersSave(context: *anyopaque, invocation: native_sdk.bridge.Invocati
         break :blk owned_id.?;
     };
 
+    // Edits preserve created_at, and keep the trusted host fingerprint
+    // only while the endpoint (host+port) is unchanged (spec 01 §5).
+    var loaded = self.store.loadParsed(self.io) catch {
+        return respondError(output, "failed to load servers");
+    };
+    defer loaded.deinit(self.allocator);
+    var created_at: i64 = @intCast(now);
+    var host_fingerprint: ?[]const u8 = null;
+    if (payload.id) |pid| {
+        for (loaded.parsed.value) |existing| {
+            if (std.mem.eql(u8, existing.id, pid)) {
+                created_at = existing.created_at;
+                if (std.mem.eql(u8, existing.host, host) and existing.port == payload.port) {
+                    host_fingerprint = existing.host_fingerprint;
+                }
+                break;
+            }
+        }
+    }
+
     const server = servers.Server{
         .id = id,
         .name = payload.name,
-        .host = payload.host,
+        .host = host,
         .port = payload.port,
         .user = payload.user,
         .auth_method = auth_method,
         .key_path = key_path,
         .key_has_passphrase = payload.key_has_passphrase,
+        .host_fingerprint = host_fingerprint,
         .group = payload.group orelse "",
-        .created_at = @intCast(now),
+        .tags = tags.items,
+        .via_server_id = payload.via_server_id,
+        .created_at = created_at,
         .updated_at = @intCast(now),
+    };
+
+    // Jump chains are validated against the saved set at save time:
+    // existing references, no self-links, depth <= 3, no cycles (spec 18).
+    servers.validateViaChain(server, loaded.parsed.value) catch |err| {
+        return respondError(output, switch (err) {
+            error.SelfLink => "a server cannot connect via itself",
+            error.MissingVia => "the configured jump host does not exist",
+            error.ChainTooDeep => "jump chains are limited to 3 hops",
+            error.Cycle => "jump chain contains a cycle",
+        });
     };
 
     self.store.upsert(self.io, server) catch {
@@ -211,6 +282,17 @@ fn writeServer(writer: anytype, server: servers.Server) !void {
     }
     try writer.writeAll(",\"group\":");
     try writeJsonString(writer, server.group);
+    try writer.writeAll(",\"tags\":[");
+    for (server.tags, 0..) |tag, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writeJsonString(writer, tag);
+    }
+    try writer.writeAll("],\"via_server_id\":");
+    if (server.via_server_id) |via| {
+        try writeJsonString(writer, via);
+    } else {
+        try writer.writeAll("null");
+    }
     try writer.print(",\"created_at\":{d},\"updated_at\":{d}}}", .{ server.created_at, server.updated_at });
 }
 

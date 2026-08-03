@@ -1,7 +1,9 @@
 # Spec 01 — Multi-Server Management
 
-**Status:** Partial (CRUD, Keychain flow, and session tabs exist; persistence
-hardening and grouping are not yet implemented) · **Depends on:** — · **Spec owner:** core
+**Status:** Partial (CRUD, Keychain flow, session tabs, and store hardening
+landed 2026-08-03 — owner-only permissions, corrupt-file quarantine, save
+semantics, tags/via validation; `SHA256:` base64 fingerprint migration (spec
+02) and grouping pending) · **Depends on:** — · **Spec owner:** core
 
 ## 1. Overview
 
@@ -140,23 +142,29 @@ feature request.
 
 ## 11. Testing
 
-- Unit: Store round-trip (save→load), corrupt-file fallback, id generation, deep-copy independence (mutating copy doesn't affect original).
-- Bridge: dispatcher-level save/list/delete with permission-denied negative test (exists in `main.zig`).
+- Unit: Store round-trip (save→load), corrupt-file quarantine, id generation,
+  deep-copy independence (mutating copy doesn't affect original), via-chain
+  validation (self/missing/depth-4/cycle), 0600 permissions, permissive-file
+  tightening — all in `src/servers.zig` under `std.testing.allocator`.
+- Bridge: dispatcher-level save/list/delete with permission-denied negative
+  test, save semantics (created_at preservation, fingerprint endpoint rule),
+  tags normalization, host/port validation, via-chain rejection, and
+  quarantine recovery reporting — in `src/main.zig`.
 - Manual: add → edit → delete flows; Keychain write/read on macOS.
 
 ## 12. Acceptance criteria
 
-- [ ] Add, edit, delete, and list servers survive app restart.
-- [ ] Passwords never appear in `servers.json`.
-- [ ] Deleting a server disconnects its session and closes its tabs.
-- [ ] Sidebar shows live status dots for all servers with sessions.
-- [ ] `zig build test` passes with store/bridge coverage.
-- [ ] Editing a profile preserves `created_at` and preserves or clears the
+- [x] Add, edit, delete, and list servers survive app restart.
+- [x] Passwords never appear in `servers.json`.
+- [x] Deleting a server disconnects its session and closes its tabs.
+- [x] Sidebar shows live status dots for all servers with sessions.
+- [x] `zig build test` passes with store/bridge coverage.
+- [x] Editing a profile preserves `created_at` and preserves or clears the
       host fingerprint according to the endpoint rule above.
 - [ ] Stored and displayed host fingerprints match OpenSSH's
       `SHA256:<base64-without-padding>` form. Existing hex records migrate only
-      after the same host key verifies.
-- [ ] `servers.json` is written with owner-only permissions and a corrupt file
+      after the same host key verifies. — backend session-side work is spec 02.
+- [x] `servers.json` is written with owner-only permissions and a corrupt file
       is quarantined before the app continues.
 
 ## 13. Research & References
@@ -177,6 +185,17 @@ installed Native SDK) rather than assumed.
   so it resets `created_at` and clears `host_fingerprint`; malformed JSON is
   treated as empty but is not quarantined; and the store does not explicitly
   set owner-only file permissions.
+  **Landed 2026-08-03:** save semantics (created_at preservation, fingerprint
+  kept only while host+port are unchanged, trailing-slash host and port 0
+  rejected, tags trimmed/deduped), corrupt-file quarantine to
+  `servers.json.corrupt-<ts>` with `recovery_error` in `oars.servers.list`,
+  0600 write permissions plus tightening of a permissive existing file, and
+  `via_server_id` chain validation (existing refs, no self-links, depth ≤ 3,
+  no cycles). Two pre-existing memory leaks were fixed while landing this:
+  `Store.upsert` never released its deep-copied server after `save`, and
+  `loadParsed` built its empty `Loaded` eagerly, leaking the parse arena on
+  every successful load. The `SHA256:` base64 fingerprint migration and
+  duplicate-connect idempotence are spec 02 session-side work.
 - **Bridge protocol (invoke/response, no native→JS push)** — verified in
   the installed SDK at
   `node_modules/@native-sdk/cli/src/bridge/root.zig`: `Handler` with

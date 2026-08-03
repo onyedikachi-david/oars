@@ -11,7 +11,7 @@ already exists.
 
 | # | Spec | Status |
 |---|------|--------|
-| 01 | [Multi-Server Management](01-multi-server.md) | Partial: core CRUD and UI exist |
+| 01 | [Multi-Server Management](01-multi-server.md) | Partial: CRUD, UI, and store hardening (perms, quarantine, save semantics) land; fingerprint migration (02) and grouping pending |
 | 02 | [Terminal (SSH)](02-terminal.md) | Partial: shell and exec exist; mirrored cursors and resize are not yet implemented |
 | 03 | [Infra Monitoring](03-monitoring.md) | 📋 |
 | 04 | [Log Management](04-logs.md) | 📋 |

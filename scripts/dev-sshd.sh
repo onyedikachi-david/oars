@@ -29,17 +29,20 @@ up() {
     docker rm -f "$NAME" >/dev/null 2>&1 || true
     docker run -d --name "$NAME" -p "127.0.0.1:$PORT:22" "$IMAGE" >/dev/null
 
-    # Wait for sshd to accept connections (30 s budget).
+    # Wait until sshd accepts TCP connections (30 s budget). A connect
+    # probe is the honest readiness check: the process may be up while
+    # the listener is still starting.
     deadline=$((SECONDS + 30))
-    until docker exec "$NAME" sh -c 'pgrep -x sshd >/dev/null' 2>/dev/null; do
+    until (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; do
         if ((SECONDS >= deadline)); then
-            echo "error: sshd did not start in the container" >&2
+            echo "error: sshd did not accept connections in the container" >&2
             docker logs "$NAME" >&2 || true
             docker rm -f "$NAME" >/dev/null 2>&1 || true
             exit 1
         fi
         sleep 1
     done
+    exec 3>&- 3<&-
 
     docker cp "$NAME:/root/.ssh/id_ed25519" "$KEY_FILE"
     chmod 600 "$KEY_FILE"
