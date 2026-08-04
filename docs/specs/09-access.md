@@ -147,13 +147,13 @@ Oars cannot read the required files or sudo policy.
 
 ## 12. Acceptance criteria
 
-- [ ] Scan builds an accurate people/fingerprint/login/server map, separates
+- [x] Scan builds an accurate people/fingerprint/login/server map, separates
       unassigned keys, and states whether coverage is complete or partial.
-- [ ] Offboard removes only the selected fingerprint grants and detects
+- [x] Offboard removes only the selected fingerprint grants and detects
       concurrent line changes.
-- [ ] Onboard installs keys with per-server roles.
-- [ ] Unreachable servers are flagged, never silent.
-- [ ] Export produces correct CSV/JSON; all mutations audited.
+- [x] Onboard installs keys with per-server roles.
+- [x] Unreachable servers are flagged, never silent.
+- [x] Export produces correct CSV/JSON; all mutations audited.
 
 ## 13. Research & References
 

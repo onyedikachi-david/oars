@@ -21,10 +21,13 @@ const bridge = @import("bridge.zig");
 const sftpmod = @import("sftp.zig");
 const scripts = @import("scripts.zig");
 const deploy = @import("deploy.zig");
+const access = @import("access.zig");
 const integration_keys = @import("integration_keys.zig");
+const integration_access = @import("integration_access.zig");
 
 comptime {
     _ = integration_keys;
+    _ = integration_access;
 }
 
 /// Reads an environment variable from the process environment. The raw
@@ -81,6 +84,7 @@ pub const TestRig = struct {
     scripts_path_buf: [512]u8 = undefined,
     deploy_apps_path_buf: [512]u8 = undefined,
     deploy_history_path_buf: [512]u8 = undefined,
+    access_path_buf: [512]u8 = undefined,
     dir_name: []const u8,
     store: servers.Store,
     audit_store: audit.Store,
@@ -88,6 +92,7 @@ pub const TestRig = struct {
     scripts_store: scripts.Store,
     deploy_apps_store: deploy.AppStore,
     deploy_history_store: deploy.HistoryStore,
+    access_registry: access.Registry,
     manager: sessions.Manager,
     ctx: bridge.Context,
     dispatcher: native_sdk.BridgeDispatcher,
@@ -103,18 +108,21 @@ pub const TestRig = struct {
         const scripts_path = try std.fmt.bufPrint(&self.scripts_path_buf, "/tmp/{s}/scripts.json", .{self.dir_name});
         const deploy_apps_path = try std.fmt.bufPrint(&self.deploy_apps_path_buf, "/tmp/{s}/apps.json", .{self.dir_name});
         const deploy_history_path = try std.fmt.bufPrint(&self.deploy_history_path_buf, "/tmp/{s}/deploy_runs.json", .{self.dir_name});
+        const access_path = try std.fmt.bufPrint(&self.access_path_buf, "/tmp/{s}/access_identities.json", .{self.dir_name});
         self.store = .{ .allocator = std.testing.allocator, .path = store_path };
         self.audit_store = .{ .allocator = std.testing.allocator, .path = audit_path };
         self.logs_store = .{ .allocator = std.testing.allocator, .path = logs_path };
         self.scripts_store = .{ .allocator = std.testing.allocator, .path = scripts_path };
         self.deploy_apps_store = .{ .allocator = std.testing.allocator, .path = deploy_apps_path };
         self.deploy_history_store = .{ .allocator = std.testing.allocator, .path = deploy_history_path };
+        self.access_registry = access.Registry.init(std.testing.allocator, access_path);
         self.manager = sessions.Manager.init(std.testing.allocator, io, &self.store, &self.audit_store, null);
-        self.ctx = .{ .allocator = std.testing.allocator, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store };
+        self.ctx = .{ .allocator = std.testing.allocator, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store, .access = &self.access_registry };
         self.dispatcher = self.ctx.dispatcher();
     }
 
     pub fn deinit(self: *TestRig) void {
+        self.access_registry.deinit();
         self.manager.deinit();
         std.Io.Dir.cwd().deleteTree(std.testing.io, self.dir_name) catch {};
     }

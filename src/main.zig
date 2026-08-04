@@ -10,6 +10,7 @@ const logs = @import("logs.zig");
 const scripts = @import("scripts.zig");
 const deploy = @import("deploy.zig");
 const integration = @import("integration.zig");
+const access = @import("access.zig");
 
 // Zig 0.16 only collects test blocks from files that are actually
 // analyzed, and an unused import is never analyzed — so the env-gated
@@ -48,6 +49,7 @@ const App = struct {
     scripts_store: scripts.Store,
     deploy_apps_store: deploy.AppStore,
     deploy_history_store: deploy.HistoryStore,
+    access_registry: access.Registry,
     manager: sessions.Manager,
     bridge_ctx: bridge.Context,
     store_path_buf: [2048]u8 = undefined,
@@ -56,6 +58,7 @@ const App = struct {
     scripts_path_buf: [2048]u8 = undefined,
     deploy_apps_path_buf: [2048]u8 = undefined,
     deploy_history_path_buf: [2048]u8 = undefined,
+    access_path_buf: [2048]u8 = undefined,
     data_dir_buf: [1024]u8 = undefined,
     fallback_dir_buf: [1024]u8 = undefined,
 
@@ -111,12 +114,18 @@ const App = struct {
             &self.deploy_history_path_buf,
             &.{ base, "deploy_runs.json" },
         ) catch unreachable;
+        const access_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.access_path_buf,
+            &.{ base, access.identity_store_name },
+        ) catch unreachable;
         self.store = .{ .allocator = self.allocator, .path = store_path };
         self.audit_store = .{ .allocator = self.allocator, .path = audit_path };
         self.logs_store = .{ .allocator = self.allocator, .path = logs_path };
         self.scripts_store = .{ .allocator = self.allocator, .path = scripts_path };
         self.deploy_apps_store = .{ .allocator = self.allocator, .path = deploy_apps_path };
         self.deploy_history_store = .{ .allocator = self.allocator, .path = deploy_history_path };
+        self.access_registry = access.Registry.init(self.allocator, access_path);
 
         self.manager = sessions.Manager.init(self.allocator, self.io, &self.store, &self.audit_store, self.env_map.get("HOME"));
         self.bridge_ctx = .{
@@ -129,10 +138,12 @@ const App = struct {
             .scripts = &self.scripts_store,
             .apps = &self.deploy_apps_store,
             .deploy_history = &self.deploy_history_store,
+            .access = &self.access_registry,
         };
     }
 
     fn deinit(self: *App) void {
+        self.access_registry.deinit();
         self.manager.deinit();
         ssh.Session.deinitGlobal();
     }
@@ -209,9 +220,13 @@ test "servers.save round trips through the bridge dispatcher" {
     var deploy_hist_buf: [512]u8 = undefined;
     const deploy_hist_path = std.fmt.bufPrint(&deploy_hist_buf, "/tmp/{s}/deploy_runs.json", .{dir_name}) catch unreachable;
     var deploy_hist_store = deploy.HistoryStore{ .allocator = store_alloc, .path = deploy_hist_path };
+    var access_buf: [512]u8 = undefined;
+    const access_path = std.fmt.bufPrint(&access_buf, "/tmp/{s}/access_identities.json", .{dir_name}) catch unreachable;
+    var access_registry = access.Registry.init(store_alloc, access_path);
+    defer access_registry.deinit();
     var manager = sessions.Manager.init(store_alloc, io, &store, &audit_store, null);
     defer manager.deinit();
-    var ctx = bridge.Context{ .allocator = store_alloc, .io = io, .store = &store, .manager = &manager, .audit = &audit_store, .logs = &logs_store, .scripts = &scripts_store, .apps = &deploy_apps_store, .deploy_history = &deploy_hist_store };
+    var ctx = bridge.Context{ .allocator = store_alloc, .io = io, .store = &store, .manager = &manager, .audit = &audit_store, .logs = &logs_store, .scripts = &scripts_store, .apps = &deploy_apps_store, .deploy_history = &deploy_hist_store, .access = &access_registry };
     var dispatcher = ctx.dispatcher();
     var output: [64 * 1024]u8 = undefined;
 
@@ -279,6 +294,7 @@ const TestApp = struct {
     scripts_store: scripts.Store,
     deploy_apps_store: deploy.AppStore,
     deploy_history_store: deploy.HistoryStore,
+    access_registry: access.Registry,
     manager: sessions.Manager,
     ctx: bridge.Context,
     dispatcher: native_sdk.BridgeDispatcher,
@@ -290,6 +306,7 @@ const TestApp = struct {
     scripts_path_buf: [512]u8 = undefined,
     deploy_apps_path_buf: [512]u8 = undefined,
     deploy_history_path_buf: [512]u8 = undefined,
+    access_path_buf: [512]u8 = undefined,
     dir_name: []const u8,
 
     fn init(self: *TestApp) !void {
@@ -304,6 +321,7 @@ const TestApp = struct {
         const scripts_path = try std.fmt.bufPrint(&self.scripts_path_buf, "/tmp/{s}/scripts.json", .{self.dir_name});
         const deploy_apps_path = try std.fmt.bufPrint(&self.deploy_apps_path_buf, "/tmp/{s}/apps.json", .{self.dir_name});
         const deploy_history_path = try std.fmt.bufPrint(&self.deploy_history_path_buf, "/tmp/{s}/deploy_runs.json", .{self.dir_name});
+        const access_path = try std.fmt.bufPrint(&self.access_path_buf, "/tmp/{s}/access_identities.json", .{self.dir_name});
         const store_alloc = self.arena.allocator();
         self.store = .{ .allocator = store_alloc, .path = store_path };
         self.audit_store = .{ .allocator = store_alloc, .path = audit_path };
@@ -311,12 +329,14 @@ const TestApp = struct {
         self.scripts_store = .{ .allocator = store_alloc, .path = scripts_path };
         self.deploy_apps_store = .{ .allocator = store_alloc, .path = deploy_apps_path };
         self.deploy_history_store = .{ .allocator = store_alloc, .path = deploy_history_path };
+        self.access_registry = access.Registry.init(store_alloc, access_path);
         self.manager = sessions.Manager.init(store_alloc, io, &self.store, &self.audit_store, null);
-        self.ctx = .{ .allocator = store_alloc, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store };
+        self.ctx = .{ .allocator = store_alloc, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store, .access = &self.access_registry };
         self.dispatcher = self.ctx.dispatcher();
     }
 
     fn deinit(self: *TestApp) void {
+        self.access_registry.deinit();
         self.manager.deinit();
         self.arena.deinit();
         std.Io.Dir.cwd().deleteTree(std.testing.io, self.dir_name) catch {};
@@ -1100,4 +1120,156 @@ test "sshkeys handlers require a session and validate payloads" {
         \\{"id":"9","command":"oars.sshkeys.roles.create","payload":{"server_id":"ghost","name":"Bad Name!","read_only":true}}
     );
     try std.testing.expect(std.mem.indexOf(u8, bad_name, "invalid role name") != null);
+}
+
+test "access identities save/list/delete round trip through the dispatcher" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    const fp1 = "SHA256:IIiiMx8dWbmaEVhH8Oc9GEt16E2UPRuGtQ3itmbNZxs";
+    const fp2 = "SHA256:el3RAdX7MPz8bGotR4kPQ4XBQTl42+OD1WbuC4jrRtg";
+
+    const created = app.dispatch("{\"id\":\"1\",\"command\":\"oars.access.identities.save\",\"payload\":{\"identity\":{\"name\":\"Ada\",\"fingerprints\":[\"" ++ fp1 ++ "\",\"" ++ fp2 ++ "\"]}}}");
+    try std.testing.expect(std.mem.indexOf(u8, created, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, created, "\"name\":\"Ada\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, created, fp1) != null);
+    const id_start = std.mem.indexOf(u8, created, "\"id\":\"id-") orelse return error.TestUnexpectedResult;
+    var id_buf: [64]u8 = undefined;
+    var id_len: usize = 0;
+    for (created[id_start + 6 ..]) |ch| {
+        if (ch == '\"') break;
+        if (id_len >= id_buf.len) return error.TestUnexpectedResult;
+        id_buf[id_len] = ch;
+        id_len += 1;
+    }
+    const id = id_buf[0..id_len];
+
+    // A second person cannot claim Ada's fingerprint.
+    const conflict = app.dispatch("{\"id\":\"2\",\"command\":\"oars.access.identities.save\",\"payload\":{\"identity\":{\"name\":\"Bob\",\"fingerprints\":[\"" ++ fp1 ++ "\"]}}}");
+    try std.testing.expect(std.mem.indexOf(u8, conflict, "at most one person") != null);
+
+    // Shared identities may overlap.
+    const shared = app.dispatch("{\"id\":\"3\",\"command\":\"oars.access.identities.save\",\"payload\":{\"identity\":{\"name\":\"Oncall\",\"fingerprints\":[\"" ++ fp1 ++ "\"],\"shared\":true}}}");
+    try std.testing.expect(std.mem.indexOf(u8, shared, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shared, "\"shared\":true") != null);
+
+    // Validation errors surface as ok:false messages.
+    const bad_fp = app.dispatch(
+        \\{"id":"4","command":"oars.access.identities.save","payload":{"identity":{"name":"X","fingerprints":["nope"]}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_fp, "invalid fingerprint") != null);
+    const no_name = app.dispatch("{\"id\":\"5\",\"command\":\"oars.access.identities.save\",\"payload\":{\"identity\":{\"name\":\"  \",\"fingerprints\":[\"" ++ fp2 ++ "\"]}}}");
+    try std.testing.expect(std.mem.indexOf(u8, no_name, "invalid identity name") != null);
+
+    // List shows all three identities; delete removes one.
+    const listed = app.dispatch(
+        \\{"id":"6","command":"oars.access.identities.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, listed, "Ada") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "Oncall") != null);
+    var del_buf: [256]u8 = undefined;
+    const del_req = try std.fmt.bufPrint(&del_buf, "{{\"id\":\"7\",\"command\":\"oars.access.identities.delete\",\"payload\":{{\"id\":\"{s}\"}}}}", .{id});
+    const deleted = app.dispatch(del_req);
+    try std.testing.expect(std.mem.indexOf(u8, deleted, "\"ok\":true") != null);
+    const del_unknown = app.dispatch(
+        \\{"id":"8","command":"oars.access.identities.delete","payload":{"id":"id-nope"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, del_unknown, "unknown identity") != null);
+}
+
+test "access scan and job handlers validate payloads without sessions" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // An unknown server id is rejected before any work.
+    const bad_server = app.dispatch(
+        \\{"id":"1","command":"oars.access.scan","payload":{"server_ids":["ghost"]}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_server, "unknown server") != null);
+
+    // An empty fleet scans fine (nothing to do).
+    const scan = app.dispatch(
+        \\{"id":"2","command":"oars.access.scan","payload":{"full":true}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, scan, "\"ok\":true") != null);
+    const scan_id_start = std.mem.indexOf(u8, scan, "\"scan_id\":\"scan-") orelse return error.TestUnexpectedResult;
+    var scan_id_buf: [32]u8 = undefined;
+    var scan_id_len: usize = 0;
+    for (scan[scan_id_start + 11 ..]) |ch| {
+        if (ch == '\"') break;
+        if (scan_id_len >= scan_id_buf.len) return error.TestUnexpectedResult;
+        scan_id_buf[scan_id_len] = ch;
+        scan_id_len += 1;
+    }
+    const scan_id = scan_id_buf[0..scan_id_len];
+    var poll_buf: [128]u8 = undefined;
+    const poll_req = try std.fmt.bufPrint(&poll_buf, "{{\"id\":\"3\",\"command\":\"oars.access.poll\",\"payload\":{{\"scan_id\":\"{s}\"}}}}", .{scan_id});
+    const done = app.dispatch(poll_req);
+    try std.testing.expect(std.mem.indexOf(u8, done, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, done, "\"coverage\":\"complete\"") != null);
+    const unknown_scan = app.dispatch(
+        \\{"id":"4","command":"oars.access.poll","payload":{"scan_id":"scan-nope"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, unknown_scan, "unknown scan") != null);
+
+    // Offboard requires a real identity and its own fingerprints.
+    const offboard_unknown = app.dispatch(
+        \\{"id":"5","command":"oars.access.offboard","payload":{"identity_id":"id-nope","grants":[{"fingerprint":"SHA256:IIiiMx8dWbmaEVhH8Oc9GEt16E2UPRuGtQ3itmbNZxs","server_id":"s1","user":"root","expected_line_hash":"h"}]}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, offboard_unknown, "unknown identity") != null);
+
+    // The fingerprint must belong to the identity.
+    const identity_saved = app.dispatch(
+        \\{"id":"6","command":"oars.access.identities.save","payload":{"identity":{"name":"Ada","fingerprints":["SHA256:IIiiMx8dWbmaEVhH8Oc9GEt16E2UPRuGtQ3itmbNZxs"]}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, identity_saved, "\"ok\":true") != null);
+    const identity_id_start = std.mem.indexOf(u8, identity_saved, "\"id\":\"id-") orelse return error.TestUnexpectedResult;
+    var identity_id_buf: [64]u8 = undefined;
+    var identity_id_len: usize = 0;
+    for (identity_saved[identity_id_start + 6 ..]) |ch| {
+        if (ch == '\"') break;
+        if (identity_id_len >= identity_id_buf.len) return error.TestUnexpectedResult;
+        identity_id_buf[identity_id_len] = ch;
+        identity_id_len += 1;
+    }
+    const identity_id = identity_id_buf[0..identity_id_len];
+    var off_buf: [512]u8 = undefined;
+    const off_wrong_fp = try std.fmt.bufPrint(&off_buf, "{{\"id\":\"7\",\"command\":\"oars.access.offboard\",\"payload\":{{\"identity_id\":\"{s}\",\"grants\":[{{\"fingerprint\":\"SHA256:el3RAdX7MPz8bGotR4kPQ4XBQTl42+OD1WbuC4jrRtg\",\"server_id\":\"s1\",\"user\":\"root\",\"expected_line_hash\":\"h\"}}]}}}}", .{identity_id});
+    const off_wrong = app.dispatch(off_wrong_fp);
+    try std.testing.expect(std.mem.indexOf(u8, off_wrong, "not part of this identity") != null);
+
+    // Onboard validates the public key before any session work.
+    var onboard_buf: [512]u8 = undefined;
+    const onboard_req = try std.fmt.bufPrint(&onboard_buf, "{{\"id\":\"8\",\"command\":\"oars.access.onboard\",\"payload\":{{\"identity_id\":\"{s}\",\"public_key\":\"not-a-key\",\"grants\":[{{\"server_id\":\"s1\",\"user\":\"root\"}}]}}}}", .{identity_id});
+    const onboard_bad_key = app.dispatch(onboard_req);
+    try std.testing.expect(std.mem.indexOf(u8, onboard_bad_key, "invalid public key") != null);
+
+    // Rotate rejects a foreign old fingerprint.
+    var rot_buf: [512]u8 = undefined;
+    const rot_req = try std.fmt.bufPrint(&rot_buf, "{{\"id\":\"9\",\"command\":\"oars.access.rotate\",\"payload\":{{\"identity_id\":\"{s}\",\"old_fingerprint\":\"SHA256:el3RAdX7MPz8bGotR4kPQ4XBQTl42+OD1WbuC4jrRtg\",\"new_public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBs5Tnge2MIGi6Zcyo04aosYAQ+iwk4hKYUNpIHkyMQt z\",\"grants\":[{{\"server_id\":\"s1\",\"user\":\"root\",\"expected_line_hash\":\"h\"}}]}}}}", .{identity_id});
+    const rotated = app.dispatch(rot_req);
+    try std.testing.expect(std.mem.indexOf(u8, rotated, "not part of this identity") != null);
+
+    // Unknown jobs and exports without a completed scan are explicit.
+    const unknown_job = app.dispatch(
+        \\{"id":"10","command":"oars.access.jobPoll","payload":{"job_id":"job-nope"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, unknown_job, "unknown job") != null);
+    const no_export = app.dispatch(
+        \\{"id":"11","command":"oars.access.export","payload":{"format":"csv"}}
+    );
+    // The empty-fleet scan above completed, so the CSV export has a header.
+    try std.testing.expect(std.mem.indexOf(u8, no_export, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, no_export, "identity_id,name,fingerprint,server_id,user,sudo,comment") != null);
+    const json_export = app.dispatch(
+        \\{"id":"12","command":"oars.access.export","payload":{"format":"json"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, json_export, "\\\"coverage\\\": \\\"complete\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_export, "Ada") != null);
+    const bad_format = app.dispatch(
+        \\{"id":"13","command":"oars.access.export","payload":{"format":"xlsx"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_format, "invalid format") != null);
 }

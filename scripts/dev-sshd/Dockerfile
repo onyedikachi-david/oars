@@ -15,7 +15,7 @@
 
 FROM alpine:3.20
 
-RUN apk add --no-cache openssh bash zip unzip git nodejs npm nginx curl shadow \
+RUN apk add --no-cache openssh bash zip unzip git nodejs npm nginx curl shadow sudo \
     && ssh-keygen -A \
     && echo 'root:oars-test-password' | chpasswd \
     && mkdir -p /root/.ssh \
@@ -23,6 +23,9 @@ RUN apk add --no-cache openssh bash zip unzip git nodejs npm nginx curl shadow \
     && ssh-keygen -t ed25519 -N 'oars-test-passphrase' -f /root/.ssh/id_ed25519 -q \
     && cp /root/.ssh/id_ed25519.pub /root/.ssh/authorized_keys \
     && chmod 600 /root/.ssh/authorized_keys \
+    && mkdir -p /etc/sudoers.d \
+    && printf 'root ALL=(ALL) ALL\ncarol ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/oars-test \
+    && chmod 440 /etc/sudoers.d/oars-test \
     && printf 'Port 22\nPermitRootLogin yes\nPasswordAuthentication yes\nSubsystem sftp internal-sftp\n' > /etc/ssh/sshd_config \
     && npm install -g pm2 --silent \
     && mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled \

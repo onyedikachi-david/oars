@@ -55,7 +55,7 @@ const KeysGenResp = struct {
 /// Generates a local key pair through the dispatcher (host side) and
 /// returns the parsed response. The temp files are left in /tmp (the
 /// test connects with the private half later) and removed at test end.
-fn keysGenerate(rig: *TestRig, tag: []const u8) !std.json.Parsed(KeysGenResp) {
+pub fn keysGenerate(rig: *TestRig, tag: []const u8) !std.json.Parsed(KeysGenResp) {
     var dest_buf: [256]u8 = undefined;
     const dest = try std.fmt.bufPrint(&dest_buf, "/tmp/oars-itest-key-{s}", .{tag});
     var pub_buf: [272]u8 = undefined;
@@ -142,7 +142,7 @@ test "integration: sshkeys add/connect/revoke/rotate, roles, and deploy keys" {
     // Start clean: the container persists between runs. userdel can refuse
     // (e.g. "currently logged in" after a crashed run), so also remove the
     // home by hand — a stale authorized_keys is what breaks repeat runs.
-    try execWait(&rig.manager, "itest-keys", "rm -f ~/.ssh/authorized_keys /tmp/oars-role-key", 0, "");
+    try execWait(&rig.manager, "itest-keys", "rm -f ~/.ssh/authorized_keys /tmp/oars-role-key /var/log/faillog /var/log/lastlog", 0, "");
     try execWait(&rig.manager, "itest-keys", "userdel -r ro-alice >/dev/null 2>&1; rm -rf /home/ro-alice; rm -f /etc/oars-roles.json", 0, "");
     // Always restore the container's own key at the end — even when this
     // test fails mid-way — so the earlier key-auth test keeps working on

@@ -908,3 +908,118 @@ per server). The `GIT_SSH_COMMAND` scoped-key piece of spec 07 §6
 (per-app `known_hosts` + the spec-08 `oars_deploy` key +
 `IdentitiesOnly=yes`) is still unimplemented backend work if taken
 before the frontend.
+
+## 18. Session handover — 2026-08-04 (session 8): spec 09 access management backend
+
+### 18.1 What landed
+
+**`src/access.zig` (new):** the identity registry, scan/job models, pure
+parsers, the people-map join, and export formatting.
+
+- `IdentityStore` (`access_identities.json`, 0600, quarantine-on-corrupt,
+  arena-safe): save/list/delete with the spec-09 ownership rule — a
+  fingerprint belongs to at most one person unless that person is marked
+  `shared`; ids are generated (`id-<n>`); validation covers name, count,
+  duplicates, and canonical fingerprints (`SHA256:` + unpadded-or-padded
+  base64 of exactly 32 bytes).
+- Scan model: `Scan`/`ServerScan`/`AccountScan`/`Grant` with an explicit
+  phase machine (queued → identity → sudo_probe → enumerate →
+  read_accounts → sshd_config → done/error). Optional owned fields
+  (never comptime defaults in deinit paths).
+- Pure parsers: `parseSudoList` (yes/no/unknown — the denial *message*
+  wins over the exit code, because Alpine's sudo prints "is not allowed
+  to run sudo" and still exits 0 for `-l -U` queries), `parsePasswd`
+  (uid ≥ 1000, nologin excluded), `skippedAccounts` (nologin rows
+  recorded, not silently dropped), `safeUserName`, `sshdSourcesForcePartial`
+  (dynamic/alternate `AuthorizedKeys*` sources ⇒ partial coverage).
+- `buildMap`: fingerprint-keyed join of scanned grants with identities —
+  people (per identity, grants across servers), unassigned (claimed by no
+  identity), coverage (complete only when every server is done with
+  complete coverage and no sync errors), sync errors (errored servers
+  with reasons).
+- `serverView` + `PollPayload`: the poll/export wire shape lives here;
+  every view field is dupe'd (even empty defaults) so deinit never frees
+  comptime literals.
+- `exportCsv` (RFC 4180: quoting, doubled quotes, CRLF) and `exportJson`
+  (indent-2 serialization of the same payload).
+
+**`src/bridge.zig`:** 10 handlers (handler_count 59 → 69):
+`oars.access.{scan, poll, identities.list, identities.save,
+identities.delete, offboard, onboard, rotate, jobPoll, export}`, all
+origin-gated. `scan` takes `server_ids?` (default all) + `full?`;
+`poll` advances every server one phase per call (the deploy poll
+pattern — zero extra threads) and serializes a bounded response (row
+budget, counts stay honest). The scan: connected-only by default (the
+connected account's `authorized_keys` via SFTP, its sudo via
+`sudo -n -l`); `full` adds `getent passwd` enumeration (uid ≥ 1000,
+nologin skipped), per-account `sudo -n -l -U <user>` probes (root only),
+and an sshd-config sources check; coverage is partial with a reason
+when accounts are unreadable, sources are dynamic, or authority is
+missing. Unconnected/untrusted/errored sessions become sync errors —
+never silent. Jobs (offboard/onboard/rotate) are validated against the
+identity (fingerprints must belong to it), executed one item per
+`jobPoll` via the spec-08 writer (offboard = fingerprint+line-hash
+guarded drop; rotate = options-preserving replace; onboard = dedupe by
+fingerprint then append, with read-only roles ensured first and the
+forced-command options auto-applied), idempotent by fingerprint, and
+audited (`access.offboard`/`onboard`/`rotate`). `export` formats the
+last finished scan (no round trip). Reused refactors: `sshkeysPathMsg`/
+`sshkeysRewriteCore` (plain-message cores; the bridge handlers wrap
+them into JSON errors) and `sshkeysRoleEnsureCore` (shared by
+`sshkeys.roles.create` and read-only onboarding).
+
+**Tests:** 11 access unit tests (identity store incl. ownership/shared/
+validation; sudo parsing incl. the Alpine denial; passwd/skipped
+classification; buildMap joins + unassigned + sync errors; RFC 4180 CSV;
+JSON export; sshd sources; serverView), 2 dispatcher suites (identity
+round trip; scan/job validation — unknown servers/scans/jobs, foreign
+fingerprints, invalid keys, exports), and one container integration test
+covering the whole spec: two sessions to one box as two fleet servers +
+a dead-port server; connected scan (root-only, sudo yes, complete
+coverage); full scan (alice no-sudo, carol passwordless-sudo via a
+sudoers rule, `nobody` recorded skipped, unassigned key separated,
+10 grants, complete coverage); dead server ⇒ sync error + partial;
+offboard with a fresh hash removes exactly one line (verified by blob in
+the file) while a stale hash conflicts and leaves the key;
+onboard to a plain user + a read-only role (created, forced command
+applied, idempotent re-onboard dedupes); rotate replaces the line;
+CSV/JSON exports; every mutation audited. **121/121 pass, leak-checked,
+two consecutive container runs green.**
+
+`scripts/dev-sshd/Dockerfile` now installs `sudo` and ships a sudoers
+file (`root ALL=(ALL) ALL`, `carol ALL=(ALL) NOPASSWD: ALL`) so the
+per-account sudo matrix is real.
+
+### 18.2 Bugs the integration test found (all fixed)
+
+- **Alpine sudo denies with exit 0:** `sudo -n -l -U alice` prints "User
+alice is not allowed to run sudo" and exits 0 — a naive exit-code check
+reported `yes` for a user with no privileges. The denial message now
+wins over the exit code.
+- **Comptime literals in deinit paths:** `serverView`/`AccountView`
+  fallbacks (`""`, `sudo_unknown`, `coverage_partial`) pointed at
+  comptime data and crashed in deinit once a server errored before its
+  sudo/coverage were set. Every view field is now dupe'd, even empty
+  defaults.
+- **Read-only onboard order:** the item resolved the user's
+  `authorized_keys` path *before* creating the role, so onboarding to a
+  new role failed with "user not found". Role creation now runs first.
+- **`useradd` pollutes `/var/log`:** creating users leaves
+  `faillog`/`lastlog`, which broke the earlier logs-count test on repeat
+  runs against the persistent container. Both user-creating tests now
+  remove them at start.
+- **Test-side fixes:** fingerprints were searched for in raw
+  `authorized_keys` output (they never appear there — the blob does);
+  the stale-hash conflict probe re-added a byte-identical line (same
+  hash) so a different comment is used; JSON-escaped export content
+  needed escaped search strings; `nobody` is a legitimately skipped
+  account (uid 65534, nologin) — asserted as such.
+
+### 18.3 Next
+
+Spec 07 frontend UI (app form, step rail, deploy view, history). Or spec
+10 (backups — the access map's per-server sessions and the deploy
+key/gen mechanics are reusable building blocks). The `GIT_SSH_COMMAND`
+scoped-key piece of spec 07 §6 (per-app `known_hosts` + the spec-08
+`oars_deploy` key + `IdentitiesOnly=yes`) remains unimplemented backend
+work if taken before the frontend.
