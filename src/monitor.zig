@@ -260,19 +260,61 @@ pub fn parsePs(allocator: std.mem.Allocator, text: []const u8) ParseError![]Proc
         var tokens = std.mem.tokenizeAny(u8, trimmed, " \t");
         const pid_text = tokens.next() orelse continue;
         const pid = std.fmt.parseInt(u32, pid_text, 10) catch continue; // header row
-        const name = tokens.next() orelse continue;
+        const first = tokens.next() orelse continue;
+        var rest: [8][]const u8 = undefined;
+        var rest_len: usize = 0;
+        while (tokens.next()) |t| {
+            if (rest_len >= rest.len) return error.Invalid;
+            rest[rest_len] = t;
+            rest_len += 1;
+        }
+        var name_parts: [9][]const u8 = undefined;
+        name_parts[0] = first;
+        var name_len: usize = rest_len;
         var cpu: ?f32 = null;
         var mem: ?f32 = null;
-        if (tokens.next()) |cpu_text| {
-            // A third token without a fourth is a variant we cannot label
-            // confidently — fail the section rather than misreport.
-            const mem_text = tokens.next() orelse return error.Invalid;
-            cpu = std.fmt.parseFloat(f32, cpu_text) catch return error.Invalid;
-            mem = std.fmt.parseFloat(f32, mem_text) catch return error.Invalid;
+        if (rest_len >= 2) {
+            const cpu_parsed = std.fmt.parseFloat(f32, rest[rest_len - 2]) catch null;
+            const mem_parsed = std.fmt.parseFloat(f32, rest[rest_len - 1]) catch null;
+            if (cpu_parsed != null and mem_parsed != null) {
+                // procps row: pid comm… cpu mem — the trailing floats are
+                // the label; a spaced comm joins the name.
+                cpu = cpu_parsed;
+                mem = mem_parsed;
+                name_len -= 2;
+            }
+            // Otherwise this is a busybox comm containing spaces (e.g.
+            // "PM2 v7.0.3: God"): the whole remainder is the name.
+        } else if (rest_len == 1) {
+            // A three-token row whose third token parses as a float is a
+            // variant we cannot label confidently (cpu without mem) — fail
+            // the section rather than misreport. A non-float third token
+            // is a busybox comm containing one space (e.g. "npm start")
+            // and joins the name below.
+            if (std.fmt.parseFloat(f32, rest[0]) catch null != null) return error.Invalid;
+        }
+        for (rest[0..rest_len], 0..) |t, i| name_parts[1 + i] = t;
+        var name: []u8 = undefined;
+        {
+            var len: usize = 0;
+            var i: usize = 0;
+            while (i <= name_len) : (i += 1) len += name_parts[i].len;
+            len += name_len; // one joining space per gap
+            name = allocator.alloc(u8, len) catch return error.Invalid;
+            var pos: usize = 0;
+            var j: usize = 0;
+            while (j <= name_len) : (j += 1) {
+                if (j > 0) {
+                    name[pos] = ' ';
+                    pos += 1;
+                }
+                @memcpy(name[pos .. pos + name_parts[j].len], name_parts[j]);
+                pos += name_parts[j].len;
+            }
         }
         out.append(allocator, .{
             .pid = pid,
-            .name = allocator.dupe(u8, name) catch return error.Invalid,
+            .name = name,
             .cpu = cpu,
             .mem = mem,
         }) catch return error.Invalid;
@@ -570,6 +612,22 @@ test "ps parses procps rows, busybox fallback rows, and skips headers" {
 
     // A three-token row is a variant we cannot label: fail the section.
     try std.testing.expectError(error.Invalid, parsePs(allocator, "  1234 node 2.2\n"));
+
+    // A busybox comm containing spaces (the PM2 daemon's real name) keeps
+    // the whole remainder as the name; a procps row with a spaced comm
+    // still labels the trailing floats as cpu/mem; a three-token busybox
+    // row ("npm start") is a spaced comm too.
+    const spaced = try parsePs(allocator, "   26 PM2 v7.0.3: God\n  819 npm start\n  181 npm start 1.5 2.5\n");
+    defer {
+        for (spaced) |p| allocator.free(p.name);
+        allocator.free(spaced);
+    }
+    try std.testing.expectEqual(@as(usize, 3), spaced.len);
+    try std.testing.expectEqualStrings("PM2 v7.0.3: God", spaced[0].name);
+    try std.testing.expect(spaced[0].cpu == null);
+    try std.testing.expectEqualStrings("npm start", spaced[1].name);
+    try std.testing.expectEqualStrings("npm start", spaced[2].name);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), spaced[2].cpu.?, 0.01);
 }
 
 test "ps output is capped at 10 rows" {

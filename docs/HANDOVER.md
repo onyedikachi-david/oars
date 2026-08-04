@@ -703,3 +703,85 @@ Spec 06 frontend UI (script library, variable prompt, broadcast preview /
 side-by-side streams). Or spec 07 (deployment). The broadcast wire format
 in spec 06 §5 is final; `broadcastPoll` cursors are per-view absolute
 positions.
+
+## 16. Session handover — 2026-08-04 (session 6): spec 07 one-click deployment backend
+
+### 16.1 What landed
+
+**`src/deploy.zig` (new):** the App model + `AppStore` (`apps.json`, 0600,
+quarantine-on-corrupt), the six-step planner (`buildPlan`: clone/pull
+recheck → lockfile install → build → pm2 → nginx → certbot, every dynamic
+value shell-quoted), the file builders (`nginxConfig`, `envFile`,
+`ecosystemFile` — valid JSON), the run state machine (`Run`/`Runs`: steps,
+step_index, protected `secrets`, masked bounded output, `env_written`
+flag, owned app snapshot per run), `maskSecrets` (longest-first), and the
+`HistoryStore` (`deploy_runs.json`, 200-run cap, `history_list_limit` 10).
+Secret env values never enter the store; the run keeps them in protected
+memory and frees them at eviction.
+
+**`src/bridge.zig`:** 7 handlers `oars.deploy.{apps.list, apps.save,
+apps.delete, run, poll, cancel, history}` (handler_count 43 → 50). The
+pipeline is poll-driven with zero extra threads: `run` validates the app
+and the secret names (every supplied name must match a declared secret
+field), audits the command list (the Create/Update click is the approval),
+and registers the run; `poll` starts/advances steps sequentially — after
+clone, `.env` is written via SFTP (before install or build, whichever runs
+first); before pm2 the ecosystem file, before nginx `mkdir -p` + the site
+config — then execs the step on the session worker. Step EOF with exit 0
+advances; non-zero fails the run; a vanished session marks it `interrupted`
+(spec 07 §10); cancel closes the current channel and reports `canceled`
+("cancel requested"). Poll responses mask every data delta with the run's
+secret values and carry per-caller absolute cursors (spec 02 protocol).
+`sessions.Manager` owns the `deploys` registry; `apps.json` +
+`deploy_runs.json` are wired into App/TestApp/TestRig.
+
+**Tests:** 10 deploy unit tests (store round trip — secret value never
+persisted; validation; six-step plan + quoting + no `|| npm install`
+fallback; ssl-off skips certbot but keeps nginx; well-formed
+nginx/ecosystem/env files; maskSecrets longest-first; run capture
+mask+truncate; history persists + prunes), 2 dispatcher suites (apps
+CRUD round trip; run validation — unknown app / wrong server / unknown
+secret / not connected / empty history), and one full container
+integration test: save → run with a secret value → poll to `done` (clone
+→ install → build → pm2 → nginx, certbot skipped) → site live through
+PM2 and nginx → `.env` on the server carries the real value → the value
+never appears in apps.json, audit, poll data, or history (build step
+greps the .env: `DATABASE_URL=***`) → re-deploy after a new commit
+serves v2 → history newest-first → broken build (`build=false`) fails the
+run with the step red → cancel of a `sleep 30` build reports `canceled`.
+**94/94 pass, leak-checked, container up.**
+
+`scripts/dev-sshd/Dockerfile` now installs `git`, `nodejs`, `npm`, `nginx`,
+`curl` + global `pm2`, a Debian-style `sites-available`/`sites-enabled`
+nginx.conf, and a fixture repo (`/srv/fixture.git` — a bare clone of a
+node app serving `fixture.txt` on 127.0.0.1:3000).
+
+### 16.2 Bugs the integration test found (all fixed)
+
+- `parsePs` (spec 03) failed the whole ps section on comm names containing
+  spaces — the pm2 daemon's real name is `PM2 v7.0.3: God`, and `npm start`
+  is a 3-token busybox row. The parser now labels trailing float pairs as
+  cpu/mem, joins spaced comms into the name, and still refuses a 3-token
+  row whose third token is a float (unlabelable).
+- The clone recheck's dirty test flagged Oars' own untracked files
+  (`.env`, `.oars-pm2.json`, `package-lock.json` from npm) → every
+  re-deploy refused. The check now uses `--untracked-files=no` (modified
+  tracked files still refuse; git itself refuses a pull that would
+  overwrite an untracked file — honesty preserved, spec 07 §10).
+- `deployWriteFile` leaked the worker's success JSON (freed in
+  `sftpSyncOutcome`, not in the deploy helper).
+- The deploy audit truncated the clone command at 300 chars, cutting off
+  the `git clone` line the test asserts; caps raised (600/step, 3800 total).
+- The fixture commits must be pushed to the *bare* repo the deploy clones
+  from; the integration test's v1/v2 transitions are now idempotent across
+  container reuse (no commit when nothing changed; `pgrep nginx || nginx`
+  instead of a blind start; fixture reset to v1 at test start).
+
+### 16.3 Next
+
+Spec 07 frontend UI (app form, step rail, deploy view, history). Or spec
+08 (SSH key management — the deploy flow's `GIT_SSH_COMMAND` scoped-key
+piece is designed but not implemented: per-app `known_hosts` + deploy key
++ `IdentitiesOnly=yes`, spec 07 §6). The deploy wire format in spec 07 §5
+is final; `deploy.poll` cursors are per-view absolute positions like the
+broadcast poll.

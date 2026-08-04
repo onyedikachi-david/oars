@@ -20,6 +20,7 @@ const logs = @import("logs.zig");
 const bridge = @import("bridge.zig");
 const sftpmod = @import("sftp.zig");
 const scripts = @import("scripts.zig");
+const deploy = @import("deploy.zig");
 
 /// Reads an environment variable from the process environment. The raw
 /// environ pointer is the only env source in 0.16 outside `main(init)`.
@@ -73,11 +74,15 @@ const TestRig = struct {
     audit_path_buf: [512]u8 = undefined,
     logs_path_buf: [512]u8 = undefined,
     scripts_path_buf: [512]u8 = undefined,
+    deploy_apps_path_buf: [512]u8 = undefined,
+    deploy_history_path_buf: [512]u8 = undefined,
     dir_name: []const u8,
     store: servers.Store,
     audit_store: audit.Store,
     logs_store: logs.SourceStore,
     scripts_store: scripts.Store,
+    deploy_apps_store: deploy.AppStore,
+    deploy_history_store: deploy.HistoryStore,
     manager: sessions.Manager,
     ctx: bridge.Context,
     dispatcher: native_sdk.BridgeDispatcher,
@@ -91,12 +96,16 @@ const TestRig = struct {
         const audit_path = try std.fmt.bufPrint(&self.audit_path_buf, "/tmp/{s}/audit.jsonl", .{self.dir_name});
         const logs_path = try std.fmt.bufPrint(&self.logs_path_buf, "/tmp/{s}/logs.json", .{self.dir_name});
         const scripts_path = try std.fmt.bufPrint(&self.scripts_path_buf, "/tmp/{s}/scripts.json", .{self.dir_name});
+        const deploy_apps_path = try std.fmt.bufPrint(&self.deploy_apps_path_buf, "/tmp/{s}/apps.json", .{self.dir_name});
+        const deploy_history_path = try std.fmt.bufPrint(&self.deploy_history_path_buf, "/tmp/{s}/deploy_runs.json", .{self.dir_name});
         self.store = .{ .allocator = std.testing.allocator, .path = store_path };
         self.audit_store = .{ .allocator = std.testing.allocator, .path = audit_path };
         self.logs_store = .{ .allocator = std.testing.allocator, .path = logs_path };
         self.scripts_store = .{ .allocator = std.testing.allocator, .path = scripts_path };
+        self.deploy_apps_store = .{ .allocator = std.testing.allocator, .path = deploy_apps_path };
+        self.deploy_history_store = .{ .allocator = std.testing.allocator, .path = deploy_history_path };
         self.manager = sessions.Manager.init(std.testing.allocator, io, &self.store, &self.audit_store, null);
-        self.ctx = .{ .allocator = std.testing.allocator, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store, .scripts = &self.scripts_store };
+        self.ctx = .{ .allocator = std.testing.allocator, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store };
         self.dispatcher = self.ctx.dispatcher();
     }
 
@@ -1365,4 +1374,384 @@ test "integration: scripts run with variables, injection neutralization, broadca
 
     rig.manager.disconnect("itest-scr-a");
     rig.manager.disconnect("itest-scr-b");
+}
+
+// --- deploy helpers (spec 07) -------------------------------------------------
+
+const DeployStepResp = struct {
+    id: []const u8,
+    label: []const u8,
+    state: []const u8,
+    channel: ?u32 = null,
+    exit: ?i32 = null,
+    @"error": []const u8 = "",
+    data: []const u8 = "",
+    cursor: u64 = 0,
+    gap: u64 = 0,
+    eof: bool = false,
+};
+
+const DeployPollResp = struct {
+    result: struct {
+        ok: bool,
+        run_id: u32,
+        status: []const u8,
+        canceled: bool = false,
+        steps: []const DeployStepResp = &.{},
+        done: bool = false,
+    },
+};
+
+/// Polls a deploy run until the parsed response shows `done` (the caller
+/// owns `out` and must deinit it).
+fn deployPollUntil(rig: *TestRig, run_id: u32, timeout_ns: i128, out: *std.json.Parsed(DeployPollResp)) !void {
+    const deadline = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds + timeout_ns;
+    while (std.Io.Timestamp.now(std.testing.io, .real).nanoseconds < deadline) {
+        var buf: [256]u8 = undefined;
+        const req = try std.fmt.bufPrint(&buf, "{{\"id\":\"dep\",\"command\":\"oars.deploy.poll\",\"payload\":{{\"run_id\":{d}}}}}", .{run_id});
+        const resp = rig.dispatch(req);
+        out.* = try std.json.parseFromSlice(DeployPollResp, std.testing.allocator, resp, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        });
+        if (out.value.result.done) return;
+        out.deinit();
+        testSleep(250);
+    }
+    return error.TestUnexpectedResult;
+}
+
+/// Polls until the step with `step_id` reaches `state` (or the run is
+/// done, whichever comes first).
+fn deployPollUntilStep(rig: *TestRig, run_id: u32, step_id: []const u8, state: []const u8, timeout_ns: i128, out: *std.json.Parsed(DeployPollResp)) !void {
+    const deadline = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds + timeout_ns;
+    while (std.Io.Timestamp.now(std.testing.io, .real).nanoseconds < deadline) {
+        var buf: [256]u8 = undefined;
+        const req = try std.fmt.bufPrint(&buf, "{{\"id\":\"dep\",\"command\":\"oars.deploy.poll\",\"payload\":{{\"run_id\":{d}}}}}", .{run_id});
+        const resp = rig.dispatch(req);
+        out.* = try std.json.parseFromSlice(DeployPollResp, std.testing.allocator, resp, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        });
+        for (out.value.result.steps) |s| {
+            if (std.mem.eql(u8, s.id, step_id) and std.mem.eql(u8, s.state, state)) return;
+        }
+        if (out.value.result.done) return;
+        out.deinit();
+        testSleep(250);
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn deployStep(resp: *const DeployPollResp, step_id: []const u8) ?DeployStepResp {
+    for (resp.result.steps) |s| {
+        if (std.mem.eql(u8, s.id, step_id)) return s;
+    }
+    return null;
+}
+
+/// Runs an exec and returns the full captured output (owned by caller).
+fn execOut(manager: *sessions.Manager, server_id: []const u8, command: []const u8) ![]u8 {
+    const channel = try manager.exec(server_id, command);
+    const deadline = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds + 15 * std.time.ns_per_s;
+    var acc: std.ArrayList(u8) = .empty;
+    errdefer acc.deinit(std.testing.allocator);
+    var cursor: u64 = 0;
+    while (std.Io.Timestamp.now(std.testing.io, .real).nanoseconds < deadline) {
+        const polls = try manager.pollChannels(server_id, &.{.{ .id = channel, .pos = cursor }}, false, 64 * 1024, 64 * 1024);
+        var eof = false;
+        for (polls) |*poll| {
+            if (poll.id != channel) continue;
+            try acc.appendSlice(std.testing.allocator, poll.data);
+            cursor = poll.cursor;
+            eof = poll.eof;
+        }
+        for (polls) |*poll| poll.deinit(std.testing.allocator);
+        std.testing.allocator.free(polls);
+        if (eof) return acc.toOwnedSlice(std.testing.allocator);
+        testSleep(50);
+    }
+    return error.TestUnexpectedResult;
+}
+
+/// Runs an exec and reports whether it exited 0 (used for retry loops
+/// around service readiness).
+fn execOk(manager: *sessions.Manager, server_id: []const u8, command: []const u8) bool {
+    execWait(manager, server_id, command, 0, "") catch return false;
+    return true;
+}
+
+test "integration: deploy pipeline clones, installs, builds, pm2, nginx, and masks secrets" {
+    const env = TestEnv.load();
+    if (!env.active) return;
+
+    ssh.initGlobal();
+
+    var rig: TestRig = undefined;
+    try rig.init("deploy");
+    defer rig.deinit();
+    const io = std.testing.io;
+
+    const server = servers.Server{
+        .id = "itest-dep",
+        .name = "dev-sshd",
+        .host = env.host,
+        .port = env.port,
+        .user = env.user,
+        .auth_method = .password,
+    };
+    try rig.store.upsert(io, server);
+    _ = try rig.manager.connect(server, env.password, null);
+    try waitForStatus(&rig.manager, "itest-dep", .needs_trust, 20 * std.time.ns_per_s);
+    try rig.manager.trust("itest-dep", true);
+    try waitForStatus(&rig.manager, "itest-dep", .ready, 20 * std.time.ns_per_s);
+
+    // nginx must be running for the nginx step's reload to succeed, and
+    // the deploy folder must start fresh (the container persists between
+    // test runs — nginx may already be up). The fixture repo is reset to
+    // v1 so the first deploy always serves v1 and the re-deploy flips v2.
+    try execWait(&rig.manager, "itest-dep", "pgrep nginx >/dev/null || nginx", 0, "");
+    try execWait(&rig.manager, "itest-dep", "rm -rf /srv/oars-apps; mkdir -p /srv/oars-apps", 0, "");
+    try execWait(&rig.manager, "itest-dep", "pm2 delete storefront >/dev/null 2>&1 || true", 0, "");
+    // The fixture commits happen in the working repo and are pushed to the
+    // bare repo the deploy clones from (idempotent: no commit when the
+    // content already matches).
+    try execWait(&rig.manager, "itest-dep", "printf 'hello v1\\n' > /srv/fixture/fixture.txt && git -C /srv/fixture add -A && (git -C /srv/fixture diff --cached --quiet || (git -C /srv/fixture -c user.email=test@oars.dev -c user.name=oars commit -q -m v1 && git -C /srv/fixture push -q /srv/fixture.git main))", 0, "");
+
+    // --- save the app through the dispatcher ---
+    const saved = rig.dispatch(
+        \\{"id":"1","command":"oars.deploy.apps.save","payload":{"app":{"server_id":"itest-dep","name":"storefront","folder":"/srv/oars-apps/storefront","repo":{"url":"file:///srv/fixture.git","transport":"file","branch":"main"},"runtime":{"node_version":"22","type":"node","install":"npm install --no-audit --no-fund","build":"echo build-ok && grep DATABASE_URL /srv/oars-apps/storefront/.env","start":"npm start","build_folder":""},"env_vars":[{"name":"NODE_ENV","secret":false,"value":"production"},{"name":"DATABASE_URL","secret":true,"has_value":true}],"domains":[],"ssl":false,"app_port":3000}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"ok\":true") != null);
+    const DeploySaveResp = struct {
+        result: struct { ok: bool, app: struct { id: []const u8 } },
+    };
+    const saved_parsed = try std.json.parseFromSlice(DeploySaveResp, std.testing.allocator, saved, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer saved_parsed.deinit();
+    const app_id = saved_parsed.value.result.app.id;
+
+    // --- first deploy: secret value goes to .env and never leaks ---
+    var run_buf: [1024]u8 = undefined;
+    const run_req = try std.fmt.bufPrint(&run_buf, "{{\"id\":\"2\",\"command\":\"oars.deploy.run\",\"payload\":{{\"server_id\":\"itest-dep\",\"app_id\":\"{s}\",\"secret_values\":[{{\"name\":\"DATABASE_URL\",\"value\":\"postgres://super-secret\"}}]}}}}", .{app_id});
+    const run_resp = rig.dispatch(run_req);
+    const RunResp = struct { result: struct { ok: bool, run_id: u32 } };
+    const run_parsed = try std.json.parseFromSlice(RunResp, std.testing.allocator, run_resp, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer run_parsed.deinit();
+    try std.testing.expect(run_parsed.value.result.ok);
+    const run_id = run_parsed.value.result.run_id;
+
+    var final_resp: std.json.Parsed(DeployPollResp) = undefined;
+    try deployPollUntil(&rig, run_id, 180 * std.time.ns_per_s, &final_resp);
+    defer final_resp.deinit();
+    if (!std.mem.eql(u8, final_resp.value.result.status, "done")) {
+        for (final_resp.value.result.steps) |s| {
+            const tail = if (s.data.len > 200) s.data[s.data.len - 200 ..] else s.data;
+            std.debug.print("TEST step {s} state={s} exit={?} err={s} data={s}\n", .{ s.id, s.state, s.exit, s.@"error", tail });
+        }
+    }
+    try std.testing.expectEqualStrings("done", final_resp.value.result.status);
+
+    const clone_step = deployStep(&final_resp.value, "clone") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("success", clone_step.state);
+    const install_step = deployStep(&final_resp.value, "install") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("success", install_step.state);
+    const build_step = deployStep(&final_resp.value, "build") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("success", build_step.state);
+    const pm2_step = deployStep(&final_resp.value, "pm2") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("success", pm2_step.state);
+    const nginx_step = deployStep(&final_resp.value, "nginx") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("success", nginx_step.state);
+    // SSL is off in the test: certbot is skipped (reported success, no
+    // channel).
+    const certbot_step = deployStep(&final_resp.value, "certbot") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("success", certbot_step.state);
+    try std.testing.expect(certbot_step.channel == null);
+
+    // The build step greps the .env, so its output carried the secret
+    // value — the poll response must show it masked.
+    try std.testing.expect(std.mem.indexOf(u8, build_step.data, "postgres://super-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, build_step.data, "DATABASE_URL=***") != null);
+
+    // --- the app is live: PM2 serves it and nginx proxies it ---
+    const site_deadline = std.Io.Timestamp.now(io, .real).nanoseconds + 30 * std.time.ns_per_s;
+    var site_ok = false;
+    while (std.Io.Timestamp.now(io, .real).nanoseconds < site_deadline) {
+        if (execOk(&rig.manager, "itest-dep", "wget -qO- http://127.0.0.1:3000/ | grep -q 'hello v1'")) {
+            site_ok = true;
+            break;
+        }
+        testSleep(500);
+    }
+    try std.testing.expect(site_ok);
+    try execWait(&rig.manager, "itest-dep", "wget -qO- http://127.0.0.1/ | grep -q 'hello v1'", 0, "");
+
+    // --- the .env landed on the server with the real value ---
+    const env_content = try execOut(&rig.manager, "itest-dep", "cat /srv/oars-apps/storefront/.env");
+    defer std.testing.allocator.free(env_content);
+    try std.testing.expect(std.mem.indexOf(u8, env_content, "DATABASE_URL=postgres://super-secret") != null);
+    try std.testing.expect(std.mem.indexOf(u8, env_content, "NODE_ENV=production") != null);
+
+    // --- the stores never see the value ---
+    const apps_content = try std.Io.Dir.cwd().readFileAlloc(io, rig.deploy_apps_store.path, std.testing.allocator, .limited(1024 * 1024));
+    defer std.testing.allocator.free(apps_content);
+    try std.testing.expect(std.mem.indexOf(u8, apps_content, "super-secret") == null);
+    const audit_content = try std.Io.Dir.cwd().readFileAlloc(io, rig.audit_store.path, std.testing.allocator, .limited(256 * 1024));
+    defer std.testing.allocator.free(audit_content);
+    try std.testing.expect(std.mem.indexOf(u8, audit_content, "deploy.run") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_content, "git clone") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_content, "super-secret") == null);
+
+    // --- re-deploy: a new commit is pulled and the site serves v2 ---
+    try execWait(&rig.manager, "itest-dep", "printf 'hello v2\\n' > /srv/fixture/fixture.txt && git -C /srv/fixture add -A && (git -C /srv/fixture diff --cached --quiet || (git -C /srv/fixture -c user.email=test@oars.dev -c user.name=oars commit -q -m v2 && git -C /srv/fixture push -q /srv/fixture.git main))", 0, "");
+    var run2_buf: [1024]u8 = undefined;
+    const run2_req = try std.fmt.bufPrint(&run2_buf, "{{\"id\":\"3\",\"command\":\"oars.deploy.run\",\"payload\":{{\"server_id\":\"itest-dep\",\"app_id\":\"{s}\",\"secret_values\":[{{\"name\":\"DATABASE_URL\",\"value\":\"postgres://super-secret\"}}]}}}}", .{app_id});
+    const run2_resp = rig.dispatch(run2_req);
+    const run2_parsed = try std.json.parseFromSlice(RunResp, std.testing.allocator, run2_resp, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer run2_parsed.deinit();
+    try std.testing.expect(run2_parsed.value.result.ok);
+    const run2_id = run2_parsed.value.result.run_id;
+
+    var redeploy_resp: std.json.Parsed(DeployPollResp) = undefined;
+    try deployPollUntil(&rig, run2_id, 180 * std.time.ns_per_s, &redeploy_resp);
+    defer redeploy_resp.deinit();
+    if (!std.mem.eql(u8, redeploy_resp.value.result.status, "done")) {
+        for (redeploy_resp.value.result.steps) |s| {
+            const tail = if (s.data.len > 200) s.data[s.data.len - 200 ..] else s.data;
+            std.debug.print("TEST redeploy step {s} state={s} exit={?} err={s} data={s}\n", .{ s.id, s.state, s.exit, s.@"error", tail });
+        }
+    }
+    try std.testing.expectEqualStrings("done", redeploy_resp.value.result.status);
+    const redeploy_pm2 = deployStep(&redeploy_resp.value, "pm2") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("success", redeploy_pm2.state);
+
+    const site2_deadline = std.Io.Timestamp.now(io, .real).nanoseconds + 30 * std.time.ns_per_s;
+    var site2_ok = false;
+    while (std.Io.Timestamp.now(io, .real).nanoseconds < site2_deadline) {
+        if (execOk(&rig.manager, "itest-dep", "wget -qO- http://127.0.0.1:3000/ | grep -q 'hello v2'")) {
+            site2_ok = true;
+            break;
+        }
+        testSleep(500);
+    }
+    try std.testing.expect(site2_ok);
+    const pulled = try execOut(&rig.manager, "itest-dep", "cat /srv/oars-apps/storefront/fixture.txt");
+    defer std.testing.allocator.free(pulled);
+    try std.testing.expect(std.mem.indexOf(u8, pulled, "hello v2") != null);
+
+    // --- history: two done runs, newest first, output pre-masked ---
+    var hist_buf: [512]u8 = undefined;
+    const hist_req = try std.fmt.bufPrint(&hist_buf, "{{\"id\":\"4\",\"command\":\"oars.deploy.history\",\"payload\":{{\"server_id\":\"itest-dep\",\"app_id\":\"{s}\"}}}}", .{app_id});
+    const hist_resp = rig.dispatch(hist_req);
+    const HistResp = struct {
+        result: struct {
+            ok: bool,
+            runs: []const struct {
+                id: u32,
+                status: []const u8,
+                output: []const u8 = "",
+                steps: []const struct {
+                    id: []const u8,
+                    state: []const u8,
+                    exit: ?i32 = null,
+                } = &.{},
+            } = &.{},
+        },
+    };
+    const hist_parsed = try std.json.parseFromSlice(HistResp, std.testing.allocator, hist_resp, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer hist_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), hist_parsed.value.result.runs.len);
+    try std.testing.expectEqual(run2_id, hist_parsed.value.result.runs[0].id); // newest first
+    try std.testing.expectEqualStrings("done", hist_parsed.value.result.runs[0].status);
+    try std.testing.expect(std.mem.indexOf(u8, hist_parsed.value.result.runs[0].output, "build-ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hist_parsed.value.result.runs[0].output, "super-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, hist_parsed.value.result.runs[0].output, "***") != null);
+    try std.testing.expectEqual(@as(usize, 6), hist_parsed.value.result.runs[0].steps.len);
+
+    // --- failure injection: a broken build fails the run and lands in history ---
+    var edit_buf: [1024]u8 = undefined;
+    const edit_req = try std.fmt.bufPrint(&edit_buf, "{{\"id\":\"5\",\"command\":\"oars.deploy.apps.save\",\"payload\":{{\"app\":{{\"id\":\"{s}\",\"server_id\":\"itest-dep\",\"name\":\"storefront\",\"folder\":\"/srv/oars-apps/storefront\",\"repo\":{{\"url\":\"file:///srv/fixture.git\",\"transport\":\"file\",\"branch\":\"main\"}},\"runtime\":{{\"node_version\":\"22\",\"type\":\"node\",\"install\":\"npm install --no-audit --no-fund\",\"build\":\"false\",\"start\":\"npm start\",\"build_folder\":\"\"}},\"env_vars\":[{{\"name\":\"NODE_ENV\",\"secret\":false,\"value\":\"production\"}},{{\"name\":\"DATABASE_URL\",\"secret\":true,\"has_value\":true}}],\"domains\":[],\"ssl\":false,\"app_port\":3000}}}}}}", .{app_id});
+    _ = rig.dispatch(edit_req);
+    var fail_buf: [1024]u8 = undefined;
+    const fail_req = try std.fmt.bufPrint(&fail_buf, "{{\"id\":\"6\",\"command\":\"oars.deploy.run\",\"payload\":{{\"server_id\":\"itest-dep\",\"app_id\":\"{s}\",\"secret_values\":[{{\"name\":\"DATABASE_URL\",\"value\":\"postgres://super-secret\"}}]}}}}", .{app_id});
+    const fail_resp = rig.dispatch(fail_req);
+    const fail_parsed = try std.json.parseFromSlice(RunResp, std.testing.allocator, fail_resp, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer fail_parsed.deinit();
+    const fail_run = fail_parsed.value.result.run_id;
+    var fail_poll: std.json.Parsed(DeployPollResp) = undefined;
+    try deployPollUntil(&rig, fail_run, 120 * std.time.ns_per_s, &fail_poll);
+    defer fail_poll.deinit();
+    try std.testing.expectEqualStrings("failed", fail_poll.value.result.status);
+    const fail_build = deployStep(&fail_poll.value, "build") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("failed", fail_build.state);
+    try std.testing.expect(fail_build.exit != null and fail_build.exit.? != 0);
+    const fail_clone = deployStep(&fail_poll.value, "clone") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("success", fail_clone.state);
+
+    // --- cancel: a long build is canceled mid-run ---
+    var cancel_edit_buf: [1024]u8 = undefined;
+    const cancel_edit_req = try std.fmt.bufPrint(&cancel_edit_buf, "{{\"id\":\"7\",\"command\":\"oars.deploy.apps.save\",\"payload\":{{\"app\":{{\"id\":\"{s}\",\"server_id\":\"itest-dep\",\"name\":\"storefront\",\"folder\":\"/srv/oars-apps/storefront\",\"repo\":{{\"url\":\"file:///srv/fixture.git\",\"transport\":\"file\",\"branch\":\"main\"}},\"runtime\":{{\"node_version\":\"22\",\"type\":\"node\",\"install\":\"npm install --no-audit --no-fund\",\"build\":\"sleep 30 && echo never\",\"start\":\"npm start\",\"build_folder\":\"\"}},\"env_vars\":[{{\"name\":\"NODE_ENV\",\"secret\":false,\"value\":\"production\"}},{{\"name\":\"DATABASE_URL\",\"secret\":true,\"has_value\":true}}],\"domains\":[],\"ssl\":false,\"app_port\":3000}}}}}}", .{app_id});
+    _ = rig.dispatch(cancel_edit_req);
+    var cancel_run_buf: [1024]u8 = undefined;
+    const cancel_run_req = try std.fmt.bufPrint(&cancel_run_buf, "{{\"id\":\"8\",\"command\":\"oars.deploy.run\",\"payload\":{{\"server_id\":\"itest-dep\",\"app_id\":\"{s}\",\"secret_values\":[{{\"name\":\"DATABASE_URL\",\"value\":\"postgres://super-secret\"}}]}}}}", .{app_id});
+    const cancel_run_resp = rig.dispatch(cancel_run_req);
+    const cancel_run_parsed = try std.json.parseFromSlice(RunResp, std.testing.allocator, cancel_run_resp, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer cancel_run_parsed.deinit();
+    const cancel_run_id = cancel_run_parsed.value.result.run_id;
+
+    var running_poll: std.json.Parsed(DeployPollResp) = undefined;
+    try deployPollUntilStep(&rig, cancel_run_id, "build", "running", 60 * std.time.ns_per_s, &running_poll);
+    defer running_poll.deinit();
+    var cancel_buf: [256]u8 = undefined;
+    const cancel_req = try std.fmt.bufPrint(&cancel_buf, "{{\"id\":\"9\",\"command\":\"oars.deploy.cancel\",\"payload\":{{\"run_id\":{d}}}}}", .{cancel_run_id});
+    const cancel_resp = rig.dispatch(cancel_req);
+    try std.testing.expect(std.mem.indexOf(u8, cancel_resp, "\"ok\":true") != null);
+
+    var canceled_poll: std.json.Parsed(DeployPollResp) = undefined;
+    try deployPollUntil(&rig, cancel_run_id, 60 * std.time.ns_per_s, &canceled_poll);
+    defer canceled_poll.deinit();
+    try std.testing.expectEqualStrings("canceled", canceled_poll.value.result.status);
+    try std.testing.expect(canceled_poll.value.result.canceled);
+    const canceled_build = deployStep(&canceled_poll.value, "build") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("canceled", canceled_build.state);
+
+    // The cancel was audited and history now holds all four runs.
+    const audit2 = try std.Io.Dir.cwd().readFileAlloc(io, rig.audit_store.path, std.testing.allocator, .limited(256 * 1024));
+    defer std.testing.allocator.free(audit2);
+    try std.testing.expect(std.mem.indexOf(u8, audit2, "deploy.cancel") != null);
+    var hist2_buf: [512]u8 = undefined;
+    const hist2_req = try std.fmt.bufPrint(&hist2_buf, "{{\"id\":\"10\",\"command\":\"oars.deploy.history\",\"payload\":{{\"server_id\":\"itest-dep\",\"app_id\":\"{s}\"}}}}", .{app_id});
+    const hist2_resp = rig.dispatch(hist2_req);
+    const hist2_parsed = try std.json.parseFromSlice(HistResp, std.testing.allocator, hist2_resp, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer hist2_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 4), hist2_parsed.value.result.runs.len);
+    try std.testing.expectEqualStrings("canceled", hist2_parsed.value.result.runs[0].status);
+    try std.testing.expectEqualStrings("failed", hist2_parsed.value.result.runs[1].status);
+    try std.testing.expectEqualStrings("done", hist2_parsed.value.result.runs[2].status);
+    try std.testing.expectEqualStrings("done", hist2_parsed.value.result.runs[3].status);
+    for (hist2_parsed.value.result.runs) |r| {
+        try std.testing.expect(std.mem.indexOf(u8, r.output, "super-secret") == null);
+    }
+
+    rig.manager.disconnect("itest-dep");
 }

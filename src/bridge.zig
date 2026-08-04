@@ -17,10 +17,11 @@ const shellquote = @import("shellquote.zig");
 const sftpmod = @import("sftp.zig");
 const scripts = @import("scripts.zig");
 const broadcast = @import("broadcast.zig");
+const deploy = @import("deploy.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 43;
+const handler_count = 50;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -30,6 +31,8 @@ pub const Context = struct {
     audit: *audit.Store,
     logs: *logs.SourceStore,
     scripts: *scripts.Store,
+    apps: *deploy.AppStore,
+    deploy_history: *deploy.HistoryStore,
     handlers: [handler_count]native_sdk.BridgeHandler = undefined,
     policies: [handler_count]native_sdk.BridgeCommandPolicy = undefined,
 
@@ -78,6 +81,13 @@ pub const Context = struct {
             .{ .name = "oars.scripts.broadcast", .context = self, .invoke_fn = handleScriptsBroadcast },
             .{ .name = "oars.scripts.broadcastPoll", .context = self, .invoke_fn = handleScriptsBroadcastPoll },
             .{ .name = "oars.scripts.broadcastCancel", .context = self, .invoke_fn = handleScriptsBroadcastCancel },
+            .{ .name = "oars.deploy.apps.list", .context = self, .invoke_fn = handleDeployAppsList },
+            .{ .name = "oars.deploy.apps.save", .context = self, .invoke_fn = handleDeployAppsSave },
+            .{ .name = "oars.deploy.apps.delete", .context = self, .invoke_fn = handleDeployAppsDelete },
+            .{ .name = "oars.deploy.run", .context = self, .invoke_fn = handleDeployRun },
+            .{ .name = "oars.deploy.poll", .context = self, .invoke_fn = handleDeployPoll },
+            .{ .name = "oars.deploy.cancel", .context = self, .invoke_fn = handleDeployCancel },
+            .{ .name = "oars.deploy.history", .context = self, .invoke_fn = handleDeployHistory },
         };
         self.policies = .{
             .{ .name = "oars.servers.list", .origins = &allowed_origins },
@@ -123,6 +133,13 @@ pub const Context = struct {
             .{ .name = "oars.scripts.broadcast", .origins = &allowed_origins },
             .{ .name = "oars.scripts.broadcastPoll", .origins = &allowed_origins },
             .{ .name = "oars.scripts.broadcastCancel", .origins = &allowed_origins },
+            .{ .name = "oars.deploy.apps.list", .origins = &allowed_origins },
+            .{ .name = "oars.deploy.apps.save", .origins = &allowed_origins },
+            .{ .name = "oars.deploy.apps.delete", .origins = &allowed_origins },
+            .{ .name = "oars.deploy.run", .origins = &allowed_origins },
+            .{ .name = "oars.deploy.poll", .origins = &allowed_origins },
+            .{ .name = "oars.deploy.cancel", .origins = &allowed_origins },
+            .{ .name = "oars.deploy.history", .origins = &allowed_origins },
         };
         return .{
             .policy = .{ .enabled = true, .commands = &self.policies },
@@ -2199,6 +2216,537 @@ fn handleScriptsBroadcastCancel(context: *anyopaque, invocation: native_sdk.brid
 }
 
 // --- tests -----------------------------------------------------------------
+// --- one-click deployment (spec 07) ------------------------------------------
+
+const deploy_poll_data_budget: usize = 256 * 1024;
+const deploy_file_wait_ns = 20 * std.time.ns_per_s;
+const deploy_mkdir_cap: usize = 4 * 1024;
+
+const DeployAppsListPayload = struct { server_id: []const u8 };
+const DeployAppsSavePayload = struct { app: deploy.AppInput };
+const DeployAppsDeletePayload = struct {
+    server_id: []const u8,
+    app_id: []const u8,
+};
+const DeployRunPayload = struct {
+    server_id: []const u8,
+    app_id: []const u8,
+    secret_values: ?[]const deploy.SecretValue = null,
+};
+const DeployPollPayload = struct {
+    run_id: u32,
+    cursors: std.json.Value = .null,
+};
+const DeployCancelPayload = struct { run_id: u32 };
+const DeployHistoryPayload = struct {
+    server_id: []const u8,
+    app_id: []const u8,
+    limit: ?usize = null,
+};
+
+fn deployTerminal(status: deploy.RunStatus) bool {
+    return switch (status) {
+        .queued, .running => false,
+        else => true,
+    };
+}
+
+fn deploySaveError(err: anyerror) []const u8 {
+    return switch (err) {
+        error.MissingId => "missing app id",
+        error.MissingServer => "missing server",
+        error.MissingName => "app name is required",
+        error.InvalidName => "invalid app name",
+        error.MissingFolder => "deploy folder is required",
+        error.InvalidFolder => "invalid deploy folder",
+        error.InvalidRepo => "invalid repository URL",
+        error.InvalidTransport => "invalid repository transport",
+        error.InvalidBranch => "invalid branch",
+        error.InvalidNodeVersion => "unsupported Node.js version (supported: 22, 24)",
+        error.InvalidAppType => "invalid app type",
+        error.InvalidCommand => "invalid install/build/start command",
+        error.InvalidEnvVar => "invalid environment variable",
+        error.DuplicateEnvVar => "duplicate environment variable",
+        error.TooManyEnvVars => "too many environment variables",
+        error.InvalidDomain => "invalid domain",
+        error.TooManyDomains => "too many domains",
+        error.EmailRequired => "an email is required when SSL is enabled",
+        error.InvalidEmail => "invalid certificate email",
+        error.InvalidPort => "invalid app port",
+        error.SerializeFailed => "failed to save apps",
+        error.StoreCorrupt => "app registry is unreadable",
+        error.OutOfMemory => "out of memory",
+        else => "failed to save app",
+    };
+}
+
+fn handleDeployAppsList(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(DeployAppsListPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    var loaded = self.apps.loadParsed(self.io) catch {
+        return respondError(output, "failed to load apps");
+    };
+    defer loaded.deinit(self.allocator);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"apps\":[") catch return output[0..0];
+    var first = true;
+    for (loaded.parsed.value) |a| {
+        if (!std.mem.eql(u8, a.server_id, parsed.value.server_id)) continue;
+        if (!first) writer.writeAll(",") catch return output[0..0];
+        first = false;
+        std.json.Stringify.value(a, .{}, &writer) catch return output[0..0];
+    }
+    writer.writeAll("]}") catch return output[0..0];
+    return writer.buffered();
+}
+
+/// Upserts an app (spec 07 §5); ids are generated for creates. Secret
+/// env values never enter the store (the keychain holds them).
+fn handleDeployAppsSave(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(DeployAppsSavePayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    var input = parsed.value.app;
+    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+    var owned_id: ?[]const u8 = null;
+    defer if (owned_id) |o| self.allocator.free(o);
+    if (input.id == null) {
+        owned_id = servers.makeId(self.allocator, now) catch return respondError(output, "out of memory");
+        input.id = owned_id;
+    }
+    var saved = self.apps.saveApp(self.io, input, now) catch |err| {
+        return respondError(output, deploySaveError(err));
+    };
+    defer deploy.deinit(self.allocator, &saved);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"app\":") catch return output[0..0];
+    std.json.Stringify.value(saved, .{}, &writer) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleDeployAppsDelete(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(DeployAppsDeletePayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    var owned_opt = self.apps.find(self.io, payload.app_id) catch {
+        return respondError(output, "app registry is unreadable");
+    };
+    defer if (owned_opt) |*a| deploy.deinit(self.allocator, a);
+    const app = owned_opt orelse return respondError(output, "app not found");
+    if (!std.mem.eql(u8, app.server_id, payload.server_id)) return respondError(output, "app not found on this server");
+    _ = self.apps.delete(self.io, payload.app_id) catch {
+        return respondError(output, "failed to delete app");
+    };
+    return ok_json;
+}
+
+/// One audit entry per run with the planned command list (spec 07 §8:
+/// the Create/Update click is the approval). Commands never contain
+/// secret values — env values go to files, not commands. Returns the
+/// error response on failure.
+fn deployAudit(self: *Context, output: []u8, action: []const u8, server_id: []const u8, app: *const deploy.App, plan: []const deploy.PlanStep) ?[]const u8 {
+    var detail_buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&detail_buf);
+    writer.print("app={s} name={s} folder={s} ssl={s}", .{ app.id, app.name, app.folder, if (app.ssl) "yes" else "no" }) catch return respondError(output, "out of memory");
+    for (plan) |*s| {
+        writer.print("\n{d}: ", .{@intFromEnum(s.id)}) catch return respondError(output, "out of memory");
+        const cmd = if (s.command.len > 600) s.command[0..600] else s.command;
+        writer.writeAll(cmd) catch return respondError(output, "out of memory");
+        if (writer.buffered().len > 3800) break;
+    }
+    self.audit.append(self.io, .{
+        .ts = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds),
+        .action = action,
+        .server_id = server_id,
+        .detail = writer.buffered(),
+    }) catch return respondError(output, "audit failed");
+    return null;
+}
+
+/// Registers a run and hands the pipeline to the poll handler (spec 07
+/// §6: steps execute sequentially, driven by the frontend's polls — no
+/// extra threads). Secret values are validated against the declared
+/// secret fields and kept only in the run's protected memory.
+fn handleDeployRun(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(DeployRunPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+
+    var owned_opt = self.apps.find(self.io, payload.app_id) catch {
+        return respondError(output, "app registry is unreadable");
+    };
+    defer if (owned_opt) |*a| deploy.deinit(self.allocator, a);
+    const app = owned_opt orelse return respondError(output, "app not found");
+    if (!std.mem.eql(u8, app.server_id, payload.server_id)) return respondError(output, "app not found on this server");
+
+    var values: std.ArrayList(deploy.SecretValue) = .empty;
+    defer values.deinit(self.allocator);
+    if (payload.secret_values) |svs| {
+        for (svs) |sv| {
+            var declared = false;
+            for (app.env_vars) |v| {
+                if (v.secret and std.mem.eql(u8, v.name, sv.name)) {
+                    declared = true;
+                    break;
+                }
+            }
+            if (!declared) return respondError(output, "unknown secret variable");
+            values.append(self.allocator, sv) catch return respondError(output, "out of memory");
+        }
+    }
+
+    const session = self.manager.get(payload.server_id) orelse return respondError(output, "not connected");
+    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
+
+    const plan = deploy.buildPlan(self.allocator, &app) catch return respondError(output, "failed to plan the deploy");
+    defer {
+        for (plan) |*s| s.deinit(self.allocator);
+        self.allocator.free(plan);
+    }
+    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+    if (deployAudit(self, output, "deploy.run", payload.server_id, &app, plan)) |resp| return resp;
+
+    const run_id = self.manager.deploys.start(payload.server_id, &app, plan, values.items, @intCast(now)) catch return respondError(output, "out of memory");
+    var writer = std.Io.Writer.fixed(output);
+    writer.print("{{\"ok\":true,\"run_id\":{d}}}", .{run_id}) catch return output[0..0];
+    return writer.buffered();
+}
+
+/// The caller's absolute cursor for a step channel (spec 02 protocol;
+/// each deploy view polls with its own cursors).
+fn deployCursor(cursors: std.json.Value, channel: u32) u64 {
+    if (cursors != .object) return 0;
+    var key_buf: [16]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{d}", .{channel}) catch return 0;
+    const v = cursors.object.get(key) orelse return 0;
+    return switch (v) {
+        .integer => |i| if (i < 0) 0 else @intCast(i),
+        .float => |f| if (f < 0) 0 else @intFromFloat(f),
+        else => 0,
+    };
+}
+
+/// Synchronous SFTP write for deploy config files (`.env`, PM2
+/// ecosystem, nginx site). Returns a static error message or null.
+fn deployWriteFile(self: *Context, server_id: []const u8, path: []const u8, data: []const u8) ?[]const u8 {
+    var outcome: sessions.SftpOutcome = .{};
+    self.manager.sftpSave(server_id, path, data, &outcome) catch |err| {
+        return switch (err) {
+            error.NoSession => "not connected",
+            error.NotReady => "session not ready",
+            else => "failed to write the file",
+        };
+    };
+    const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + deploy_file_wait_ns;
+    outcome.wait(self.io, deadline);
+    if (!outcome.isDone()) return "timed out writing the file";
+    if (!outcome.ok) return outcome.message();
+    // The worker's success payload is owned; free it (mirrors
+    // sftpSyncOutcome).
+    if (outcome.json) |j| self.allocator.free(j);
+    return null;
+}
+
+/// Writes the config file the next step depends on: `.env` before install
+/// (or build, when install is skipped), the PM2 ecosystem file before
+/// pm2, the nginx site config before nginx (spec 07 §6). Returns a
+/// static error message or null.
+fn deployWriteStepFiles(self: *Context, run: *deploy.Run, step: *const deploy.Step) ?[]const u8 {
+    switch (step.id) {
+        .install, .build => {
+            if (run.env_written) return null;
+            const path = deploy.envFilePath(self.allocator, run.app.folder) catch return "out of memory";
+            defer self.allocator.free(path);
+            const content = deploy.envFile(self.allocator, &run.app, run.secrets.items) catch return "out of memory";
+            defer self.allocator.free(content);
+            if (deployWriteFile(self, run.server_id, path, content)) |msg| return msg;
+            run.env_written = true;
+            return null;
+        },
+        .pm2 => {
+            const path = deploy.pm2EcosystemPath(self.allocator, run.app.folder) catch return "out of memory";
+            defer self.allocator.free(path);
+            const content = deploy.ecosystemFile(self.allocator, &run.app, run.secrets.items) catch return "out of memory";
+            defer self.allocator.free(content);
+            return deployWriteFile(self, run.server_id, path, content);
+        },
+        .nginx => {
+            // The site config needs its directory to exist first; `mkdir
+            // -p` is idempotent so the step's own mkdir is harmless.
+            const q_avail = shellquote.quote(self.allocator, deploy.nginxAvailableDir()) catch return "out of memory";
+            defer self.allocator.free(q_avail);
+            const q_enabled = shellquote.quote(self.allocator, deploy.nginxEnabledDir()) catch return "out of memory";
+            defer self.allocator.free(q_enabled);
+            const mk = std.fmt.allocPrint(self.allocator, "mkdir -p {s} {s}", .{ q_avail, q_enabled }) catch return "out of memory";
+            defer self.allocator.free(mk);
+            var check = self.manager.execWait(run.server_id, mk, deploy_mkdir_cap, deploy_file_wait_ns) catch return "session lost";
+            defer check.output.deinit(self.allocator);
+            if (check.exit != 0) return "failed to create the nginx config directory";
+            const path = deploy.nginxAvailablePath(self.allocator, run.app.id) catch return "out of memory";
+            defer self.allocator.free(path);
+            const content = deploy.nginxConfig(self.allocator, &run.app) catch return "out of memory";
+            defer self.allocator.free(content);
+            return deployWriteFile(self, run.server_id, path, content);
+        },
+        else => return null,
+    }
+}
+
+/// Poll-driven step engine: starts the next step on each call, advances
+/// on channel EOF, writes each step's config file first, and marks the
+/// run done/failed/canceled/interrupted exactly once (appending the
+/// history record).
+fn deployPollStep(self: *Context, run: *deploy.Run, now_ns: i128) void {
+    while (run.currentStep()) |step| {
+        if (run.canceled) {
+            step.state = .canceled;
+            run.status = .canceled;
+            run.finished_at = @intCast(now_ns);
+            self.deploy_history.append(self.io, run);
+            return;
+        }
+        if (step.channel) |ch| {
+            const polls = self.manager.pollChannels(run.server_id, &.{.{ .id = ch, .pos = 0 }}, false, 64 * 1024, 64 * 1024) catch {
+                step.@"error" = "session lost";
+                step.state = .failed;
+                run.status = .interrupted;
+                run.finished_at = @intCast(now_ns);
+                self.deploy_history.append(self.io, run);
+                return;
+            };
+            defer {
+                for (polls) |*poll| poll.deinit(self.allocator);
+                self.allocator.free(polls);
+            }
+            var eof = false;
+            var exit: ?i32 = null;
+            for (polls) |*poll| {
+                if (poll.id != ch) continue;
+                eof = poll.eof;
+                exit = poll.exit_status;
+                run.captureOutput(self.allocator, poll.data);
+            }
+            if (!eof) return;
+            step.exit = exit;
+            if (exit != 0) {
+                step.state = .failed;
+                step.@"error" = "command failed";
+                run.status = .failed;
+                run.finished_at = @intCast(now_ns);
+                self.deploy_history.append(self.io, run);
+                return;
+            }
+            step.state = .success;
+            run.step_index += 1;
+            continue;
+        }
+        if (step.command.len == 0) {
+            step.state = .success; // skipped step (no command configured)
+            run.step_index += 1;
+            continue;
+        }
+        if (deployWriteStepFiles(self, run, step)) |msg| {
+            step.state = .failed;
+            step.@"error" = msg;
+            run.status = .failed;
+            run.finished_at = @intCast(now_ns);
+            self.deploy_history.append(self.io, run);
+            return;
+        }
+        const channel = self.manager.exec(run.server_id, step.command) catch {
+            step.@"error" = "session lost";
+            step.state = .failed;
+            run.status = .interrupted;
+            run.finished_at = @intCast(now_ns);
+            self.deploy_history.append(self.io, run);
+            return;
+        };
+        if (run.status == .queued) run.status = .running;
+        step.channel = channel;
+        step.state = .running;
+        return;
+    }
+    if (run.status != .done) {
+        run.status = .done;
+        run.finished_at = @intCast(now_ns);
+        self.deploy_history.append(self.io, run);
+    }
+}
+
+/// One poll pass: starts/advances steps, then serializes every step with
+/// the caller's cursor deltas (masked — secret values never appear in
+/// step output; spec 07 §8).
+fn handleDeployPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(DeployPollPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+
+    self.manager.deploys.lock();
+    const run = self.manager.deploys.get(payload.run_id) orelse {
+        self.manager.deploys.unlock();
+        return respondError(output, "unknown run");
+    };
+    self.manager.deploys.unlock();
+
+    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+    if (!deployTerminal(run.status)) {
+        const session = self.manager.get(run.server_id);
+        if (session == null or session.?.status.load(.acquire) != .ready) {
+            // Spec 07 §10: a server lost mid-deploy marks the run
+            // `interrupted`; the next run replans from live state.
+            if (run.currentStep()) |step| {
+                if (step.state == .running or step.state == .pending) {
+                    step.@"error" = "session lost";
+                    step.state = .failed;
+                }
+            }
+            run.status = .interrupted;
+            run.finished_at = @intCast(now);
+            self.deploy_history.append(self.io, run);
+        } else {
+            deployPollStep(self, run, now);
+        }
+    }
+
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"run_id\":") catch return output[0..0];
+    writer.print("{d}", .{run.id}) catch return output[0..0];
+    writer.writeAll(",\"status\":") catch return output[0..0];
+    json.writeJsonString(&writer, run.status.jsonName()) catch return output[0..0];
+    writer.print(",\"canceled\":{s}", .{if (run.canceled) "true" else "false"}) catch return output[0..0];
+    writer.writeAll(",\"steps\":[") catch return output[0..0];
+
+    var first = true;
+    var budget = deploy_poll_data_budget;
+    for (run.steps.items) |*step| {
+        if (!first) writer.writeAll(",") catch return output[0..0];
+        first = false;
+        writer.writeAll("{\"id\":") catch return output[0..0];
+        json.writeJsonString(&writer, step.id.jsonName()) catch return output[0..0];
+        writer.writeAll(",\"label\":") catch return output[0..0];
+        json.writeJsonString(&writer, step.label) catch return output[0..0];
+        writer.writeAll(",\"state\":") catch return output[0..0];
+        json.writeJsonString(&writer, step.state.jsonName()) catch return output[0..0];
+        if (step.channel) |ch| {
+            writer.print(",\"channel\":{d}", .{ch}) catch return output[0..0];
+        }
+        if (step.exit) |exit| {
+            writer.print(",\"exit\":{d}", .{exit}) catch return output[0..0];
+        }
+        if (step.@"error".len > 0) {
+            writer.writeAll(",\"error\":") catch return output[0..0];
+            json.writeJsonString(&writer, step.@"error") catch return output[0..0];
+        }
+        if (step.channel) |ch| {
+            const cursor = deployCursor(payload.cursors, ch);
+            const polls = self.manager.pollChannels(run.server_id, &.{.{ .id = ch, .pos = cursor }}, false, budget, 128 * 1024) catch {
+                // Session lost mid-serialize: report the step as-is; the
+                // next poll marks the run interrupted.
+                writer.print(",\"cursor\":{d},\"gap\":0,\"eof\":false,\"data\":\"\"", .{cursor}) catch return output[0..0];
+                continue;
+            };
+            var data: []u8 = &.{};
+            var new_cursor = cursor;
+            var gap: u64 = 0;
+            var eof = false;
+            for (polls) |*poll| {
+                if (poll.id != ch) continue;
+                data = poll.data;
+                new_cursor = poll.cursor;
+                gap = poll.gap;
+                eof = poll.eof;
+            }
+            // Secret values never appear in step output (spec 07 §8).
+            const masked = deploy.maskSecrets(self.allocator, data, run.secrets.items) catch data;
+            defer if (masked.ptr != data.ptr) self.allocator.free(masked);
+            budget = budget -| data.len;
+            writer.print(",\"cursor\":{d},\"gap\":{d},\"eof\":{s},\"data\":", .{ new_cursor, gap, if (eof) "true" else "false" }) catch return output[0..0];
+            json.writeJsonString(&writer, masked) catch return output[0..0];
+            // The data must be serialized before the polls are freed.
+            for (polls) |*poll| poll.deinit(self.allocator);
+            self.allocator.free(polls);
+        }
+        writer.writeAll("}") catch return output[0..0];
+    }
+    writer.writeAll("]") catch return output[0..0];
+    writer.print(",\"done\":{s}}}", .{if (deployTerminal(run.status)) "true" else "false"}) catch return output[0..0];
+    self.manager.deploys.evictFinished();
+    return writer.buffered();
+}
+
+/// Cancels a run: the current channel is closed and the run is reported
+/// `canceled` on the next poll ("cancel requested" — closing a channel
+/// does not prove the remote process died; spec 07 §4.2).
+fn handleDeployCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(DeployCancelPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    self.manager.deploys.lock();
+    const run = self.manager.deploys.get(parsed.value.run_id) orelse {
+        self.manager.deploys.unlock();
+        return respondError(output, "unknown run");
+    };
+    run.canceled = true;
+    const server_id = run.server_id;
+    if (run.currentStep()) |step| {
+        if (step.channel) |ch| self.manager.closeChannel(server_id, ch) catch {};
+    }
+    self.manager.deploys.unlock();
+    self.audit.append(self.io, .{
+        .ts = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds),
+        .action = "deploy.cancel",
+        .server_id = server_id,
+        .detail = "run canceled by the user",
+    }) catch {};
+    return ok_json;
+}
+
+/// Run history (spec 07 §7): newest first, filtered by server + app,
+/// bounded by the payload limit (default 10). Output is pre-masked.
+fn handleDeployHistory(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(DeployHistoryPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    const cap = @min(payload.limit orelse deploy.history_list_limit, 50);
+    var loaded = self.deploy_history.loadParsed(self.io) catch {
+        return respondError(output, "failed to load deploy history");
+    };
+    defer loaded.deinit(self.allocator);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"runs\":[") catch return output[0..0];
+    var emitted: usize = 0;
+    var i = loaded.parsed.value.len;
+    while (i > 0 and emitted < cap) {
+        i -= 1;
+        const rec = loaded.parsed.value[i];
+        if (!std.mem.eql(u8, rec.server_id, payload.server_id) or !std.mem.eql(u8, rec.app_id, payload.app_id)) continue;
+        if (emitted > 0) writer.writeAll(",") catch return output[0..0];
+        std.json.Stringify.value(rec, .{}, &writer) catch return output[0..0];
+        emitted += 1;
+    }
+    writer.writeAll("]}") catch return output[0..0];
+    return writer.buffered();
+}
 
 test "logs scan command is marker-escaped for busybox and GNU printf" {
     // busybox printf errors on bare %B-style directives and prints nothing

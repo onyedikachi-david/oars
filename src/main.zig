@@ -8,6 +8,7 @@ const bridge = @import("bridge.zig");
 const audit = @import("audit.zig");
 const logs = @import("logs.zig");
 const scripts = @import("scripts.zig");
+const deploy = @import("deploy.zig");
 const integration = @import("integration.zig");
 
 // Zig 0.16 only collects test blocks from files that are actually
@@ -16,6 +17,7 @@ const integration = @import("integration.zig");
 // this reference.
 comptime {
     _ = integration;
+    _ = deploy;
 }
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
@@ -44,12 +46,16 @@ const App = struct {
     audit_store: audit.Store,
     logs_store: logs.SourceStore,
     scripts_store: scripts.Store,
+    deploy_apps_store: deploy.AppStore,
+    deploy_history_store: deploy.HistoryStore,
     manager: sessions.Manager,
     bridge_ctx: bridge.Context,
     store_path_buf: [2048]u8 = undefined,
     audit_path_buf: [2048]u8 = undefined,
     logs_path_buf: [2048]u8 = undefined,
     scripts_path_buf: [2048]u8 = undefined,
+    deploy_apps_path_buf: [2048]u8 = undefined,
+    deploy_history_path_buf: [2048]u8 = undefined,
     data_dir_buf: [1024]u8 = undefined,
     fallback_dir_buf: [1024]u8 = undefined,
 
@@ -95,10 +101,22 @@ const App = struct {
             &self.scripts_path_buf,
             &.{ base, "scripts.json" },
         ) catch unreachable;
+        const deploy_apps_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.deploy_apps_path_buf,
+            &.{ base, "apps.json" },
+        ) catch unreachable;
+        const deploy_history_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.deploy_history_path_buf,
+            &.{ base, "deploy_runs.json" },
+        ) catch unreachable;
         self.store = .{ .allocator = self.allocator, .path = store_path };
         self.audit_store = .{ .allocator = self.allocator, .path = audit_path };
         self.logs_store = .{ .allocator = self.allocator, .path = logs_path };
         self.scripts_store = .{ .allocator = self.allocator, .path = scripts_path };
+        self.deploy_apps_store = .{ .allocator = self.allocator, .path = deploy_apps_path };
+        self.deploy_history_store = .{ .allocator = self.allocator, .path = deploy_history_path };
 
         self.manager = sessions.Manager.init(self.allocator, self.io, &self.store, &self.audit_store, self.env_map.get("HOME"));
         self.bridge_ctx = .{
@@ -109,6 +127,8 @@ const App = struct {
             .audit = &self.audit_store,
             .logs = &self.logs_store,
             .scripts = &self.scripts_store,
+            .apps = &self.deploy_apps_store,
+            .deploy_history = &self.deploy_history_store,
         };
     }
 
@@ -183,9 +203,15 @@ test "servers.save round trips through the bridge dispatcher" {
     var scripts_buf: [512]u8 = undefined;
     const scripts_path = std.fmt.bufPrint(&scripts_buf, "/tmp/{s}/scripts.json", .{dir_name}) catch unreachable;
     var scripts_store = scripts.Store{ .allocator = store_alloc, .path = scripts_path };
+    var deploy_apps_buf: [512]u8 = undefined;
+    const deploy_apps_path = std.fmt.bufPrint(&deploy_apps_buf, "/tmp/{s}/apps.json", .{dir_name}) catch unreachable;
+    var deploy_apps_store = deploy.AppStore{ .allocator = store_alloc, .path = deploy_apps_path };
+    var deploy_hist_buf: [512]u8 = undefined;
+    const deploy_hist_path = std.fmt.bufPrint(&deploy_hist_buf, "/tmp/{s}/deploy_runs.json", .{dir_name}) catch unreachable;
+    var deploy_hist_store = deploy.HistoryStore{ .allocator = store_alloc, .path = deploy_hist_path };
     var manager = sessions.Manager.init(store_alloc, io, &store, &audit_store, null);
     defer manager.deinit();
-    var ctx = bridge.Context{ .allocator = store_alloc, .io = io, .store = &store, .manager = &manager, .audit = &audit_store, .logs = &logs_store, .scripts = &scripts_store };
+    var ctx = bridge.Context{ .allocator = store_alloc, .io = io, .store = &store, .manager = &manager, .audit = &audit_store, .logs = &logs_store, .scripts = &scripts_store, .apps = &deploy_apps_store, .deploy_history = &deploy_hist_store };
     var dispatcher = ctx.dispatcher();
     var output: [64 * 1024]u8 = undefined;
 
@@ -251,6 +277,8 @@ const TestApp = struct {
     audit_store: audit.Store,
     logs_store: logs.SourceStore,
     scripts_store: scripts.Store,
+    deploy_apps_store: deploy.AppStore,
+    deploy_history_store: deploy.HistoryStore,
     manager: sessions.Manager,
     ctx: bridge.Context,
     dispatcher: native_sdk.BridgeDispatcher,
@@ -260,6 +288,8 @@ const TestApp = struct {
     audit_path_buf: [512]u8 = undefined,
     logs_path_buf: [512]u8 = undefined,
     scripts_path_buf: [512]u8 = undefined,
+    deploy_apps_path_buf: [512]u8 = undefined,
+    deploy_history_path_buf: [512]u8 = undefined,
     dir_name: []const u8,
 
     fn init(self: *TestApp) !void {
@@ -272,13 +302,17 @@ const TestApp = struct {
         const audit_path = try std.fmt.bufPrint(&self.audit_path_buf, "/tmp/{s}/audit.jsonl", .{self.dir_name});
         const logs_path = try std.fmt.bufPrint(&self.logs_path_buf, "/tmp/{s}/logs.json", .{self.dir_name});
         const scripts_path = try std.fmt.bufPrint(&self.scripts_path_buf, "/tmp/{s}/scripts.json", .{self.dir_name});
+        const deploy_apps_path = try std.fmt.bufPrint(&self.deploy_apps_path_buf, "/tmp/{s}/apps.json", .{self.dir_name});
+        const deploy_history_path = try std.fmt.bufPrint(&self.deploy_history_path_buf, "/tmp/{s}/deploy_runs.json", .{self.dir_name});
         const store_alloc = self.arena.allocator();
         self.store = .{ .allocator = store_alloc, .path = store_path };
         self.audit_store = .{ .allocator = store_alloc, .path = audit_path };
         self.logs_store = .{ .allocator = store_alloc, .path = logs_path };
         self.scripts_store = .{ .allocator = store_alloc, .path = scripts_path };
+        self.deploy_apps_store = .{ .allocator = store_alloc, .path = deploy_apps_path };
+        self.deploy_history_store = .{ .allocator = store_alloc, .path = deploy_history_path };
         self.manager = sessions.Manager.init(store_alloc, io, &self.store, &self.audit_store, null);
-        self.ctx = .{ .allocator = store_alloc, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store, .scripts = &self.scripts_store };
+        self.ctx = .{ .allocator = store_alloc, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store };
         self.dispatcher = self.ctx.dispatcher();
     }
 
@@ -808,4 +842,146 @@ test "scripts.run and broadcast require a session and validate inputs" {
         \\{"id":"12","command":"oars.scripts.broadcastCancel","payload":{"run_id":9999}}
     );
     try std.testing.expect(std.mem.indexOf(u8, cancel_unknown, "unknown run") != null);
+}
+
+test "deploy apps save/list/delete round trip through the dispatcher" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // Create on s1: the id is generated, secret values never persist.
+    const created = app.dispatch(
+        \\{"id":"1","command":"oars.deploy.apps.save","payload":{"app":{"server_id":"s1","name":"storefront","folder":"/home/ubuntu/storefront","repo":{"url":"git@github.com:you/storefront.git","transport":"ssh","branch":"main"},"runtime":{"node_version":"22","type":"next","install":"npm ci","build":"npm run build","start":"npm start"},"env_vars":[{"name":"NODE_ENV","secret":false,"value":"production"},{"name":"DATABASE_URL","secret":true,"has_value":true}],"domains":["storefront.dev"],"ssl":true,"email":"ops@storefront.dev","app_port":3000}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, created, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, created, "postgres://secret") == null);
+
+    const DeploySaveResp = struct {
+        result: struct {
+            ok: bool,
+            app: struct {
+                id: []const u8,
+                server_id: []const u8,
+                name: []const u8,
+                env_vars: []const struct {
+                    name: []const u8,
+                    secret: bool,
+                    value: []const u8 = "",
+                    has_value: bool,
+                } = &.{},
+            },
+        },
+    };
+    const created_parsed = try std.json.parseFromSlice(DeploySaveResp, std.testing.allocator, created, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer created_parsed.deinit();
+    try std.testing.expect(created_parsed.value.result.ok);
+    const app_id = created_parsed.value.result.app.id;
+    try std.testing.expectEqualStrings("s1", created_parsed.value.result.app.server_id);
+    try std.testing.expectEqual(@as(usize, 2), created_parsed.value.result.app.env_vars.len);
+    try std.testing.expectEqualStrings("", created_parsed.value.result.app.env_vars[1].value); // never stored
+
+    // A second app on a different server stays out of s1's list.
+    _ = app.dispatch(
+        \\{"id":"2","command":"oars.deploy.apps.save","payload":{"app":{"server_id":"s2","name":"api","folder":"/home/ubuntu/api","repo":{"url":"https://github.com/you/api.git","transport":"https"},"runtime":{"node_version":"22","type":"node","start":"node index.js"}}}}
+    );
+
+    const DeployListResp = struct {
+        result: struct {
+            ok: bool,
+            apps: []const struct {
+                id: []const u8,
+                server_id: []const u8,
+                env_vars: []const struct {
+                    name: []const u8,
+                    secret: bool,
+                    value: []const u8 = "",
+                    has_value: bool,
+                } = &.{},
+            } = &.{},
+        },
+    };
+    const listed = app.dispatch(
+        \\{"id":"3","command":"oars.deploy.apps.list","payload":{"server_id":"s1"}}
+    );
+    const listed_parsed = try std.json.parseFromSlice(DeployListResp, std.testing.allocator, listed, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer listed_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), listed_parsed.value.result.apps.len);
+    try std.testing.expectEqualStrings(app_id, listed_parsed.value.result.apps[0].id);
+    try std.testing.expectEqualStrings("", listed_parsed.value.result.apps[0].env_vars[1].value);
+
+    // Delete requires the owning server and removes the app.
+    const wrong_server = app.dispatch(
+        \\{"id":"4","command":"oars.deploy.apps.delete","payload":{"server_id":"s2","app_id":""}}
+    );
+    _ = wrong_server;
+    var del_buf: [512]u8 = undefined;
+    const del_req = try std.fmt.bufPrint(&del_buf, "{{\"id\":\"5\",\"command\":\"oars.deploy.apps.delete\",\"payload\":{{\"server_id\":\"s1\",\"app_id\":\"{s}\"}}}}", .{app_id});
+    const deleted = app.dispatch(del_req);
+    try std.testing.expect(std.mem.indexOf(u8, deleted, "\"ok\":true") != null);
+    const after = app.dispatch(
+        \\{"id":"6","command":"oars.deploy.apps.list","payload":{"server_id":"s1"}}
+    );
+    const after_parsed = try std.json.parseFromSlice(DeployListResp, std.testing.allocator, after, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer after_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), after_parsed.value.result.apps.len);
+}
+
+test "deploy.run requires a session and validates secret values" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // Unknown app.
+    const unknown = app.dispatch(
+        \\{"id":"1","command":"oars.deploy.run","payload":{"server_id":"ghost","app_id":"nope","secret_values":[]}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "app not found") != null);
+
+    // Create an app on a different server: the server must own the app.
+    const created = app.dispatch(
+        \\{"id":"2","command":"oars.deploy.apps.save","payload":{"app":{"id":"dep-1","server_id":"s1","name":"storefront","folder":"/home/ubuntu/storefront","repo":{"url":"git@github.com:you/storefront.git","transport":"ssh"},"runtime":{"node_version":"22","type":"node","install":"npm ci","build":"npm run build","start":"npm start"},"env_vars":[{"name":"DATABASE_URL","secret":true,"has_value":true}],"app_port":3000}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, created, "\"ok\":true") != null);
+
+    const wrong_server = app.dispatch(
+        \\{"id":"3","command":"oars.deploy.run","payload":{"server_id":"ghost","app_id":"dep-1","secret_values":[]}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, wrong_server, "app not found on this server") != null);
+
+    // Unknown secret variable names are rejected before any work.
+    const bad_secret = app.dispatch(
+        \\{"id":"4","command":"oars.deploy.run","payload":{"server_id":"s1","app_id":"dep-1","secret_values":[{"name":"NOPE","value":"x"}]}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_secret, "unknown secret variable") != null);
+
+    // A declared secret name passes validation, then the missing session
+    // stops the run.
+    const no_session = app.dispatch(
+        \\{"id":"5","command":"oars.deploy.run","payload":{"server_id":"s1","app_id":"dep-1","secret_values":[{"name":"DATABASE_URL","value":"postgres://secret"}]}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, no_session, "not connected") != null);
+
+    // Unknown run ids are explicit errors; history is empty and never
+    // leaks secret values.
+    const unknown_poll = app.dispatch(
+        \\{"id":"6","command":"oars.deploy.poll","payload":{"run_id":9999}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, unknown_poll, "unknown run") != null);
+    const cancel_unknown = app.dispatch(
+        \\{"id":"7","command":"oars.deploy.cancel","payload":{"run_id":9999}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, cancel_unknown, "unknown run") != null);
+    const history = app.dispatch(
+        \\{"id":"8","command":"oars.deploy.history","payload":{"server_id":"s1","app_id":"dep-1"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, history, "\"runs\":[]") != null);
 }
