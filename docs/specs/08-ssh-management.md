@@ -154,15 +154,15 @@ generate keys and GitHub deploy keys. The fleet-wide view is spec 09.
 
 ## 12. Acceptance criteria
 
-- [ ] List/add/revoke/rotate work and are atomic.
-- [ ] Read-only role permits SFTP reads and rejects an interactive shell,
+- [x] List/add/revoke/rotate work and are atomic.
+- [x] Read-only role permits SFTP reads and rejects an interactive shell,
       forwarding, file creation, write, rename, remove, and permission changes
       in integration tests.
-- [ ] Fingerprints match `ssh-keygen -lf` output.
-- [ ] Generated keys are readable by OpenSSH, never overwrite an existing path,
+- [x] Fingerprints match `ssh-keygen -lf` output.
+- [x] Generated keys are readable by OpenSSH, never overwrite an existing path,
       and never expose a passphrase through argv, environment, logs, history,
       audit, or telemetry.
-- [ ] All mutations audited.
+- [x] All mutations audited.
 
 ## 13. Research & References
 

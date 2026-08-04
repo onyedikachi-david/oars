@@ -18,10 +18,12 @@ const sftpmod = @import("sftp.zig");
 const scripts = @import("scripts.zig");
 const broadcast = @import("broadcast.zig");
 const deploy = @import("deploy.zig");
+const sshkeys = @import("sshkeys.zig");
+const keygen = @import("keygen.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 50;
+const handler_count = 59;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -88,6 +90,15 @@ pub const Context = struct {
             .{ .name = "oars.deploy.poll", .context = self, .invoke_fn = handleDeployPoll },
             .{ .name = "oars.deploy.cancel", .context = self, .invoke_fn = handleDeployCancel },
             .{ .name = "oars.deploy.history", .context = self, .invoke_fn = handleDeployHistory },
+            .{ .name = "oars.sshkeys.list", .context = self, .invoke_fn = handleSshKeysList },
+            .{ .name = "oars.sshkeys.add", .context = self, .invoke_fn = handleSshKeysAdd },
+            .{ .name = "oars.sshkeys.revoke", .context = self, .invoke_fn = handleSshKeysRevoke },
+            .{ .name = "oars.sshkeys.rotate", .context = self, .invoke_fn = handleSshKeysRotate },
+            .{ .name = "oars.sshkeys.generate", .context = self, .invoke_fn = handleSshKeysGenerate },
+            .{ .name = "oars.sshkeys.roles.list", .context = self, .invoke_fn = handleSshKeysRolesList },
+            .{ .name = "oars.sshkeys.roles.create", .context = self, .invoke_fn = handleSshKeysRolesCreate },
+            .{ .name = "oars.sshkeys.roles.delete", .context = self, .invoke_fn = handleSshKeysRolesDelete },
+            .{ .name = "oars.sshkeys.deployKey.generate", .context = self, .invoke_fn = handleSshKeysDeployKeyGenerate },
         };
         self.policies = .{
             .{ .name = "oars.servers.list", .origins = &allowed_origins },
@@ -140,6 +151,15 @@ pub const Context = struct {
             .{ .name = "oars.deploy.poll", .origins = &allowed_origins },
             .{ .name = "oars.deploy.cancel", .origins = &allowed_origins },
             .{ .name = "oars.deploy.history", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.list", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.add", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.revoke", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.rotate", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.generate", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.roles.list", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.roles.create", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.roles.delete", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.deployKey.generate", .origins = &allowed_origins },
         };
         return .{
             .policy = .{ .enabled = true, .commands = &self.policies },
@@ -2745,6 +2765,909 @@ fn handleDeployHistory(context: *anyopaque, invocation: native_sdk.bridge.Invoca
         emitted += 1;
     }
     writer.writeAll("]}") catch return output[0..0];
+    return writer.buffered();
+}
+// --- SSH key management (spec 08) --------------------------------------------
+
+const sshkeys_read_chunk: usize = 256 * 1024;
+const sshkeys_exec_cap: usize = 8 * 1024;
+const sshkeys_exec_timeout_ns = 10 * std.time.ns_per_s;
+const sshkeys_wait_ns = 20 * std.time.ns_per_s;
+const roles_marker_path = "/etc/oars-roles.json";
+const deploy_key_name = "oars_deploy";
+
+const SshKeysListPayload = struct {
+    server_id: []const u8,
+    user: ?[]const u8 = null,
+};
+const SshKeysAddPayload = struct {
+    server_id: []const u8,
+    public_key: []const u8,
+    comment: ?[]const u8 = null,
+    user: ?[]const u8 = null,
+};
+const SshKeysRevokePayload = struct {
+    server_id: []const u8,
+    fingerprint: []const u8,
+    expected_line_hash: []const u8,
+    user: ?[]const u8 = null,
+};
+const SshKeysRotatePayload = struct {
+    server_id: []const u8,
+    fingerprint: []const u8,
+    expected_line_hash: []const u8,
+    new_public_key: []const u8,
+    user: ?[]const u8 = null,
+};
+const SshKeysGeneratePayload = struct {
+    destination: []const u8,
+    comment: ?[]const u8 = null,
+    passphrase: ?[]const u8 = null,
+    remember_passphrase: bool = false,
+};
+const SshKeysRolesListPayload = struct { server_id: []const u8 };
+const SshKeysRolesCreatePayload = struct {
+    server_id: []const u8,
+    name: []const u8,
+    read_only: bool = false,
+};
+const SshKeysRolesDeletePayload = struct {
+    server_id: []const u8,
+    name: []const u8,
+};
+const SshKeysDeployKeyPayload = struct { server_id: []const u8 };
+
+fn validRoleName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 32) return false;
+    const first = name[0];
+    if (!((first >= 'a' and first <= 'z') or first == '_')) return false;
+    for (name[1..]) |ch| {
+        if (!((ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '-')) return false;
+    }
+    return true;
+}
+
+/// Resolves `<home>/.ssh/authorized_keys` for the connected account or a
+/// named role user (spec 08 §5 extension: `user` targets per-user files).
+/// Returns the owned path or null with the error response set.
+fn sshkeysPath(self: *Context, output: []u8, server_id: []const u8, user: ?[]const u8, err_response: *[]const u8) ?[]u8 {
+    err_response.* = "";
+    // The home is duplicated while the exec output is alive (the
+    // outcome's buffer is freed when this block exits).
+    const home: []u8 = if (user) |u| blk: {
+        if (!validRoleName(u)) {
+            err_response.* = respondError(output, "invalid user name");
+            return null;
+        }
+        var cmd_buf: [96]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&cmd_buf, "getent passwd {s}", .{u}) catch {
+            err_response.* = respondError(output, "invalid user name");
+            return null;
+        };
+        var check = self.manager.execWait(server_id, cmd, sshkeys_exec_cap, sshkeys_exec_timeout_ns) catch {
+            err_response.* = respondError(output, "not connected");
+            return null;
+        };
+        defer check.output.deinit(self.allocator);
+        if (check.exit != 0) {
+            err_response.* = respondError(output, "user not found");
+            return null;
+        }
+        // passwd: name:x:uid:gid:gecos:home:shell — the home field is
+        // second-to-last even when gecos contains colons.
+        var tokens = std.mem.splitScalar(u8, std.mem.trim(u8, check.output.items, " \t\r\n"), ':');
+        var all: [16][]const u8 = undefined;
+        var n: usize = 0;
+        while (tokens.next()) |t| {
+            if (n >= all.len) break;
+            all[n] = t;
+            n += 1;
+        }
+        if (n < 3) {
+            err_response.* = respondError(output, "cannot resolve the user's home");
+            return null;
+        }
+        break :blk self.allocator.dupe(u8, all[n - 2]) catch {
+            err_response.* = respondError(output, "out of memory");
+            return null;
+        };
+    } else blk: {
+        var check = self.manager.execWait(server_id, "echo ~", sshkeys_exec_cap, sshkeys_exec_timeout_ns) catch {
+            err_response.* = respondError(output, "not connected");
+            return null;
+        };
+        defer check.output.deinit(self.allocator);
+        const trimmed = std.mem.trim(u8, check.output.items, " \t\r\n");
+        if (trimmed.len == 0 or trimmed[0] != '/') {
+            err_response.* = respondError(output, "cannot resolve the home directory");
+            return null;
+        }
+        break :blk self.allocator.dupe(u8, trimmed) catch {
+            err_response.* = respondError(output, "out of memory");
+            return null;
+        };
+    };
+    defer self.allocator.free(home);
+    return std.fmt.allocPrint(self.allocator, "{s}/.ssh/authorized_keys", .{home}) catch {
+        err_response.* = respondError(output, "out of memory");
+        return null;
+    };
+}
+
+/// Synchronous SFTP read of a small file; null when the file is missing
+/// (spec 08 §10: missing → empty list/create path). Bounded.
+fn sshkeysRead(self: *Context, server_id: []const u8, path: []const u8) ?[]u8 {
+    var stat_out: sessions.SftpOutcome = .{};
+    self.manager.sftpStat(server_id, path, &stat_out) catch return null;
+    const stat_deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + sshkeys_wait_ns;
+    stat_out.wait(self.io, stat_deadline);
+    defer if (stat_out.json) |j| self.allocator.free(j);
+    if (!stat_out.isDone() or !stat_out.ok) return null; // missing
+
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(self.allocator);
+    var offset: u64 = 0;
+    while (true) {
+        var read_out: sessions.SftpOutcome = .{};
+        self.manager.sftpRead(server_id, path, offset, sshkeys_read_chunk, &read_out) catch return null;
+        read_out.wait(self.io, stat_deadline);
+        if (!read_out.isDone() or !read_out.ok) return null;
+        const payload = read_out.json orelse return null;
+        defer self.allocator.free(payload);
+        const parsed = std.json.parseFromSlice(struct {
+            ok: bool,
+            base64: []const u8 = "",
+            eof: bool = false,
+        }, self.allocator, payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return null;
+        defer parsed.deinit();
+        if (!parsed.value.ok) return null;
+        const size = std.base64.standard.Decoder.calcSizeForSlice(parsed.value.base64) catch return null;
+        if (content.items.len + size > sshkeys.max_keys_file_bytes) return null;
+        const decoded = self.allocator.alloc(u8, size) catch return null;
+        defer self.allocator.free(decoded);
+        std.base64.standard.Decoder.decode(decoded, parsed.value.base64) catch return null;
+        content.appendSlice(self.allocator, decoded) catch return null;
+        offset += decoded.len;
+        if (parsed.value.eof) break;
+    }
+    return content.toOwnedSlice(self.allocator) catch null;
+}
+
+/// Synchronous SFTP save with an optional chmod after the atomic rename
+/// (temp + posix-rename — the same editor-save path, spec 05 §4.2) and an
+/// optional chown (role-user files are written by the root session and
+/// must be readable by the account sshd reads them as). Returns a static
+/// error message or null on success.
+fn sshkeysWrite(self: *Context, server_id: []const u8, path: []const u8, content: []const u8, mode: ?u32, owner: ?[]const u8) ?[]const u8 {
+    var out: sessions.SftpOutcome = .{};
+    self.manager.sftpSave(server_id, path, content, &out) catch |err| {
+        return switch (err) {
+            error.NoSession => "not connected",
+            error.NotReady => "session not ready",
+            else => "failed to write the file",
+        };
+    };
+    const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + sshkeys_wait_ns;
+    out.wait(self.io, deadline);
+    if (!out.isDone()) return "timed out writing the file";
+    if (!out.ok) return out.message();
+    if (out.json) |j| self.allocator.free(j);
+    if (mode) |m| {
+        var chmod_out: sessions.SftpOutcome = .{};
+        self.manager.sftpChmod(server_id, path, m, &chmod_out) catch return "failed to set file permissions";
+        chmod_out.wait(self.io, deadline);
+        if (!chmod_out.isDone() or !chmod_out.ok) return "failed to set file permissions";
+        if (chmod_out.json) |j| self.allocator.free(j);
+    }
+    if (owner) |o| {
+        var cmd_buf: [512]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&cmd_buf, "chown {s} {s}", .{ o, path }) catch return "failed to set file ownership";
+        var check = self.manager.execWait(server_id, cmd, sshkeys_exec_cap, sshkeys_exec_timeout_ns) catch return "failed to set file ownership";
+        defer check.output.deinit(self.allocator);
+        if (check.exit != 0) return "failed to set file ownership";
+    }
+    return null;
+}
+
+/// Ensures `<home>/.ssh` exists with mode 0700 (StrictModes discipline;
+/// spec 08 §8). Returns a static error message or null.
+fn sshkeysEnsureSshDir(self: *Context, server_id: []const u8, path: []const u8) ?[]const u8 {
+    const dir = std.fs.path.dirname(path) orelse return "invalid path";
+    var stat_out: sessions.SftpOutcome = .{};
+    self.manager.sftpStat(server_id, dir, &stat_out) catch return "cannot stat the ssh directory";
+    const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + sshkeys_wait_ns;
+    stat_out.wait(self.io, deadline);
+    if (stat_out.isDone() and stat_out.ok) {
+        if (stat_out.json) |j| self.allocator.free(j);
+        return null;
+    }
+    if (stat_out.json) |j| self.allocator.free(j);
+    // Missing: create it, then tighten to 0700.
+    var mk_out: sessions.SftpOutcome = .{};
+    self.manager.sftpMkdir(server_id, dir, &mk_out) catch return "failed to create the ssh directory";
+    mk_out.wait(self.io, deadline);
+    if (!mk_out.isDone() or !mk_out.ok) return "failed to create the ssh directory";
+    if (mk_out.json) |j| self.allocator.free(j);
+    var chmod_out: sessions.SftpOutcome = .{};
+    self.manager.sftpChmod(server_id, dir, 0o700, &chmod_out) catch return "failed to set the ssh directory permissions";
+    chmod_out.wait(self.io, deadline);
+    if (!chmod_out.isDone() or !chmod_out.ok) return "failed to set the ssh directory permissions";
+    if (chmod_out.json) |j| self.allocator.free(j);
+    return null;
+}
+
+/// The current mode of `path` (from a fresh stat) or 0600 for a missing
+/// file — authorized_keys discipline (spec 08 §10).
+fn sshkeysMode(self: *Context, server_id: []const u8, path: []const u8) u32 {
+    var stat_out: sessions.SftpOutcome = .{};
+    self.manager.sftpStat(server_id, path, &stat_out) catch return 0o600;
+    const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + sshkeys_wait_ns;
+    stat_out.wait(self.io, deadline);
+    defer if (stat_out.json) |j| self.allocator.free(j);
+    if (!stat_out.isDone() or !stat_out.ok) return 0o600;
+    const parsed = std.json.parseFromSlice(struct {
+        ok: bool,
+        entry: struct { mode: []const u8 = "" },
+    }, self.allocator, stat_out.json.?, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return 0o600;
+    defer parsed.deinit();
+    _ = parsed.value.ok;
+    // The entry mode is the `ls -l`-style string; 0600 starts with "-rw-------".
+    const mode_text = parsed.value.entry.mode;
+    if (mode_text.len >= 10) {
+        var m: u32 = 0;
+        const groups = [_][3]u8{ mode_text[1..4].*, mode_text[4..7].*, mode_text[7..10].* };
+        const perms = [_]u8{ 4, 2, 1 };
+        for (groups, 0..) |g, gi| {
+            for (g, 0..) |ch, pi| {
+                if (ch != '-') m |= perms[pi] << @intCast((2 - gi) * 3);
+            }
+        }
+        return m;
+    }
+    return 0o600;
+}
+
+/// Finds the parsed key whose fingerprint and line hash both match the
+/// client's expectations (spec 08 §5: a line index is not stable after
+/// an external edit — the hash is the conflict guard).
+const SshKeysTarget = struct {
+    line_index: usize,
+    options: []const u8,
+};
+fn sshkeysFindTarget(parsed: *const sshkeys.ParsedFile, fingerprint: []const u8, expected_hash: []const u8) ?SshKeysTarget {
+    for (parsed.keys) |*k| {
+        if (!k.parsed) continue;
+        if (!std.mem.eql(u8, k.fingerprint_sha256, fingerprint)) continue;
+        if (std.mem.eql(u8, k.line_hash, expected_hash)) {
+            return .{ .line_index = k.line_index, .options = k.options };
+        }
+    }
+    return null;
+}
+
+fn sshkeysAudit(self: *Context, action: []const u8, server_id: []const u8, detail: []const u8) void {
+    self.audit.append(self.io, .{
+        .ts = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds),
+        .action = action,
+        .server_id = server_id,
+        .detail = detail,
+    }) catch {};
+}
+
+/// The read-only role's authorized-key options, from the roles marker
+/// (recorded at role creation from the server's actual SFTP subsystem).
+fn sshkeysRoleOptions(self: *Context, server_id: []const u8, user: []const u8) ?[]const u8 {
+    const marker = sshkeysRead(self, server_id, roles_marker_path) orelse return null;
+    defer self.allocator.free(marker);
+    const parsed = std.json.parseFromSlice([]struct {
+        name: []const u8,
+        read_only: bool,
+        forced_command: []const u8 = "",
+    }, self.allocator, marker, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return null;
+    defer parsed.deinit();
+    for (parsed.value) |role| {
+        if (std.mem.eql(u8, role.name, user) and role.read_only) {
+            if (role.forced_command.len == 0) return null;
+            var buf: [512]u8 = undefined;
+            const options = std.fmt.bufPrint(&buf, "restrict,command=\"{s}\"", .{role.forced_command}) catch return null;
+            return self.allocator.dupe(u8, options) catch null;
+        }
+    }
+    return null;
+}
+
+fn handleSshKeysList(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SshKeysListPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    var err_response: []const u8 = "";
+    const path = sshkeysPath(self, output, parsed.value.server_id, parsed.value.user, &err_response) orelse return err_response;
+    defer self.allocator.free(path);
+    const content = sshkeysRead(self, parsed.value.server_id, path) orelse "";
+    defer if (content.len > 0) self.allocator.free(content);
+    var file = sshkeys.parse(self.allocator, content) catch {
+        return respondError(output, "failed to parse authorized_keys");
+    };
+    defer file.deinit(self.allocator);
+
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"keys\":[") catch return output[0..0];
+    var first = true;
+    for (file.keys) |*k| {
+        if (!first) writer.writeAll(",") catch return output[0..0];
+        first = false;
+        writer.writeAll("{\"line_index\":") catch return output[0..0];
+        writer.print("{d}", .{k.line_index}) catch return output[0..0];
+        writer.writeAll(",\"parsed\":") catch return output[0..0];
+        writer.writeAll(if (k.parsed) "true" else "false") catch return output[0..0];
+        if (k.parsed) {
+            writer.writeAll(",\"options\":") catch return output[0..0];
+            json.writeJsonString(&writer, k.options) catch return output[0..0];
+            writer.writeAll(",\"type\":") catch return output[0..0];
+            json.writeJsonString(&writer, k.key_type) catch return output[0..0];
+            writer.writeAll(",\"key\":") catch return output[0..0];
+            json.writeJsonString(&writer, k.key) catch return output[0..0];
+            writer.writeAll(",\"comment\":") catch return output[0..0];
+            json.writeJsonString(&writer, k.comment) catch return output[0..0];
+            writer.writeAll(",\"fingerprint_sha256\":") catch return output[0..0];
+            json.writeJsonString(&writer, k.fingerprint_sha256) catch return output[0..0];
+            writer.writeAll(",\"bits\":") catch return output[0..0];
+            if (k.bits) |b| {
+                writer.print("{d}", .{b}) catch return output[0..0];
+            } else {
+                writer.writeAll("null") catch return output[0..0];
+            }
+            writer.writeAll(",\"line_hash\":") catch return output[0..0];
+            json.writeJsonString(&writer, k.line_hash) catch return output[0..0];
+        } else {
+            // Malformed lines surface with their raw text (spec 08 §10).
+            writer.writeAll(",\"raw\":") catch return output[0..0];
+            json.writeJsonString(&writer, k.raw) catch return output[0..0];
+            writer.writeAll(",\"error\":") catch return output[0..0];
+            json.writeJsonString(&writer, k.@"error") catch return output[0..0];
+            writer.writeAll(",\"line_hash\":") catch return output[0..0];
+            json.writeJsonString(&writer, k.line_hash) catch return output[0..0];
+        }
+        writer.writeAll("}") catch return output[0..0];
+    }
+    writer.writeAll("]}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleSshKeysAdd(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SshKeysAddPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    var err_response: []const u8 = "";
+    const path = sshkeysPath(self, output, payload.server_id, payload.user, &err_response) orelse return err_response;
+    defer self.allocator.free(path);
+    if (sshkeysEnsureSshDir(self, payload.server_id, path)) |msg| return respondError(output, msg);
+
+    const normalized = sshkeys.normalizePublicKey(self.allocator, payload.public_key, payload.comment) catch |err| {
+        return respondError(output, switch (err) {
+            error.Multiline => "public key must be a single line",
+            else => "invalid public key",
+        });
+    };
+    defer {
+        self.allocator.free(normalized.line);
+        self.allocator.free(normalized.fingerprint_sha256);
+    }
+
+    // Read-only role keys get the forced-command options automatically.
+    var options: ?[]const u8 = null;
+    defer if (options) |o| self.allocator.free(o);
+    if (payload.user) |u| options = sshkeysRoleOptions(self, payload.server_id, u);
+
+    const content = sshkeysRead(self, payload.server_id, path) orelse "";
+    defer if (content.len > 0) self.allocator.free(content);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(self.allocator);
+    if (content.len > 0) {
+        try out.appendSlice(self.allocator, content);
+        if (content[content.len - 1] != '\n') try out.append(self.allocator, '\n'); // newline guard
+    }
+    if (options) |o| {
+        try out.appendSlice(self.allocator, o);
+        try out.append(self.allocator, ' ');
+    }
+    try out.appendSlice(self.allocator, normalized.line);
+    try out.append(self.allocator, '\n');
+
+    const mode = sshkeysMode(self, payload.server_id, path);
+    if (sshkeysWrite(self, payload.server_id, path, out.items, mode, payload.user)) |msg| return respondError(output, msg);
+
+    // Report the new line's index/hash from the written state.
+    var written = sshkeys.parse(self.allocator, out.items) catch {
+        return respondError(output, "failed to parse the written file");
+    };
+    defer written.deinit(self.allocator);
+    var line_index: usize = 0;
+    if (written.keys.len > 0) line_index = written.keys[written.keys.len - 1].line_index;
+    var detail_buf: [256]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "fingerprint={s} user={s}", .{ normalized.fingerprint_sha256, payload.user orelse "-" }) catch "sshkeys.add";
+    sshkeysAudit(self, "sshkeys.add", payload.server_id, detail);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"line_index\":") catch return output[0..0];
+    writer.print("{d},\"fingerprint\":", .{line_index}) catch return output[0..0];
+    json.writeJsonString(&writer, normalized.fingerprint_sha256) catch return output[0..0];
+    writer.writeAll(",\"line_hash\":") catch return output[0..0];
+    json.writeJsonString(&writer, written.keys[written.keys.len - 1].line_hash) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+/// Loads the file, finds the target key by fingerprint + line hash, and
+/// rewrites it (drop or replace). Shared by revoke and rotate. Returns
+/// null with the error response set on any conflict.
+fn sshkeysRewrite(
+    self: *Context,
+    output: []u8,
+    err_response: *[]const u8,
+    server_id: []const u8,
+    path: []const u8,
+    fingerprint: []const u8,
+    expected_hash: []const u8,
+    replacement: ?[]const u8,
+    owner: ?[]const u8,
+) ?[]u8 {
+    err_response.* = "";
+    const content = sshkeysRead(self, server_id, path) orelse {
+        err_response.* = respondError(output, "key not found");
+        return null;
+    };
+    defer self.allocator.free(content);
+    var file = sshkeys.parse(self.allocator, content) catch {
+        err_response.* = respondError(output, "failed to parse authorized_keys");
+        return null;
+    };
+    defer file.deinit(self.allocator);
+    const target = sshkeysFindTarget(&file, fingerprint, expected_hash) orelse {
+        for (file.keys) |*k| {
+            if (k.parsed and std.mem.eql(u8, k.fingerprint_sha256, fingerprint)) {
+                err_response.* = respondError(output, "authorized_keys changed since the preview; refresh and retry");
+                return null;
+            }
+        }
+        err_response.* = respondError(output, "key not found");
+        return null;
+    };
+    var new_line: ?[]u8 = null;
+    defer if (new_line) |n| self.allocator.free(n);
+    if (replacement) |r| {
+        if (target.options.len > 0) {
+            new_line = std.fmt.allocPrint(self.allocator, "{s} {s}", .{ target.options, r }) catch {
+                err_response.* = respondError(output, "out of memory");
+                return null;
+            };
+        } else {
+            new_line = self.allocator.dupe(u8, r) catch {
+                err_response.* = respondError(output, "out of memory");
+                return null;
+            };
+        }
+    }
+    const rewritten = sshkeys.rewrite(self.allocator, &file, target.line_index, new_line) catch {
+        err_response.* = respondError(output, "out of memory");
+        return null;
+    };
+    errdefer self.allocator.free(rewritten);
+    const mode = sshkeysMode(self, server_id, path);
+    if (sshkeysWrite(self, server_id, path, rewritten, mode, owner)) |msg| {
+        err_response.* = respondError(output, msg);
+        return null;
+    }
+    return rewritten;
+}
+
+fn handleSshKeysRevoke(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SshKeysRevokePayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    var err_response: []const u8 = "";
+    const path = sshkeysPath(self, output, payload.server_id, payload.user, &err_response) orelse return err_response;
+    defer self.allocator.free(path);
+    const rewritten = sshkeysRewrite(self, output, &err_response, payload.server_id, path, payload.fingerprint, payload.expected_line_hash, null, payload.user) orelse return err_response;
+    self.allocator.free(rewritten);
+    var detail_buf: [256]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "fingerprint={s} user={s}", .{ payload.fingerprint, payload.user orelse "-" }) catch "sshkeys.revoke";
+    sshkeysAudit(self, "sshkeys.revoke", payload.server_id, detail);
+    return ok_json;
+}
+
+fn handleSshKeysRotate(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SshKeysRotatePayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    const normalized = sshkeys.normalizePublicKey(self.allocator, payload.new_public_key, null) catch |err| {
+        return respondError(output, switch (err) {
+            error.Multiline => "public key must be a single line",
+            else => "invalid public key",
+        });
+    };
+    defer {
+        self.allocator.free(normalized.line);
+        self.allocator.free(normalized.fingerprint_sha256);
+    }
+    var err_response: []const u8 = "";
+    const path = sshkeysPath(self, output, payload.server_id, payload.user, &err_response) orelse return err_response;
+    defer self.allocator.free(path);
+    const rewritten = sshkeysRewrite(self, output, &err_response, payload.server_id, path, payload.fingerprint, payload.expected_line_hash, normalized.line, payload.user) orelse return err_response;
+    self.allocator.free(rewritten);
+    var detail_buf: [256]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "old={s} new={s} user={s}", .{ payload.fingerprint, normalized.fingerprint_sha256, payload.user orelse "-" }) catch "sshkeys.rotate";
+    sshkeysAudit(self, "sshkeys.rotate", payload.server_id, detail);
+    return ok_json;
+}
+
+/// Local key generation (spec 08 §5): ssh-keygen through a private PTY;
+/// the passphrase never enters argv, env, or audit text. When
+/// `remember_passphrase` is set, the response names the Keychain account
+/// (`localkey:<fingerprint>`) the frontend stores the passphrase under.
+fn handleSshKeysGenerate(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SshKeysGeneratePayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    const generated = keygen.generate(self.io, self.allocator, .{
+        .destination = payload.destination,
+        .comment = payload.comment,
+        .passphrase = payload.passphrase,
+    }) catch |err| {
+        return respondError(output, switch (err) {
+            error.SshKeygenMissing => "ssh-keygen is not available on this machine",
+            error.InvalidDestination => "invalid destination path",
+            error.DestinationMissing => "the destination folder does not exist",
+            error.DestinationExists => "a key already exists at that destination",
+            error.PtyFailed, error.SpawnFailed, error.PromptFailed => "ssh-keygen failed during generation",
+            error.GenerationFailed => "ssh-keygen failed to generate the key",
+            error.VerifyFailed => "the generated key failed verification",
+            error.InstallFailed => "failed to install the key pair",
+            error.Timeout => "ssh-keygen did not finish in time",
+            error.UnexpectedOutput => "ssh-keygen produced unexpected output",
+            error.OutOfMemory => "out of memory",
+        });
+    };
+    defer {
+        self.allocator.free(generated.public_key);
+        self.allocator.free(generated.private_path);
+        self.allocator.free(generated.fingerprint_sha256);
+    }
+    var detail_buf: [512]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "destination={s} type=ed25519 fingerprint={s}", .{ generated.private_path, generated.fingerprint_sha256 }) catch "sshkeys.generate";
+    sshkeysAudit(self, "sshkeys.generate", "-", detail);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"public_key\":") catch return output[0..0];
+    json.writeJsonString(&writer, generated.public_key) catch return output[0..0];
+    writer.writeAll(",\"private_path\":") catch return output[0..0];
+    json.writeJsonString(&writer, generated.private_path) catch return output[0..0];
+    if (payload.remember_passphrase and payload.passphrase != null and payload.passphrase.?.len > 0) {
+        writer.writeAll(",\"keychain_account\":") catch return output[0..0];
+        var account_buf: [128]u8 = undefined;
+        const account = std.fmt.bufPrint(&account_buf, "localkey:{s}", .{generated.fingerprint_sha256}) catch "";
+        json.writeJsonString(&writer, account) catch return output[0..0];
+    }
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+// --- roles (spec 08 §4.2) -----------------------------------------------------
+
+/// The roles marker (`/etc/oars-roles.json`): Oars-created role users,
+/// with the forced command recorded from the server's SFTP subsystem.
+const RolesMarkerEntry = struct {
+    name: []const u8,
+    read_only: bool,
+    forced_command: []const u8 = "",
+};
+
+fn sshkeysRolesLoad(self: *Context, server_id: []const u8, out: *std.ArrayList(RolesMarkerEntry)) bool {
+    const content = sshkeysRead(self, server_id, roles_marker_path) orelse return true;
+    defer self.allocator.free(content);
+    if (content.len == 0) return true;
+    const parsed = std.json.parseFromSlice([]RolesMarkerEntry, self.allocator, content, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return false;
+    defer parsed.deinit();
+    for (parsed.value) |r| {
+        out.append(self.allocator, .{
+            .name = self.allocator.dupe(u8, r.name) catch return false,
+            .read_only = r.read_only,
+            .forced_command = self.allocator.dupe(u8, r.forced_command) catch return false,
+        }) catch return false;
+    }
+    return true;
+}
+
+fn sshkeysRolesSave(self: *Context, server_id: []const u8, roles: *const std.ArrayList(RolesMarkerEntry)) bool {
+    var out: std.Io.Writer.Allocating = .init(self.allocator);
+    defer out.deinit();
+    std.json.Stringify.value(roles.items, .{}, &out.writer) catch return false;
+    return sshkeysWrite(self, server_id, roles_marker_path, out.writer.buffered(), 0o600, null) == null;
+}
+
+fn handleSshKeysRolesList(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SshKeysRolesListPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const server_id = parsed.value.server_id;
+    const session = self.manager.get(server_id) orelse return respondError(output, "not connected");
+    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
+    var roles: std.ArrayList(RolesMarkerEntry) = .empty;
+    defer {
+        for (roles.items) |*r| {
+            self.allocator.free(r.name);
+            self.allocator.free(r.forced_command);
+        }
+        roles.deinit(self.allocator);
+    }
+    if (!sshkeysRolesLoad(self, server_id, &roles)) return respondError(output, "failed to read the roles marker");
+
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"roles\":[") catch return output[0..0];
+    var first = true;
+    for (roles.items) |*role| {
+        // Live state: the user must still exist; read the shell and home.
+        var cmd_buf: [96]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&cmd_buf, "getent passwd {s}", .{role.name}) catch continue;
+        var check = self.manager.execWait(server_id, cmd, sshkeys_exec_cap, sshkeys_exec_timeout_ns) catch continue;
+        defer check.output.deinit(self.allocator);
+        if (check.exit != 0) continue; // stale marker entry
+        const passwd = std.mem.trim(u8, check.output.items, " \t\r\n");
+        var tokens = std.mem.splitScalar(u8, passwd, ':');
+        var fields: [16][]const u8 = undefined;
+        var n: usize = 0;
+        while (tokens.next()) |t| {
+            if (n >= fields.len) break;
+            fields[n] = t;
+            n += 1;
+        }
+        if (n < 7) continue;
+        const home = fields[n - 2];
+        const shell = fields[n - 1];
+
+        if (!first) writer.writeAll(",") catch return output[0..0];
+        first = false;
+        writer.writeAll("{\"name\":") catch return output[0..0];
+        json.writeJsonString(&writer, role.name) catch return output[0..0];
+        writer.writeAll(",\"shell\":") catch return output[0..0];
+        json.writeJsonString(&writer, shell) catch return output[0..0];
+        writer.print(",\"read_only\":{s},\"policy\":", .{if (role.read_only) "true" else "false"}) catch return output[0..0];
+        json.writeJsonString(&writer, if (role.read_only) "read-only-sftp" else "standard") catch return output[0..0];
+        writer.writeAll(",\"users\":[") catch return output[0..0];
+        // The people holding keys on this account (authorized_keys comments).
+        var ak_buf: [512]u8 = undefined;
+        const ak_cmd = std.fmt.bufPrint(&ak_buf, "cat {s}/.ssh/authorized_keys 2>/dev/null", .{home}) catch "";
+        if (ak_cmd.len > 0) {
+            var ak = self.manager.execWait(server_id, ak_cmd, sshkeys_exec_cap, sshkeys_exec_timeout_ns) catch null;
+            if (ak) |*a| {
+                defer a.output.deinit(self.allocator);
+                var file = sshkeys.parse(self.allocator, a.output.items) catch null;
+                if (file) |*f| {
+                    defer f.deinit(self.allocator);
+                    var k_first = true;
+                    for (f.keys) |*k| {
+                        if (!k.parsed) continue;
+                        if (!k_first) writer.writeAll(",") catch return output[0..0];
+                        k_first = false;
+                        json.writeJsonString(&writer, k.comment) catch return output[0..0];
+                    }
+                }
+            }
+        }
+        writer.writeAll("]}") catch return output[0..0];
+    }
+    writer.writeAll("]}") catch return output[0..0];
+    return writer.buffered();
+}
+
+/// Runs one privileged command; returns false on non-zero exit (the
+/// caller's error response is set).
+fn sshkeysExec(self: *Context, output: []u8, err_response: *[]const u8, server_id: []const u8, cmd: []const u8, fail_msg: []const u8) bool {
+    var check = self.manager.execWait(server_id, cmd, sshkeys_exec_cap, sshkeys_exec_timeout_ns) catch {
+        err_response.* = respondError(output, "not connected");
+        return false;
+    };
+    defer check.output.deinit(self.allocator);
+    if (check.exit != 0) {
+        err_response.* = respondError(output, fail_msg);
+        return false;
+    }
+    return true;
+}
+
+fn handleSshKeysRolesCreate(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SshKeysRolesCreatePayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (!validRoleName(payload.name)) return respondError(output, "invalid role name");
+    if (std.mem.eql(u8, payload.name, "root")) return respondError(output, "invalid role name");
+    const server_id = payload.server_id;
+
+    var err_response: []const u8 = "";
+    // User creation requires root (spec 08 §4.2: show the exact
+    // privileged commands; stop when the authority is absent).
+    var id_check = self.manager.execWait(server_id, "id -u", sshkeys_exec_cap, sshkeys_exec_timeout_ns) catch {
+        return respondError(output, "not connected");
+    };
+    defer id_check.output.deinit(self.allocator);
+    if (id_check.exit != 0 or std.mem.indexOf(u8, std.mem.trim(u8, id_check.output.items, " \t\r\n"), "0") == null) {
+        return respondError(output, "roles require root access on the server");
+    }
+
+    var roles: std.ArrayList(RolesMarkerEntry) = .empty;
+    defer {
+        for (roles.items) |*r| {
+            self.allocator.free(r.name);
+            self.allocator.free(r.forced_command);
+        }
+        roles.deinit(self.allocator);
+    }
+    if (!sshkeysRolesLoad(self, server_id, &roles)) return respondError(output, "failed to read the roles marker");
+    for (roles.items) |r| {
+        if (std.mem.eql(u8, r.name, payload.name)) {
+            // Idempotent: the role already exists; verify the user does too.
+            var cmd_buf: [96]u8 = undefined;
+            const cmd = std.fmt.bufPrint(&cmd_buf, "getent passwd {s}", .{payload.name}) catch "";
+            if (!sshkeysExec(self, output, &err_response, server_id, cmd, "role user is missing")) return err_response;
+            return ok_json;
+        }
+    }
+
+    // Capability-detect the SFTP subsystem for read-only roles before
+    // creating anything (spec 08 §4.2).
+    var forced_command: []const u8 = "";
+    var forced_owned: ?[]u8 = null;
+    defer if (forced_owned) |f| self.allocator.free(f);
+    if (payload.read_only) {
+        var sub = self.manager.execWait(server_id, "sshd -T 2>/dev/null | grep -E '^subsystem sftp'", sshkeys_exec_cap, sshkeys_exec_timeout_ns) catch {
+            return respondError(output, "not connected");
+        };
+        defer sub.output.deinit(self.allocator);
+        if (sub.exit != 0) return respondError(output, "the server does not expose an SFTP subsystem");
+        var tokens = std.mem.tokenizeAny(u8, std.mem.trim(u8, sub.output.items, " \t\r\n"), " \t");
+        _ = tokens.next(); // "subsystem"
+        _ = tokens.next(); // "sftp"
+        const sftp_bin = tokens.next() orelse return respondError(output, "the server does not expose an SFTP subsystem");
+        forced_owned = std.fmt.allocPrint(self.allocator, "{s} -R", .{sftp_bin}) catch return respondError(output, "out of memory");
+        forced_command = forced_owned.?;
+    }
+
+    var useradd_buf: [160]u8 = undefined;
+    // `-p ''` creates an unlocked account with an empty password field:
+    // sshd refuses key auth for locked accounts, and password auth stays
+    // refused (no PermitEmptyPasswords). Key access is the only way in.
+    const useradd_cmd = std.fmt.bufPrint(&useradd_buf, "useradd -m -s /bin/bash -p '' {s}", .{payload.name}) catch return respondError(output, "invalid role name");
+    var created = self.manager.execWait(server_id, useradd_cmd, sshkeys_exec_cap, sshkeys_exec_timeout_ns) catch {
+        return respondError(output, "not connected");
+    };
+    defer created.output.deinit(self.allocator);
+    if (created.exit != 0) {
+        // useradd exits 9 when the user exists; anything else is a failure.
+        const out_text = std.mem.trim(u8, created.output.items, " \t\r\n");
+        if (created.exit != 9 and std.mem.indexOf(u8, out_text, "already exists") == null) {
+            return respondError(output, "useradd failed");
+        }
+        var cmd_buf: [96]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&cmd_buf, "getent passwd {s}", .{payload.name}) catch "";
+        if (!sshkeysExec(self, output, &err_response, server_id, cmd, "useradd failed")) return err_response;
+        return respondError(output, "a user with this name already exists but was not created by Oars");
+    }
+
+    // Per-user authorized_keys setup: 0700 .ssh, 0600 authorized_keys.
+    var home_buf: [96]u8 = undefined;
+    const home_cmd = std.fmt.bufPrint(&home_buf, "getent passwd {s} | awk -F: '{{print $6}}'", .{payload.name}) catch "";
+    var home_check = self.manager.execWait(server_id, home_cmd, sshkeys_exec_cap, sshkeys_exec_timeout_ns) catch {
+        return respondError(output, "not connected");
+    };
+    defer home_check.output.deinit(self.allocator);
+    if (home_check.exit != 0) return respondError(output, "cannot resolve the new user's home");
+    const home = std.mem.trim(u8, home_check.output.items, " \t\r\n");
+    var setup_buf: [768]u8 = undefined;
+    const setup_cmd = std.fmt.bufPrint(&setup_buf, "mkdir -p {s}/.ssh && chmod 700 {s}/.ssh && touch {s}/.ssh/authorized_keys && chmod 600 {s}/.ssh/authorized_keys && chown {s} {s}/.ssh {s}/.ssh/authorized_keys", .{ home, home, home, home, payload.name, home, home }) catch return respondError(output, "out of memory");
+    if (!sshkeysExec(self, output, &err_response, server_id, setup_cmd, "failed to set up the role user")) return err_response;
+
+    // Record the role (with the forced command, for future key adds).
+    try roles.append(self.allocator, .{
+        .name = try self.allocator.dupe(u8, payload.name),
+        .read_only = payload.read_only,
+        .forced_command = try self.allocator.dupe(u8, forced_command),
+    });
+    if (!sshkeysRolesSave(self, server_id, &roles)) return respondError(output, "failed to save the roles marker");
+
+    var detail_buf: [128]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "name={s} read_only={s}", .{ payload.name, if (payload.read_only) "yes" else "no" }) catch "sshkeys.roles.create";
+    sshkeysAudit(self, "sshkeys.roles.create", server_id, detail);
+    return ok_json;
+}
+
+fn handleSshKeysRolesDelete(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SshKeysRolesDeletePayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    const server_id = payload.server_id;
+    const session = self.manager.get(server_id) orelse return respondError(output, "not connected");
+    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
+    var roles: std.ArrayList(RolesMarkerEntry) = .empty;
+    defer {
+        for (roles.items) |*r| {
+            self.allocator.free(r.name);
+            self.allocator.free(r.forced_command);
+        }
+        roles.deinit(self.allocator);
+    }
+    if (!sshkeysRolesLoad(self, server_id, &roles)) return respondError(output, "failed to read the roles marker");
+    var found = false;
+    var i: usize = 0;
+    while (i < roles.items.len) {
+        if (std.mem.eql(u8, roles.items[i].name, payload.name)) {
+            const removed = roles.orderedRemove(i);
+            self.allocator.free(removed.name);
+            self.allocator.free(removed.forced_command);
+            found = true;
+        } else {
+            i += 1;
+        }
+    }
+    if (!found) return respondError(output, "role not found");
+
+    var err_response: []const u8 = "";
+    var del_buf: [96]u8 = undefined;
+    const del_cmd = std.fmt.bufPrint(&del_buf, "userdel {s}", .{payload.name}) catch return respondError(output, "invalid role name");
+    // userdel leaves the home dir (spec 08 §5).
+    if (!sshkeysExec(self, output, &err_response, server_id, del_cmd, "userdel failed")) return err_response;
+    if (!sshkeysRolesSave(self, server_id, &roles)) return respondError(output, "failed to save the roles marker");
+    var detail_buf: [128]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "name={s}", .{payload.name}) catch "sshkeys.roles.delete";
+    sshkeysAudit(self, "sshkeys.roles.delete", server_id, detail);
+    return ok_json;
+}
+
+/// Server-side deploy key (spec 08 §5): `~/.ssh/oars_deploy` ed25519 with
+/// no passphrase, 0600, idempotent; authorized_keys is never touched.
+fn handleSshKeysDeployKeyGenerate(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SshKeysDeployKeyPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const server_id = parsed.value.server_id;
+    var cmd_buf: [512]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&cmd_buf, "mkdir -p ~/.ssh && chmod 700 ~/.ssh && (test -f ~/.ssh/{s} || ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/{s} -C oars-deploy) && chmod 600 ~/.ssh/{s} && cat ~/.ssh/{s}.pub", .{ deploy_key_name, deploy_key_name, deploy_key_name, deploy_key_name }) catch return respondError(output, "out of memory");
+    var check = self.manager.execWait(server_id, cmd, sshkeys_exec_cap, sshkeys_exec_timeout_ns) catch {
+        return respondError(output, "not connected");
+    };
+    defer check.output.deinit(self.allocator);
+    if (check.exit != 0) return respondError(output, "ssh-keygen failed on the server");
+    const pub_key = std.mem.trim(u8, check.output.items, " \t\r\n");
+    if (pub_key.len == 0) return respondError(output, "the deploy key could not be read");
+    sshkeysAudit(self, "sshkeys.deployKey.generate", server_id, "path=~/.ssh/oars_deploy");
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"public_key\":") catch return output[0..0];
+    json.writeJsonString(&writer, pub_key) catch return output[0..0];
+    writer.writeAll(",\"path\":\"~/.ssh/oars_deploy\"}") catch return output[0..0];
     return writer.buffered();
 }
 

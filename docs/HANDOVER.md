@@ -785,3 +785,126 @@ piece is designed but not implemented: per-app `known_hosts` + deploy key
 + `IdentitiesOnly=yes`, spec 07 §6). The deploy wire format in spec 07 §5
 is final; `deploy.poll` cursors are per-view absolute positions like the
 broadcast poll.
+
+## 17. Session handover — 2026-08-04 (session 7): spec 08 SSH key management backend
+
+### 17.1 What landed
+
+**`src/sshkeys.zig` (new):** the pure authorized_keys parser — no shell.
+Line split (CRLF, comments, empties; a trailing newline does not produce a
+phantom line), the OpenSSH options field (comma-separated, quote-aware,
+no spaces outside quotes), key-type detection, base64 blob, and comment;
+embedded-type verification against the decoded SSH wire blob; `bits`
+derived only for understood formats (ed25519 256, rsa via mpint, ecdsa via
+curve point length); `fingerprint` → `SHA256:<base64>` matching
+`ssh-keygen -lf` byte-for-byte; `lineHash` (lowercase hex, stable per
+line); `rewrite` (line-preserving drop/replace of the target line only);
+`normalizePublicKey` (parse + fingerprint of a pasted/generated public
+key). Unit vectors include a known ed25519, rsa, and padded-ecdsa key.
+
+**`src/keygen.zig` (new):** in-app key generation via the installed
+OpenSSH `ssh-keygen`. `promptAction` is a prompt state machine that
+matches the documented prompts by suffix (`(empty for no passphrase): `
+embeds the key path, so full-text matching is wrong) and detects the
+passphrase-mismatch loop by counting prompt occurrences in the
+accumulated PTY output. `runSshKeygen` drives a private PTY
+(posix_openpt/grantpt/unlockpt, fork, setsid + TIOCSCTTY, dup2, execve)
+with hand-declared async-signal-safe externs; a non-empty passphrase goes
+only to the terminal — never argv, env, or audit — and the scratch
+buffer is scrubbed with `secureZero`. `generate` validates the
+destination (absolute, sane, existing dir), writes to a same-dir
+`.oars-tmp-<ns>` pair, verifies mode 0600 + public-key parseability, and
+installs with no-clobber renames (private first, rollback on failure).
+Empty passphrase uses `-N ""` and skips the PTY entirely.
+
+**`src/bridge.zig`:** 9 handlers (handler_count 50 → 59):
+`oars.sshkeys.{list, add, revoke, rotate, generate, roles.list,
+roles.create, roles.delete, deployKey.generate}`, all approval-gated in
+`policies`. `add`/`revoke`/`rotate` take `user?` (default: the connected
+account) and guard every write with the fingerprint + expected line hash
+(a stale hash is a conflict, never a silent overwrite); `rotate`
+preserves the line's options and comment. Role handlers run through exec
+(root): `roles.create` is idempotent, capability-detects `internal-sftp
+-R` before offering read-only, creates the user with
+`useradd -m -s /bin/bash -p ''` (an empty password keeps the account
+*unlocked* for key auth while password auth stays refused — a default
+`useradd` leaves the account locked and sshd refuses it), chowns `.ssh`
+and `authorized_keys` to the role user, and records the marker in
+`/etc/oars-roles.json`; `roles.delete` removes user + marker entry;
+`roles.list` reads the marker + live `getent passwd`. Read-only role keys
+are written with `restrict,command="internal-sftp -R"` (spec 08 §4.2 —
+no `rbash`). `deployKey.generate` is an idempotent server-side ed25519
+at `~/.ssh/oars_deploy` (0600) that never touches `authorized_keys`.
+`generate` responds with `keychain_account: "localkey:<fingerprint>"`
+when the passphrase should be remembered — the bridge never holds it.
+
+**Tests:** 10 sshkeys parser/keygen unit tests, 2 dispatcher suites (the
+9 handlers reject ghost servers and bad role names; generate makes a
+0600 key, refuses dupes and relative destinations, and keeps the
+passphrase out of response + audit), and one container integration test
+taking the whole spec end to end: generate a local key → add → list
+(fingerprint matches `ssh-keygen -lf`) → connect with it → revoke
+(connect now fails; stale line hash is a conflict) → rotate (old
+fingerprint gone, options preserved) → create the read-only role → list
+roles → add a key to the role (forced command auto-applied) → as the
+role user: SFTP reads OK, shell/exec refused, every filesystem mutation
+(save/mkdir/rm/rename/chmod) refused, and `ssh -W` (a direct-tcpip-only
+channel) refused with "administratively prohibited" → roles.delete
+(login now fails) → deploy key generated (0600, idempotent,
+authorized_keys untouched) → every mutation present in the audit store.
+The container's own key is restored at the end so the earlier key-auth
+test stays green on the next run. **109/109 pass, leak-checked, two
+consecutive container runs green.**
+
+`scripts/dev-sshd/Dockerfile` now installs `shadow` (useradd/userdel for
+roles).
+
+### 17.2 Bugs the integration test found (all fixed)
+
+- **Revoked-account denial:** a fresh `useradd` (no `-p`) leaves the
+  account *locked* — sshd refuses key auth with "account is locked".
+  Fixed with `useradd -m -s /bin/bash -p '' <name>`.
+- **Ownership:** sshd reads the role user's `authorized_keys` after the
+  privilege drop; a root-owned 0700 `.ssh` blocks it. Role setup and
+  every `sshkeysWrite` to a role user's file now `chown` to that user.
+- **Dangling home:** `sshkeysPath` returned a slice into the freed exec
+  output buffer → garbage SFTP paths. The home is now duped while the
+  output lives.
+- **Memory leaks:** `trust()`'s fingerprint dupe left the session's
+  `host_fingerprint` dangling (now owned by the session copy);
+  `Channel` allocations were never freed (close() now self-destroys);
+  ops/channels lists deinit instead of clearing; marker entries freed
+  their duped strings; a padded-base64 decode must be re-sliced to the
+  padded size before copy (DebugAllocator).
+- **Prompt matching:** matching the full "Enter passphrase …" text is
+  wrong — the prompt embeds the key path. Match the `(empty for no
+  passphrase): ` suffix and *count* occurrences to detect the mismatch
+  loop.
+- **Defer restore after disconnect (this session):** the test restored
+  the container's `authorized_keys` in a `defer`, but the explicit
+  `disconnect` is the last statement — the defer ran *after* it and
+  silently failed (`catch {}`), leaving the rotated key in the file and
+  breaking the earlier key-auth test on the next run. Restore now runs
+  explicitly before the disconnect; the defer remains as a safety net
+  for mid-test failures (the session is still connected then).
+- **Silent `userdel` failure:** shadow's `userdel` refuses (e.g. a user
+  it considers logged in) and the test swallowed the exit code, leaving
+  a stale two-key `authorized_keys` that failed the roles assertions.
+  Cleanup is now belt-and-braces: `userdel -r …; rm -rf /home/…;
+  rm -f /etc/oars-roles.json`.
+- **Forwarding probe placement:** exec as the read-only user is replaced
+  by the forced command, so a forwarding test *from that session* tests
+  nothing. The probe runs from the root session: `ssh -W` (which opens
+  only a direct-tcpip channel) authenticates as the role user with the
+  uploaded role key, and the assertions check the refusal message
+  ("administratively prohibited", "open failed") and `rc=255` — so the
+  refusal is about `restrict`, not about auth.
+
+### 17.3 Next
+
+Spec 07 frontend UI (app form, step rail, deploy view, history). Or spec
+09 (fleet-wide access view — it can reuse `sshkeys.list` + role markers
+per server). The `GIT_SSH_COMMAND` scoped-key piece of spec 07 §6
+(per-app `known_hosts` + the spec-08 `oars_deploy` key +
+`IdentitiesOnly=yes`) is still unimplemented backend work if taken
+before the frontend.

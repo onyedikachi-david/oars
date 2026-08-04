@@ -985,3 +985,119 @@ test "deploy.run requires a session and validates secret values" {
     );
     try std.testing.expect(std.mem.indexOf(u8, history, "\"runs\":[]") != null);
 }
+
+test "sshkeys.generate creates a key, refuses overwrites, and hides the passphrase" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+    const io = std.testing.io;
+
+    const now = std.Io.Timestamp.now(io, .real).nanoseconds;
+    var dir_buf: [160]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/oars-keygen-test-{d}", .{now});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    std.Io.Dir.cwd().createDirPath(io, dir) catch return error.TestUnexpectedResult;
+    var dest_buf: [256]u8 = undefined;
+    const dest = try std.fmt.bufPrint(&dest_buf, "{s}/id_ed25519_oars", .{dir});
+
+    var req_buf: [512]u8 = undefined;
+    const req = try std.fmt.bufPrint(&req_buf, "{{\"id\":\"1\",\"command\":\"oars.sshkeys.generate\",\"payload\":{{\"destination\":\"{s}\",\"comment\":\"oars-test\",\"passphrase\":\"hunter2-secret\",\"remember_passphrase\":true}}}}", .{dest});
+    const resp = app.dispatch(req);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"ok\":true") != null);
+    // The passphrase never appears in the response; the Keychain account
+    // name tells the frontend where to store it.
+    try std.testing.expect(std.mem.indexOf(u8, resp, "hunter2-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "keychain_account") != null);
+
+    const GenResp = struct {
+        result: struct {
+            ok: bool,
+            public_key: []const u8 = "",
+            private_path: []const u8 = "",
+            keychain_account: []const u8 = "",
+        },
+    };
+    const gen_parsed = try std.json.parseFromSlice(GenResp, std.testing.allocator, resp, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer gen_parsed.deinit();
+    try std.testing.expect(gen_parsed.value.result.ok);
+    try std.testing.expect(std.mem.indexOf(u8, gen_parsed.value.result.public_key, "ssh-ed25519") != null);
+    try std.testing.expectEqualStrings(dest, gen_parsed.value.result.private_path);
+    try std.testing.expect(std.mem.startsWith(u8, gen_parsed.value.result.keychain_account, "localkey:SHA256:"));
+
+    // The private file exists with mode 0600.
+    var priv = std.Io.Dir.cwd().openFile(io, dest, .{}) catch return error.TestUnexpectedResult;
+    defer priv.close(io);
+    const st = try priv.stat(io);
+    try std.testing.expectEqual(@as(u16, 0o600), st.permissions.toMode() & 0o777);
+
+    // The audit entry has the fingerprint but never the passphrase.
+    const audit_content = try std.Io.Dir.cwd().readFileAlloc(io, app.audit_store.path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(audit_content);
+    try std.testing.expect(std.mem.indexOf(u8, audit_content, "sshkeys.generate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_content, "hunter2-secret") == null);
+
+    // An existing destination is refused, not overwritten.
+    const dup = app.dispatch(req);
+    try std.testing.expect(std.mem.indexOf(u8, dup, "already exists") != null);
+
+    // A relative destination is rejected before any work.
+    var rel_buf: [320]u8 = undefined;
+    const rel_req = try std.fmt.bufPrint(&rel_buf, "{{\"id\":\"2\",\"command\":\"oars.sshkeys.generate\",\"payload\":{{\"destination\":\"relative/path\"}}}}", .{});
+    const rel = app.dispatch(rel_req);
+    try std.testing.expect(std.mem.indexOf(u8, rel, "invalid destination") != null);
+}
+
+test "sshkeys handlers require a session and validate payloads" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    const list = app.dispatch(
+        \\{"id":"1","command":"oars.sshkeys.list","payload":{"server_id":"ghost"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, list, "not connected") != null);
+
+    const add = app.dispatch(
+        \\{"id":"2","command":"oars.sshkeys.add","payload":{"server_id":"ghost","public_key":"ssh-ed25519 AAAA x"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, add, "not connected") != null);
+
+    const revoke = app.dispatch(
+        \\{"id":"3","command":"oars.sshkeys.revoke","payload":{"server_id":"ghost","fingerprint":"SHA256:x","expected_line_hash":"y"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, revoke, "not connected") != null);
+
+    const rotate = app.dispatch(
+        \\{"id":"4","command":"oars.sshkeys.rotate","payload":{"server_id":"ghost","fingerprint":"SHA256:x","expected_line_hash":"y","new_public_key":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBs5Tnge2MIGi6Zcyo04aosYAQ+iwk4hKYUNpIHkyMQt z"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, rotate, "not connected") != null);
+
+    const roles_list = app.dispatch(
+        \\{"id":"5","command":"oars.sshkeys.roles.list","payload":{"server_id":"ghost"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, roles_list, "not connected") != null);
+
+    const roles_create = app.dispatch(
+        \\{"id":"6","command":"oars.sshkeys.roles.create","payload":{"server_id":"ghost","name":"ro-user","read_only":true}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, roles_create, "not connected") != null);
+
+    const roles_delete = app.dispatch(
+        \\{"id":"7","command":"oars.sshkeys.roles.delete","payload":{"server_id":"ghost","name":"ro-user"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, roles_delete, "not connected") != null);
+
+    const deploy_key = app.dispatch(
+        \\{"id":"8","command":"oars.sshkeys.deployKey.generate","payload":{"server_id":"ghost"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, deploy_key, "not connected") != null);
+
+    // Role names are validated before any session work.
+    const bad_name = app.dispatch(
+        \\{"id":"9","command":"oars.sshkeys.roles.create","payload":{"server_id":"ghost","name":"Bad Name!","read_only":true}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_name, "invalid role name") != null);
+}

@@ -21,6 +21,11 @@ const bridge = @import("bridge.zig");
 const sftpmod = @import("sftp.zig");
 const scripts = @import("scripts.zig");
 const deploy = @import("deploy.zig");
+const integration_keys = @import("integration_keys.zig");
+
+comptime {
+    _ = integration_keys;
+}
 
 /// Reads an environment variable from the process environment. The raw
 /// environ pointer is the only env source in 0.16 outside `main(init)`.
@@ -38,11 +43,11 @@ fn getEnv(name: []const u8) ?[]const u8 {
 
 /// Test sleep: std.Thread.sleep does not exist in 0.16 — sleeps go
 /// through the Io clock.
-fn testSleep(ms: i64) void {
+pub fn testSleep(ms: i64) void {
     std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(ms), .awake) catch {};
 }
 
-const TestEnv = struct {
+pub const TestEnv = struct {
     active: bool = false,
     host: []const u8 = "",
     port: u16 = 22,
@@ -51,7 +56,7 @@ const TestEnv = struct {
     key_path: []const u8 = "",
     passphrase: []const u8 = "",
 
-    fn load() TestEnv {
+    pub fn load() TestEnv {
         const host = getEnv("OARS_TEST_SSH_HOST") orelse return .{};
         return .{
             .active = true,
@@ -68,7 +73,7 @@ const TestEnv = struct {
 /// A temp store + manager pair backed by std.testing.allocator, so every
 /// allocation the session stack makes is leak-checked. init() runs in
 /// place: the manager holds a pointer to the store inside the rig.
-const TestRig = struct {
+pub const TestRig = struct {
     dir_buf: [128]u8 = undefined,
     path_buf: [512]u8 = undefined,
     audit_path_buf: [512]u8 = undefined,
@@ -88,7 +93,7 @@ const TestRig = struct {
     dispatcher: native_sdk.BridgeDispatcher,
     output: [64 * 1024]u8 = undefined,
 
-    fn init(self: *TestRig, tag: []const u8) !void {
+    pub fn init(self: *TestRig, tag: []const u8) !void {
         const io = std.testing.io;
         const now = std.Io.Timestamp.now(io, .real).nanoseconds;
         self.dir_name = try std.fmt.bufPrint(&self.dir_buf, "oars-itest-{s}-{d}", .{ tag, now });
@@ -109,14 +114,14 @@ const TestRig = struct {
         self.dispatcher = self.ctx.dispatcher();
     }
 
-    fn deinit(self: *TestRig) void {
+    pub fn deinit(self: *TestRig) void {
         self.manager.deinit();
         std.Io.Dir.cwd().deleteTree(std.testing.io, self.dir_name) catch {};
     }
 
     /// Returns a slice into `self.output`; the caller must read or parse
     /// it before the next dispatch call.
-    fn dispatch(self: *TestRig, request: []const u8) []const u8 {
+    pub fn dispatch(self: *TestRig, request: []const u8) []const u8 {
         return self.dispatcher.dispatch(request, .{ .origin = "zero://app" }, &self.output);
     }
 };
@@ -124,7 +129,7 @@ const TestRig = struct {
 /// Waits for a session status, failing explicitly on error status or
 /// timeout. `want_error_text` (optional) is asserted when the session
 /// lands in the error state.
-fn waitForStatus(
+pub fn waitForStatus(
     manager: *sessions.Manager,
     server_id: []const u8,
     want: sessions.Status,
@@ -193,7 +198,7 @@ fn shellReadUntil(manager: *sessions.Manager, server_id: []const u8, command: []
 
 /// Runs an exec and waits for its channel to complete with the expected
 /// exit code and output marker (the channel stays readable after EOF).
-fn execWait(manager: *sessions.Manager, server_id: []const u8, command: []const u8, want_exit: i32, want_out: []const u8) !void {
+pub fn execWait(manager: *sessions.Manager, server_id: []const u8, command: []const u8, want_exit: i32, want_out: []const u8) !void {
     const channel = try manager.exec(server_id, command);
     const deadline = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds + 15 * std.time.ns_per_s;
     var acc: std.ArrayList(u8) = .empty;
@@ -1451,7 +1456,7 @@ fn deployStep(resp: *const DeployPollResp, step_id: []const u8) ?DeployStepResp 
 }
 
 /// Runs an exec and returns the full captured output (owned by caller).
-fn execOut(manager: *sessions.Manager, server_id: []const u8, command: []const u8) ![]u8 {
+pub fn execOut(manager: *sessions.Manager, server_id: []const u8, command: []const u8) ![]u8 {
     const channel = try manager.exec(server_id, command);
     const deadline = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds + 15 * std.time.ns_per_s;
     var acc: std.ArrayList(u8) = .empty;

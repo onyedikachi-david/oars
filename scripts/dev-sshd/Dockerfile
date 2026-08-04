@@ -15,7 +15,7 @@
 
 FROM alpine:3.20
 
-RUN apk add --no-cache openssh bash zip unzip git nodejs npm nginx curl \
+RUN apk add --no-cache openssh bash zip unzip git nodejs npm nginx curl shadow \
     && ssh-keygen -A \
     && echo 'root:oars-test-password' | chpasswd \
     && mkdir -p /root/.ssh \
