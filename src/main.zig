@@ -319,6 +319,7 @@ const SaveResponse = struct {
             id: []const u8,
             created_at: i64,
             host_fingerprint: ?[]const u8 = null,
+            group: []const u8 = "",
             tags: [][]const u8 = &.{},
             via_server_id: ?[]const u8 = null,
         },
@@ -514,6 +515,59 @@ test "servers.save normalizes tags and validates host, port, and via chains" {
         \\{"id":"8","command":"oars.servers.save","payload":{"id":"c","name":"c","host":"3.3.3.3","user":"root","auth_method":"password","via_server_id":"c"}}
     );
     try std.testing.expect(std.mem.indexOf(u8, self_link, "cannot connect via itself") != null);
+}
+
+test "servers.save validates group paths and dedupes tags case-insensitively" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+    const store_alloc = app.arena.allocator();
+
+    // A one-level group saves and round-trips with trimmed value.
+    const grouped = app.dispatch(
+        \\{"id":"1","command":"oars.servers.save","payload":{"id":"g1","name":"acme","host":"1.2.3.4","user":"root","auth_method":"password","group":"  clients/acme  ","tags":[" Web ","web","API",""]}}
+    );
+    var grouped_parsed = try parseSaveResponse(store_alloc, grouped);
+    defer grouped_parsed.deinit();
+    try std.testing.expectEqualStrings("clients/acme", grouped_parsed.value.result.server.group);
+    // Case-insensitive dedupe keeps the first-seen casing.
+    try std.testing.expectEqual(@as(usize, 2), grouped_parsed.value.result.server.tags.len);
+    try std.testing.expectEqualStrings("Web", grouped_parsed.value.result.server.tags[0]);
+    try std.testing.expectEqualStrings("API", grouped_parsed.value.result.server.tags[1]);
+
+    // The group survives a reload (persistence is the store's own file).
+    const listed = app.dispatch(
+        \\{"id":"2","command":"oars.servers.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"group\":\"clients/acme\"") != null);
+
+    // Two nesting levels are rejected.
+    const deep = app.dispatch(
+        \\{"id":"3","command":"oars.servers.save","payload":{"id":"g2","name":"x","host":"1.2.3.4","user":"root","auth_method":"password","group":"a/b/c"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, deep, "one nesting level") != null);
+
+    // Empty segments are rejected.
+    const leading = app.dispatch(
+        \\{"id":"4","command":"oars.servers.save","payload":{"id":"g3","name":"x","host":"1.2.3.4","user":"root","auth_method":"password","group":"/prod"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, leading, "segments cannot be empty") != null);
+
+    // Control characters are rejected in groups and tags alike.
+    const ctrl_group = app.dispatch(
+        \\{"id":"5","command":"oars.servers.save","payload":{"id":"g4","name":"x","host":"1.2.3.4","user":"root","auth_method":"password","group":"prod\n"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, ctrl_group, "control characters") != null);
+    const ctrl_tag = app.dispatch(
+        \\{"id":"6","command":"oars.servers.save","payload":{"id":"g5","name":"x","host":"1.2.3.4","user":"root","auth_method":"password","tags":["ok\n"]}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, ctrl_tag, "control characters") != null);
+
+    // A failed save must not persist anything (the store is untouched).
+    const listed2 = app.dispatch(
+        \\{"id":"7","command":"oars.servers.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, listed2, "\"id\":\"g4\"") == null);
 }
 
 test "servers.list reports quarantine recovery when the store is corrupt" {

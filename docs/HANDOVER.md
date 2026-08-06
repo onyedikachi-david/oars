@@ -1413,3 +1413,52 @@ snippet — fixed with exact-value snippet masking.
   work; until it lands the UI must label coverage `app commands only`.
 - History/audit UI (views, filters, palette, export CSV via spec 17).
 - Spec 14 (groups) is next per the agreed order.
+
+## 23. Session handover — 2026-08-06 (session 12): spec 14 groups backend
+
+Landed: the spec-14 backend — save-time group path validation and tag
+normalization on the canonical `Server.group`/`Server.tags` fields.
+**169/169 tests pass** (166 at spec 15 + 2 servers.zig unit + 1
+dispatcher), two consecutive full container runs green, `zig build` +
+frontend build clean.
+
+### 23.1 What landed
+
+**`src/servers.zig` (pure, fixture-tested):**
+- `validateGroup` — one-level path rule (spec 14 §5): ungrouped `""`, one
+  segment, or `parent/child`; at most one `/`, no empty segments, no
+  control characters. Returns the trimmed value (view into the input).
+- `normalizeTags` — trimmed, empties dropped, control-character values
+  rejected, deduped case-insensitively while preserving the first-seen
+  casing. Returns an owned list; the empty case is an explicit
+  `alloc([]const u8, 0)` so callers can always free (the comptime
+  `.empty` slice from `toOwnedSlice` is never returned — spec-15 lesson).
+
+**`src/bridge.zig`:** `handleServersSave` replaces its inline tag loop
+with `servers.normalizeTags` and validates `payload.group` with
+`servers.validateGroup`, mapping the three errors to user-facing
+messages. No new bridge API (spec 14 §5).
+
+**Tests:** 2 servers.zig unit (group table incl. `a/b/c`, `a//b`, `/`,
+`prod/`, control chars; tag normalization incl. `[" Web ","api","WEB",
+"","Web"] → ["web","api"]` and the freeable-empty case) + 1 dispatcher
+(`servers.save` round trip with trimmed `clients/acme` and deduped
+`["Web","API"]`, persistence visible in `servers.list`, one-nesting-
+level / empty-segment / control-char rejections, and a failed save
+leaving the store untouched).
+
+### 23.2 Pitfall
+
+- **Trimming before control-char checks silently accepts control
+  characters.** The old tag path trimmed ` \t\r\n` and dropped empties,
+  so `"prod\n"` became `"prod"` — exactly the value the spec-14 rule
+  exists to reject. The new helpers trim only `" "` and reject anything
+  < 0x20 or 0x7f anywhere, including the edges. The unit tests pin this.
+
+### 23.3 Known limits / next
+
+- All of spec 14's visible surface is frontend: sidebar grouping,
+  collapsible state, counts, the monitor grid (spec 03 cache), drag-
+  move via `servers.save`, broadcast preselection.
+- Spec 17 (Vault export/import) is next per the agreed order — the
+  history/audit journals and the servers store are its export surface.

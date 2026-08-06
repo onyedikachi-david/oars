@@ -339,27 +339,30 @@ fn handleServersSave(context: *anyopaque, invocation: native_sdk.bridge.Invocati
         };
     }
 
-    // Tags are normalized: trimmed, empties dropped, duplicates removed.
-    var tags: std.ArrayList([]const u8) = .empty;
+    // Tags are normalized (spec 14 §6): trimmed, empties dropped,
+    // control characters rejected, deduped case-insensitively with the
+    // first-seen casing preserved.
+    const tags = servers.normalizeTags(self.allocator, payload.tags) catch |err| {
+        return respondError(output, switch (err) {
+            error.TagControlChar => "tags cannot contain control characters",
+            else => "out of memory",
+        });
+    };
     defer {
-        for (tags.items) |t| self.allocator.free(t);
-        tags.deinit(self.allocator);
+        for (tags) |t| self.allocator.free(t);
+        self.allocator.free(tags);
     }
-    if (payload.tags) |incoming| {
-        for (incoming) |raw| {
-            const tag = std.mem.trim(u8, raw, " \t\r\n");
-            if (tag.len == 0) continue;
-            var dup = false;
-            for (tags.items) |existing| {
-                if (std.mem.eql(u8, existing, tag)) {
-                    dup = true;
-                    break;
-                }
-            }
-            if (dup) continue;
-            tags.append(self.allocator, self.allocator.dupe(u8, tag) catch return respondError(output, "out of memory")) catch return respondError(output, "out of memory");
-        }
-    }
+
+    // Group paths follow the one-level rule (spec 14 §5): ungrouped, one
+    // segment, or `parent/child` — at most one '/', no empty segments,
+    // no control characters.
+    const group = servers.validateGroup(payload.group orelse "") catch |err| {
+        return respondError(output, switch (err) {
+            error.GroupControlChar => "group names cannot contain control characters",
+            error.GroupTooDeep => "groups are limited to one nesting level (parent/child)",
+            error.GroupEmptySegment => "group segments cannot be empty",
+        });
+    };
 
     const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
     var owned_id: ?[]const u8 = null;
@@ -401,8 +404,8 @@ fn handleServersSave(context: *anyopaque, invocation: native_sdk.bridge.Invocati
         .key_path = key_path,
         .key_has_passphrase = payload.key_has_passphrase,
         .host_fingerprint = host_fingerprint,
-        .group = payload.group orelse "",
-        .tags = tags.items,
+        .group = group,
+        .tags = tags,
         .via_server_id = payload.via_server_id,
         .created_at = created_at,
         .updated_at = @intCast(now),

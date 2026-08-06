@@ -1,6 +1,8 @@
 # Spec 14 — Server Groups & Fleet Views
 
-**Status:** 📋 · **Depends on:** 01, 03 · **Spec owner:** frontend (grouping), core (server store)
+**Status:** ✅ backend in (UI pending): `Server.group` + `Server.tags`
+validation and normalization (one-level path rule, case-insensitive tag
+dedupe, control-character rejection) · **Depends on:** 01, 03 · **Spec owner:** frontend (grouping), core (server store)
 
 ## 1. Overview
 
@@ -91,12 +93,25 @@ profile through `oars.servers.save` and reports partial failures. Add
 
 ## 12. Acceptance criteria
 
-- [ ] Group assignment persists and survives restart (via Server.group).
-- [ ] Tags persist in `Server.tags`, survive restart and export/import, and
+Backend-verifiable items are ticked as of the spec-14 backend landing;
+the grouping/fleet UI is open frontend work.
+
+- [x] Group assignment persists and survives restart (via Server.group).
+      `servers.save` validates the one-level path rule, trims, and the
+      store round-trips the value (dispatcher + unit fixtures).
+- [x] Tags persist in `Server.tags`, survive restart and export/import, and
       filter the sidebar without becoming a second source of truth.
-- [ ] Group header shows live connected/error counts.
-- [ ] Group view renders monitor grid at ≤ 5 s staleness.
-- [ ] Deleting a group never deletes servers.
+      `Server.tags` is the canonical field; save-time normalization now
+      rejects control characters and dedupes case-insensitively while
+      preserving the first-seen casing (unit + dispatcher fixtures).
+- [ ] Group header shows live connected/error counts. (Frontend — derived
+      from `servers.list` + per-server session status.)
+- [ ] Group view renders monitor grid at ≤ 5 s staleness. (Frontend —
+      reuses the spec 03 snapshot cache per §13.)
+- [x] Deleting a group never deletes servers. No group-delete API exists;
+      servers carry their group inline, so there is nothing to cascade
+      (spec §10: a deleted group merely leaves servers ungrouped, which
+      the frontend expresses by saving an empty `group`).
 
 ## 13. Research & References
 
@@ -117,3 +132,16 @@ profile through `oars.servers.save` and reports partial failures. Add
   `oars.servers.save` (spec 01 §5) with the new `group` value.
 
 Sources: `src/servers.zig`, spec 01 §13, spec 03 §13.
+
+### Corrections forced by implementation (2026-08-06)
+
+- **Only spaces trim.** The spec-01 tag normalization trimmed ` \t\r\n`
+  before dropping empties, which silently trimmed control characters into
+  acceptance (`"prod\n"` became `"prod"`). The spec-14 rule — reject
+  control-character values — requires control characters to be checked
+  before/without that trim; the landed `validateGroup`/`normalizeTags`
+  trim only `" "` and reject anything below 0x20 (or 0x7f) anywhere,
+  including the edges.
+- **Group validation lives in `servers.zig`** as `validateGroup` (pure,
+  fixture-tested) beside `validateViaChain`; the bridge maps its three
+  errors to user-facing messages. No new bridge API, per §5.

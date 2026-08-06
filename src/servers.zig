@@ -131,6 +131,71 @@ pub fn validateViaChain(server: Server, all: []const Server) !void {
     }
 }
 
+/// Spec 14 §5: validates a group path and returns its trimmed form. A
+/// group is ungrouped (""), a single segment, or a one-level nest
+/// `parent/child`: at most one `/`, no empty segments, no control
+/// characters. The returned slice views the input (caller keeps it).
+pub fn validateGroup(group: []const u8) ![]const u8 {
+    // Only spaces trim: control characters anywhere (including the
+    // edges) are rejected, never silently trimmed away.
+    const g = std.mem.trim(u8, group, " ");
+    if (g.len == 0) return g;
+    for (g) |ch| {
+        if (ch < 0x20 or ch == 0x7f) return error.GroupControlChar;
+    }
+    var slash: ?usize = null;
+    for (g, 0..) |ch, i| {
+        if (ch == '/') {
+            if (slash != null) return error.GroupTooDeep;
+            slash = i;
+        }
+    }
+    if (slash) |i| {
+        if (i == 0 or i + 1 >= g.len) return error.GroupEmptySegment;
+    }
+    return g;
+}
+
+/// Spec 14 §6: normalized tags — trimmed, empty values dropped,
+/// control-character values rejected, deduped case-insensitively while
+/// the first-seen casing is preserved. Returns an owned list of owned
+/// values (an owned empty slice when there are no tags, so callers can
+/// always free). `incoming` may be null (a missing payload field).
+pub fn normalizeTags(allocator: std.mem.Allocator, incoming: ?[]const []const u8) ![][]const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (out.items) |t| allocator.free(t);
+        out.deinit(allocator);
+    }
+    if (incoming) |raw_list| {
+        for (raw_list) |raw| {
+            // Only spaces trim: control characters anywhere (including
+            // the edges) are rejected, never silently trimmed away.
+            const tag = std.mem.trim(u8, raw, " ");
+            if (tag.len == 0) continue;
+            for (tag) |ch| {
+                if (ch < 0x20 or ch == 0x7f) return error.TagControlChar;
+            }
+            var seen = false;
+            for (out.items) |existing| {
+                if (std.ascii.eqlIgnoreCase(existing, tag)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            try out.append(allocator, try allocator.dupe(u8, tag));
+        }
+    }
+    var result = try out.toOwnedSlice(allocator);
+    if (result.len == 0) {
+        // toOwnedSlice of an untouched list is the comptime `.empty`
+        // slice; hand back an owned empty so callers can always free.
+        result = try allocator.alloc([]const u8, 0);
+    }
+    return result;
+}
+
 pub const Store = struct {
     allocator: std.mem.Allocator,
     /// Full path to servers.json inside the app data directory.
@@ -517,4 +582,56 @@ test "expandHome expands only a leading tilde" {
     const bare = try expandHome(allocator, "~", "/home/oars");
     defer allocator.free(bare);
     try std.testing.expectEqualStrings("~", bare);
+}
+
+test "group validation enforces the one-level path rule" {
+    // Valid: ungrouped, one segment, one-level nesting, trimmed.
+    try std.testing.expectEqualStrings("", try validateGroup(""));
+    try std.testing.expectEqualStrings("prod", try validateGroup("prod"));
+    try std.testing.expectEqualStrings("prod", try validateGroup("  prod  "));
+    try std.testing.expectEqualStrings("clients/acme", try validateGroup("clients/acme"));
+
+    // More than one '/' is a second nesting level.
+    try std.testing.expectError(error.GroupTooDeep, validateGroup("a/b/c"));
+    try std.testing.expectError(error.GroupTooDeep, validateGroup("a//b"));
+
+    // Empty segments: leading/trailing slash.
+    try std.testing.expectError(error.GroupEmptySegment, validateGroup("/"));
+    try std.testing.expectError(error.GroupEmptySegment, validateGroup("/prod"));
+    try std.testing.expectError(error.GroupEmptySegment, validateGroup("prod/"));
+
+    // Control characters are rejected.
+    try std.testing.expectError(error.GroupControlChar, validateGroup("prod\n"));
+    try std.testing.expectError(error.GroupControlChar, validateGroup("a\tb"));
+}
+
+test "normalizeTags trims, rejects control chars, and dedupes case-insensitively" {
+    const allocator = std.testing.allocator;
+
+    // Trim, drop empties, dedupe case-insensitively preserving the
+    // first-seen casing.
+    const tags = try normalizeTags(allocator, &.{ " web ", "api", "WEB", "", "Web" });
+    defer {
+        for (tags) |t| allocator.free(t);
+        allocator.free(tags);
+    }
+    try std.testing.expectEqual(@as(usize, 2), tags.len);
+    try std.testing.expectEqualStrings("web", tags[0]);
+    try std.testing.expectEqualStrings("api", tags[1]);
+
+    // Control characters are rejected outright.
+    try std.testing.expectError(
+        error.TagControlChar,
+        normalizeTags(allocator, &.{"prod\n"}),
+    );
+
+    // No tags at all yields an owned (freeable) empty slice.
+    const none = try normalizeTags(allocator, &.{});
+    defer allocator.free(none);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
+
+    // Missing payload field behaves like an empty list.
+    const none2 = try normalizeTags(allocator, null);
+    defer allocator.free(none2);
+    try std.testing.expectEqual(@as(usize, 0), none2.len);
 }
