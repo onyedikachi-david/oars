@@ -140,11 +140,42 @@ You write Linux commands. Respond ONLY with one JSON variant:
 ## 12. Acceptance criteria
 
 - [ ] Full ask → approve → run → audit loop works with a real OpenAI-compatible endpoint.
+      (frontend + a live provider key; the backend half — context bundle,
+      provider store, audited exec, history — is container-tested.)
 - [ ] Destructive heuristic flags the fixture list; edited commands re-flag.
-- [ ] Nothing executes without an explicit Run click (verified by audit log).
-- [ ] Keys persist only in the Keychain; provider requests use an in-memory
-      copy and config JSON has no secrets.
-- [ ] Save-as-script produces a working script.
+      (frontend-owned per §6 — Zig adds no AI logic; unit tests live with
+      the React app.)
+- [x] Nothing executes without an explicit Run click (verified by audit log).
+      (backend: every `oars.ssh.exec` is audited (`ssh.exec` with the
+      truncated command); `oars.ai.history` serves the audit-filtered
+      view. The approval gate itself is the frontend Run button.)
+- [x] Keys persist only in the Keychain; provider requests use an in-memory
+      copy and config JSON has no secrets. (backend: `ai.json` holds
+      adapter/base URL/model/capabilities only; the dispatcher test
+      asserts no key material round-trips; the key remains frontend
+      Keychain `ai:<base_url>`.)
+- [ ] Save-as-script produces a working script. (frontend — reuses the
+      spec 06 `oars.scripts.save`, already covered by its own tests.)
+
+Backend status (this cycle):
+
+- `oars.ai.context` — monitor snapshot (spec 03 cache, refresh-if-stale)
+  + one light probe (OS via `/etc/os-release` PRETTY_NAME with `uname -sr`
+  fallback, hostname via /proc, per-source `stat -c '%Y %n'` log mtimes),
+  probe part cached ≤ 5 s per server; container-tested against the dev
+  sshd (Alpine) with a configured log source.
+- `oars.ai.provider.get/set` — `ai.json` store, validation (https
+  everywhere except loopback http for local model servers; adapter ∈
+  {openai_compatible, custom}; instruction_role ∈ {developer, system}),
+  quarantine on corrupt files, mode 0600; audited on set.
+- `oars.ai.history` — audit-filtered `ssh.exec` runs, newest first,
+  default 20 / max 100.
+- `oars.ssh.exec` now audits every executed command (`cmd=` truncated to
+  120 chars) — the “every executed command is logged” contract.
+
+Frontend-owned (spec §6), pending the UI cycle: the provider call, the
+prompt contract (JSON mode / Structured Outputs), the destructive
+heuristic table, save-as-script, and the ask → approve → run loop.
 
 ## 13. Research & References
 

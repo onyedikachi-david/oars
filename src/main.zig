@@ -12,6 +12,7 @@ const deploy = @import("deploy.zig");
 const integration = @import("integration.zig");
 const access = @import("access.zig");
 const backup = @import("backup.zig");
+const ai = @import("ai.zig");
 
 // Zig 0.16 only collects test blocks from files that are actually
 // analyzed, and an unused import is never analyzed — so the env-gated
@@ -52,6 +53,7 @@ const App = struct {
     deploy_history_store: deploy.HistoryStore,
     access_registry: access.Registry,
     backup_registry: backup.Registry,
+    ai_registry: ai.Registry,
     manager: sessions.Manager,
     bridge_ctx: bridge.Context,
     store_path_buf: [2048]u8 = undefined,
@@ -63,6 +65,7 @@ const App = struct {
     access_path_buf: [2048]u8 = undefined,
     backup_jobs_path_buf: [2048]u8 = undefined,
     backup_runs_path_buf: [2048]u8 = undefined,
+    ai_path_buf: [2048]u8 = undefined,
     data_dir_buf: [1024]u8 = undefined,
     fallback_dir_buf: [1024]u8 = undefined,
 
@@ -133,6 +136,11 @@ const App = struct {
             &self.backup_runs_path_buf,
             &.{ base, "backup_runs.json" },
         ) catch unreachable;
+        const ai_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.ai_path_buf,
+            &.{ base, "ai.json" },
+        ) catch unreachable;
         self.store = .{ .allocator = self.allocator, .path = store_path };
         self.audit_store = .{ .allocator = self.allocator, .path = audit_path };
         self.logs_store = .{ .allocator = self.allocator, .path = logs_path };
@@ -141,6 +149,7 @@ const App = struct {
         self.deploy_history_store = .{ .allocator = self.allocator, .path = deploy_history_path };
         self.access_registry = access.Registry.init(self.allocator, access_path);
         self.backup_registry = backup.Registry.init(self.allocator, backup_jobs_path, backup_runs_path);
+        self.ai_registry = ai.Registry.init(self.allocator, ai_path);
 
         self.manager = sessions.Manager.init(self.allocator, self.io, &self.store, &self.audit_store, self.env_map.get("HOME"));
         self.bridge_ctx = .{
@@ -155,12 +164,14 @@ const App = struct {
             .deploy_history = &self.deploy_history_store,
             .access = &self.access_registry,
             .backup = &self.backup_registry,
+            .ai = &self.ai_registry,
         };
     }
 
     fn deinit(self: *App) void {
         self.access_registry.deinit();
         self.backup_registry.deinit();
+        self.ai_registry.deinit();
         self.manager.deinit();
         ssh.Session.deinitGlobal();
     }
@@ -247,9 +258,13 @@ test "servers.save round trips through the bridge dispatcher" {
     const backup_runs_path = std.fmt.bufPrint(&backup_runs_buf, "/tmp/{s}/backup_runs.json", .{dir_name}) catch unreachable;
     var backup_registry = backup.Registry.init(store_alloc, backup_jobs_path, backup_runs_path);
     defer backup_registry.deinit();
+    var ai_path_buf: [512]u8 = undefined;
+    const ai_path = std.fmt.bufPrint(&ai_path_buf, "/tmp/{s}/ai.json", .{dir_name}) catch unreachable;
+    var ai_registry = ai.Registry.init(store_alloc, ai_path);
+    defer ai_registry.deinit();
     var manager = sessions.Manager.init(store_alloc, io, &store, &audit_store, null);
     defer manager.deinit();
-    var ctx = bridge.Context{ .allocator = store_alloc, .io = io, .store = &store, .manager = &manager, .audit = &audit_store, .logs = &logs_store, .scripts = &scripts_store, .apps = &deploy_apps_store, .deploy_history = &deploy_hist_store, .access = &access_registry, .backup = &backup_registry };
+    var ctx = bridge.Context{ .allocator = store_alloc, .io = io, .store = &store, .manager = &manager, .audit = &audit_store, .logs = &logs_store, .scripts = &scripts_store, .apps = &deploy_apps_store, .deploy_history = &deploy_hist_store, .access = &access_registry, .backup = &backup_registry, .ai = &ai_registry };
     var dispatcher = ctx.dispatcher();
     var output: [64 * 1024]u8 = undefined;
 
@@ -319,6 +334,7 @@ const TestApp = struct {
     deploy_history_store: deploy.HistoryStore,
     access_registry: access.Registry,
     backup_registry: backup.Registry,
+    ai_registry: ai.Registry,
     manager: sessions.Manager,
     ctx: bridge.Context,
     dispatcher: native_sdk.BridgeDispatcher,
@@ -333,6 +349,7 @@ const TestApp = struct {
     access_path_buf: [512]u8 = undefined,
     backup_jobs_path_buf: [512]u8 = undefined,
     backup_runs_path_buf: [512]u8 = undefined,
+    ai_path_buf: [512]u8 = undefined,
     dir_name: []const u8,
 
     fn init(self: *TestApp) !void {
@@ -350,6 +367,7 @@ const TestApp = struct {
         const access_path = try std.fmt.bufPrint(&self.access_path_buf, "/tmp/{s}/access_identities.json", .{self.dir_name});
         const backup_jobs_path = try std.fmt.bufPrint(&self.backup_jobs_path_buf, "/tmp/{s}/backups.json", .{self.dir_name});
         const backup_runs_path = try std.fmt.bufPrint(&self.backup_runs_path_buf, "/tmp/{s}/backup_runs.json", .{self.dir_name});
+        const ai_path = try std.fmt.bufPrint(&self.ai_path_buf, "/tmp/{s}/ai.json", .{self.dir_name});
         const store_alloc = self.arena.allocator();
         self.store = .{ .allocator = store_alloc, .path = store_path };
         self.audit_store = .{ .allocator = store_alloc, .path = audit_path };
@@ -359,14 +377,16 @@ const TestApp = struct {
         self.deploy_history_store = .{ .allocator = store_alloc, .path = deploy_history_path };
         self.access_registry = access.Registry.init(store_alloc, access_path);
         self.backup_registry = backup.Registry.init(store_alloc, backup_jobs_path, backup_runs_path);
+        self.ai_registry = ai.Registry.init(store_alloc, ai_path);
         self.manager = sessions.Manager.init(store_alloc, io, &self.store, &self.audit_store, null);
-        self.ctx = .{ .allocator = store_alloc, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store, .access = &self.access_registry, .backup = &self.backup_registry };
+        self.ctx = .{ .allocator = store_alloc, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store, .access = &self.access_registry, .backup = &self.backup_registry, .ai = &self.ai_registry };
         self.dispatcher = self.ctx.dispatcher();
     }
 
     fn deinit(self: *TestApp) void {
         self.access_registry.deinit();
         self.backup_registry.deinit();
+        self.ai_registry.deinit();
         self.manager.deinit();
         self.arena.deinit();
         std.Io.Dir.cwd().deleteTree(std.testing.io, self.dir_name) catch {};
@@ -1406,4 +1426,64 @@ test "backup jobs save/list/delete, run gates, and capability-test gates through
         \\{"id":"15","command":"oars.backup.jobs.list","payload":{"server_id":"s1"}}
     );
     try std.testing.expect(std.mem.indexOf(u8, after, "daily-www") == null);
+}
+
+test "ai provider config and context/history gates through the dispatcher" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // No provider configured yet.
+    const empty = app.dispatch(
+        \\{"id":"1","command":"oars.ai.provider.get","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, empty, "\"provider\":null") != null);
+
+    // A valid HTTPS provider round trips; the key never enters JSON.
+    const set_ok = app.dispatch(
+        \\{"id":"2","command":"oars.ai.provider.set","payload":{"provider":{"adapter":"openai_compatible","base_url":"https://api.openai.com/v1","model":"gpt-4o-mini","capabilities":{"instruction_role":"developer","streaming":true,"structured_output":true}}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, set_ok, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, set_ok, "\"adapter\":\"openai_compatible\"") != null);
+    const got = app.dispatch(
+        \\{"id":"3","command":"oars.ai.provider.get","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, got, "gpt-4o-mini") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"instruction_role\":\"developer\"") != null);
+
+    // Loopback http is accepted (user-chosen local model server)...
+    const loopback = app.dispatch(
+        \\{"id":"4","command":"oars.ai.provider.set","payload":{"provider":{"adapter":"custom","base_url":"http://localhost:11434/v1","model":"llama3","capabilities":{"instruction_role":"system","streaming":false,"structured_output":false}}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, loopback, "\"ok\":true") != null);
+
+    // ...but plain http anywhere else is refused, as are bad shapes.
+    const plain_http = app.dispatch(
+        \\{"id":"5","command":"oars.ai.provider.set","payload":{"provider":{"adapter":"openai_compatible","base_url":"http://api.example.com/v1","model":"x"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, plain_http, "the base URL must be https") != null);
+    const bad_adapter = app.dispatch(
+        \\{"id":"6","command":"oars.ai.provider.set","payload":{"provider":{"adapter":"claude","base_url":"https://api.example.com/v1","model":"x"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_adapter, "unsupported adapter") != null);
+    const bad_model = app.dispatch(
+        \\{"id":"7","command":"oars.ai.provider.set","payload":{"provider":{"adapter":"openai_compatible","base_url":"https://api.example.com/v1","model":" "}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_model, "invalid model name") != null);
+    const bad_role = app.dispatch(
+        \\{"id":"8","command":"oars.ai.provider.set","payload":{"provider":{"adapter":"openai_compatible","base_url":"https://api.example.com/v1","model":"x","capabilities":{"instruction_role":"assistant"}}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_role, "invalid capabilities") != null);
+
+    // Context needs a live session; history is local and never blocks on
+    // the server.
+    const ctx = app.dispatch(
+        \\{"id":"9","command":"oars.ai.context","payload":{"server_id":"ghost"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, ctx, "not connected") != null);
+    const history = app.dispatch(
+        \\{"id":"10","command":"oars.ai.history","payload":{"server_id":"ghost","limit":10}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, history, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, history, "\"runs\":[]") != null);
 }

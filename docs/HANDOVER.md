@@ -1142,3 +1142,93 @@ oars-sentinel-<ts>` and the read check lists the destination with the
 
 Next: spec 10 frontend or spec 11. Backend reusables for later specs:
 `backupImportStaged`'s staged-file pattern and the JSON-log parser.
+
+## 20. Session handover — 2026-08-06 (session 10): spec 11 AI terminal backend
+
+Landed: the spec-11 backend half — provider config store, the server
+context bundle, and audit-filtered run history. **145/145 tests pass**
+(144 at spec 10 + 1 container AI integration), two consecutive full
+container runs green, `zig build` + frontend build clean.
+
+### 20.1 What landed
+
+Per spec 11 §6, Zig adds only `oars.ai.context` and history filtering;
+the AI call, prompt contract, destructive heuristic, and save-as-script
+are frontend-owned (documented in the spec §12 as pending UI work).
+
+**`src/ai.zig` (new, 7 unit tests):**
+- `ProviderStore` (`<data>/ai.json`): adapter (`openai_compatible` |
+  `custom`), base URL, model, capabilities (instruction_role ∈
+  {developer, system}, streaming, structured_output) — never the key
+  (frontend Keychain `ai:<base_url>`). Validation: https everywhere;
+  plain http only for loopback hosts (`localhost`, `127.0.0.1`,
+  `[::1]`) — a user-chosen local model server. Mode 0600, quarantine on
+  corrupt files, `null` when unset.
+- Context probe: one exec with the spec-03 marker style — `%BEGIN_OS%`
+  (`grep -m1 '^PRETTY_NAME=' /etc/os-release` with `uname -sr`
+  fallback), `%BEGIN_HOSTNAME%` (/proc/sys/kernel/hostname), and
+  `%BEGIN_LOGS%` (a busybox-compatible `stat -c '%Y %n'` per configured
+  log source, shell-quoted, missing files skipped). `parseProbeOutput`
+  views the output (no allocs); `buildActiveLogs` filters to configured
+  sources, sorts newest-write-first, caps at 10.
+- `ContextCache`: per-server probe cache, 5 s TTL, 16-slot ring with
+  oldest eviction (the spec's "cached ≤ 5 s").
+
+**`src/audit.zig`:** `Store.read` — owned entries filtered by server +
+optional action, newest first, capped (the minimal read spec 15 will
+own later).
+
+**`src/bridge.zig` (handler_count 78 → 82):**
+- `oars.ai.context` — session gate, probe-or-cache (≤ 5 s), monitor
+  snapshot under the cache lock with the same refresh-if-stale force as
+  `oars.monitor.poll`, honest `probe_error` passthrough. Response:
+  `{os, hostname, uptime_sec, load{utilization_pct, load_1/5/15, cores},
+  mem, disk, top_processes, active_logs[{path, last_write}],
+  probe_error}`.
+- `oars.ai.provider.get` (config only, `null` when unset) / `set`
+  (validated, audited `ai.provider.set`).
+- `oars.ai.history` — `ssh.exec` audit entries for the server, newest
+  first, default 20 / max 100.
+- `oars.ssh.exec` now audits every executed command (`ssh.exec`,
+  `cmd=` truncated to 120 chars) — spec 11's "every executed command is
+  logged".
+
+**Wiring:** `ai.Registry` in App/TestApp/TestRig + the standalone
+dispatcher test; a new dispatcher suite (provider round trip,
+loopback-http accepted, plain-http refused, bad adapter/model/role
+messages, context ghost → not connected, history empty).
+
+**Container test (`src/integration_ai.zig`):** provider set/get round
+trip; `logs.addSource` → context bundle with Alpine OS, hostname,
+uptime/mem/disk, top processes, and the configured source in
+`active_logs` with a real mtime (retry loop absorbs the worker-async
+first monitor probe); cache-hit check on a second call; `oars.ssh.exec`
+→ channel drained → marker file verified → `oars.ai.history` shows the
+`ssh.exec` entry with the command in the detail.
+
+### 20.2 Bugs / notes
+
+- **`probe_error` nullability:** the monitor snapshot's `probe_error` is
+  `?[]const u8` and serializes as `null` when healthy — the integration
+  test initially parsed it as a string. Test-side fix.
+- **`utilization_pct`/`Process.cpu|mem` are optional** in the monitor
+  types (null until a second probe / busybox ps) — the bundle passes
+  them through rather than inventing zeros.
+- The context handler never blocks on the worker's probe cadence: it
+  serves the committed snapshot and enqueues a force probe when stale,
+  matching `oars.monitor.poll` semantics.
+- The pre-existing keys/access container flake (parallel
+  `authorized_keys` races) still appears occasionally; reruns pass.
+
+### 20.3 Known limits / next
+
+- Frontend-owned per spec §6: the provider call + streaming, the prompt
+  contract (JSON mode / Structured Outputs / prompt fallback), the
+  destructive heuristic table (incl. edited-card re-flagging),
+  save-as-script, and the ask → approve → run loop. Their unit tests
+  (spec §11) live with the React app.
+- Spec 15 (history) will supersede the minimal `audit.read`.
+- No changes to the dev harness this cycle (containers unchanged).
+
+Next: spec 11 frontend, or spec 12 (VNC — likely the thinnest backend:
+TLS-wrapped TCP port forwarding over the session).

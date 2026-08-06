@@ -16,6 +16,7 @@ const logs = @import("logs.zig");
 const shellquote = @import("shellquote.zig");
 const sftpmod = @import("sftp.zig");
 const scripts = @import("scripts.zig");
+const ai = @import("ai.zig");
 const broadcast = @import("broadcast.zig");
 const deploy = @import("deploy.zig");
 const sshkeys = @import("sshkeys.zig");
@@ -25,7 +26,7 @@ const backup = @import("backup.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 78;
+const handler_count = 82;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -39,6 +40,7 @@ pub const Context = struct {
     deploy_history: *deploy.HistoryStore,
     access: *access.Registry,
     backup: *backup.Registry,
+    ai: *ai.Registry,
     handlers: [handler_count]native_sdk.BridgeHandler = undefined,
     policies: [handler_count]native_sdk.BridgeCommandPolicy = undefined,
 
@@ -122,6 +124,10 @@ pub const Context = struct {
             .{ .name = "oars.backup.history", .context = self, .invoke_fn = handleBackupHistory },
             .{ .name = "oars.backup.install", .context = self, .invoke_fn = handleBackupInstall },
             .{ .name = "oars.backup.cronStatus", .context = self, .invoke_fn = handleBackupCronStatus },
+            .{ .name = "oars.ai.context", .context = self, .invoke_fn = handleAiContext },
+            .{ .name = "oars.ai.provider.get", .context = self, .invoke_fn = handleAiProviderGet },
+            .{ .name = "oars.ai.provider.set", .context = self, .invoke_fn = handleAiProviderSet },
+            .{ .name = "oars.ai.history", .context = self, .invoke_fn = handleAiHistory },
         };
         self.policies = .{
             .{ .name = "oars.servers.list", .origins = &allowed_origins },
@@ -202,6 +208,10 @@ pub const Context = struct {
             .{ .name = "oars.backup.history", .origins = &allowed_origins },
             .{ .name = "oars.backup.install", .origins = &allowed_origins },
             .{ .name = "oars.backup.cronStatus", .origins = &allowed_origins },
+            .{ .name = "oars.ai.context", .origins = &allowed_origins },
+            .{ .name = "oars.ai.provider.get", .origins = &allowed_origins },
+            .{ .name = "oars.ai.provider.set", .origins = &allowed_origins },
+            .{ .name = "oars.ai.history", .origins = &allowed_origins },
         };
         return .{
             .policy = .{ .enabled = true, .commands = &self.policies },
@@ -547,6 +557,12 @@ fn handleSshExec(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
             else => "exec failed",
         });
     };
+    // Spec 11: every executed command is logged; the AI panel's history
+    // is the audit-filtered view of these entries.
+    var detail_buf: [256]u8 = undefined;
+    const cmd = if (parsed.value.command.len > ai.audit_cmd_cap) parsed.value.command[0..ai.audit_cmd_cap] else parsed.value.command;
+    const detail = std.fmt.bufPrint(&detail_buf, "cmd={s}", .{cmd}) catch "ssh.exec";
+    sshkeysAudit(self, "ssh.exec", parsed.value.server_id, detail);
     var writer = std.Io.Writer.fixed(output);
     writer.print("{{\"ok\":true,\"channel\":{d}}}", .{channel_id}) catch return output[0..0];
     return writer.buffered();
@@ -5633,5 +5649,223 @@ fn handleBackupCronStatus(context: *anyopaque, invocation: native_sdk.bridge.Inv
     const cron_running = backupCheck(self, server_id, "pgrep -x crond >/dev/null 2>&1 || pgrep -f 'crond -b' >/dev/null 2>&1");
     var writer = std.Io.Writer.fixed(output);
     writer.print("{{\"ok\":true,\"rclone\":{s},\"cron_installed\":{s},\"cron_running\":{s}}}", .{ if (rclone) "true" else "false", if (cron_installed) "true" else "false", if (cron_running) "true" else "false" }) catch return output[0..0];
+    return writer.buffered();
+}
+
+// --- AI terminal (spec 11) ------------------------------------------------
+//
+// The AI call itself is frontend-side (spec 11 §6). Zig adds: the
+// context bundle (monitor cache + one light probe, cached ≤ 5 s), the
+// provider config store (ai.json — the key stays in the frontend
+// Keychain under `ai:<base_url>`), and audit-filtered run history.
+
+const ai_exec_cap: usize = 256 * 1024;
+const ai_exec_timeout_ns = 20 * std.time.ns_per_s;
+
+const AiContextPayloadIn = struct { server_id: []const u8 };
+const AiProviderGetPayload = struct {};
+const AiProviderSetPayload = struct { provider: ai.ProviderInput };
+const AiHistoryPayload = struct {
+    server_id: []const u8,
+    limit: ?usize = null,
+};
+
+const AiHistoryEntry = struct {
+    ts: i64,
+    action: []const u8,
+    detail: []const u8 = "",
+};
+
+/// Honest "no sample yet" state for the monitor part of the bundle.
+const ai_empty_snapshot = monitor.Snapshot{ .probe_error = "no sample yet" };
+
+const AiContextBundle = struct {
+    ok: bool = true,
+    os: []const u8,
+    hostname: []const u8,
+    uptime_sec: u64,
+    load: struct {
+        utilization_pct: ?f32,
+        load_1: f32,
+        load_5: f32,
+        load_15: f32,
+        cores: u32,
+    },
+    mem: monitor.MemInfo,
+    disk: monitor.DiskInfo,
+    top_processes: []monitor.Process,
+    active_logs: []ai.LogInfo,
+    probe_error: ?[]const u8 = null,
+};
+
+/// Runs the light context probe (OS, hostname, log mtimes), caches the
+/// result ≤ 5 s, and returns the cache entry (owned by the cache).
+fn aiProbeOrCache(self: *Context, server_id: []const u8, now_ns: i128) ?*ai.ContextCache.CacheEntry {
+    if (self.ai.cache.fresh(server_id, now_ns)) |entry| return entry;
+
+    const paths = self.logs.pathsFor(self.io, server_id) catch return null;
+    defer {
+        for (paths) |p| self.allocator.free(p);
+        self.allocator.free(paths);
+    }
+    const cmd = ai.buildProbeCommand(self.allocator, paths) catch return null;
+    defer self.allocator.free(cmd);
+    var outcome = self.manager.execWait(server_id, cmd, ai_exec_cap, ai_exec_timeout_ns) catch return null;
+    defer outcome.output.deinit(self.allocator);
+    const parsed = ai.parseProbeOutput(self.allocator, outcome.output.items) catch return null;
+    defer self.allocator.free(parsed.logs);
+    const active_logs = ai.buildActiveLogs(self.allocator, parsed.logs, paths, ai.max_active_logs) catch return null;
+    errdefer {
+        for (active_logs) |*l| l.deinit(self.allocator);
+        self.allocator.free(active_logs);
+    }
+    const sid_owned = self.allocator.dupe(u8, server_id) catch return null;
+    errdefer self.allocator.free(sid_owned);
+    const os_owned = if (parsed.os.len == 0) "" else (self.allocator.dupe(u8, parsed.os) catch return null);
+    errdefer if (os_owned.len > 0) self.allocator.free(os_owned);
+    const host_owned = if (parsed.hostname.len == 0) "" else (self.allocator.dupe(u8, parsed.hostname) catch return null);
+    errdefer if (host_owned.len > 0) self.allocator.free(host_owned);
+    var entry = ai.ContextCache.CacheEntry{
+        .server_id = sid_owned,
+        .os = os_owned,
+        .hostname = host_owned,
+        .active_logs = active_logs,
+        .ts_ns = now_ns,
+    };
+    self.ai.cache.put(entry) catch {
+        entry.deinit(self.allocator);
+        return null;
+    };
+    return self.ai.cache.fresh(server_id, now_ns) orelse unreachable;
+}
+
+/// The context bundle (spec 11 §5): monitor cache snapshot + one light
+/// probe (OS/hostname/log mtimes), the probe part cached ≤ 5 s.
+fn handleAiContext(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiContextPayloadIn, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const server_id = parsed.value.server_id;
+
+    const session = self.manager.get(server_id) orelse return respondError(output, "not connected");
+    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
+
+    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+    const probe = aiProbeOrCache(self, server_id, now) orelse return respondError(output, "context probe failed");
+
+    session.monitor_cache.lock();
+    defer session.monitor_cache.unlock();
+    const snap = session.monitor_cache.current() orelse &ai_empty_snapshot;
+    // Refresh-if-stale: enqueue one monitor probe when the cache is
+    // stale and none is running (same contract as oars.monitor.poll).
+    if (now - session.monitor_last_probe_ns.load(.acquire) >= session.monitor_interval_ns and
+        !session.monitor_probe_active.load(.acquire))
+    {
+        session.monitor_force.store(true, .release);
+    }
+
+    var writer = std.Io.Writer.fixed(output);
+    const bundle = AiContextBundle{
+        .os = probe.os,
+        .hostname = probe.hostname,
+        .uptime_sec = snap.cpu.uptime_sec,
+        .load = .{
+            .utilization_pct = snap.cpu.utilization_pct,
+            .load_1 = snap.cpu.load_1,
+            .load_5 = snap.cpu.load_5,
+            .load_15 = snap.cpu.load_15,
+            .cores = snap.cpu.cores,
+        },
+        .mem = snap.mem,
+        .disk = snap.disk,
+        .top_processes = snap.processes,
+        .active_logs = probe.active_logs,
+        .probe_error = snap.probe_error,
+    };
+    std.json.Stringify.value(bundle, .{}, &writer) catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleAiProviderGet(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiProviderGetPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const provider = self.ai.provider.get(self.io) catch return respondError(output, "provider config is unreadable");
+    defer if (provider) |p| {
+        var owned = p;
+        owned.deinit(self.allocator);
+    };
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"provider\":") catch return output[0..0];
+    if (provider) |p| {
+        std.json.Stringify.value(p, .{}, &writer) catch return output[0..0];
+    } else {
+        writer.writeAll("null") catch return output[0..0];
+    }
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleAiProviderSet(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiProviderSetPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const now = @as(i64, @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds));
+    var saved = self.ai.provider.set(self.io, parsed.value.provider, now) catch |err| {
+        return respondError(output, switch (err) {
+            error.InvalidAdapter => "unsupported adapter",
+            error.InvalidBaseUrl => "the base URL must be https:// (http:// is allowed only for localhost providers)",
+            error.InvalidModel => "invalid model name",
+            error.InvalidCapabilities => "invalid capabilities",
+            else => "provider config is unreadable",
+        });
+    };
+    defer saved.deinit(self.allocator);
+    var detail_buf: [128]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "adapter={s} model={s}", .{ saved.adapter.jsonName(), saved.model }) catch "ai.provider.set";
+    sshkeysAudit(self, "ai.provider.set", "", detail);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"provider\":") catch return output[0..0];
+    std.json.Stringify.value(saved, .{}, &writer) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+/// Approved-run history: the audit-filtered `ssh.exec` entries for the
+/// server, newest first (spec 11 §5; full history is spec 15).
+fn handleAiHistory(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiHistoryPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    const limit = @min(payload.limit orelse ai.history_default_limit, ai.history_max_limit);
+    const entries = self.audit.read(self.io, payload.server_id, "ssh.exec", limit) catch {
+        return respondError(output, "audit log is unreadable");
+    };
+    defer {
+        for (entries) |*e| e.deinit(self.allocator);
+        self.allocator.free(entries);
+    }
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"runs\":[") catch return output[0..0];
+    var first = true;
+    for (entries) |*e| {
+        if (!first) writer.writeAll(",") catch return output[0..0];
+        first = false;
+        writer.print("{{\"ts\":{d},\"action\":", .{e.ts}) catch return output[0..0];
+        json.writeJsonString(&writer, e.action) catch return output[0..0];
+        writer.writeAll(",\"detail\":") catch return output[0..0];
+        json.writeJsonString(&writer, e.detail) catch return output[0..0];
+        writer.writeAll("}") catch return output[0..0];
+    }
+    writer.writeAll("]}") catch return output[0..0];
     return writer.buffered();
 }
