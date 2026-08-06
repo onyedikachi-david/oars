@@ -13,6 +13,7 @@ const integration = @import("integration.zig");
 const access = @import("access.zig");
 const backup = @import("backup.zig");
 const ai = @import("ai.zig");
+const vault = @import("vault.zig");
 
 // Zig 0.16 only collects test blocks from files that are actually
 // analyzed, and an unused import is never analyzed — so the env-gated
@@ -21,6 +22,7 @@ const ai = @import("ai.zig");
 comptime {
     _ = integration;
     _ = deploy;
+    _ = vault;
 }
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
@@ -1713,4 +1715,79 @@ test "spec 15: history record/list/replay and audit list/clear over the bridge" 
         \\{"id":"16","command":"oars.audit.list","payload":{}}
     );
     try std.testing.expect(std.mem.indexOf(u8, audit_after, "\"entries\":[]") != null);
+}
+
+test "vault export/import round trip via bridge" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+    const io = std.testing.io;
+
+    // Seed a server (spec 01 validation: host/user required).
+    const save = app.dispatch(
+        \\{"id":"1","command":"oars.servers.save","payload":{"id":"srv-vault-1","name":"vault-a","host":"10.0.0.1","port":22,"user":"root","auth_method":"password"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, save, "\"ok\":true") != null);
+
+    // Export an encrypted vault containing the server.
+    var vault_path_buf: [512]u8 = undefined;
+    const vault_path = try std.fmt.bufPrint(&vault_path_buf, "/tmp/{s}/backup.oarsvault", .{app.dir_name});
+    var export_buf: [1024]u8 = undefined;
+    const export_req = try std.fmt.bufPrint(&export_buf, "{{\"id\":\"2\",\"command\":\"oars.vault.export\",\"payload\":{{\"path\":\"{s}\",\"password\":\"correct horse battery\",\"sections\":[\"servers\"]}}}}", .{vault_path});
+    const exported = app.dispatch(export_req);
+    try std.testing.expect(std.mem.indexOf(u8, exported, "\"ok\":true") != null);
+
+    // Wipe the local store (simulates a new machine).
+    std.Io.Dir.cwd().deleteFile(io, app.store.path) catch {};
+    const wiped = app.dispatch(
+        \\{"id":"3","command":"oars.servers.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, wiped, "10.0.0.1") == null);
+
+    // Wrong password is rejected before any store is touched.
+    var wrong_buf: [1024]u8 = undefined;
+    const wrong_req = try std.fmt.bufPrint(&wrong_buf, "{{\"id\":\"4\",\"command\":\"oars.vault.import\",\"payload\":{{\"path\":\"{s}\",\"password\":\"wrong password!!\"}}}}", .{vault_path});
+    const wrong = app.dispatch(wrong_req);
+    try std.testing.expect(std.mem.indexOf(u8, wrong, "wrong password") != null);
+    const still_wiped = app.dispatch(
+        \\{"id":"5","command":"oars.servers.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, still_wiped, "10.0.0.1") == null);
+
+    // Preview with the correct password shows one new server.
+    var preview_buf: [1024]u8 = undefined;
+    const preview_req = try std.fmt.bufPrint(&preview_buf, "{{\"id\":\"6\",\"command\":\"oars.vault.import\",\"payload\":{{\"path\":\"{s}\",\"password\":\"correct horse battery\"}}}}", .{vault_path});
+    const preview = app.dispatch(preview_req);
+    try std.testing.expect(std.mem.indexOf(u8, preview, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, preview, "\"name\":\"servers\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, preview, "\"new\":1") != null);
+
+    // Confirm the import — server reappears.
+    var confirm_buf: [1024]u8 = undefined;
+    const confirm_req = try std.fmt.bufPrint(&confirm_buf, "{{\"id\":\"7\",\"command\":\"oars.vault.importConfirm\",\"payload\":{{\"path\":\"{s}\",\"password\":\"correct horse battery\"}}}}", .{vault_path});
+    const confirmed = app.dispatch(confirm_req);
+    try std.testing.expect(std.mem.indexOf(u8, confirmed, "\"ok\":true") != null);
+    const restored = app.dispatch(
+        \\{"id":"8","command":"oars.servers.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, restored, "10.0.0.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, restored, "srv-vault-1") != null);
+
+    // Plain JSON export round trip (no password).
+    var plain_path_buf: [512]u8 = undefined;
+    const plain_path = try std.fmt.bufPrint(&plain_path_buf, "/tmp/{s}/plain.json", .{app.dir_name});
+    var plain_export_buf: [1024]u8 = undefined;
+    const plain_export_req = try std.fmt.bufPrint(&plain_export_buf, "{{\"id\":\"9\",\"command\":\"oars.vault.export\",\"payload\":{{\"path\":\"{s}\",\"sections\":[\"servers\"]}}}}", .{plain_path});
+    const plain_exported = app.dispatch(plain_export_req);
+    try std.testing.expect(std.mem.indexOf(u8, plain_exported, "\"ok\":true") != null);
+    // Wipe again and import the plain file.
+    std.Io.Dir.cwd().deleteFile(io, app.store.path) catch {};
+    var plain_import_buf: [1024]u8 = undefined;
+    const plain_import_req = try std.fmt.bufPrint(&plain_import_buf, "{{\"id\":\"10\",\"command\":\"oars.vault.importConfirm\",\"payload\":{{\"path\":\"{s}\"}}}}", .{plain_path});
+    const plain_confirmed = app.dispatch(plain_import_req);
+    try std.testing.expect(std.mem.indexOf(u8, plain_confirmed, "\"ok\":true") != null);
+    const plain_restored = app.dispatch(
+        \\{"id":"11","command":"oars.servers.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, plain_restored, "10.0.0.1") != null);
 }

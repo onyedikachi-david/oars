@@ -24,10 +24,11 @@ const sshkeys = @import("sshkeys.zig");
 const keygen = @import("keygen.zig");
 const access = @import("access.zig");
 const backup = @import("backup.zig");
+const vault = @import("vault.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 92;
+const handler_count = 95;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -140,6 +141,9 @@ pub const Context = struct {
             .{ .name = "oars.history.replay", .context = self, .invoke_fn = handleHistoryReplay },
             .{ .name = "oars.audit.list", .context = self, .invoke_fn = handleAuditList },
             .{ .name = "oars.audit.clear", .context = self, .invoke_fn = handleAuditClear },
+            .{ .name = "oars.vault.export", .context = self, .invoke_fn = handleVaultExport },
+            .{ .name = "oars.vault.import", .context = self, .invoke_fn = handleVaultImport },
+            .{ .name = "oars.vault.importConfirm", .context = self, .invoke_fn = handleVaultImportConfirm },
         };
         self.policies = .{
             .{ .name = "oars.servers.list", .origins = &allowed_origins },
@@ -234,6 +238,9 @@ pub const Context = struct {
             .{ .name = "oars.history.replay", .origins = &allowed_origins },
             .{ .name = "oars.audit.list", .origins = &allowed_origins },
             .{ .name = "oars.audit.clear", .origins = &allowed_origins },
+            .{ .name = "oars.vault.export", .origins = &allowed_origins },
+            .{ .name = "oars.vault.import", .origins = &allowed_origins },
+            .{ .name = "oars.vault.importConfirm", .origins = &allowed_origins },
         };
         return .{
             .policy = .{ .enabled = true, .commands = &self.policies },
@@ -6292,4 +6299,256 @@ fn handleAuditClear(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
         return respondError(output, "audit log could not be cleared");
     };
     return ok_json;
+}
+
+// --- vault (spec 17) ---------------------------------------------------------
+
+const VaultExportPayload = struct {
+    path: []const u8,
+    password: ?[]const u8 = null,
+    sections: ?[]const []const u8 = null,
+};
+
+const VaultImportPayload = struct {
+    path: []const u8,
+    password: ?[]const u8 = null,
+};
+
+const VaultImportConfirmPayload = struct {
+    path: []const u8,
+    password: ?[]const u8 = null,
+    keep_local: ?[]const []const u8 = null,
+    import_as_new: ?[]const []const u8 = null,
+};
+
+fn vaultAllSections(self: *Context, buf: []vault.Section) usize {
+    var n: usize = 0;
+    buf[n] = .{ .name = "servers", .path = self.store.path, .jsonl = false }; n += 1;
+    buf[n] = .{ .name = "logs", .path = self.logs.path, .jsonl = false }; n += 1;
+    buf[n] = .{ .name = "scripts", .path = self.scripts.path, .jsonl = false }; n += 1;
+    buf[n] = .{ .name = "apps", .path = self.apps.path, .jsonl = false }; n += 1;
+    buf[n] = .{ .name = "deploy_runs", .path = self.deploy_history.path, .jsonl = false }; n += 1;
+    buf[n] = .{ .name = "access_identities", .path = self.access.identities.path, .jsonl = false }; n += 1;
+    buf[n] = .{ .name = "backup_jobs", .path = self.backup.jobs.path, .jsonl = false }; n += 1;
+    buf[n] = .{ .name = "backup_runs", .path = self.backup.history.path, .jsonl = false }; n += 1;
+    buf[n] = .{ .name = "ai_provider", .path = self.ai.provider.path, .jsonl = false }; n += 1;
+    buf[n] = .{ .name = "history", .path = self.history.path, .jsonl = true }; n += 1;
+    buf[n] = .{ .name = "audit", .path = self.audit.path, .jsonl = true }; n += 1;
+    return n;
+}
+
+fn vaultFilteredSections(self: *Context, requested: ?[]const []const u8, buf: []vault.Section, is_encrypted: bool) usize {
+    var all: [12]vault.Section = undefined;
+    const all_n = vaultAllSections(self, &all);
+    if (requested == null or requested.?.len == 0) {
+        // Plain export by default excludes history-like sections (spec 17 §8:
+        // best-effort redaction cannot prove arbitrary text is clean).
+        if (!is_encrypted) {
+            var n: usize = 0;
+            for (all[0..all_n]) |s| {
+                if (s.jsonl) continue;
+                if (std.mem.eql(u8, s.name, "deploy_runs")) continue;
+                if (std.mem.eql(u8, s.name, "backup_runs")) continue;
+                buf[n] = s; n += 1;
+            }
+            return n;
+        }
+        @memcpy(buf[0..all_n], all[0..all_n]);
+        return all_n;
+    }
+    var n: usize = 0;
+    for (requested.?) |name| {
+        for (all[0..all_n]) |s| {
+            if (std.mem.eql(u8, s.name, name)) {
+                buf[n] = s; n += 1; break;
+            }
+        }
+    }
+    return n;
+}
+
+fn vaultLoadPayloadForImport(self: *Context, path: []const u8, password: ?[]const u8) !vault.Payload {
+    // Try encrypted path first when a password is supplied; otherwise plain.
+    // For robustness, if the file starts with the vault magic, treat it as
+    // encrypted regardless of whether a password was supplied (and then fail
+    // with AuthFailed if the password is missing/wrong).
+    const content = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(vault.max_file_bytes)) catch {
+        return error.FileMissing;
+    };
+    defer self.allocator.free(content);
+    if (content.len >= 9 and std.mem.eql(u8, content[0..9], vault.magic)) {
+        // Encrypted vault — needs a password.
+        const pw = password orelse return error.AuthFailed;
+        const plain = try vault.readVaultFile(self.io, self.allocator, path, pw);
+        defer self.allocator.free(plain);
+        return vault.parsePayload(self.allocator, plain);
+    } else {
+        // Plain JSON.
+        if (password != null and password.?.len > 0) {
+            // If a password was supplied but the file is plain, treat the
+            // password as extraneous — plain files are not encrypted.
+        }
+        return vault.parsePayload(self.allocator, content);
+    }
+}
+
+fn vaultErrorString(err: anyerror) []const u8 {
+    return switch (err) {
+        error.PasswordTooShort => "password must be at least 12 characters",
+        error.AuthFailed => "wrong password or corrupt file",
+        error.UnsupportedVersion => "unsupported vault version",
+        error.NotAVault => "not a vault file",
+        error.TooLarge => "file too large",
+        error.InvalidJson => "invalid vault JSON",
+        error.DuplicateId => "duplicate id in vault section",
+        error.RecordWithoutId => "record without id",
+        error.FileMissing => "vault file not found",
+        error.WriteFailed => "failed to write vault file",
+        error.KdfFailed => "key derivation failed",
+        error.SealFailed => "encryption failed",
+        error.OutOfMemory => "out of memory",
+        else => "vault operation failed",
+    };
+}
+
+fn handleVaultExport(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(VaultExportPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (payload.path.len == 0) return respondError(output, "path is required");
+    const is_encrypted = payload.password != null and payload.password.?.len > 0;
+    if (is_encrypted and payload.password.?.len < vault.min_password_len) {
+        return respondError(output, vaultErrorString(error.PasswordTooShort));
+    }
+    var sections_buf: [12]vault.Section = undefined;
+    const n = vaultFilteredSections(self, payload.sections, &sections_buf, is_encrypted);
+    var vault_payload = vault.buildPayload(self.io, self.allocator, sections_buf[0..n]) catch |err| {
+        return respondError(output, vaultErrorString(err));
+    };
+    defer vault_payload.deinit(self.allocator);
+    if (is_encrypted) {
+        const plain = vault.serializePayload(self.allocator, &vault_payload) catch {
+            return respondError(output, "out of memory");
+        };
+        defer self.allocator.free(plain);
+        vault.writeVaultFile(self.io, self.allocator, payload.path, payload.password.?, plain) catch |err| {
+            return respondError(output, vaultErrorString(err));
+        };
+    } else {
+        const plain = vault.serializePayload(self.allocator, &vault_payload) catch {
+            return respondError(output, "out of memory");
+        };
+        defer self.allocator.free(plain);
+        // Atomic write — same pattern as vault/store.
+        const cwd = std.Io.Dir.cwd();
+        if (std.fs.path.dirname(payload.path)) |dir| {
+            cwd.createDirPath(self.io, dir) catch {
+                return respondError(output, "failed to write vault file");
+            };
+        }
+        var file = cwd.createFile(self.io, payload.path, .{}) catch {
+            return respondError(output, "failed to write vault file");
+        };
+        defer file.close(self.io);
+        file.writeStreamingAll(self.io, plain) catch {
+            return respondError(output, "failed to write vault file");
+        };
+        file.sync(self.io) catch {
+            return respondError(output, "failed to write vault file");
+        };
+    }
+    var writer = std.Io.Writer.fixed(output);
+    writer.print("{{\"ok\":true,\"exported\":{d},\"sections\":{d}}}", .{ vault_payload.sections.count(), n }) catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleVaultImport(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(VaultImportPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (payload.path.len == 0) return respondError(output, "path is required");
+    var vault_payload = vaultLoadPayloadForImport(self, payload.path, payload.password) catch |err| {
+        return respondError(output, vaultErrorString(err));
+    };
+    defer vault_payload.deinit(self.allocator);
+    var sections_buf: [12]vault.Section = undefined;
+    const n = vaultAllSections(self, &sections_buf);
+    var preview = vault.previewImport(self.io, self.allocator, &vault_payload, sections_buf[0..n]) catch |err| {
+        return respondError(output, vaultErrorString(err));
+    };
+    defer preview.deinit(self.allocator);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"preview\":{\"reports\":[") catch return output[0..0];
+    var first_report = true;
+    for (preview.reports.items) |*r| {
+        if (!first_report) writer.writeAll(",") catch return output[0..0];
+        first_report = false;
+        writer.writeAll("{\"name\":") catch return output[0..0];
+        json.writeJsonString(&writer, r.name) catch return output[0..0];
+        writer.print(",\"incoming\":{d},\"new\":{d},\"updated\":{d},\"conflicts\":[", .{ r.incoming, r.new, r.updated }) catch return output[0..0];
+        var first_c = true;
+        for (r.conflicts.items) |*c| {
+            if (!first_c) writer.writeAll(",") catch return output[0..0];
+            first_c = false;
+            writer.writeAll("{\"key\":") catch return output[0..0];
+            json.writeJsonString(&writer, c.key) catch return output[0..0];
+            writer.writeAll(",\"reason\":") catch return output[0..0];
+            json.writeJsonString(&writer, c.reason) catch return output[0..0];
+            writer.writeAll("}") catch return output[0..0];
+        }
+        writer.writeAll("]}") catch return output[0..0];
+    }
+    writer.writeAll("],\"errors\":[") catch return output[0..0];
+    var first_err = true;
+    for (preview.errors.items) |*e| {
+        if (!first_err) writer.writeAll(",") catch return output[0..0];
+        first_err = false;
+        writer.writeAll("{\"key\":") catch return output[0..0];
+        json.writeJsonString(&writer, e.key) catch return output[0..0];
+        writer.writeAll(",\"reason\":") catch return output[0..0];
+        json.writeJsonString(&writer, e.reason) catch return output[0..0];
+        writer.writeAll("}") catch return output[0..0];
+    }
+    writer.writeAll("]}}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleVaultImportConfirm(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(VaultImportConfirmPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (payload.path.len == 0) return respondError(output, "path is required");
+    var vault_payload = vaultLoadPayloadForImport(self, payload.path, payload.password) catch |err| {
+        return respondError(output, vaultErrorString(err));
+    };
+    defer vault_payload.deinit(self.allocator);
+    var sections_buf: [12]vault.Section = undefined;
+    const n = vaultAllSections(self, &sections_buf);
+    const opts = vault.ImportOptions{
+        .keep_local = payload.keep_local orelse &.{},
+        .import_as_new = payload.import_as_new orelse &.{},
+    };
+    var result = vault.applyImport(self.io, self.allocator, &vault_payload, sections_buf[0..n], opts) catch |err| {
+        return respondError(output, vaultErrorString(err));
+    };
+    defer result.deinit(self.allocator);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"result\":{\"notes\":[") catch return output[0..0];
+    var first = true;
+    for (result.notes.items) |note| {
+        if (!first) writer.writeAll(",") catch return output[0..0];
+        first = false;
+        json.writeJsonString(&writer, note) catch return output[0..0];
+    }
+    writer.writeAll("]}}") catch return output[0..0];
+    return writer.buffered();
 }

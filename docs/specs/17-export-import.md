@@ -1,6 +1,8 @@
 # Spec 17 — Export / Import (Vault)
 
-**Status:** 📋 · **Depends on:** 01, 04, 06, 07, 09, 10, 11, 15 · **Spec owner:** core
+**Status:** ✅ backend in (UI pending): AES-256-GCM vault + plain JSON
+export/import with merge preview, credential-binding conflict handling,
+and atomic write-back
 
 ## 1. Overview
 
@@ -118,18 +120,28 @@ mbedTLS) and **plain JSON** (no secrets, for sharing/review).
 
 ## 12. Acceptance criteria
 
-- [ ] Encrypted vault round-trips every selected section. Plain export uses a
+All items verified as of the spec-17 backend landing (crypto vector
+tests, vault unit tests, and the bridge round-trip dispatcher test —
+export → wipe → wrong-password rejection → preview → confirm → restore).
+
+- [x] Encrypted vault round-trips every selected section. Plain export uses a
       configuration-only allowlist and contains no history or captured output.
-- [ ] Group paths, tags, and explicit person-to-fingerprint mappings survive a
-      vault round trip.
-- [ ] Saved applications, custom log sources, and backup jobs survive a vault
-      round trip without their Keychain-backed values.
-- [ ] Import previews conflicts and never overwrites silently.
-- [ ] A colliding imported id cannot attach an existing local credential to a
-      changed server, app target, or backup destination.
-- [ ] Wrong password / tampered file → explicit error, no partial writes.
-- [ ] Crypto unit tests green against known vectors.
-- [ ] Two exports with the same password have different salts and nonces; a
+- [x] Group paths, tags, and explicit person-to-fingerprint mappings survive a
+      vault round trip (sections carry the store records verbatim).
+- [x] Saved applications, custom log sources, and backup jobs survive a vault
+      round trip without their Keychain-backed values (the stores never hold
+      secret values; the Keychain is never read by the exporter).
+- [x] Import previews conflicts and never overwrites silently.
+- [x] A colliding imported id cannot attach an existing local credential to a
+      changed server, app target, or backup destination (endpoint/auth/server/
+      destination identity is compared; conflicts require keep-local or
+      import-as-new, and import-as-new rewrites via-chain references).
+- [x] Wrong password / tampered file → explicit error, no partial writes
+      (GCM auth is atomic and runs before any parse or store write).
+- [x] Crypto unit tests green against known vectors (PBKDF2 RFC 7914 §11,
+      AES-256-GCM NIST SP 800-38D Case 3 — both cross-checked against
+      independent implementations).
+- [x] Two exports with the same password have different salts and nonces; a
       changed header, ciphertext, or tag is rejected before any store write.
 
 ## 13. Research & References
@@ -182,3 +194,28 @@ mbedTLS) and **plain JSON** (no secrets, for sharing/review).
 
 Sources: OWASP Password Storage Cheat Sheet (2026), RFC 8018, NIST SP
 800-38D, RFC 7914 §11, `third_party/mbedtls/include/mbedtls/{pkcs5,gcm}.h`.
+
+### Corrections forced by implementation (2026-08-06)
+
+- **Payload sections carry store content verbatim.** `vault.buildPayload`
+  reads each store file and embeds its records as-is (JSONL sections are
+  converted to arrays) instead of re-serializing typed models. The stores
+  are the source of truth, so group/tags/identity fields survive exactly;
+  import still validates structure (every section parses, array sections
+  reject duplicate ids and id-less records) before anything is written.
+- **Plain-export exclusion is structural, not redactive.** The default
+  plain export drops every JSONL section (history, audit) plus
+  `deploy_runs` and `backup_runs` (bridge `vaultFilteredSections`); the
+  remaining sections are secret-free by construction (Keychain is never
+  read). A password on a plain file is treated as extraneous; a file with
+  the vault magic always requires a password (import magic-sniffs).
+- **Unaddressed credential conflicts default to keep-local.** `applyImport`
+  skips conflicting records not covered by `keep_local`/`import_as_new`
+  options and reports the count in the result notes — nothing is ever
+  overwritten silently.
+- **Import-as-new ids are `imp-<section>-<n>`** and the merge rewrites
+  `via_server_id` references to the fresh ids so server chains stay valid.
+- **Zig 0.16 JSON API notes for future work:** `std.json.Value` has no
+  `deinit` (own recursive `freeValue`), `std.json.Array` is a managed
+  list (`.init(allocator)`, `append` without allocator), and the dynamic
+  parser requires an explicit `max_value_len`.

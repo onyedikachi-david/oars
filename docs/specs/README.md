@@ -27,7 +27,7 @@ already exists.
 | 14 | [Server Groups & Fleet Views](14-groups.md) | ✅ backend in (UI pending): group/tags validation + normalization on `servers.save` (one-level path rule, case-insensitive dedupe) |
 | 15 | [Command History & Audit](15-history.md) | ✅ backend in (UI pending): history/audit journals with write-time redaction, tracked-exec capture, replay, type-to-confirm clear |
 | 16 | [Themes & Terminal Appearance](16-themes.md) | 📋 (Oars+) |
-| 17 | [Export / Import (Vault)](17-export-import.md) | 📋 (Oars+) |
+| 17 | [Export / Import (Vault)](17-export-import.md) | ✅ backend in (UI pending): AES-256-GCM vault + plain JSON export/import, merge preview, credential-binding conflicts, atomic write-back |
 | 18 | [SSH Agent & Jump Hosts](18-agent-jump-hosts.md) | 📋 (Oars+) |
 
 ## Template used by every spec

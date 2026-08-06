@@ -1462,3 +1462,36 @@ leaving the store untouched).
   move via `servers.save`, broadcast preselection.
 - Spec 17 (Vault export/import) is next per the agreed order — the
   history/audit journals and the servers store are its export surface.
+
+## 24. Session handover — 2026-08-06 (session 13): spec 17 vault export/import backend
+
+Landed: the full spec-17 backend — `src/crypto.zig` (mbedTLS wrappers:
+PBKDF2-HMAC-SHA256 + AES-256-GCM, 600k iterations, random salt/nonce per
+file, header authenticated as GCM AAD) and `src/vault.zig` (versioned
+`.oarsvault` format, 50 MB cap, payload build/parse with duplicate-id and
+id-less-record rejection, merge preview with credential-binding conflicts,
+keep-local / import-as-new options with via-chain reference rewriting,
+atomic write-back, JSONL section support). Bridge: `oars.vault.export`,
+`oars.vault.import`, `oars.vault.importConfirm`; plain export defaults to a
+config-only allowlist (no history/audit/deploy_runs/backup_runs); import
+magic-sniffs encrypted vs plain. Tests: 3 crypto vectors (PBKDF2 RFC 7914
+§11 and AES-256-GCM NIST SP 800-38D Case 3, both cross-checked against
+independent implementations; round trip + tamper/wrong-password) + 4 vault
+unit tests + 1 bridge dispatcher round trip (export → wipe → wrong
+password → preview → confirm → restore) = 177/177 with the container suite
+(two consecutive runs), frontend build clean.
+
+Notes for the next session:
+- Crypto vectors were verified independently BEFORE pinning: PBKDF2 via
+  `python3 -c hashlib.pbkdf2_hmac`, GCM via a Zig-std harness (`zig run`
+  with `std.crypto.aead.aes_gcm`); LibreSSL's `openssl enc` lacks AEAD.
+- Pitfall 25: in Zig 0.16, `ArrayList.toOwnedSlice` may return the list's
+  own buffer via `allocator.remap` — an `errdefer out.deinit(allocator)`
+  then frees the returned slice (use an `owned` flag guard).
+- Pitfall 26: Zig 0.16 `std.json.Value` has no `deinit`; `std.json.Array`
+  is a managed list (`.init(allocator)`, `append` w/o allocator); the
+  dynamic parser requires explicit `.max_value_len`; `std.StringArrayHashMap`
+  is `std.StringArrayHashMapUnmanaged`.
+- The bridge vault handlers (sections allowlist, magic-sniff import,
+  error strings) were written in-session; vault.zig `applyImport` got the
+  `owned`-flag fix for the toOwnedSlice UAF.
