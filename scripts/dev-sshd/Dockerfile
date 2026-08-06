@@ -12,10 +12,14 @@
 # Debian-style sites-available → sites-enabled include), and a fixture git
 # repo (/srv/fixture.git) whose app serves fixture.txt on port 3000. The
 # fixture has no dependencies, so `npm install` runs offline.
+#
+# Spec 10 adds rclone (community repo) for the backups integration leg;
+# the bucket side lives in a separate minio/minio container on the shared
+# oars-dev-net network (see scripts/dev-sshd.sh).
 
 FROM alpine:3.20
 
-RUN apk add --no-cache openssh bash zip unzip git nodejs npm nginx curl shadow sudo \
+RUN apk add --no-cache openssh bash zip unzip git nodejs npm nginx curl shadow sudo rclone \
     && ssh-keygen -A \
     && echo 'root:oars-test-password' | chpasswd \
     && mkdir -p /root/.ssh \

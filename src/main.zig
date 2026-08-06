@@ -11,6 +11,7 @@ const scripts = @import("scripts.zig");
 const deploy = @import("deploy.zig");
 const integration = @import("integration.zig");
 const access = @import("access.zig");
+const backup = @import("backup.zig");
 
 // Zig 0.16 only collects test blocks from files that are actually
 // analyzed, and an unused import is never analyzed — so the env-gated
@@ -50,6 +51,7 @@ const App = struct {
     deploy_apps_store: deploy.AppStore,
     deploy_history_store: deploy.HistoryStore,
     access_registry: access.Registry,
+    backup_registry: backup.Registry,
     manager: sessions.Manager,
     bridge_ctx: bridge.Context,
     store_path_buf: [2048]u8 = undefined,
@@ -59,6 +61,8 @@ const App = struct {
     deploy_apps_path_buf: [2048]u8 = undefined,
     deploy_history_path_buf: [2048]u8 = undefined,
     access_path_buf: [2048]u8 = undefined,
+    backup_jobs_path_buf: [2048]u8 = undefined,
+    backup_runs_path_buf: [2048]u8 = undefined,
     data_dir_buf: [1024]u8 = undefined,
     fallback_dir_buf: [1024]u8 = undefined,
 
@@ -119,6 +123,16 @@ const App = struct {
             &self.access_path_buf,
             &.{ base, access.identity_store_name },
         ) catch unreachable;
+        const backup_jobs_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.backup_jobs_path_buf,
+            &.{ base, "backups.json" },
+        ) catch unreachable;
+        const backup_runs_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.backup_runs_path_buf,
+            &.{ base, "backup_runs.json" },
+        ) catch unreachable;
         self.store = .{ .allocator = self.allocator, .path = store_path };
         self.audit_store = .{ .allocator = self.allocator, .path = audit_path };
         self.logs_store = .{ .allocator = self.allocator, .path = logs_path };
@@ -126,6 +140,7 @@ const App = struct {
         self.deploy_apps_store = .{ .allocator = self.allocator, .path = deploy_apps_path };
         self.deploy_history_store = .{ .allocator = self.allocator, .path = deploy_history_path };
         self.access_registry = access.Registry.init(self.allocator, access_path);
+        self.backup_registry = backup.Registry.init(self.allocator, backup_jobs_path, backup_runs_path);
 
         self.manager = sessions.Manager.init(self.allocator, self.io, &self.store, &self.audit_store, self.env_map.get("HOME"));
         self.bridge_ctx = .{
@@ -139,11 +154,13 @@ const App = struct {
             .apps = &self.deploy_apps_store,
             .deploy_history = &self.deploy_history_store,
             .access = &self.access_registry,
+            .backup = &self.backup_registry,
         };
     }
 
     fn deinit(self: *App) void {
         self.access_registry.deinit();
+        self.backup_registry.deinit();
         self.manager.deinit();
         ssh.Session.deinitGlobal();
     }
@@ -224,9 +241,15 @@ test "servers.save round trips through the bridge dispatcher" {
     const access_path = std.fmt.bufPrint(&access_buf, "/tmp/{s}/access_identities.json", .{dir_name}) catch unreachable;
     var access_registry = access.Registry.init(store_alloc, access_path);
     defer access_registry.deinit();
+    var backup_jobs_buf: [512]u8 = undefined;
+    const backup_jobs_path = std.fmt.bufPrint(&backup_jobs_buf, "/tmp/{s}/backups.json", .{dir_name}) catch unreachable;
+    var backup_runs_buf: [512]u8 = undefined;
+    const backup_runs_path = std.fmt.bufPrint(&backup_runs_buf, "/tmp/{s}/backup_runs.json", .{dir_name}) catch unreachable;
+    var backup_registry = backup.Registry.init(store_alloc, backup_jobs_path, backup_runs_path);
+    defer backup_registry.deinit();
     var manager = sessions.Manager.init(store_alloc, io, &store, &audit_store, null);
     defer manager.deinit();
-    var ctx = bridge.Context{ .allocator = store_alloc, .io = io, .store = &store, .manager = &manager, .audit = &audit_store, .logs = &logs_store, .scripts = &scripts_store, .apps = &deploy_apps_store, .deploy_history = &deploy_hist_store, .access = &access_registry };
+    var ctx = bridge.Context{ .allocator = store_alloc, .io = io, .store = &store, .manager = &manager, .audit = &audit_store, .logs = &logs_store, .scripts = &scripts_store, .apps = &deploy_apps_store, .deploy_history = &deploy_hist_store, .access = &access_registry, .backup = &backup_registry };
     var dispatcher = ctx.dispatcher();
     var output: [64 * 1024]u8 = undefined;
 
@@ -295,6 +318,7 @@ const TestApp = struct {
     deploy_apps_store: deploy.AppStore,
     deploy_history_store: deploy.HistoryStore,
     access_registry: access.Registry,
+    backup_registry: backup.Registry,
     manager: sessions.Manager,
     ctx: bridge.Context,
     dispatcher: native_sdk.BridgeDispatcher,
@@ -307,6 +331,8 @@ const TestApp = struct {
     deploy_apps_path_buf: [512]u8 = undefined,
     deploy_history_path_buf: [512]u8 = undefined,
     access_path_buf: [512]u8 = undefined,
+    backup_jobs_path_buf: [512]u8 = undefined,
+    backup_runs_path_buf: [512]u8 = undefined,
     dir_name: []const u8,
 
     fn init(self: *TestApp) !void {
@@ -322,6 +348,8 @@ const TestApp = struct {
         const deploy_apps_path = try std.fmt.bufPrint(&self.deploy_apps_path_buf, "/tmp/{s}/apps.json", .{self.dir_name});
         const deploy_history_path = try std.fmt.bufPrint(&self.deploy_history_path_buf, "/tmp/{s}/deploy_runs.json", .{self.dir_name});
         const access_path = try std.fmt.bufPrint(&self.access_path_buf, "/tmp/{s}/access_identities.json", .{self.dir_name});
+        const backup_jobs_path = try std.fmt.bufPrint(&self.backup_jobs_path_buf, "/tmp/{s}/backups.json", .{self.dir_name});
+        const backup_runs_path = try std.fmt.bufPrint(&self.backup_runs_path_buf, "/tmp/{s}/backup_runs.json", .{self.dir_name});
         const store_alloc = self.arena.allocator();
         self.store = .{ .allocator = store_alloc, .path = store_path };
         self.audit_store = .{ .allocator = store_alloc, .path = audit_path };
@@ -330,13 +358,15 @@ const TestApp = struct {
         self.deploy_apps_store = .{ .allocator = store_alloc, .path = deploy_apps_path };
         self.deploy_history_store = .{ .allocator = store_alloc, .path = deploy_history_path };
         self.access_registry = access.Registry.init(store_alloc, access_path);
+        self.backup_registry = backup.Registry.init(store_alloc, backup_jobs_path, backup_runs_path);
         self.manager = sessions.Manager.init(store_alloc, io, &self.store, &self.audit_store, null);
-        self.ctx = .{ .allocator = store_alloc, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store, .access = &self.access_registry };
+        self.ctx = .{ .allocator = store_alloc, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store, .access = &self.access_registry, .backup = &self.backup_registry };
         self.dispatcher = self.ctx.dispatcher();
     }
 
     fn deinit(self: *TestApp) void {
         self.access_registry.deinit();
+        self.backup_registry.deinit();
         self.manager.deinit();
         self.arena.deinit();
         std.Io.Dir.cwd().deleteTree(std.testing.io, self.dir_name) catch {};
@@ -1272,4 +1302,108 @@ test "access scan and job handlers validate payloads without sessions" {
         \\{"id":"13","command":"oars.access.export","payload":{"format":"xlsx"}}
     );
     try std.testing.expect(std.mem.indexOf(u8, bad_format, "invalid format") != null);
+}
+
+test "backup jobs save/list/delete, run gates, and capability-test gates through the dispatcher" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // 1. Save a MinIO job with schedule credentials. The server is not
+    //    connected, so the job persists locally and the handler reports
+    //    the session state explicitly (the schedule install is deferred
+    //    until the next connected save).
+    const saved = app.dispatch(
+        \\{"id":"1","command":"oars.backup.jobs.save","payload":{"job":{"server_id":"s1","name":"daily-website","source_path":"/var/www/html","destination":{"type":"s3","provider":"minio","bucket":"acme","endpoint":"http://127.0.0.1:9000","storage_class":"standard"},"transfer":"sync","schedule":{"mode":"interval","interval_unit":"hours","interval_every":24,"enabled":true}},"schedule_credentials":{"access_key":"AKID","secret_key":"SECRET"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, saved, "not connected") != null);
+
+    // The job persisted despite the session state; secrets never do.
+    const listed = app.dispatch(
+        \\{"id":"2","command":"oars.backup.jobs.list","payload":{"server_id":"s1"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "daily-website") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"transfer\":\"sync\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "AKID") == null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "SECRET") == null);
+    const id_start = std.mem.indexOf(u8, listed, "\"id\":\"bk-") orelse return error.TestUnexpectedResult;
+    var id_buf: [64]u8 = undefined;
+    var id_len: usize = 0;
+    for (listed[id_start + 6 ..]) |ch| {
+        if (ch == '\"') break;
+        if (id_len >= id_buf.len) return error.TestUnexpectedResult;
+        id_buf[id_len] = ch;
+        id_len += 1;
+    }
+    const job_id = id_buf[0..id_len];
+
+    // 2. Enabling an unattended schedule without credentials is rejected
+    //    before any persistence (the remote-secret disclosure gate).
+    const no_creds = app.dispatch(
+        \\{"id":"3","command":"oars.backup.jobs.save","payload":{"job":{"server_id":"s1","name":"daily-website","source_path":"/var/www/html","destination":{"type":"s3","provider":"minio","bucket":"acme","endpoint":"http://127.0.0.1:9000"},"transfer":"sync","schedule":{"mode":"interval","interval_unit":"hours","interval_every":24,"enabled":true}}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, no_creds, "credentials are required") != null);
+
+    // 3. Editing an existing job by id keeps the generated id.
+    var edit_buf: [512]u8 = undefined;
+    const edit_req = try std.fmt.bufPrint(&edit_buf, "{{\"id\":\"4\",\"command\":\"oars.backup.jobs.save\",\"payload\":{{\"job\":{{\"id\":\"{s}\",\"server_id\":\"s1\",\"name\":\"daily-www\",\"source_path\":\"/var/www/html\",\"destination\":{{\"type\":\"s3\",\"provider\":\"minio\",\"bucket\":\"acme\",\"endpoint\":\"http://127.0.0.1:9000\"}},\"transfer\":\"sync\",\"schedule\":{{\"mode\":\"manual\",\"enabled\":false}}}},\"schedule_credentials\":{{\"access_key\":\"AKID\",\"secret_key\":\"SECRET\"}}}}}}", .{job_id});
+    const edited = app.dispatch(edit_req);
+    try std.testing.expect(std.mem.indexOf(u8, edited, "not connected") != null);
+
+    // 4. Shape errors surface with the spec messages.
+    const bad_bucket = app.dispatch(
+        \\{"id":"5","command":"oars.backup.jobs.save","payload":{"job":{"server_id":"s1","name":"x","source_path":"/var/www","destination":{"type":"s3","provider":"minio","bucket":"bad bucket","endpoint":"http://127.0.0.1:9000"}}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_bucket, "invalid bucket name") != null);
+    const bad_cron = app.dispatch(
+        \\{"id":"6","command":"oars.backup.jobs.save","payload":{"job":{"server_id":"s1","name":"x","source_path":"/var/www","destination":{"type":"s3","provider":"aws","bucket":"acme","region":"us-east-1"},"schedule":{"mode":"custom","expr":"not a cron","enabled":true}},"schedule_credentials":{"access_key":"A","secret_key":"B"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_cron, "invalid cron expression") != null);
+
+    // 5. Every session-gated handler says so explicitly on a ghost server.
+    const test_req = app.dispatch(
+        \\{"id":"7","command":"oars.backup.test","payload":{"job":{"server_id":"s1","name":"x","source_path":"/var/www","destination":{"type":"s3","provider":"minio","bucket":"acme","endpoint":"http://127.0.0.1:9000"}},"credentials":{"access_key":"AKID","secret_key":"SECRET"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, test_req, "not connected") != null);
+    var run_buf: [256]u8 = undefined;
+    const run_req = try std.fmt.bufPrint(&run_buf, "{{\"id\":\"8\",\"command\":\"oars.backup.run\",\"payload\":{{\"server_id\":\"s1\",\"job_id\":\"{s}\",\"credentials\":{{\"access_key\":\"AKID\",\"secret_key\":\"SECRET\"}}}}}}", .{job_id});
+    const run_resp = app.dispatch(run_req);
+    try std.testing.expect(std.mem.indexOf(u8, run_resp, "not connected") != null);
+    const run_unknown = app.dispatch(
+        \\{"id":"9","command":"oars.backup.run","payload":{"server_id":"s1","job_id":"bk-nope","credentials":{"access_key":"AKID","secret_key":"SECRET"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, run_unknown, "not connected") != null); // session gate precedes job lookup
+    const install = app.dispatch(
+        \\{"id":"10","command":"oars.backup.install","payload":{"server_id":"s1","what":"rclone","dry_run":true}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, install, "not connected") != null);
+    const cron_status = app.dispatch(
+        \\{"id":"11","command":"oars.backup.cronStatus","payload":{"server_id":"s1"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, cron_status, "not connected") != null);
+
+    // 6. Poll and history never touch the server: poll rejects unknown
+    //    run ids, history serves the empty local store.
+    const poll = app.dispatch(
+        \\{"id":"12","command":"oars.backup.poll","payload":{"run_id":"run-nope"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, poll, "unknown run") != null);
+    var hist_buf: [256]u8 = undefined;
+    const hist_req = try std.fmt.bufPrint(&hist_buf, "{{\"id\":\"13\",\"command\":\"oars.backup.history\",\"payload\":{{\"server_id\":\"s1\",\"job_id\":\"{s}\",\"limit\":20}}}}", .{job_id});
+    const history = app.dispatch(hist_req);
+    try std.testing.expect(std.mem.indexOf(u8, history, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, history, "\"runs\":[]") != null);
+
+    // 7. Delete persists without a session; deleting twice is explicit.
+    var del_buf: [256]u8 = undefined;
+    const del_req = try std.fmt.bufPrint(&del_buf, "{{\"id\":\"14\",\"command\":\"oars.backup.jobs.delete\",\"payload\":{{\"server_id\":\"s1\",\"job_id\":\"{s}\"}}}}", .{job_id});
+    const deleted = app.dispatch(del_req);
+    try std.testing.expect(std.mem.indexOf(u8, deleted, "\"ok\":true") != null);
+    const deleted_again = app.dispatch(del_req);
+    try std.testing.expect(std.mem.indexOf(u8, deleted_again, "unknown job") != null);
+    const after = app.dispatch(
+        \\{"id":"15","command":"oars.backup.jobs.list","payload":{"server_id":"s1"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, after, "daily-www") == null);
 }

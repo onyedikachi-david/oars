@@ -22,12 +22,15 @@ const sftpmod = @import("sftp.zig");
 const scripts = @import("scripts.zig");
 const deploy = @import("deploy.zig");
 const access = @import("access.zig");
+const backup = @import("backup.zig");
 const integration_keys = @import("integration_keys.zig");
 const integration_access = @import("integration_access.zig");
+const integration_backup = @import("integration_backup.zig");
 
 comptime {
     _ = integration_keys;
     _ = integration_access;
+    _ = integration_backup;
 }
 
 /// Reads an environment variable from the process environment. The raw
@@ -58,6 +61,11 @@ pub const TestEnv = struct {
     password: []const u8 = "",
     key_path: []const u8 = "",
     passphrase: []const u8 = "",
+    /// Spec 10: the S3-compatible store the backups integration leg uses
+    /// (http://oars-dev-minio:9000 from inside the sshd container).
+    minio_endpoint: []const u8 = "",
+    minio_access: []const u8 = "",
+    minio_secret: []const u8 = "",
 
     pub fn load() TestEnv {
         const host = getEnv("OARS_TEST_SSH_HOST") orelse return .{};
@@ -69,6 +77,9 @@ pub const TestEnv = struct {
             .password = getEnv("OARS_TEST_SSH_PASSWORD") orelse "",
             .key_path = getEnv("OARS_TEST_SSH_KEY_PATH") orelse "",
             .passphrase = getEnv("OARS_TEST_SSH_PASSPHRASE") orelse "",
+            .minio_endpoint = getEnv("OARS_TEST_MINIO_ENDPOINT") orelse "",
+            .minio_access = getEnv("OARS_TEST_MINIO_ACCESS") orelse "",
+            .minio_secret = getEnv("OARS_TEST_MINIO_SECRET") orelse "",
         };
     }
 };
@@ -85,6 +96,8 @@ pub const TestRig = struct {
     deploy_apps_path_buf: [512]u8 = undefined,
     deploy_history_path_buf: [512]u8 = undefined,
     access_path_buf: [512]u8 = undefined,
+    backup_jobs_path_buf: [512]u8 = undefined,
+    backup_runs_path_buf: [512]u8 = undefined,
     dir_name: []const u8,
     store: servers.Store,
     audit_store: audit.Store,
@@ -93,6 +106,7 @@ pub const TestRig = struct {
     deploy_apps_store: deploy.AppStore,
     deploy_history_store: deploy.HistoryStore,
     access_registry: access.Registry,
+    backup_registry: backup.Registry,
     manager: sessions.Manager,
     ctx: bridge.Context,
     dispatcher: native_sdk.BridgeDispatcher,
@@ -109,6 +123,8 @@ pub const TestRig = struct {
         const deploy_apps_path = try std.fmt.bufPrint(&self.deploy_apps_path_buf, "/tmp/{s}/apps.json", .{self.dir_name});
         const deploy_history_path = try std.fmt.bufPrint(&self.deploy_history_path_buf, "/tmp/{s}/deploy_runs.json", .{self.dir_name});
         const access_path = try std.fmt.bufPrint(&self.access_path_buf, "/tmp/{s}/access_identities.json", .{self.dir_name});
+        const backup_jobs_path = try std.fmt.bufPrint(&self.backup_jobs_path_buf, "/tmp/{s}/backups.json", .{self.dir_name});
+        const backup_runs_path = try std.fmt.bufPrint(&self.backup_runs_path_buf, "/tmp/{s}/backup_runs.json", .{self.dir_name});
         self.store = .{ .allocator = std.testing.allocator, .path = store_path };
         self.audit_store = .{ .allocator = std.testing.allocator, .path = audit_path };
         self.logs_store = .{ .allocator = std.testing.allocator, .path = logs_path };
@@ -116,13 +132,15 @@ pub const TestRig = struct {
         self.deploy_apps_store = .{ .allocator = std.testing.allocator, .path = deploy_apps_path };
         self.deploy_history_store = .{ .allocator = std.testing.allocator, .path = deploy_history_path };
         self.access_registry = access.Registry.init(std.testing.allocator, access_path);
+        self.backup_registry = backup.Registry.init(std.testing.allocator, backup_jobs_path, backup_runs_path);
         self.manager = sessions.Manager.init(std.testing.allocator, io, &self.store, &self.audit_store, null);
-        self.ctx = .{ .allocator = std.testing.allocator, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store, .access = &self.access_registry };
+        self.ctx = .{ .allocator = std.testing.allocator, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store, .access = &self.access_registry, .backup = &self.backup_registry };
         self.dispatcher = self.ctx.dispatcher();
     }
 
     pub fn deinit(self: *TestRig) void {
         self.access_registry.deinit();
+        self.backup_registry.deinit();
         self.manager.deinit();
         std.Io.Dir.cwd().deleteTree(std.testing.io, self.dir_name) catch {};
     }

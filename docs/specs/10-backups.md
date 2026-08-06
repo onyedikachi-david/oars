@@ -157,15 +157,39 @@ Job model:
 
 ## 12. Acceptance criteria
 
-- [ ] S3 job (MinIO in tests) runs and lands objects; progress + log correct.
-- [ ] Test Connection proves the selected prefix permissions needed by Copy or
-      Sync and removes its sentinel object.
-- [ ] Crontab entries are idempotent (re-save doesn't duplicate).
+- [x] S3 job (MinIO in tests) runs and lands objects; progress + log correct.
+      (container integration: `src/integration_backup.zig` — sync run polled to
+      success with 2 files, incremental run after a source edit, no-changes run,
+      history records, and object-landing verification via `rclone lsf`.)
+- [x] Test Connection proves the selected prefix permissions needed by Copy or
+      Sync and removes its sentinel object. (real sentinel write/read/delete in
+      the bucket, leftover verified absent; sync jobs additionally prove
+      prefix-level delete authority.)
+- [x] Crontab entries are idempotent (re-save doesn't duplicate). (unit:
+      `crontabAdd`/`crontabRemove` round trip, marker `# oars:job:<id>`, and
+      unchanged-content no-op; the live cron-daemon leg of the install path is
+      not container-tested yet.)
 - [ ] A scheduled run that completes while Oars is closed appears after the
-      next connection with its real exit status and log.
-- [ ] Unchanged and empty valid sources finish as "No changes"; missing or
-      unreadable sources fail before transfer.
-- [ ] Secrets never appear in JSON, logs, or audit.
+      next connection with its real exit status and log. (import path
+      `backupImportStaged` implemented — status/log staging under
+      `~/.local/state/oars/backups/<job-id>/` — but needs a live cron run in
+      the harness; pending next spec cycle.)
+- [x] Unchanged and empty valid sources finish as "No changes"; missing or
+      unreadable sources fail before transfer. (no-changes verified in the
+      container; the pre-transfer `test -d || test -f` gate is handler-level.)
+- [x] Secrets never appear in JSON, logs, or audit. (dispatcher test asserts
+      access/secret key material is absent from `jobs.list`; run/test configs
+      are unique temp files mode 0600, deleted after finalize; audit detail
+      carries only job ids.)
+
+Integration harness (spec 10): `scripts/dev-sshd.sh` now also starts an
+`oars-dev-minio` container on the shared `oars-dev-net` network and exports
+`OARS_TEST_MINIO_*`; the dev sshd image installs rclone. Run the full leg
+with `scripts/integration-test.sh`.
+
+Known rclone quirks handled (spec 13): `--use-json-log` writes to stderr, so
+manual runs append `2>&1`; MinIO rejects the lowercase `storage_class`, so
+configs emit the canonical uppercase S3 value.
 
 ## 13. Research & References
 

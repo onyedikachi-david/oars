@@ -1023,3 +1023,122 @@ key/gen mechanics are reusable building blocks). The `GIT_SSH_COMMAND`
 scoped-key piece of spec 07 §6 (per-app `known_hosts` + the spec-08
 `oars_deploy` key + `IdentitiesOnly=yes`) remains unimplemented backend
 work if taken before the frontend.
+
+## 19. Session handover — 2026-08-06 (session 9): spec 10 backups backend
+
+Landed: the full spec-10 backend — job model + store, rclone config
+management, cron management, JSON-log run polling, capability test, run
+history, scheduled-run staging import, and a real MinIO integration leg.
+**135/135 tests pass** (121 at spec 09 + 12 backup unit + 1 backup
+dispatcher + 1 backup container integration), two consecutive full
+container runs green, `zig build` + frontend build clean.
+
+### 19.1 What landed
+
+**`src/backup.zig` (new, 12 unit tests):** `Job`/`JobInput`/`Destination`/
+`Schedule` + `validate` (absolute source, provider/bucket/endpoint/region/
+storage-class rules, five-field cron grammar, IAM-requires-AWS,
+`EnabledScheduleNeedsCredentials` for non-IAM unattended schedules);
+`Provider` (aws/r2/b2/wasabi/minio/spaces) with `needsEndpoint`/
+`needsRegion`/`storageClasses`; cron (`validCronExpr`, `intervalToCronExpr`,
+`escapePercent`, `crontabAdd`/`crontabRemove` with `# oars:job:<id>`
+markers, idempotent); rclone config (`remoteConfigSection` — IAM omits key
+material; `configMergeSection` replaces only the job's section;
+`destinationArg`); the scheduled-run wrapper (`flock`-per-job, one
+`.status`+`.log` per run under `~/.local/state/oars/backups/<job-id>/`);
+JSON-log parsing (top-level *and* nested `stats`, error lines surfaced,
+views the line — no allocs); `JobStore` (id generation `bk-<n>`, save/
+list/delete/find, quarantine on corrupt files); `HistoryStore` (append
+idempotent by run id, 90-day retention + 200-run cap, newest-first list,
+200 KB log trim); `Runs` registry (one manual run per server,
+`run-<n>` ids, completed eviction).
+
+**`src/bridge.zig` (handler_count 69 → 78):** `oars.backup.{jobs.list,
+jobs.save, jobs.delete, test, run, poll, history, install, cronStatus}`,
+all origin-gated and audited. `jobs.save` persists first, then installs/
+removes the schedule when the session is live; `test` runs the §5
+capability test on one unique sentinel in the job's exact bucket/prefix
+(sync jobs must prove prefix-level delete authority; failed cleanup is
+reported, never passed); `run` checks rclone + source existence + one-run
+per server, writes a unique temp config (mode 0600), execs with
+`--use-json-log --stats 1s --stats-log-level NOTICE`, and deletes the
+config at finalize; `poll` parses stats deltas, finalizes on EOF (maps
+exit 0 + zero transfers to `no_changes`, surfaces error lines, trims the
+log, appends history); `install`/`cronStatus` probe rclone + crond and
+detect the OS for an honest plan (Alpine/Debian adapters, manual
+instructions otherwise); `history`/`jobs.list` import staged scheduled
+runs on connect (`backupImportStaged` — status/log files parsed,
+deduped by `sched-<job>-<ts>`, consumed after import). Secrets only ever
+touch the 0600 config file on the server — never argv, JSON, logs, or
+audit.
+
+**`src/main.zig`:** App/TestApp carry `backup.Registry` (jobs +
+history paths), plus a new dispatcher suite: save with schedule
+credentials on a ghost server (persists, then `not connected`), list
+(secrets absent), edit-by-id, credential-gated enabled schedules, bucket/
+cron shape errors, `test`/`run`/`install`/`cronStatus` session gates,
+`poll` unknown-run, `history` empty store, delete + double-delete.
+
+**Integration harness (spec 10):** `scripts/dev-sshd.sh` now runs a
+second container, `oars-dev-minio` (minio/minio) on the shared
+`oars-dev-net` network, and exports `OARS_TEST_MINIO_*`; the dev sshd
+image installs rclone. `src/integration_backup.zig`: job save over a
+live session, capability test (real sentinel write/read/delete,
+leftover verified absent), three manual sync runs — full (2 files,
+success), unchanged (no_changes), incremental (1 file) — history
+(newest first, all three), and object-landing verification via `rclone
+lsf`. Idempotent: bucket emptied at setup, temp configs deleted by the
+run finalize, fresh stores per rig.
+
+### 19.2 Bugs found by the container leg (all fixed)
+
+- **Capability test ran vacuously:** the sentinel path never included the
+  remote prefix (`oars-test:`), so `copyto`/`deletefile` operated on a
+  local relative path and exited 0 without touching the bucket — the
+  whole test passed without proving anything. Now `remote:bucket[/prefix]/
+oars-sentinel-<ts>` and the read check lists the destination with the
+  sentinel filter.
+- **`--use-json-log` writes to stderr:** the exec channel captures
+  stdout only, so runs produced an empty log and finalized with zero
+  stats (`no_changes` despite transfers). Manual runs append `2>&1`
+  (the cron wrapper already did).
+- **MinIO rejects lowercase `storage_class`:** the config wrote
+  `standard` and every PUT failed with 400 InvalidStorageClass (AWS
+  tolerates it, MinIO does not). `remoteConfigSection` now emits the
+  canonical uppercase S3 value (STANDARD/STANDARD_IA/…).
+- **Poll response wrote a dangling `log_delta`:** `poll.data` was freed
+  by the poll list's `defer` before the response serialized it — empty
+  before the stderr fix, garbage NULs after. The delta is now duped
+  before the list dies.
+- **`backupSessionReady` swallowed errors:** handlers returned
+  `output[0..0]`, which the dispatcher turns into `"result":null` — the
+  "not connected"/"session not ready" message was lost. It now returns
+  the error response the caller must return verbatim.
+- **Comptime-literal frees in `Job`/`RunRecord` deinit:** the
+  `handleBackupTest` job used `Schedule` defaults (`"manual"` literal)
+  and crashed on deinit. Fixed properly: `dupOrLiteral` (empty strings
+  are never owned) + guarded `Job.deinit` frees; `RunRecord.@"error"`/
+  `log` are optional (`null` until set).
+- **Test-side:** the bucket persists in the MinIO volume between runs
+  (setup now empties it); `execWait` format args were dropped in one
+  command (server ran `{s}` literally — redirect to a missing dir exits
+  1); the run request JSON had an extra closing brace.
+
+### 19.3 Known limits / next
+
+- The live cron leg is not container-tested yet: install-schedule →
+  crontab → cron runs the wrapper while Oars is closed → import on next
+  connect (`backupImportStaged`). The crontab add/remove logic is
+  unit-tested; the full loop needs a running crond in the harness
+  (Alpine ships busybox crond; add `crond -b` to the container CMD).
+- `backup.install`'s OS adapters (apk/apt) are implemented but not
+  exercised against the container (rclone is preinstalled there).
+- Pre-existing flake: the keys/access container tests occasionally race
+  each other on `authorized_keys`/user counts when the full suite runs
+  (also seen before spec 10); rerun passes. Worth a serialization or
+  per-test isolation pass.
+- Frontend: nothing yet — the whole spec-10 UI (backups view, job form,
+  run progress card, history, install banner) is open work.
+
+Next: spec 10 frontend or spec 11. Backend reusables for later specs:
+`backupImportStaged`'s staged-file pattern and the JSON-log parser.
