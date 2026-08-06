@@ -1487,3 +1487,30 @@ test "ai provider config and context/history gates through the dispatcher" {
     try std.testing.expect(std.mem.indexOf(u8, history, "\"ok\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, history, "\"runs\":[]") != null);
 }
+
+test "vnc handlers require a session and validate payloads" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    const start = app.dispatch(
+        \\{"id":"1","command":"oars.vnc.start","payload":{"server_id":"ghost"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, start, "not connected") != null);
+    const stop = app.dispatch(
+        \\{"id":"2","command":"oars.vnc.stop","payload":{"server_id":"ghost","tunnel_id":1}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, stop, "not connected") != null);
+    const probe = app.dispatch(
+        \\{"id":"3","command":"oars.vnc.probe","payload":{"server_id":"ghost"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, probe, "not connected") != null);
+    const setup = app.dispatch(
+        \\{"id":"4","command":"oars.vnc.setup","payload":{"server_id":"ghost","dry_run":true}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, setup, "not connected") != null);
+    const poll = app.dispatch(
+        \\{"id":"5","command":"oars.vnc.poll","payload":{"server_id":"ghost","tunnel_id":1}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, poll, "not connected") != null);
+}

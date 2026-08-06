@@ -28,12 +28,14 @@ const integration_keys = @import("integration_keys.zig");
 const integration_access = @import("integration_access.zig");
 const integration_backup = @import("integration_backup.zig");
 const integration_ai = @import("integration_ai.zig");
+const integration_vnc = @import("integration_vnc.zig");
 
 comptime {
     _ = integration_keys;
     _ = integration_access;
     _ = integration_backup;
     _ = integration_ai;
+    _ = integration_vnc;
 }
 
 /// Reads an environment variable from the process environment. The raw

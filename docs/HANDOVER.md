@@ -1230,5 +1230,97 @@ first monitor probe); cache-hit check on a second call; `oars.ssh.exec`
 - Spec 15 (history) will supersede the minimal `audit.read`.
 - No changes to the dev harness this cycle (containers unchanged).
 
-Next: spec 11 frontend, or spec 12 (VNC — likely the thinnest backend:
-TLS-wrapped TCP port forwarding over the session).
+## 21. Spec 12 — VNC over SSH backend (complete)
+
+Landed: the full remote-desktop backend — an RFC 6455 WebSocket server
+(`src/ws.zig`, pure codec, no heap in the handshake path), SSH
+direct-tcpip tunnels (`src/ssh.zig` `openTunnel`), the worker-side tunnel
+state machine in `src/sessions.zig` (listening → handshake → connected →
+closing → closed, driven from the existing run loop), the probe/setup
+helpers (`src/vnc.zig`), the five `oars.vnc.*` bridge handlers
+(start/stop/probe/setup/poll), and the full container integration test
+(`src/integration_vnc.zig`). 157/157 tests green (two consecutive runs),
+`zig build` + frontend build clean. `docs/specs/12-vnc.md` §12 acceptance
+marked for the backend-verifiable items (the credential-bridge box stays
+open for the frontend).
+
+### 21.1 What landed
+
+- **`src/ws.zig`** — `parseHandshake` (validates GET / Host / Upgrade /
+  Connection / version 13 / 16-byte key / Origin ∈ {`zero://app`,
+  `http://127.0.0.1:5173`} / `/vnc/<token>` path / `binary` subprotocol),
+  `acceptKey` (sha1+base64), `encodeUpgradeResponse`, `parseFrame`
+  (masked client frames required, zero RSV, no fragmented control,
+  ≤125-byte control frames, ≤8 MB payloads), `unmask`, `encodeFrame`,
+  `encodeCloseFrame`. The handshake never heap-allocates and its error
+  set has no `OutOfMemory` — keep it that way.
+- **`src/ssh.zig`** — `Session.openTunnel`: `libssh2_channel_direct_tcpip_ex`
+  with the EAGAIN loop, allocates a `Channel` (closed by the tunnel).
+- **`src/sessions.zig`** — `Tunnel` (worker-owned: listener, ws stream,
+  raw channel, token/host (owned `[]const u8`), bounded buffers
+  (16 MB connection cap), byte counters, error text), `Op.tunnel_start` /
+  `tunnel_stop`, `tunnelStart/Stop/Poll`, run-loop hook `processTunnels`
+  (~10 ms cadence, blocking sockets driven poll-then-act — no fcntl/
+  non-blocking in this std), 15 s idle self-destruct, session teardown
+  cleans all tunnels. **Tombstones:** a closed tunnel keeps its record
+  (state `closed`, resources released) for 60 s so `oars.vnc.poll` keeps
+  reporting `closed` per spec §5 instead of “unknown tunnel”, then the
+  record is pruned.
+- **`src/vnc.zig`** — probe command + parser (`ss -tlnp || netstat -tlnp
+  || netstat -tln`, `%BEGIN_VNC_PROBE%`-delimited, ports 5900-5999
+  deduped, process name from both `users:((` (ss) and `pid/name`
+  (netstat) formats), IPv6 `:::` lines handled) and the OS-adapter
+  setup plan (Alpine apk / Debian apt / manual; hint always carries
+  `-passwd`, never `-nopw`).
+- **`src/bridge.zig`** — 5 handlers: `oars.vnc.start` (ephemeral loopback
+  listener; 32-hex token from `std.Io.random`), `.stop`, `.probe`,
+  `.setup` (dry-run plan first; execute requires root and audits with
+  `display=<n>`), `.poll` (state + byte counters; `closed` for
+  tombstones). Session gate: only a `ready` session tunnels.
+- **`src/integration_vnc.zig`** — full container test: setup dry-run →
+  execute + audit, `setsid`-detached Xvfb + x11vnc on :1/5901,
+  probe-with-readiness-loop (asserts the listener process name),
+  `oars.vnc.start` → Zig WebSocket client performs the real RFC 6455
+  handshake (Origin `zero://app`) → observes `RFB 003.008` through the
+  tunnel → poll `connected` with real byte counters → stop → poll
+  `closed`.
+
+### 21.2 Bugs / notes (the container saga)
+
+- **Root cause of the dead VNC server: `pkill -f` self-kill.** The start
+  command began `pkill -f x11vnc ...` — the pattern matches the very
+  shell running it (its command line contains “x11vnc”), so the exec
+  died with exit 143 (SIGTERM) and Xvfb/x11vnc never started. Verified
+  in the container: `sh -c 'pkill -f x11vnc; echo alive'` never prints
+  `alive` and returns 143. Fix: `pkill -x x11vnc` / `pkill -x Xvfb`
+  (exact process-name match; busybox supports `-x`).
+- **Daemons must be detached from the exec session.** Even with the
+  pkill fixed, background processes started by a plain `sh -c '... &
+  ...'` exec channel can die with the channel. Both Xvfb and x11vnc
+  now start via `setsid ... </dev/null >/dev/null 2>&1 &` (verified
+  surviving the launching shell). Stale `/tmp/.X1-lock` is removed
+  first.
+- **busybox `ss` is a no-op and `netstat -tlnp` is the truth.** The
+  container's `ss` is not even installed; `netstat -tlnp` works and
+  emits a `PID/name` column (`42766/x11vnc`, `1/sshd -D [listener`).
+  The probe now tries `netstat -tlnp` between `ss` and plain
+  `netstat -tln`, and `listenerProcess` parses both formats. The
+  integration test asserts the listener's process name is `x11vnc`.
+- **`--test-filter` does not exist in Zig 0.16** — neither as a runner
+  flag nor a build flag; the runner only accepts `--listen=-`,
+  `--seed=`, `--cache-dir`. You cannot run one container test in
+  isolation; run the full suite (`set -a; source
+  scripts/.dev-sshd.env; set +a; zig build test --summary all`).
+- **Keys/access/backup container flakes are state, not code.** Repeated
+  full-suite runs on the persistent container accumulate users
+  (`useradd` exits 9), keys, and rclone state (`no_changes` on a second
+  sync); the next full run passes again. Known, non-blocking.
+
+### 21.3 Known limits / next
+
+- Frontend (spec 12 §12): the noVNC view, the credential-bridge
+  handoff of a remembered VNC password, CSP for the loopback WS source,
+  rendering/input acceptance, and the tab footer stats wiring.
+- `poll` on a tombstone returns the final byte counters — good enough
+  for the footer; a future cleanup could add a `closed_reason`.
+- Tunnels are bounded by usage; tombstones prune after 60 s.

@@ -17,6 +17,7 @@ const sftpmod = @import("sftp.zig");
 const shellquote = @import("shellquote.zig");
 const broadcast = @import("broadcast.zig");
 const deploy = @import("deploy.zig");
+const wsmod = @import("ws.zig");
 
 /// Blocking acquire on std.atomic.Mutex (spinlock) — 0.16's atomic.Mutex
 /// only exposes tryLock. Sections are short (buffer/cursor updates), so
@@ -227,6 +228,14 @@ const Op = union(enum) {
         outcome: ?*SftpOutcome,
     },
     sftp_cancel: struct { transfer_id: u32 },
+    tunnel_start: struct {
+        id: u32,
+        token: []const u8,
+        host: []const u8,
+        port: u16,
+        outcome: *TunnelStartOutcome,
+    },
+    tunnel_stop: struct { id: u32 },
 };
 
 /// Completion record for synchronous SFTP ops (spec 05): the worker builds
@@ -359,6 +368,134 @@ const FolderSizeEntry = struct {
     ts_ns: i128,
 };
 
+// --- VNC tunnels (spec 12) ------------------------------------------------
+
+/// A WebSocket → SSH direct-tcpip tunnel (spec 12 §6). Worker-owned: the
+/// session worker is the only thread that mutates it; bridge handlers
+/// copy stats under `tunnels_mutex` (state/bytes/error are written and
+/// read under that lock — the list itself is guarded the same way).
+pub const TunnelState = enum(u8) {
+    listening,
+    handshake,
+    connected,
+    closing,
+    closed,
+};
+
+pub const Tunnel = struct {
+    id: u32,
+    /// 128-bit URL token (hex) — the unguessable half of the WS path.
+    token: []const u8,
+    /// Remote host as seen by the SSH server (owned; default loopback).
+    host: []const u8,
+    port: u16,
+    listener: std.Io.net.Server,
+    ws: ?std.Io.net.Stream = null,
+    raw: ?*ssh.Channel = null,
+    state: TunnelState = .listening,
+    created_at_ns: i128 = 0,
+    last_activity_ns: i128 = 0,
+    /// Worker-only buffers (no lock).
+    handshake_buf: std.ArrayList(u8) = .empty,
+    recv_buf: std.ArrayList(u8) = .empty,
+    msg_buf: std.ArrayList(u8) = .empty,
+    to_channel: std.ArrayList(u8) = .empty,
+    send_buf: std.ArrayList(u8) = .empty,
+    bytes_up: u64 = 0,
+    bytes_down: u64 = 0,
+    error_buf: [160]u8 = undefined,
+    error_len: usize = 0,
+    /// Tombstone bookkeeping: when the tunnel reaches `.closed` its
+    /// resources are released but the record survives so `oars.vnc.poll`
+    /// keeps reporting `closed` (spec 12 §5) until it is pruned.
+    closed_at_ns: i128 = 0,
+    resources_released: bool = false,
+
+    pub fn setError(self: *Tunnel, msg: []const u8) void {
+        const n = @min(msg.len, self.error_buf.len - 1);
+        @memcpy(self.error_buf[0..n], msg[0..n]);
+        self.error_len = n;
+    }
+
+    pub fn deinit(self: *Tunnel, allocator: std.mem.Allocator, io: std.Io) void {
+        if (!self.resources_released) {
+            self.listener.deinit(io);
+            if (self.ws) |*ws| ws.close(io);
+            if (self.raw) |raw| raw.close(io);
+        }
+        allocator.free(self.token);
+        allocator.free(self.host);
+        self.handshake_buf.deinit(allocator);
+        self.recv_buf.deinit(allocator);
+        self.msg_buf.deinit(allocator);
+        self.to_channel.deinit(allocator);
+        self.send_buf.deinit(allocator);
+    }
+};
+
+/// Completion record for `oars.vnc.start`: the worker binds the listener
+/// and opens the SSH channel, then reports the ephemeral port.
+pub const TunnelStartOutcome = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    done: bool = false,
+    ok: bool = false,
+    port: u16 = 0,
+    msg_buf: [160]u8 = undefined,
+    msg_len: usize = 0,
+
+    pub fn set(self: *TunnelStartOutcome, ok: bool, port: u16, msg: []const u8) void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        self.ok = ok;
+        self.port = port;
+        const n = @min(msg.len, self.msg_buf.len - 1);
+        @memcpy(self.msg_buf[0..n], msg[0..n]);
+        self.msg_len = n;
+        self.done = true;
+    }
+
+    pub fn message(self: *TunnelStartOutcome) []const u8 {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.msg_buf[0..self.msg_len];
+    }
+
+    pub fn isDone(self: *TunnelStartOutcome) bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.done;
+    }
+
+    /// Spins until done or the deadline passes (the handler must never
+    /// block the main thread indefinitely).
+    pub fn wait(self: *TunnelStartOutcome, io: std.Io, deadline_ns: i128) void {
+        while (true) {
+            lockSpin(&self.mutex);
+            const done = self.done;
+            self.mutex.unlock();
+            if (done) return;
+            if (std.Io.Timestamp.now(io, .real).nanoseconds >= deadline_ns) return;
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch return;
+        }
+    }
+};
+
+/// Stats snapshot for `oars.vnc.poll` (copied under the tunnel lock).
+pub const TunnelPollInfo = struct {
+    state: TunnelState = .listening,
+    bytes_up: u64 = 0,
+    bytes_down: u64 = 0,
+    error_buf: [160]u8 = undefined,
+    error_len: usize = 0,
+};
+
+/// A tunnel with no WebSocket connection auto-destroys after this long.
+const tunnel_idle_timeout_ns: i128 = 15 * std.time.ns_per_s;
+
+/// Closed tunnels survive this long as tombstones so polls keep
+/// reporting `closed` before the record is pruned.
+const tunnel_tombstone_ns: i128 = 60 * std.time.ns_per_s;
+
 const error_buf_len = 512;
 
 pub const Session = struct {
@@ -409,6 +546,10 @@ pub const Session = struct {
     sftp_transfers: sftpmod.Transfers = .{},
     /// folderSize cache (spec 05 §5: 5 min per path; main thread only).
     folder_size_cache: std.ArrayList(FolderSizeEntry) = .empty,
+    /// VNC tunnels (spec 12): list guarded by tunnels_mutex; the worker
+    /// owns each tunnel's lifecycle.
+    tunnels_mutex: std.atomic.Mutex = .unlocked,
+    tunnels: std.ArrayList(*Tunnel) = .empty,
 
     pub fn setError(self: *Session, msg: []const u8) void {
         lockSpin(&self.error_mutex);
@@ -450,6 +591,8 @@ pub const Manager = struct {
     /// shrink these to keep probe assertions fast).
     monitor_interval_ns: i128 = 2 * std.time.ns_per_s,
     monitor_liveness_ns: i128 = 4 * std.time.ns_per_s,
+    /// Monotonic VNC tunnel ids (the WS URL token carries the randomness).
+    next_tunnel_id: std.atomic.Value(u32) = .init(1),
     mutex: std.atomic.Mutex = .unlocked,
     sessions: std.StringHashMap(*Session) = undefined,
     next_session_id: u64 = 1,
@@ -1056,6 +1199,59 @@ pub const Manager = struct {
         session.monitor_last_poll_ns.store(now_ns, .release);
         session.monitor_force.store(true, .release);
     }
+
+    // --- VNC tunnels (spec 12) ---------------------------------------------
+
+    pub fn nextTunnelId(self: *Manager) u32 {
+        return self.next_tunnel_id.fetchAdd(1, .monotonic);
+    }
+
+    /// Queues a tunnel start: the worker binds 127.0.0.1:0 and opens the
+    /// direct-tcpip channel, then fills `outcome` with the ephemeral port.
+    pub fn tunnelStart(self: *Manager, server_id: []const u8, id: u32, token: []const u8, host: []const u8, port: u16, outcome: *TunnelStartOutcome) !void {
+        const session = self.get(server_id) orelse return error.NoSession;
+        if (session.status.load(.acquire) != .ready) return error.NotReady;
+        const token_owned = try self.allocator.dupe(u8, token);
+        errdefer self.allocator.free(token_owned);
+        const host_owned = try self.allocator.dupe(u8, host);
+        errdefer self.allocator.free(host_owned);
+        lockSpin(&session.ops_mutex);
+        defer session.ops_mutex.unlock();
+        try session.ops.append(self.allocator, .{ .tunnel_start = .{
+            .id = id,
+            .token = token_owned,
+            .host = host_owned,
+            .port = port,
+            .outcome = outcome,
+        } });
+    }
+
+    /// Queues a tunnel teardown (idempotent; unknown ids are a no-op).
+    pub fn tunnelStop(self: *Manager, server_id: []const u8, id: u32) !void {
+        const session = self.get(server_id) orelse return error.NoSession;
+        lockSpin(&session.ops_mutex);
+        defer session.ops_mutex.unlock();
+        try session.ops.append(self.allocator, .{ .tunnel_stop = .{ .id = id } });
+    }
+
+    /// Copies the tunnel's stats under the lock; false when the tunnel is
+    /// unknown (already removed).
+    pub fn tunnelPoll(self: *Manager, server_id: []const u8, id: u32, info: *TunnelPollInfo) bool {
+        const session = self.get(server_id) orelse return false;
+        lockSpin(&session.tunnels_mutex);
+        defer session.tunnels_mutex.unlock();
+        for (session.tunnels.items) |t| {
+            if (t.id == id) {
+                info.state = t.state;
+                info.bytes_up = t.bytes_up;
+                info.bytes_down = t.bytes_down;
+                info.error_len = t.error_len;
+                @memcpy(info.error_buf[0..t.error_len], t.error_buf[0..t.error_len]);
+                return true;
+            }
+        }
+        return false;
+    }
 };
 
 pub const Cursor = struct {
@@ -1436,6 +1632,9 @@ fn workerMain(session: *Session) void {
             }
         }
 
+        // --- VNC tunnels (spec 12) -------------------------------------
+        processTunnels(session, io, std.Io.Timestamp.now(io, .real).nanoseconds);
+
         // --- monitor probe (probe-on-demand, spec 03 §6) -----------------
         // The worker probes only while monitor polls are recent (liveness
         // window) or a poll explicitly enqueued one (force); a session with
@@ -1657,8 +1856,443 @@ fn processOps(session: *Session) void {
             .sftp_unzip => |so| sftpOpUnzip(session, so.zip_path, so.dest, so.transfer_id, so.outcome),
             .sftp_zip_download => |so| sftpOpZipDownload(session, so.paths, so.local_partial, so.local_final, so.transfer_id, so.outcome),
             .sftp_cancel => |so| sftpOpCancel(session, so.transfer_id),
+            .tunnel_start => |t| tunnelStartOp(session, t),
+            .tunnel_stop => |s| tunnelStopOp(session, s),
         }
     }
+}
+
+/// Binds the loopback listener and opens the direct-tcpip channel.
+/// Owns `t.token`/`t.host` on every path (the Tunnel takes them over on
+/// success).
+fn tunnelStartOp(session: *Session, t: anytype) void {
+    const allocator = session.allocator;
+    const now = std.Io.Timestamp.now(session.io, .real).nanoseconds;
+    const addr = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch {
+        allocator.free(t.token);
+        allocator.free(t.host);
+        t.outcome.set(false, 0, "could not bind the local listener");
+        return;
+    };
+    var listener = std.Io.net.IpAddress.listen(&addr, session.io, .{ .mode = .stream, .protocol = .tcp, .reuse_address = true }) catch {
+        allocator.free(t.token);
+        allocator.free(t.host);
+        t.outcome.set(false, 0, "could not bind the local listener");
+        return;
+    };
+    const ws_port = listener.socket.address.getPort();
+    const raw = session.transport.openTunnel(session.io, t.host, t.port) catch {
+        listener.deinit(session.io);
+        allocator.free(t.token);
+        allocator.free(t.host);
+        t.outcome.set(false, 0, "could not open the SSH tunnel to the VNC port");
+        return;
+    };
+    const tunnel = allocator.create(Tunnel) catch {
+        raw.close(session.io);
+        listener.deinit(session.io);
+        allocator.free(t.token);
+        allocator.free(t.host);
+        t.outcome.set(false, 0, "out of memory");
+        return;
+    };
+    tunnel.* = .{
+        .id = t.id,
+        .token = t.token,
+        .host = t.host,
+        .port = t.port,
+        .listener = listener,
+        .raw = raw,
+        .created_at_ns = now,
+        .last_activity_ns = now,
+    };
+    lockSpin(&session.tunnels_mutex);
+    session.tunnels.append(session.allocator, tunnel) catch {
+        session.tunnels_mutex.unlock();
+        tunnel.deinit(session.allocator, session.io);
+        allocator.destroy(tunnel);
+        t.outcome.set(false, 0, "out of memory");
+        return;
+    };
+    session.tunnels_mutex.unlock();
+    t.outcome.set(true, ws_port, "");
+}
+
+/// Marks the tunnel for teardown (the run loop removes it). Idempotent.
+fn tunnelStopOp(session: *Session, s: anytype) void {
+    lockSpin(&session.tunnels_mutex);
+    defer session.tunnels_mutex.unlock();
+    for (session.tunnels.items) |t| {
+        if (t.id == s.id and t.state != .closed) {
+            t.setError("stopped");
+            t.state = .closing;
+            return;
+        }
+    }
+}
+
+// --- tunnel run-loop processing (spec 12 §6) ------------------------------
+
+/// Marks the tunnel for teardown with an error; the run loop removes it.
+fn tunnelFail(session: *Session, t: *Tunnel, msg: []const u8) void {
+    lockSpin(&session.tunnels_mutex);
+    t.setError(msg);
+    t.state = .closing;
+    session.tunnels_mutex.unlock();
+}
+
+/// Closes the tunnel's listener, WebSocket, and SSH channel. Runs at the
+/// terminal transition: the record lives on as a tombstone (see
+/// `tunnel_tombstone_ns`), so `deinit` skips the fds once released.
+fn tunnelReleaseResources(t: *Tunnel, io: std.Io) void {
+    t.listener.deinit(io);
+    if (t.ws) |*ws| ws.close(io);
+    if (t.raw) |raw| raw.close(io);
+    t.ws = null;
+    t.raw = null;
+    t.resources_released = true;
+}
+
+/// The terminal transition: state `.closed` plus the tombstone clock.
+fn tunnelMarkClosed(session: *Session, t: *Tunnel, now_ns: i128) void {
+    lockSpin(&session.tunnels_mutex);
+    t.state = .closed;
+    t.closed_at_ns = now_ns;
+    session.tunnels_mutex.unlock();
+}
+
+fn tunnelSetState(session: *Session, t: *Tunnel, state: TunnelState) void {
+    lockSpin(&session.tunnels_mutex);
+    t.state = state;
+    session.tunnels_mutex.unlock();
+}
+
+fn tunnelTouch(session: *Session, t: *Tunnel, now_ns: i128) void {
+    lockSpin(&session.tunnels_mutex);
+    t.last_activity_ns = now_ns;
+    session.tunnels_mutex.unlock();
+}
+
+fn tunnelAddUp(session: *Session, t: *Tunnel, n: u64) void {
+    lockSpin(&session.tunnels_mutex);
+    t.bytes_up += n;
+    session.tunnels_mutex.unlock();
+}
+
+fn tunnelAddDown(session: *Session, t: *Tunnel, n: u64) void {
+    lockSpin(&session.tunnels_mutex);
+    t.bytes_down += n;
+    session.tunnels_mutex.unlock();
+}
+
+const WsRead = union(enum) { none, data: usize, closed };
+
+/// Poll-then-read on the WS socket: the socket stays blocking (no fcntl
+/// on this platform), so readiness is checked first and the read never
+/// blocks the worker loop.
+fn tunnelReadWs(t: *Tunnel, buf: []u8) WsRead {
+    const fd = t.ws.?.socket.handle;
+    var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = std.posix.poll(&fds, 0) catch return .none;
+    if (ready == 0) return .none;
+    if (fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) return .closed;
+    if (fds[0].revents & std.posix.POLL.IN == 0) return .none;
+    const n = std.posix.read(fd, buf) catch |err| switch (err) {
+        error.ConnectionResetByPeer => return .closed,
+        else => return .none,
+    };
+    if (n == 0) return .closed;
+    return .{ .data = n };
+}
+
+/// Flushes the outbound buffer (handshake response + frames) to the WS
+/// socket, POLLOUT-gated, ≤ 16 KB per write.
+fn tunnelFlushWs(t: *Tunnel) void {
+    const fd = t.ws.?.socket.handle;
+    while (t.send_buf.items.len > 0) {
+        var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
+        const ready = std.posix.poll(&fds, 0) catch return;
+        if (ready == 0 or fds[0].revents & std.posix.POLL.OUT == 0) return;
+        const chunk = t.send_buf.items[0..@min(t.send_buf.items.len, 16 * 1024)];
+        const rc = std.c.write(fd, chunk.ptr, chunk.len);
+        if (rc <= 0) return; // EAGAIN or error — the buffer stays for the next pass
+        const n: usize = @intCast(rc);
+        std.mem.copyForwards(u8, t.send_buf.items[0 .. t.send_buf.items.len - n], t.send_buf.items[n..]);
+        t.send_buf.items.len -= n;
+    }
+}
+
+fn tunnelQueueFrame(t: *Tunnel, allocator: std.mem.Allocator, opcode: wsmod.Opcode, payload: []const u8) void {
+    var header_buf: [14]u8 = undefined;
+    const header = wsmod.encodeFrame(&header_buf, opcode, payload.len, true);
+    t.send_buf.appendSlice(allocator, header_buf[0..header]) catch {};
+    t.send_buf.appendSlice(allocator, payload) catch {};
+}
+
+fn tunnelQueueClose(t: *Tunnel, allocator: std.mem.Allocator, code: wsmod.CloseCode, reason: []const u8) void {
+    var frame_buf: [160]u8 = undefined;
+    if (2 + 2 + reason.len > frame_buf.len) return;
+    const n = wsmod.encodeCloseFrame(&frame_buf, code, reason);
+    t.send_buf.appendSlice(allocator, frame_buf[0..n]) catch {};
+}
+
+const tunnel_ws_chunk: usize = 32 * 1024;
+
+/// Consumes complete client frames from recv_buf: binary payloads flow
+/// to the SSH channel, ping gets pong, close is echoed, text closes 1003.
+fn tunnelDriveFrames(session: *Session, t: *Tunnel, now_ns: i128) void {
+    const allocator = session.allocator;
+    while (true) {
+        const parsed = wsmod.parseFrame(t.recv_buf.items, true) catch |err| {
+            tunnelQueueClose(t, allocator, if (err == error.TooBig) .too_big else .protocol_error, "protocol error");
+            tunnelSetState(session, t, .closing);
+            return;
+        };
+        switch (parsed) {
+            .need_more => return,
+            .frame => |f| {
+                const frame_len = f.payload_offset + f.payload.len;
+                // Unmask in place, then dispatch.
+                wsmod.unmask(t.recv_buf.items[f.payload_offset .. f.payload_offset + f.payload.len], f.mask);
+                const payload = t.recv_buf.items[f.payload_offset .. f.payload_offset + f.payload.len];
+                switch (f.opcode) {
+                    .binary => {
+                        if (f.fin) {
+                            if (t.to_channel.items.len + payload.len > wsmod.max_connection_buffer) {
+                                tunnelQueueClose(t, allocator, .too_big, "buffer exceeded");
+                                tunnelSetState(session, t, .closing);
+                                return;
+                            }
+                            t.to_channel.appendSlice(allocator, payload) catch {};
+                        } else {
+                            if (t.msg_buf.items.len != 0) {
+                                tunnelQueueClose(t, allocator, .protocol_error, "new message during reassembly");
+                                tunnelSetState(session, t, .closing);
+                                return;
+                            }
+                            if (payload.len > wsmod.max_frame_bytes) {
+                                tunnelQueueClose(t, allocator, .too_big, "frame too big");
+                                tunnelSetState(session, t, .closing);
+                                return;
+                            }
+                            t.msg_buf.appendSlice(allocator, payload) catch {};
+                        }
+                    },
+                    .continuation => {
+                        if (t.msg_buf.items.len + payload.len > wsmod.max_frame_bytes) {
+                            tunnelQueueClose(t, allocator, .too_big, "message too big");
+                            tunnelSetState(session, t, .closing);
+                            return;
+                        }
+                        t.msg_buf.appendSlice(allocator, payload) catch {};
+                        if (f.fin) {
+                            if (t.to_channel.items.len + t.msg_buf.items.len > wsmod.max_connection_buffer) {
+                                tunnelQueueClose(t, allocator, .too_big, "buffer exceeded");
+                                tunnelSetState(session, t, .closing);
+                                return;
+                            }
+                            t.to_channel.appendSlice(allocator, t.msg_buf.items) catch {};
+                            t.msg_buf.clearRetainingCapacity();
+                        }
+                    },
+                    .text => {
+                        // Not part of this VNC bridge (spec 12 §6).
+                        tunnelQueueClose(t, allocator, .unsupported_data, "text is not supported");
+                        tunnelSetState(session, t, .closing);
+                        return;
+                    },
+                    .ping => {
+                        tunnelQueueFrame(t, allocator, .pong, payload);
+                    },
+                    .pong => {},
+                    .close => {
+                        tunnelQueueClose(t, allocator, .normal, "");
+                        tunnelSetState(session, t, .closing);
+                        return;
+                    },
+                }
+                tunnelTouch(session, t, now_ns);
+                std.mem.copyForwards(u8, t.recv_buf.items[0 .. t.recv_buf.items.len - frame_len], t.recv_buf.items[frame_len..]);
+                t.recv_buf.items.len -= frame_len;
+            },
+        }
+    }
+}
+
+/// One pass over every tunnel (spec 12 §6): accept (≤ 1 per pass),
+/// drive the WS handshake, pump frames both ways, enforce the 15 s idle
+/// timeout, and remove closed tunnels.
+fn processTunnels(session: *Session, io: std.Io, now_ns: i128) void {
+    const allocator = session.allocator;
+    var i: usize = 0;
+    while (true) {
+        lockSpin(&session.tunnels_mutex);
+        if (i >= session.tunnels.items.len) {
+            session.tunnels_mutex.unlock();
+            return;
+        }
+        const tunnel = session.tunnels.items[i];
+        const state = tunnel.state;
+        session.tunnels_mutex.unlock();
+
+        var remove = false;
+        switch (state) {
+            .listening => {
+                if (now_ns - tunnel.created_at_ns >= tunnel_idle_timeout_ns) {
+                    tunnelFail(session, tunnel, "no WebSocket connection arrived");
+                    continue;
+                }
+                var fds = [_]std.posix.pollfd{.{ .fd = tunnel.listener.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+                const ready = std.posix.poll(&fds, 0) catch 0;
+                if (ready == 0 or fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.ERR | std.posix.POLL.HUP) == 0) continue;
+                const ws = tunnel.listener.accept(io) catch continue;
+                tunnel.ws = ws;
+                tunnelSetState(session, tunnel, .handshake);
+                tunnelTouch(session, tunnel, now_ns);
+            },
+            .handshake => {
+                if (now_ns - tunnel.created_at_ns >= tunnel_idle_timeout_ns) {
+                    tunnelFail(session, tunnel, "WebSocket handshake timed out");
+                    continue;
+                }
+                var chunk: [tunnel_ws_chunk]u8 = undefined;
+                switch (tunnelReadWs(tunnel, &chunk)) {
+                    .closed => {
+                        tunnelFail(session, tunnel, "client disconnected during the handshake");
+                        continue;
+                    },
+                    .none => {},
+                    .data => |n| {
+                        if (tunnel.handshake_buf.items.len + n > wsmod.max_handshake_bytes) {
+                            tunnelFail(session, tunnel, "handshake headers too large");
+                            continue;
+                        }
+                        tunnel.handshake_buf.appendSlice(allocator, chunk[0..n]) catch {};
+                        tunnelTouch(session, tunnel, now_ns);
+                    },
+                }
+                if (std.mem.indexOf(u8, tunnel.handshake_buf.items, "\r\n\r\n") == null) continue;
+                const parsed = wsmod.parseHandshake(tunnel.handshake_buf.items, tunnel.token) catch |err| {
+                    tunnelFail(session, tunnel, handshakeErrorText(err));
+                    continue;
+                };
+                var accept_buf: [28]u8 = undefined;
+                const accept = wsmod.acceptKey(parsed.key, &accept_buf);
+                var resp_buf: [256]u8 = undefined;
+                const resp_len = wsmod.encodeUpgradeResponse(&resp_buf, accept);
+                tunnel.send_buf.appendSlice(allocator, resp_buf[0..resp_len]) catch {};
+                // Any bytes past the header terminator are frame data.
+                const leftover = tunnel.handshake_buf.items[parsed.header_len..];
+                if (leftover.len > 0) tunnel.recv_buf.appendSlice(allocator, leftover) catch {};
+                tunnel.handshake_buf.clearRetainingCapacity();
+                tunnelSetState(session, tunnel, .connected);
+                tunnelTouch(session, tunnel, now_ns);
+            },
+            .connected => {
+                // 1. ws → frames → to_channel / pong / close.
+                var chunk: [tunnel_ws_chunk]u8 = undefined;
+                switch (tunnelReadWs(tunnel, &chunk)) {
+                    .closed => {
+                        tunnelFail(session, tunnel, "WebSocket connection lost");
+                        continue;
+                    },
+                    .none => {},
+                    .data => |n| {
+                        if (tunnel.recv_buf.items.len + n > wsmod.max_connection_buffer) {
+                            tunnelQueueClose(tunnel, allocator, .too_big, "connection buffer exceeded");
+                            tunnelSetState(session, tunnel, .closing);
+                            continue;
+                        }
+                        tunnel.recv_buf.appendSlice(allocator, chunk[0..n]) catch {};
+                        tunnelTouch(session, tunnel, now_ns);
+                        tunnelDriveFrames(session, tunnel, now_ns);
+                    },
+                }
+                // 2. to_channel → SSH channel (EAGAIN-tolerant).
+                while (tunnel.to_channel.items.len > 0) {
+                    const w = tunnel.raw.?.write(tunnel.to_channel.items[0..@min(tunnel.to_channel.items.len, tunnel_ws_chunk)]);
+                    if (w == 0) break;
+                    std.mem.copyForwards(u8, tunnel.to_channel.items[0 .. tunnel.to_channel.items.len - w], tunnel.to_channel.items[w..]);
+                    tunnel.to_channel.items.len -= w;
+                    tunnelAddUp(session, tunnel, w);
+                    tunnelTouch(session, tunnel, now_ns);
+                }
+                // 3. SSH channel → binary frames on the WS socket.
+                switch (tunnel.raw.?.read(&chunk)) {
+                    .eof => {
+                        tunnelFail(session, tunnel, "the remote VNC server closed the connection");
+                        continue;
+                    },
+                    .again => {},
+                    .data => |n| {
+                        tunnelAddDown(session, tunnel, n);
+                        tunnelTouch(session, tunnel, now_ns);
+                        if (tunnel.send_buf.items.len + n + 14 > wsmod.max_connection_buffer) {
+                            tunnelFail(session, tunnel, "connection buffer exceeded");
+                            continue;
+                        }
+                        tunnelQueueFrame(tunnel, allocator, .binary, chunk[0..n]);
+                    },
+                }
+                // 4. Flush the outbound buffer.
+                if (tunnel.ws != null) tunnelFlushWs(tunnel);
+                // 5. Idle timeout.
+                lockSpin(&session.tunnels_mutex);
+                const idle = now_ns - tunnel.last_activity_ns >= tunnel_idle_timeout_ns;
+                session.tunnels_mutex.unlock();
+                if (idle) {
+                    tunnelFail(session, tunnel, "tunnel idle");
+                    continue;
+                }
+            },
+            .closing => {
+                if (tunnel.ws != null) tunnelFlushWs(tunnel);
+                if (tunnel.send_buf.items.len == 0) {
+                    // Terminal: release the fds but keep the record as a
+                    // tombstone so polls report `closed` (spec 12 §5).
+                    tunnelReleaseResources(tunnel, io);
+                    tunnelMarkClosed(session, tunnel, now_ns);
+                }
+            },
+            .closed => {
+                // Tombstone: pruned once the grace period is up.
+                if (now_ns - tunnel.closed_at_ns >= tunnel_tombstone_ns) remove = true;
+            },
+        }
+        if (remove) {
+            lockSpin(&session.tunnels_mutex);
+            var found: ?usize = null;
+            for (session.tunnels.items, 0..) |t, idx| {
+                if (t == tunnel) {
+                    found = idx;
+                    break;
+                }
+            }
+            if (found) |idx| _ = session.tunnels.orderedRemove(idx);
+            session.tunnels_mutex.unlock();
+            tunnel.deinit(allocator, io);
+            allocator.destroy(tunnel);
+            continue; // the next tunnel shifted into slot i
+        }
+        i += 1;
+    }
+}
+
+fn handshakeErrorText(err: wsmod.HandshakeError) []const u8 {
+    return switch (err) {
+        error.Incomplete => "incomplete handshake",
+        error.HeadersTooLarge => "handshake headers too large",
+        error.InvalidRequestLine => "malformed handshake request line",
+        error.InvalidMethod => "handshake method must be GET",
+        error.InvalidPath => "unknown tunnel token",
+        error.MissingHost => "handshake is missing the Host header",
+        error.BadUpgrade => "handshake is missing Upgrade: websocket",
+        error.BadConnection => "handshake is missing Connection: Upgrade",
+        error.BadVersion => "unsupported WebSocket version",
+        error.BadKey => "invalid Sec-WebSocket-Key",
+        error.BadOrigin => "origin is not allowed",
+        error.BadProtocol => "the client must offer the binary subprotocol",
+    };
 }
 
 /// Shared exec-channel creation for one-shot execs and follow channels.
@@ -3131,6 +3765,10 @@ fn sessionDone(session: *Session) void {
                 session.allocator.free(so.local_partial);
                 session.allocator.free(so.local_final);
             },
+            .tunnel_start => |t| {
+                session.allocator.free(t.token);
+                session.allocator.free(t.host);
+            },
             else => {},
         }
     }
@@ -3154,6 +3792,19 @@ fn sessionDone(session: *Session) void {
     session.sftp_transfers.deinit(session.allocator);
     for (session.folder_size_cache.items) |e| session.allocator.free(e.path);
     session.folder_size_cache.deinit(session.allocator);
+
+    // VNC tunnels: everything dies with the session (spec 12 §8).
+    lockSpin(&session.tunnels_mutex);
+    for (session.tunnels.items) |t| {
+        t.setError("session disconnected");
+        t.state = .closed;
+        t.deinit(session.allocator, session.io);
+        session.allocator.destroy(t);
+    }
+    session.tunnels.clearRetainingCapacity();
+    session.tunnels.deinit(session.allocator);
+    session.tunnels_mutex.unlock();
+
     session.transport.disconnect(session.io);
     const status = session.status.load(.acquire);
     if (status != .@"error" and status != .closed) session.status.store(.closed, .release);

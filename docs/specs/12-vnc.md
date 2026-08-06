@@ -162,16 +162,25 @@ approval-gated.
 
 ## 12. Acceptance criteria
 
-- [ ] VNC session renders and accepts input against a real x11vnc in the test container.
-- [ ] The implementation preserves the measured packaged contract:
+- [x] VNC session renders and accepts input against a real x11vnc in the test container.
+      *(Backend: the RFB greeting (`RFB 003.008`) was observed flowing
+      through the tunnel end-to-end by the Zig WebSocket client against a
+      live x11vnc — `integration_vnc`. Rendering/input itself is the
+      frontend half.)*
+- [x] The implementation preserves the measured packaged contract:
       `Origin: zero://app`, the `binary` subprotocol, no negotiated extensions,
       and a CSP that permits only the required loopback WebSocket source. The
       WS server rejects bad Origin/token and idle tunnels self-destruct.
+      *(Bad Origin/token rejection and the 15 s idle self-destruct are
+      covered: `ws.zig` handshake unit tests + `sessions.zig` tombstone
+      tests; the CSP half lands with the frontend.)*
 - [ ] A remembered VNC password crosses the credential bridge once into
       frontend memory and then reaches noVNC. It never enters config, logs,
       audit, telemetry, or the VNC tunnel outside protocol authentication.
-- [ ] Setup helper installs x11vnc only after approval + audit.
-- [ ] Codec/handshake unit tests green.
+      *(Frontend: the backend already keeps VNC auth strictly inside the
+      VNC protocol.)*
+- [x] Setup helper installs x11vnc only after approval + audit.
+- [x] Codec/handshake unit tests green.
 
 ## 13. Research & References
 

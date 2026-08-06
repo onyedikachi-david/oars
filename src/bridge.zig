@@ -17,6 +17,7 @@ const shellquote = @import("shellquote.zig");
 const sftpmod = @import("sftp.zig");
 const scripts = @import("scripts.zig");
 const ai = @import("ai.zig");
+const vncmod = @import("vnc.zig");
 const broadcast = @import("broadcast.zig");
 const deploy = @import("deploy.zig");
 const sshkeys = @import("sshkeys.zig");
@@ -26,7 +27,7 @@ const backup = @import("backup.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 82;
+const handler_count = 87;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -128,6 +129,11 @@ pub const Context = struct {
             .{ .name = "oars.ai.provider.get", .context = self, .invoke_fn = handleAiProviderGet },
             .{ .name = "oars.ai.provider.set", .context = self, .invoke_fn = handleAiProviderSet },
             .{ .name = "oars.ai.history", .context = self, .invoke_fn = handleAiHistory },
+            .{ .name = "oars.vnc.start", .context = self, .invoke_fn = handleVncStart },
+            .{ .name = "oars.vnc.stop", .context = self, .invoke_fn = handleVncStop },
+            .{ .name = "oars.vnc.probe", .context = self, .invoke_fn = handleVncProbe },
+            .{ .name = "oars.vnc.setup", .context = self, .invoke_fn = handleVncSetup },
+            .{ .name = "oars.vnc.poll", .context = self, .invoke_fn = handleVncPoll },
         };
         self.policies = .{
             .{ .name = "oars.servers.list", .origins = &allowed_origins },
@@ -212,6 +218,11 @@ pub const Context = struct {
             .{ .name = "oars.ai.provider.get", .origins = &allowed_origins },
             .{ .name = "oars.ai.provider.set", .origins = &allowed_origins },
             .{ .name = "oars.ai.history", .origins = &allowed_origins },
+            .{ .name = "oars.vnc.start", .origins = &allowed_origins },
+            .{ .name = "oars.vnc.stop", .origins = &allowed_origins },
+            .{ .name = "oars.vnc.probe", .origins = &allowed_origins },
+            .{ .name = "oars.vnc.setup", .origins = &allowed_origins },
+            .{ .name = "oars.vnc.poll", .origins = &allowed_origins },
         };
         return .{
             .policy = .{ .enabled = true, .commands = &self.policies },
@@ -721,7 +732,213 @@ fn handleSshPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
     return writer.buffered();
 }
 
-// --- monitor (spec 03) ----------------------------------------------------
+// --- VNC (spec 12) ---------------------------------------------------------
+
+const vnc_exec_cap: usize = 256 * 1024;
+const vnc_exec_timeout_ns = 20 * std.time.ns_per_s;
+const vnc_start_timeout_ns = 5 * std.time.ns_per_s;
+
+const VncStartPayload = struct {
+    server_id: []const u8,
+    host: ?[]const u8 = null,
+    port: ?u16 = null,
+};
+const VncStopPayload = struct {
+    server_id: []const u8,
+    tunnel_id: u32,
+};
+const VncProbePayload = struct { server_id: []const u8 };
+const VncSetupPayload = struct {
+    server_id: []const u8,
+    display: ?u16 = null,
+    dry_run: bool = false,
+};
+const VncPollPayload = struct {
+    server_id: []const u8,
+    tunnel_id: u32,
+};
+
+fn vncExec(self: *Context, server_id: []const u8, cmd: []const u8) ?sessions.ExecOutcome {
+    return self.manager.execWait(server_id, cmd, vnc_exec_cap, vnc_exec_timeout_ns) catch null;
+}
+
+fn vncCheck(self: *Context, server_id: []const u8, cmd: []const u8) bool {
+    var out = vncExec(self, server_id, cmd) orelse return false;
+    defer out.output.deinit(self.allocator);
+    return out.exit == 0;
+}
+
+fn vncSessionReady(self: *Context, output: []u8, server_id: []const u8) ?[]const u8 {
+    const session = self.manager.get(server_id) orelse return respondError(output, "not connected");
+    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
+    return null;
+}
+
+/// Starts the tunnel: a loopback listener plus the direct-tcpip SSH
+/// channel. Returns the ephemeral WS port and the URL token (spec 12
+/// §5). Defaults: host = the server's own loopback, port = 5900.
+fn handleVncStart(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(VncStartPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (vncSessionReady(self, output, payload.server_id)) |err| return err;
+    const host = payload.host orelse "127.0.0.1";
+    const port = payload.port orelse 5900;
+
+    var token_bytes: [16]u8 = undefined;
+    std.Io.random(self.io, &token_bytes);
+    var token_buf: [33]u8 = undefined;
+    const hex = "0123456789abcdef";
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        token_buf[i * 2] = hex[token_bytes[i] >> 4];
+        token_buf[i * 2 + 1] = hex[token_bytes[i] & 0xf];
+    }
+    const token = token_buf[0..32];
+    const id = self.manager.nextTunnelId();
+    var outcome: sessions.TunnelStartOutcome = .{};
+    self.manager.tunnelStart(payload.server_id, id, token, host, port, &outcome) catch |err| {
+        return respondError(output, switch (err) {
+            error.NoSession => "not connected",
+            error.NotReady => "session not ready",
+            else => "tunnel start failed",
+        });
+    };
+    outcome.wait(self.io, std.Io.Timestamp.now(self.io, .real).nanoseconds + vnc_start_timeout_ns);
+    if (!outcome.isDone()) return respondError(output, "tunnel start timed out");
+    if (!outcome.ok) return respondError(output, outcome.message());
+
+    var writer = std.Io.Writer.fixed(output);
+    writer.print("{{\"ok\":true,\"tunnel_id\":{d},\"ws_port\":{d},\"token\":", .{ id, outcome.port }) catch return output[0..0];
+    json.writeJsonString(&writer, token) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleVncStop(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(VncStopPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (vncSessionReady(self, output, payload.server_id)) |err| return err;
+    self.manager.tunnelStop(payload.server_id, payload.tunnel_id) catch |err| {
+        return respondError(output, switch (err) {
+            error.NoSession => "not connected",
+            else => "stop failed",
+        });
+    };
+    return ok_json;
+}
+
+fn handleVncProbe(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(VncProbePayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const server_id = parsed.value.server_id;
+    if (vncSessionReady(self, output, server_id)) |err| return err;
+    var outcome = vncExec(self, server_id, vncmod.probe_command) orelse return respondError(output, "probe failed");
+    defer outcome.output.deinit(self.allocator);
+    var result = vncmod.parseProbeOutput(self.allocator, outcome.output.items);
+    defer result.deinit(self.allocator);
+    var writer = std.Io.Writer.fixed(output);
+    writer.print("{{\"ok\":true,\"x11vnc\":{s},\"tigervnc\":{s},\"listening\":[", .{ if (result.x11vnc) "true" else "false", if (result.tigervnc) "true" else "false" }) catch return output[0..0];
+    var first = true;
+    for (result.listening) |l| {
+        if (!first) writer.writeAll(",") catch return output[0..0];
+        first = false;
+        writer.print("{{\"port\":{d},\"process\":", .{l.port}) catch return output[0..0];
+        json.writeJsonString(&writer, l.process) catch return output[0..0];
+        writer.writeAll("}") catch return output[0..0];
+    }
+    writer.writeAll("]}") catch return output[0..0];
+    return writer.buffered();
+}
+
+/// The setup helper (spec 12 §5): detect the OS, return the tested
+/// install plan; `dry_run: false` executes it after the user's approval
+/// (the frontend shows the plan first) and audits. Always suggests a
+/// password-protected start command — never `-nopw` (spec 12 §8).
+fn handleVncSetup(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(VncSetupPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (vncSessionReady(self, output, payload.server_id)) |err| return err;
+
+    var os_out = vncExec(self, payload.server_id, "cat /etc/os-release 2>/dev/null") orelse return respondError(output, "cannot detect the server OS");
+    defer os_out.output.deinit(self.allocator);
+    const installed = vncCheck(self, payload.server_id, "command -v x11vnc >/dev/null 2>&1");
+    var plan = vncmod.setupPlan(self.allocator, os_out.output.items, payload.display orelse 0, installed);
+    defer plan.deinit(self.allocator);
+
+    if (payload.dry_run or std.mem.eql(u8, plan.action, "already_installed") or std.mem.eql(u8, plan.action, "manual")) {
+        return vncSetupResponse(output, &plan, false);
+    }
+    var idc = vncExec(self, payload.server_id, "id -u") orelse return respondError(output, "not connected");
+    defer idc.output.deinit(self.allocator);
+    if (idc.exit != 0 or std.mem.indexOf(u8, std.mem.trim(u8, idc.output.items, " \t\r\n"), "0") == null) {
+        return respondError(output, "installing a VNC server requires root access on the server");
+    }
+    if (!vncCheck(self, payload.server_id, plan.plan)) return respondError(output, "installation failed");
+    var detail_buf: [64]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "display={d}", .{payload.display orelse 0}) catch "vnc.setup";
+    sshkeysAudit(self, "vnc.setup", payload.server_id, detail);
+    return vncSetupResponse(output, &plan, true);
+}
+
+fn vncSetupResponse(output: []u8, plan: *const vncmod.SetupPlan, executed: bool) anyerror![]const u8 {
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"action\":") catch return output[0..0];
+    json.writeJsonString(&writer, plan.action) catch return output[0..0];
+    writer.writeAll(",\"executed\":") catch return output[0..0];
+    writer.writeAll(if (executed) "true" else "false") catch return output[0..0];
+    writer.writeAll(",\"plan\":") catch return output[0..0];
+    json.writeJsonString(&writer, plan.plan) catch return output[0..0];
+    writer.writeAll(",\"hint\":") catch return output[0..0];
+    json.writeJsonString(&writer, plan.hint) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleVncPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(VncPollPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (vncSessionReady(self, output, payload.server_id)) |err| return err;
+    var info: sessions.TunnelPollInfo = .{};
+    if (!self.manager.tunnelPoll(payload.server_id, payload.tunnel_id, &info)) {
+        return respondError(output, "unknown tunnel");
+    }
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"state\":") catch return output[0..0];
+    json.writeJsonString(&writer, tunnelStateName(info.state)) catch return output[0..0];
+    writer.print(",\"bytes_up\":{d},\"bytes_down\":{d},\"error\":", .{ info.bytes_up, info.bytes_down }) catch return output[0..0];
+    json.writeJsonString(&writer, info.error_buf[0..info.error_len]) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn tunnelStateName(state: sessions.TunnelState) []const u8 {
+    return switch (state) {
+        .listening => "listening",
+        .handshake => "handshake",
+        .connected => "connected",
+        .closing => "closing",
+        .closed => "closed",
+    };
+}
 
 /// Not-ready envelope: the monitor contract has exactly two statuses
 /// (spec 03 §10) and the UI shows "waiting for connection".

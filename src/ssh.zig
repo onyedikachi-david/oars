@@ -418,6 +418,36 @@ pub const Session = struct {
         }
     }
 
+    /// Opens a direct-tcpip channel to `host:port` as seen by the SSH
+    /// server (spec 12: the VNC tunnel; the server sees the connection
+    /// as coming from its own loopback).
+    pub fn openTunnel(self: *Session, io: std.Io, host: []const u8, port: u16) Error!*Channel {
+        const host_z = self.allocator.dupeZ(u8, host) catch return error.NoChannel;
+        defer self.allocator.free(host_z);
+        const deadline = deadlineFromNow(io, handshake_timeout_ms);
+        while (true) {
+            const raw = c.libssh2_channel_direct_tcpip_ex(self.raw, host_z.ptr, @intCast(port), "127.0.0.1", 0);
+            if (raw != null) {
+                const ch = self.allocator.create(Channel) catch {
+                    _ = c.libssh2_channel_free(raw);
+                    return error.NoChannel;
+                };
+                ch.* = .{
+                    .raw = raw.?,
+                    .allocator = self.allocator,
+                    .stop_fn = self.stop_fn,
+                    .stop_ctx = self.stop_ctx,
+                };
+                return ch;
+            }
+            const rc = c.libssh2_session_last_errno(self.raw);
+            if (!isEagain(rc)) return error.NoChannel;
+            try checkDeadline(io, deadline);
+            try self.checkStop();
+            try sleep(io);
+        }
+    }
+
     /// Human-readable message for the last session error, copied into
     /// `buf` (caller-owned, typically 256 bytes).
     pub fn lastErrorMessage(self: *Session, buf: []u8) []const u8 {
