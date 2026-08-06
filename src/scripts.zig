@@ -468,12 +468,22 @@ pub const Expansion = struct {
     redacted: []u8,
     /// Owned variable names in first-use order (deduped) + secret flags.
     names: []NameInfo,
+    /// Owned values of the secret variables, in first-use order (spec 15:
+    /// history masks the command AND the output snippet with the exact
+    /// values the operation knew).
+    secrets: [][]const u8 = &.{},
 
     pub fn deinit(self: *Expansion, allocator: std.mem.Allocator) void {
         allocator.free(self.command);
         allocator.free(self.redacted);
         for (self.names) |n| allocator.free(n.name);
         allocator.free(self.names);
+        // Empty (no secret variables) is the `.empty` comptime slice —
+        // only owned when the expansion carries secret values.
+        if (self.secrets.len > 0) {
+            for (self.secrets) |s| allocator.free(s);
+            allocator.free(self.secrets);
+        }
     }
 };
 
@@ -703,6 +713,8 @@ pub fn expandTemplate(
     defer red.deinit(allocator);
     var names: std.ArrayList(NameInfo) = .empty;
     defer names.deinit(allocator);
+    var secrets: std.ArrayList([]const u8) = .empty;
+    defer secrets.deinit(allocator);
 
     var seg: usize = 0;
     for (refs) |ref| {
@@ -712,6 +724,20 @@ pub fn expandTemplate(
         try appendQuoted(&cmd, allocator, v.value);
         if (v.secret) {
             red.appendSlice(allocator, "***") catch return error.OutOfMemory;
+            var seen = false;
+            for (secrets.items) |s| {
+                if (std.mem.eql(u8, s, v.value)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                const owned = allocator.dupe(u8, v.value) catch return error.OutOfMemory;
+                secrets.append(allocator, owned) catch {
+                    allocator.free(owned);
+                    return error.OutOfMemory;
+                };
+            }
         } else {
             try appendQuoted(&red, allocator, v.value);
         }
@@ -738,6 +764,7 @@ pub fn expandTemplate(
         .command = cmd.toOwnedSlice(allocator) catch return error.OutOfMemory,
         .redacted = red.toOwnedSlice(allocator) catch return error.OutOfMemory,
         .names = names.toOwnedSlice(allocator) catch return error.OutOfMemory,
+        .secrets = secrets.toOwnedSlice(allocator) catch return error.OutOfMemory,
     };
 }
 

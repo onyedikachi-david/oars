@@ -1324,3 +1324,92 @@ open for the frontend).
 - `poll` on a tombstone returns the final byte counters — good enough
   for the footer; a future cleanup could add a `closed_reason`.
 - Tunnels are bounded by usage; tombstones prune after 60 s.
+
+## 22. Session handover — 2026-08-06 (session 11): spec 15 history + audit backend
+
+Landed: the full spec-15 backend — bounded history/audit journals with
+write-time redaction, tracked-exec capture (exit, duration, two-line
+snippet), replay with redacted-refusal, and type-to-confirm audit clear.
+**166/166 tests pass** (157 at spec 12 + 8 history unit + 1 dispatcher
+suite + 1 history container integration), two consecutive full container
+runs green, `zig build` + frontend build clean.
+
+### 22.1 What landed
+
+**`src/history.zig` (new, replaces `src/audit.zig` — deleted):**
+- `HistoryStore` (`history.jsonl`, cap 2,000) + `AuditStore`
+  (`audit.jsonl`, cap 5,000): JSONL journals, O(1) positional appends +
+  fsync, atomic temp+rename compaction, in-memory index (reads never
+  re-parse the journal), `record` upserts by `operation_id` (dedupe,
+  update moves newest), legacy `action`/`server_id` journal lines still
+  load (aliases), caps are store fields so tests shrink them.
+- Redaction: `exactMask` (known secret values, longest-match-first,
+  applied to commands AND output snippets) + `patternMask` (narrow named
+  fields — `PASSWORD=…`, `TOKEN=…`, `--password …`/`=…`, URL userinfo;
+  never `-p`/`-i`/`passin`) + `redact` = exact then pattern. `••••`
+  marker. Unit fixtures cover the non-mask cases (`-p`, `-i key.pem`,
+  `MYPASSWORD=`, `passin pass:`).
+- `AuditStore.read` keeps the minimal server/type filter for
+  `oars.ai.history` (its wire shape is unchanged — still `action`).
+
+**`src/sessions.zig`:** `execTracked(server, cmd, kind, redacted_cmd?,
+secrets)` — the channel carries `history_kind`/`history_command`/
+`history_secrets`; the worker records at channel EOF (`recordExecHistory`:
+exit, duration from `started_ns`, first-2-lines snippet masked with the
+operation's exact secrets). Plain `exec()` stays untracked (probes,
+checks, scans never pollute history). All four entry-drop paths and the
+queued-op teardown free the new strings.
+
+**`src/bridge.zig` (handler_count 87 → 92):** `oars.history.{record,
+list, replay}` + `oars.audit.{list, clear}` (clear requires the literal
+`CLEAR`). Tracked kinds wired: `ssh.exec`→`exec`, scripts.run/broadcast
+→`script` (pre-masked `***` text + secret values carried for snippet
+masking), deploy steps→`deploy`, backup runs→`backup`, monitor
+cleanDisk/dropCaches→`monitor`, replay→`exec` (chainable). The `ssh.exec`
+audit row is now redacted the same way as history (spec 15 §8).
+`ai.provider.set` audits with target `-` (app-level convention).
+
+**`src/scripts.zig` / `src/broadcast.zig`:** `Expansion.secrets` /
+`Run.secrets` — owned secret variable VALUES, freed on deinit (guarded:
+the empty case is the comptime `.empty` slice, never freed — the
+comptime-literal-free pitfall again).
+
+**Tests:** 9 history unit (redaction fixtures incl. exactMask
+longest-match, ring compaction with a shrunk cap, dedupe-by-op-id on
+record AND on reload, persistence across store instances, legacy journal
+load, audit list/clear); 1 dispatcher suite (record/list round trip +
+redaction, dedupe, replay unknown/redacted/not-connected, audit
+list/type/q filters, CLEAR gate); 1 container integration
+(`src/integration_history.zig`): exec with exit 0 + snippet, failing
+exec exit 1, `PASSWORD=` masked in history AND audit files, script run
+with a secret var — value absent from history file INCLUDING the echoed
+output snippet, replay re-runs the marker command (chainable entry),
+redacted replay refused, audit clear gate. The snippet-secret case was a
+real bug the test caught: the echoed secret value survived in the stored
+snippet — fixed with exact-value snippet masking.
+
+### 22.2 Pitfalls / notes
+
+- **Snippet redaction is mandatory.** Masking only the command leaves
+  the secret in the output snippet (`echo {{pw}}` prints the value).
+  Any operation whose output can echo its secrets must carry them to the
+  capture hook.
+- **`toOwnedSlice` on a never-append'd list returns the comptime
+  `.empty` slice** — freeing it crashes (extend §7 pitfall 13's family).
+  Guard deinit frees with `len > 0`.
+- **Test-only:** ids from a parsed bridge response alias the parse tree —
+  re-resolve them from a LIVE parse after any re-dispatch, or they
+  dangle into freed memory (hit twice this session).
+- The keys/access/vnc container tests flaked once mid-session
+  (accumulated container state — the documented pattern); the next full
+  run passed. Not code.
+- Known flake observed at 164/165 once (sshkeys.generate dispatcher
+  test) — passed on the immediate rerun with no code change; watching.
+
+### 22.3 Known limits / next
+
+- Shell integration (OSC 633 + versioned remote scripts) is NOT landed —
+  that is the interactive-capture half of spec 15, frontend+resources
+  work; until it lands the UI must label coverage `app commands only`.
+- History/audit UI (views, filters, palette, export CSV via spec 17).
+- Spec 14 (groups) is next per the agreed order.

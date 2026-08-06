@@ -52,6 +52,12 @@ pub const Run = struct {
     script_name: []const u8,
     /// Owned expanded command.
     command: []const u8,
+    /// Owned copy of the command with secret values masked (spec 15: the
+    /// history record for each server's run uses this text).
+    redacted_command: []const u8 = "",
+    /// Owned secret variable values (spec 15: history masks the output
+    /// snippet with the exact values the operation knew).
+    secrets: [][]const u8 = &.{},
     servers: std.ArrayList(ServerState) = .empty,
     /// Index of the next queued server to start.
     next_to_start: usize = 0,
@@ -64,6 +70,13 @@ pub const Run = struct {
         allocator.free(self.script_id);
         allocator.free(self.script_name);
         allocator.free(self.command);
+        allocator.free(self.redacted_command);
+        // Empty (the common case) is the `.empty` comptime slice — only
+        // owned when the run actually carries secrets.
+        if (self.secrets.len > 0) {
+            for (self.secrets) |s| allocator.free(s);
+            allocator.free(self.secrets);
+        }
         for (self.servers.items) |*s| s.deinit(allocator);
         self.servers.deinit(allocator);
     }
@@ -113,6 +126,8 @@ pub const Runs = struct {
         script_id: []const u8,
         script_name: []const u8,
         command: []const u8,
+        redacted_command: []const u8,
+        secrets: []const []const u8,
         server_ids: []const []const u8,
     ) !u32 {
         var run = Run{
@@ -120,8 +135,19 @@ pub const Runs = struct {
             .script_id = try self.allocator.dupe(u8, script_id),
             .script_name = try self.allocator.dupe(u8, script_name),
             .command = try self.allocator.dupe(u8, command),
+            .redacted_command = try self.allocator.dupe(u8, redacted_command),
         };
         errdefer run.deinit(self.allocator);
+        var secret_list: std.ArrayList([]const u8) = .empty;
+        defer secret_list.deinit(self.allocator);
+        for (secrets) |s| {
+            const owned = try self.allocator.dupe(u8, s);
+            secret_list.append(self.allocator, owned) catch {
+                self.allocator.free(owned);
+                return error.OutOfMemory;
+            };
+        }
+        run.secrets = secret_list.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
         self.next_id +%= 1;
         for (server_ids) |sid| {
             var dup = false;
@@ -185,7 +211,7 @@ test "start dedupes server ids and orders queued work" {
     runs.lock();
     defer runs.unlock();
 
-    const id = try runs.start("sc1", "disk cleanup", "rm -rf /tmp/{{d}}", &.{ "s1", "s2", "s1", "s3" });
+    const id = try runs.start("sc1", "disk cleanup", "rm -rf /tmp/{{d}}", "", &.{}, &.{ "s1", "s2", "s1", "s3" });
     const run = runs.get(id).?;
     try testing.expectEqual(@as(usize, 3), run.servers.items.len);
     try testing.expectEqualStrings("s1", run.servers.items[0].server_id);
@@ -200,7 +226,7 @@ test "status transitions and terminal accounting" {
     runs.lock();
     defer runs.unlock();
 
-    const id = try runs.start("sc1", "x", "echo hi", &.{ "s1", "s2" });
+    const id = try runs.start("sc1", "x", "echo hi", "", &.{}, &.{ "s1", "s2" });
     const run = runs.get(id).?;
     run.servers.items[0].status = .running;
     run.running = 1;
@@ -224,7 +250,7 @@ test "cancel marks queued servers and keeps terminal statuses" {
     runs.lock();
     defer runs.unlock();
 
-    const id = try runs.start("sc1", "x", "sleep 30", &.{ "s1", "s2", "s3" });
+    const id = try runs.start("sc1", "x", "sleep 30", "", &.{}, &.{ "s1", "s2", "s3" });
     const run = runs.get(id).?;
     run.servers.items[0].status = .running;
     run.running = 1;
@@ -249,7 +275,7 @@ test "finished runs evict beyond the bounded history" {
 
     var i: usize = 0;
     while (i < max_completed_runs + 4) : (i += 1) {
-        const id = try runs.start("sc1", "x", "echo hi", &.{"s1"});
+        const id = try runs.start("sc1", "x", "echo hi", "", &.{}, &.{"s1"});
         runs.get(id).?.finished = true;
     }
     try testing.expectEqual(max_completed_runs + 4, runs.list.items.len);

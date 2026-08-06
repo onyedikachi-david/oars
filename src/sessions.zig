@@ -11,7 +11,7 @@ const ssh = @import("ssh.zig");
 const servers = @import("servers.zig");
 const openssh = @import("openssh.zig");
 const monitor = @import("monitor.zig");
-const audit = @import("audit.zig");
+const history = @import("history.zig");
 const logs = @import("logs.zig");
 const sftpmod = @import("sftp.zig");
 const shellquote = @import("shellquote.zig");
@@ -171,6 +171,18 @@ pub const ChannelEntry = struct {
     /// Exec command text; allocated by the manager, freed at session
     /// teardown (or when the completed exec is evicted).
     command: []const u8 = "",
+    /// Spec 15: non-null means this channel's completion is recorded in
+    /// command history under this kind (`exec|script|deploy|backup|…`).
+    /// Owned by the entry; freed with the command text.
+    history_kind: ?[]const u8 = null,
+    /// Optional pre-redacted command text to record (the executed command
+    /// is recorded when null). Owned by the entry.
+    history_command: ?[]const u8 = null,
+    /// Known secret values (owned array of owned strings) — the command
+    /// and the output snippet are masked with them at capture.
+    history_secrets: ?[][]const u8 = null,
+    /// Monotonic time the channel opened (duration for history).
+    started_ns: i128 = 0,
     stream: *Stream,
     raw: *ssh.Channel,
     stdin_mutex: std.atomic.Mutex = .unlocked,
@@ -182,10 +194,35 @@ pub const ChannelEntry = struct {
     /// Worker-internal channel (monitor probe): never exposed in polls;
     /// its output is consumed by the worker at EOF.
     internal: bool = false,
+
+    /// Frees the command text and the optional history strings. Every
+    /// path that drops an entry (eviction, close, teardown) must call
+    /// this instead of freeing `command` alone.
+    pub fn freeCommandText(self: *ChannelEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.command);
+        if (self.history_kind) |hk| allocator.free(hk);
+        if (self.history_command) |hc| allocator.free(hc);
+        if (self.history_secrets) |hs| {
+            for (hs) |s| allocator.free(s);
+            allocator.free(hs);
+        }
+    }
 };
 
 const Op = union(enum) {
-    exec: struct { id: u32, command: []const u8 },
+    exec: struct {
+        id: u32,
+        command: []const u8,
+        /// Spec 15: when non-null the completed run is recorded in
+        /// command history under this kind. Owned by the op; the channel
+        /// entry takes them over (or frees them) when the op runs.
+        history_kind: ?[]const u8 = null,
+        history_command: ?[]const u8 = null,
+        /// Known secret values of the operation (spec 15: the stored
+        /// command AND the output snippet are masked with them). Owned
+        /// array of owned strings.
+        history_secrets: ?[][]const u8 = null,
+    },
     follow: struct { id: u32, command: []const u8 },
     resize: struct { cols: c_int, rows: c_int },
     close,
@@ -506,7 +543,10 @@ pub const Session = struct {
     io: std.Io,
     transport: ssh.Session,
     store: *servers.Store,
-    audit: *audit.Store,
+    audit: *history.AuditStore,
+    /// Spec 15 command history; the worker records completed tracked
+    /// execs here at channel EOF.
+    history: *history.HistoryStore,
     status: std.atomic.Value(Status) = .init(.connecting),
     error_mutex: std.atomic.Mutex = .unlocked,
     error_msg: [error_buf_len]u8 = undefined,
@@ -550,6 +590,9 @@ pub const Session = struct {
     /// owns each tunnel's lifecycle.
     tunnels_mutex: std.atomic.Mutex = .unlocked,
     tunnels: std.ArrayList(*Tunnel) = .empty,
+    /// Monotonic counter for history operation ids (`exec-<n>`); the
+    /// worker is the only writer.
+    history_seq: u64 = 0,
 
     pub fn setError(self: *Session, msg: []const u8) void {
         lockSpin(&self.error_mutex);
@@ -582,7 +625,8 @@ pub const Session = struct {
 pub const Manager = struct {
     allocator: std.mem.Allocator,
     store: *servers.Store,
-    audit: *audit.Store,
+    audit: *history.AuditStore,
+    history: *history.HistoryStore,
     io: std.Io,
     /// Borrowed from the process environment (outlives the manager);
     /// used to expand "~/" in key paths on the worker threads.
@@ -603,11 +647,12 @@ pub const Manager = struct {
     /// the manager owns the registry and its memory.
     deploys: deploy.Runs = .{},
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, store: *servers.Store, audit_store: *audit.Store, home: ?[]const u8) Manager {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, store: *servers.Store, audit_store: *history.AuditStore, history_store: *history.HistoryStore, home: ?[]const u8) Manager {
         var self: Manager = .{
             .allocator = allocator,
             .store = store,
             .audit = audit_store,
+            .history = history_store,
             .io = io,
             .home = home,
             .sessions = std.StringHashMap(*Session).init(allocator),
@@ -656,6 +701,7 @@ pub const Manager = struct {
             .transport = try ssh.Session.init(self.allocator),
             .store = self.store,
             .audit = self.audit,
+            .history = self.history,
             .monitor_interval_ns = self.monitor_interval_ns,
             .monitor_liveness_ns = self.monitor_liveness_ns,
             .started_at_ns = std.Io.Timestamp.now(self.io, .real).nanoseconds,
@@ -730,7 +776,10 @@ pub const Manager = struct {
     }
 
     /// Queues an exec on a fresh channel. Returns the channel id that
-    /// will carry the output (assigned by the worker).
+    /// will carry the output (assigned by the worker). Untracked: the
+    /// completed run is NOT recorded in command history (internal
+    /// plumbing such as probes and checks — use `execTracked` for
+    /// user-visible commands).
     pub fn exec(self: *Manager, server_id: []const u8, command: []const u8) !u32 {
         const session = self.get(server_id) orelse return error.NoSession;
         if (session.status.load(.acquire) != .ready) return error.NotReady;
@@ -740,6 +789,47 @@ pub const Manager = struct {
         lockSpin(&session.ops_mutex);
         defer session.ops_mutex.unlock();
         try session.ops.append(self.allocator, .{ .exec = .{ .id = id, .command = owned } });
+        return id;
+    }
+
+    /// Queues a tracked exec (spec 15): the completed run is recorded in
+    /// command history under `history_kind`. `history_command` (optional)
+    /// is pre-redacted command text to store — used when the operation
+    /// masks secret values itself (scripts); the executed command is
+    /// recorded otherwise. `history_secrets` are the operation's known
+    /// secret values, used to mask the stored command AND the output
+    /// snippet at capture.
+    pub fn execTracked(self: *Manager, server_id: []const u8, command: []const u8, history_kind: []const u8, history_command: ?[]const u8, history_secrets: []const []const u8) !u32 {
+        const session = self.get(server_id) orelse return error.NoSession;
+        if (session.status.load(.acquire) != .ready) return error.NotReady;
+        const id = session.next_channel_id.fetchAdd(1, .monotonic);
+        const owned = try self.allocator.dupe(u8, command);
+        errdefer self.allocator.free(owned);
+        const owned_kind = try self.allocator.dupe(u8, history_kind);
+        errdefer self.allocator.free(owned_kind);
+        const owned_hc: ?[]const u8 = if (history_command) |hc| try self.allocator.dupe(u8, hc) else null;
+        errdefer if (owned_hc) |hc| self.allocator.free(hc);
+        const owned_secrets: ?[][]const u8 = if (history_secrets.len > 0) blk: {
+            const arr = try self.allocator.alloc([]const u8, history_secrets.len);
+            errdefer self.allocator.free(arr);
+            for (history_secrets, 0..) |s, i| {
+                arr[i] = try self.allocator.dupe(u8, s);
+            }
+            break :blk arr;
+        } else null;
+        errdefer if (owned_secrets) |hs| {
+            for (hs) |s| self.allocator.free(s);
+            self.allocator.free(hs);
+        };
+        lockSpin(&session.ops_mutex);
+        defer session.ops_mutex.unlock();
+        try session.ops.append(self.allocator, .{ .exec = .{
+            .id = id,
+            .command = owned,
+            .history_kind = owned_kind,
+            .history_command = owned_hc,
+            .history_secrets = owned_secrets,
+        } });
         return id;
     }
 
@@ -1613,13 +1703,18 @@ fn workerMain(session: *Session) void {
                         session.channels_mutex.unlock();
                         if (still) {
                             entry.stdin_queue.deinit(allocator);
-                            allocator.free(entry.command);
+                            entry.freeCommandText(allocator);
                             entry.stream.deinit(allocator);
                             allocator.destroy(entry.stream);
                             allocator.destroy(entry);
                             continue;
                         }
                     } else if (entry.kind == .exec or entry.kind == .log) {
+                        // Spec 15: a completed tracked exec lands in
+                        // command history with exit, duration, and a
+                        // bounded output snippet before eviction may
+                        // free the entry.
+                        if (entry.kind == .exec and entry.history_kind != null) recordExecHistory(session, entry);
                         evictCompletedExecs(session);
                     }
                     i += 1;
@@ -1691,12 +1786,80 @@ fn evictCompletedExecs(session: *Session) void {
         const entry = session.channels.items[i];
         _ = session.channels.orderedRemove(i);
         entry.stdin_queue.deinit(session.allocator);
-        session.allocator.free(entry.command);
+        entry.freeCommandText(session.allocator);
         entry.stream.deinit(session.allocator);
         session.allocator.destroy(entry.stream);
         session.allocator.destroy(entry);
         completed -= 1;
     }
+}
+
+/// Spec 15 capture: records a completed tracked exec in command history.
+/// Runs on the worker at channel EOF, so it owns the stream data and the
+/// command text; everything the store needs is duplicated into the entry.
+/// Failures are dropped like audit appends (the log must never take the
+/// session down); the index stays consistent because record is atomic.
+fn recordExecHistory(session: *Session, entry: *ChannelEntry) void {
+    const allocator = session.allocator;
+    const kind = entry.history_kind orelse return;
+    const raw_command = entry.history_command orelse entry.command;
+    const secrets = entry.history_secrets orelse &.{};
+    const redacted = history.redact(allocator, raw_command, secrets) catch return;
+    defer allocator.free(redacted.text);
+    const now = std.Io.Timestamp.now(session.io, .real).nanoseconds;
+    const duration_ms: ?i64 = if (entry.started_ns > 0)
+        @intCast(@max(0, @divTrunc(now - entry.started_ns, std.time.ns_per_ms)))
+    else
+        null;
+    // First two lines of output, bounded. The snippet is masked with the
+    // operation's exact secret values (the script's echoed value must not
+    // survive in stored text); patterns never apply to program output.
+    var snippet_buf: [history.snippet_cap]u8 = undefined;
+    const snippet_len = historySnippet(entry, &snippet_buf);
+    var snippet_owned: []u8 = undefined;
+    var snippet_redacted = false;
+    if (secrets.len > 0) {
+        const r = history.exactMask(allocator, snippet_buf[0..snippet_len], secrets) catch return;
+        snippet_owned = r.text;
+        snippet_redacted = r.redacted;
+    } else {
+        snippet_owned = allocator.dupe(u8, snippet_buf[0..snippet_len]) catch return;
+    }
+    defer allocator.free(snippet_owned);
+    var op_buf: [64]u8 = undefined;
+    const op_id = std.fmt.bufPrint(&op_buf, "exec-{d}", .{session.history_seq}) catch return;
+    session.history_seq += 1;
+    session.history.record(session.io, .{
+        .id = "",
+        .operation_id = op_id,
+        .ts = @intCast(now),
+        .server_id = session.server.id,
+        .kind = kind,
+        .command = redacted.text,
+        .exit = entry.stream.exit_status,
+        .duration_ms = duration_ms,
+        .output_snippet = snippet_owned,
+        .redacted = redacted.redacted or entry.history_command != null or snippet_redacted,
+    }) catch {};
+}
+
+/// Copies the first two lines of the stream into `buf`, trimmed of
+/// trailing whitespace. Returns the length.
+fn historySnippet(entry: *ChannelEntry, buf: []u8) usize {
+    lockSpin(&entry.stream.mutex);
+    defer entry.stream.mutex.unlock();
+    const data = entry.stream.data.items;
+    var end: usize = 0;
+    var lines: usize = 0;
+    while (end < data.len and lines < 2) {
+        if (data[end] == '\n') lines += 1;
+        end += 1;
+    }
+    const cap = @min(end, buf.len);
+    if (cap > 0) @memcpy(buf[0..cap], data[0..cap]);
+    var len = cap;
+    while (len > 0 and (buf[len - 1] == '\n' or buf[len - 1] == '\r' or buf[len - 1] == ' ' or buf[len - 1] == '\t')) len -= 1;
+    return len;
 }
 
 /// Opens an internal channel and runs the probe command on it. The entry
@@ -1773,12 +1936,7 @@ fn drainProbe(session: *Session, entry: *ChannelEntry) void {
             "after drop_caches: mem_used_bytes={d} mem_available_bytes={d}",
             .{ result.snapshot.mem.used_bytes, result.snapshot.mem.available_bytes },
         ) catch "after drop_caches";
-        session.audit.append(session.io, .{
-            .ts = result.snapshot.ts,
-            .action = "monitor.drop_caches.after",
-            .server_id = session.server.id,
-            .detail = detail,
-        }) catch {};
+        session.audit.append(session.io, "monitor.drop_caches.after", session.server.id, detail) catch {};
     }
 }
 
@@ -1835,13 +1993,13 @@ fn processOps(session: *Session) void {
                     entry.raw.close(session.io);
                 }
                 entry.stdin_queue.deinit(allocator);
-                allocator.free(entry.command);
+                entry.freeCommandText(allocator);
                 entry.stream.deinit(allocator);
                 allocator.destroy(entry.stream);
                 allocator.destroy(entry);
             },
-            .exec => |e| tryOpenChannel(session, e.id, .exec, e.command),
-            .follow => |f| tryOpenChannel(session, f.id, .log, f.command),
+            .exec => |e| tryOpenChannel(session, e.id, .exec, e.command, e.history_kind, e.history_command, e.history_secrets),
+            .follow => |f| tryOpenChannel(session, f.id, .log, f.command, null, null, null),
             .clear => |cl| clearLogFile(session, cl.path, cl.expected, cl.outcome),
             .sftp_ls => |so| sftpOpLs(session, so.path, so.outcome),
             .sftp_stat => |so| sftpOpStat(session, so.path, so.outcome),
@@ -2296,40 +2454,65 @@ fn handshakeErrorText(err: wsmod.HandshakeError) []const u8 {
 }
 
 /// Shared exec-channel creation for one-shot execs and follow channels.
-fn tryOpenChannel(session: *Session, id: u32, kind: ChannelKind, command: []const u8) void {
+/// Opens an exec channel and registers it. Takes ownership of `command`,
+/// the optional history strings, and the optional secret values on every
+/// path: the entry frees them at eviction/close/teardown, the failure
+/// paths free them here.
+fn tryOpenChannel(session: *Session, id: u32, kind: ChannelKind, command: []const u8, history_kind: ?[]const u8, history_command: ?[]const u8, history_secrets: ?[][]const u8) void {
     const allocator = session.allocator;
     const raw = session.transport.openChannel(session.io) catch {
-        allocator.free(command);
+        freeChannelPayload(allocator, command, history_kind, history_command, history_secrets);
         return;
     };
     raw.exec(session.io, command) catch {
         raw.close(session.io);
-        allocator.free(command);
+        freeChannelPayload(allocator, command, history_kind, history_command, history_secrets);
         return;
     };
     const stream = allocator.create(Stream) catch {
         raw.close(session.io);
-        allocator.free(command);
+        freeChannelPayload(allocator, command, history_kind, history_command, history_secrets);
         return;
     };
     stream.* = Stream.init(allocator);
     const entry = allocator.create(ChannelEntry) catch {
         allocator.destroy(stream);
         raw.close(session.io);
-        allocator.free(command);
+        freeChannelPayload(allocator, command, history_kind, history_command, history_secrets);
         return;
     };
-    entry.* = .{ .id = id, .kind = kind, .command = command, .stream = stream, .raw = raw };
+    entry.* = .{
+        .id = id,
+        .kind = kind,
+        .command = command,
+        .history_kind = history_kind,
+        .history_command = history_command,
+        .history_secrets = history_secrets,
+        .started_ns = std.Io.Timestamp.now(session.io, .real).nanoseconds,
+        .stream = stream,
+        .raw = raw,
+    };
     lockSpin(&session.channels_mutex);
     session.channels.append(allocator, entry) catch {
         session.channels_mutex.unlock();
+        entry.freeCommandText(allocator);
         allocator.destroy(entry);
         allocator.destroy(stream);
         raw.close(session.io);
-        allocator.free(command);
         return;
     };
     session.channels_mutex.unlock();
+}
+
+/// Frees the channel-op payload strings on a failed open.
+fn freeChannelPayload(allocator: std.mem.Allocator, command: []const u8, history_kind: ?[]const u8, history_command: ?[]const u8, history_secrets: ?[][]const u8) void {
+    allocator.free(command);
+    if (history_kind) |hk| allocator.free(hk);
+    if (history_command) |hc| allocator.free(hc);
+    if (history_secrets) |hs| {
+        for (hs) |s| allocator.free(s);
+        allocator.free(hs);
+    }
 }
 
 /// Bounded EAGAIN wait for SFTP calls (deadline + stop-aware). Returns
@@ -2461,12 +2644,7 @@ fn clearLogFile(session: *Session, path: []const u8, expected: ClearExpected, ou
 
     var detail_buf: [256]u8 = undefined;
     const detail = std.fmt.bufPrint(&detail_buf, "before_size={d} after_size=0", .{before}) catch "logs.clear";
-    session.audit.append(session.io, .{
-        .ts = @intCast(std.Io.Timestamp.now(session.io, .real).nanoseconds),
-        .action = "logs.clear",
-        .server_id = session.server.id,
-        .detail = detail,
-    }) catch {};
+    session.audit.append(session.io, "logs.clear", session.server.id, detail) catch {};
 
     lockSpin(&outcome.mutex);
     outcome.ok = true;
@@ -2510,12 +2688,7 @@ fn sftpSetJson(session: *Session, outcome: *SftpOutcome, payload: anytype) void 
 }
 
 fn sftpAudit(session: *Session, action: []const u8, detail: []const u8) void {
-    session.audit.append(session.io, .{
-        .ts = @intCast(std.Io.Timestamp.now(session.io, .real).nanoseconds),
-        .action = action,
-        .server_id = session.server.id,
-        .detail = detail,
-    }) catch {};
+    session.audit.append(session.io, action, session.server.id, detail) catch {};
 }
 
 /// EAGAIN-bounded open; null on failure.
@@ -3729,7 +3902,15 @@ fn sessionDone(session: *Session) void {
     lockSpin(&session.ops_mutex);
     for (session.ops.items) |op| {
         switch (op) {
-            .exec => |e| session.allocator.free(e.command),
+            .exec => |e| {
+                session.allocator.free(e.command);
+                if (e.history_kind) |hk| session.allocator.free(hk);
+                if (e.history_command) |hc| session.allocator.free(hc);
+                if (e.history_secrets) |hs| {
+                    for (hs) |s| session.allocator.free(s);
+                    session.allocator.free(hs);
+                }
+            },
             .follow => |f| session.allocator.free(f.command),
             .clear => |cl| session.allocator.free(cl.path),
             .sftp_ls => |so| session.allocator.free(so.path),
@@ -3779,7 +3960,7 @@ fn sessionDone(session: *Session) void {
     for (session.channels.items) |entry| {
         if (!entry.raw_closed) entry.raw.close(session.io);
         entry.stdin_queue.deinit(session.allocator);
-        if (entry.kind == .exec or entry.kind == .log) session.allocator.free(entry.command);
+        entry.freeCommandText(session.allocator);
         entry.stream.deinit(session.allocator);
         session.allocator.destroy(entry.stream);
         session.allocator.destroy(entry);

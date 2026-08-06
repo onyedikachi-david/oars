@@ -10,7 +10,7 @@ const native_sdk = @import("native_sdk");
 const servers = @import("servers.zig");
 const sessions = @import("sessions.zig");
 const monitor = @import("monitor.zig");
-const audit = @import("audit.zig");
+const history = @import("history.zig");
 const json = @import("json.zig");
 const logs = @import("logs.zig");
 const shellquote = @import("shellquote.zig");
@@ -27,14 +27,15 @@ const backup = @import("backup.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 87;
+const handler_count = 92;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     store: *servers.Store,
     manager: *sessions.Manager,
-    audit: *audit.Store,
+    audit: *history.AuditStore,
+    history: *history.HistoryStore,
     logs: *logs.SourceStore,
     scripts: *scripts.Store,
     apps: *deploy.AppStore,
@@ -134,6 +135,11 @@ pub const Context = struct {
             .{ .name = "oars.vnc.probe", .context = self, .invoke_fn = handleVncProbe },
             .{ .name = "oars.vnc.setup", .context = self, .invoke_fn = handleVncSetup },
             .{ .name = "oars.vnc.poll", .context = self, .invoke_fn = handleVncPoll },
+            .{ .name = "oars.history.record", .context = self, .invoke_fn = handleHistoryRecord },
+            .{ .name = "oars.history.list", .context = self, .invoke_fn = handleHistoryList },
+            .{ .name = "oars.history.replay", .context = self, .invoke_fn = handleHistoryReplay },
+            .{ .name = "oars.audit.list", .context = self, .invoke_fn = handleAuditList },
+            .{ .name = "oars.audit.clear", .context = self, .invoke_fn = handleAuditClear },
         };
         self.policies = .{
             .{ .name = "oars.servers.list", .origins = &allowed_origins },
@@ -223,6 +229,11 @@ pub const Context = struct {
             .{ .name = "oars.vnc.probe", .origins = &allowed_origins },
             .{ .name = "oars.vnc.setup", .origins = &allowed_origins },
             .{ .name = "oars.vnc.poll", .origins = &allowed_origins },
+            .{ .name = "oars.history.record", .origins = &allowed_origins },
+            .{ .name = "oars.history.list", .origins = &allowed_origins },
+            .{ .name = "oars.history.replay", .origins = &allowed_origins },
+            .{ .name = "oars.audit.list", .origins = &allowed_origins },
+            .{ .name = "oars.audit.clear", .origins = &allowed_origins },
         };
         return .{
             .policy = .{ .enabled = true, .commands = &self.policies },
@@ -561,7 +572,7 @@ fn handleSshExec(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
         return respondError(output, "invalid payload");
     };
     defer parsed.deinit();
-    const channel_id = self.manager.exec(parsed.value.server_id, parsed.value.command) catch |err| {
+    const channel_id = self.manager.execTracked(parsed.value.server_id, parsed.value.command, "exec", null, &.{}) catch |err| {
         return respondError(output, switch (err) {
             error.NoSession => "not connected",
             error.NotReady => "session not ready",
@@ -569,9 +580,15 @@ fn handleSshExec(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
         });
     };
     // Spec 11: every executed command is logged; the AI panel's history
-    // is the audit-filtered view of these entries.
+    // is the audit-filtered view of these entries. Spec 15 §8: the audit
+    // row is redacted the same way as history — secret values never
+    // written.
+    const redacted_audit = history.redact(self.allocator, parsed.value.command, &.{}) catch {
+        return respondError(output, "out of memory");
+    };
+    defer self.allocator.free(redacted_audit.text);
     var detail_buf: [256]u8 = undefined;
-    const cmd = if (parsed.value.command.len > ai.audit_cmd_cap) parsed.value.command[0..ai.audit_cmd_cap] else parsed.value.command;
+    const cmd = if (redacted_audit.text.len > ai.audit_cmd_cap) redacted_audit.text[0..ai.audit_cmd_cap] else redacted_audit.text;
     const detail = std.fmt.bufPrint(&detail_buf, "cmd={s}", .{cmd}) catch "ssh.exec";
     sshkeysAudit(self, "ssh.exec", parsed.value.server_id, detail);
     var writer = std.Io.Writer.fixed(output);
@@ -1045,7 +1062,7 @@ fn handleMonitorCleanDisk(context: *anyopaque, invocation: native_sdk.bridge.Inv
     const plan = monitor.DiskPlan.fromJsonName(parsed.value.plan) orelse {
         return respondError(output, "unknown disk plan");
     };
-    const channel_id = self.manager.exec(parsed.value.server_id, plan.command()) catch |err| {
+    const channel_id = self.manager.execTracked(parsed.value.server_id, plan.command(), "monitor", null, &.{}) catch |err| {
         return respondError(output, switch (err) {
             error.NoSession => "not connected",
             error.NotReady => "session not ready",
@@ -1054,12 +1071,7 @@ fn handleMonitorCleanDisk(context: *anyopaque, invocation: native_sdk.bridge.Inv
     };
     var detail_buf: [64]u8 = undefined;
     const detail = std.fmt.bufPrint(&detail_buf, "plan={s}", .{plan.jsonName()}) catch "plan";
-    self.audit.append(self.io, .{
-        .ts = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds),
-        .action = "monitor.clean_disk",
-        .server_id = parsed.value.server_id,
-        .detail = detail,
-    }) catch {
+    self.audit.append(self.io, "monitor.clean_disk", parsed.value.server_id, detail) catch {
         return respondError(output, "cleanup ran but the audit entry could not be written");
     };
     var writer = std.Io.Writer.fixed(output);
@@ -1099,7 +1111,7 @@ fn handleMonitorDropCaches(context: *anyopaque, invocation: native_sdk.bridge.In
     const command = std.fmt.bufPrint(&cmd_buf, monitor.drop_cache_command, .{level}) catch {
         return respondError(output, "invalid drop-caches level");
     };
-    const channel_id = self.manager.exec(parsed.value.server_id, command) catch |err| {
+    const channel_id = self.manager.execTracked(parsed.value.server_id, command, "monitor", null, &.{}) catch |err| {
         return respondError(output, switch (err) {
             error.NoSession => "not connected",
             error.NotReady => "session not ready",
@@ -1113,12 +1125,7 @@ fn handleMonitorDropCaches(context: *anyopaque, invocation: native_sdk.bridge.In
         "level={d} before_mem_used_bytes={d} before_mem_available_bytes={d}",
         .{ level, before.mem.used_bytes, before.mem.available_bytes },
     ) catch "drop_caches";
-    self.audit.append(self.io, .{
-        .ts = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds),
-        .action = "monitor.drop_caches",
-        .server_id = parsed.value.server_id,
-        .detail = detail,
-    }) catch {
+    self.audit.append(self.io, "monitor.drop_caches", parsed.value.server_id, detail) catch {
         return respondError(output, "drop-caches ran but the audit entry could not be written");
     };
     session.monitor_drop_pending.store(true, .release);
@@ -2104,12 +2111,7 @@ fn scriptsAudit(self: *Context, output: []u8, action: []const u8, server_id: []c
     const redacted = if (expansion.redacted.len > 1000) expansion.redacted[0..1000] else expansion.redacted;
     var detail_buf: [1800]u8 = undefined;
     const detail = std.fmt.bufPrint(&detail_buf, "script={s} name={s} vars={s} command={s}", .{ script.id, script.name, names_buf.items, redacted }) catch "scripts.run";
-    self.audit.append(self.io, .{
-        .ts = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds),
-        .action = action,
-        .server_id = server_id,
-        .detail = detail,
-    }) catch return respondError(output, "audit failed");
+    self.audit.append(self.io, action, server_id, detail) catch return respondError(output, "audit failed");
     return null;
 }
 
@@ -2287,7 +2289,8 @@ fn handleScriptsRun(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
         const msg = std.fmt.bufPrint(&msg_buf, "syntax check failed (exit {d}): {s}", .{ check.exit, tail }) catch "syntax check failed";
         return respondError(output, msg);
     }
-    const channel = self.manager.exec(payload.server_id, expansion.command) catch |err| {
+    const redacted_command: ?[]const u8 = if (std.mem.eql(u8, expansion.command, expansion.redacted)) null else expansion.redacted;
+    const channel = self.manager.execTracked(payload.server_id, expansion.command, "script", redacted_command, expansion.secrets) catch |err| {
         return respondError(output, switch (err) {
             error.NoSession => "not connected",
             error.NotReady => "session not ready",
@@ -2344,7 +2347,7 @@ fn handleScriptsBroadcast(context: *anyopaque, invocation: native_sdk.bridge.Inv
     var expansion = scriptsPrepare(self, output, &err_response, "scripts.broadcast", payload.server_ids, payload.script_id, payload.vars) orelse return err_response;
     defer expansion.deinit(self.allocator);
 
-    const run_id = self.manager.broadcasts.start(payload.script_id, "", expansion.command, payload.server_ids) catch |err| {
+    const run_id = self.manager.broadcasts.start(payload.script_id, "", expansion.command, expansion.redacted, expansion.secrets, payload.server_ids) catch |err| {
         return respondError(output, switch (err) {
             error.NoServers => "no servers selected",
             else => "out of memory",
@@ -2402,7 +2405,8 @@ fn handleScriptsBroadcastPoll(context: *anyopaque, invocation: native_sdk.bridge
         run.next_to_start += 1;
         const server = &run.servers.items[idx];
         if (!scriptsCheckSyntax(self, server, run.command)) continue;
-        const channel = self.manager.exec(server.server_id, run.command) catch {
+        const redacted_command: ?[]const u8 = if (std.mem.eql(u8, run.command, run.redacted_command)) null else run.redacted_command;
+        const channel = self.manager.execTracked(server.server_id, run.command, "script", redacted_command, run.secrets) catch {
             server.status = .skipped;
             server.err = "unreachable";
             continue;
@@ -2658,12 +2662,7 @@ fn deployAudit(self: *Context, output: []u8, action: []const u8, server_id: []co
         writer.writeAll(cmd) catch return respondError(output, "out of memory");
         if (writer.buffered().len > 3800) break;
     }
-    self.audit.append(self.io, .{
-        .ts = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds),
-        .action = action,
-        .server_id = server_id,
-        .detail = writer.buffered(),
-    }) catch return respondError(output, "audit failed");
+    self.audit.append(self.io, action, server_id, writer.buffered()) catch return respondError(output, "audit failed");
     return null;
 }
 
@@ -2860,7 +2859,7 @@ fn deployPollStep(self: *Context, run: *deploy.Run, now_ns: i128) void {
             self.deploy_history.append(self.io, run);
             return;
         }
-        const channel = self.manager.exec(run.server_id, step.command) catch {
+        const channel = self.manager.execTracked(run.server_id, step.command, "deploy", null, &.{}) catch {
             step.@"error" = "session lost";
             step.state = .failed;
             run.status = .interrupted;
@@ -3004,12 +3003,7 @@ fn handleDeployCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocat
         if (step.channel) |ch| self.manager.closeChannel(server_id, ch) catch {};
     }
     self.manager.deploys.unlock();
-    self.audit.append(self.io, .{
-        .ts = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds),
-        .action = "deploy.cancel",
-        .server_id = server_id,
-        .detail = "run canceled by the user",
-    }) catch {};
+    self.audit.append(self.io, "deploy.cancel", server_id, "run canceled by the user") catch {};
     return ok_json;
 }
 
@@ -3331,12 +3325,7 @@ fn sshkeysFindTarget(parsed: *const sshkeys.ParsedFile, fingerprint: []const u8,
 }
 
 fn sshkeysAudit(self: *Context, action: []const u8, server_id: []const u8, detail: []const u8) void {
-    self.audit.append(self.io, .{
-        .ts = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds),
-        .action = action,
-        .server_id = server_id,
-        .detail = detail,
-    }) catch {};
+    self.audit.append(self.io, action, server_id, detail) catch {};
 }
 
 /// The read-only role's authorized-key options, from the roles marker
@@ -5593,7 +5582,7 @@ fn handleBackupRun(context: *anyopaque, invocation: native_sdk.bridge.Invocation
     // captures stdout only, so merge the streams or the run log stays
     // empty and no stats are ever parsed.
     const full = std.fmt.bufPrint(&full_buf, "{s} --use-json-log --stats 1s --stats-log-level NOTICE 2>&1", .{invocation_cmd}) catch return respondError(output, "out of memory");
-    const channel = self.manager.exec(payload.server_id, full) catch {
+    const channel = self.manager.execTracked(payload.server_id, full, "backup", null, &.{}) catch {
         _ = backupCheck(self, payload.server_id, std.fmt.bufPrint(&ts_buf, "rm -f {s}", .{cfg}) catch "true");
         return respondError(output, "not connected");
     };
@@ -6046,7 +6035,7 @@ fn handleAiProviderSet(context: *anyopaque, invocation: native_sdk.bridge.Invoca
     defer saved.deinit(self.allocator);
     var detail_buf: [128]u8 = undefined;
     const detail = std.fmt.bufPrint(&detail_buf, "adapter={s} model={s}", .{ saved.adapter.jsonName(), saved.model }) catch "ai.provider.set";
-    sshkeysAudit(self, "ai.provider.set", "", detail);
+    sshkeysAudit(self, "ai.provider.set", "-", detail);
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":true,\"provider\":") catch return output[0..0];
     std.json.Stringify.value(saved, .{}, &writer) catch return output[0..0];
@@ -6078,11 +6067,226 @@ fn handleAiHistory(context: *anyopaque, invocation: native_sdk.bridge.Invocation
         if (!first) writer.writeAll(",") catch return output[0..0];
         first = false;
         writer.print("{{\"ts\":{d},\"action\":", .{e.ts}) catch return output[0..0];
-        json.writeJsonString(&writer, e.action) catch return output[0..0];
+        json.writeJsonString(&writer, e.type) catch return output[0..0];
         writer.writeAll(",\"detail\":") catch return output[0..0];
         json.writeJsonString(&writer, e.detail) catch return output[0..0];
         writer.writeAll("}") catch return output[0..0];
     }
     writer.writeAll("]}") catch return output[0..0];
     return writer.buffered();
+}
+
+// --- spec 15: history + audit ----------------------------------------------
+
+const history_default_limit: usize = 50;
+const history_max_limit: usize = 500;
+
+const HistoryRecordPayload = struct {
+    operation_id: []const u8,
+    server_id: []const u8,
+    kind: []const u8,
+    command: []const u8,
+    exit: ?i32 = null,
+    duration_ms: ?i64 = null,
+    output_snippet: ?[]const u8 = null,
+};
+
+/// Internal write API (spec 15 §5): features that do not go through the
+/// exec channel record their operations here; completion updates the same
+/// record by operation_id. The command is pattern-redacted at write time.
+fn handleHistoryRecord(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(HistoryRecordPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (payload.operation_id.len == 0) return respondError(output, "operation_id is required");
+    if (payload.server_id.len == 0) return respondError(output, "server_id is required");
+    if (payload.kind.len == 0) return respondError(output, "kind is required");
+    const redacted = history.redact(self.allocator, payload.command, &.{}) catch {
+        return respondError(output, "out of memory");
+    };
+    defer self.allocator.free(redacted.text);
+    self.history.record(self.io, .{
+        .id = "",
+        .operation_id = payload.operation_id,
+        .ts = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds),
+        .server_id = payload.server_id,
+        .kind = payload.kind,
+        .command = redacted.text,
+        .exit = payload.exit,
+        .duration_ms = payload.duration_ms,
+        .output_snippet = payload.output_snippet orelse "",
+        .redacted = redacted.redacted,
+    }) catch {
+        return respondError(output, "history log is unreadable");
+    };
+    return ok_json;
+}
+
+const HistoryListPayload = struct {
+    server_id: ?[]const u8 = null,
+    q: ?[]const u8 = null,
+    limit: ?usize = null,
+};
+
+fn handleHistoryList(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(HistoryListPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    const limit = @min(payload.limit orelse history_default_limit, history_max_limit);
+    const entries = self.history.list(self.io, payload.server_id, payload.q, limit) catch {
+        return respondError(output, "history log is unreadable");
+    };
+    defer {
+        for (entries) |*e| e.deinit(self.allocator);
+        self.allocator.free(entries);
+    }
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"entries\":[") catch return output[0..0];
+    var first = true;
+    for (entries) |*e| {
+        if (!first) writer.writeAll(",") catch return output[0..0];
+        first = false;
+        writer.writeAll("{\"id\":") catch return output[0..0];
+        json.writeJsonString(&writer, e.id) catch return output[0..0];
+        writer.writeAll(",\"operation_id\":") catch return output[0..0];
+        json.writeJsonString(&writer, e.operation_id) catch return output[0..0];
+        writer.print(",\"ts\":{d},\"server_id\":", .{e.ts}) catch return output[0..0];
+        json.writeJsonString(&writer, e.server_id) catch return output[0..0];
+        writer.writeAll(",\"kind\":") catch return output[0..0];
+        json.writeJsonString(&writer, e.kind) catch return output[0..0];
+        writer.writeAll(",\"command\":") catch return output[0..0];
+        json.writeJsonString(&writer, e.command) catch return output[0..0];
+        writer.writeAll(",\"exit\":") catch return output[0..0];
+        if (e.exit) |exit| {
+            writer.print("{d}", .{exit}) catch return output[0..0];
+        } else {
+            writer.writeAll("null") catch return output[0..0];
+        }
+        writer.writeAll(",\"duration_ms\":") catch return output[0..0];
+        if (e.duration_ms) |ms| {
+            writer.print("{d}", .{ms}) catch return output[0..0];
+        } else {
+            writer.writeAll("null") catch return output[0..0];
+        }
+        writer.writeAll(",\"output_snippet\":") catch return output[0..0];
+        json.writeJsonString(&writer, e.output_snippet) catch return output[0..0];
+        writer.writeAll(",\"redacted\":") catch return output[0..0];
+        writer.writeAll(if (e.redacted) "true" else "false") catch return output[0..0];
+        writer.writeAll("}") catch return output[0..0];
+    }
+    writer.writeAll("]}") catch return output[0..0];
+    return writer.buffered();
+}
+
+const HistoryReplayPayload = struct {
+    entry_id: []const u8,
+};
+
+/// Re-runs a stored command through the exec path (spec 15 §13: the
+/// environment may have changed since capture, so the frontend confirms).
+/// A redacted command is refused — the redaction marker must never be
+/// executed as shell text; structured secret re-entry is frontend work.
+/// The re-run itself is recorded as a fresh, chainable history entry by
+/// the exec capture hook.
+fn handleHistoryReplay(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(HistoryReplayPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    var entry = (self.history.get(self.io, payload.entry_id) catch {
+        return respondError(output, "history log is unreadable");
+    }) orelse return respondError(output, "unknown history entry");
+    defer entry.deinit(self.allocator);
+    if (entry.redacted) {
+        return respondError(output, "this command contains redacted secrets; re-enter its secret fields to replay it");
+    }
+    const channel_id = self.manager.execTracked(entry.server_id, entry.command, "exec", null, &.{}) catch |err| {
+        return respondError(output, switch (err) {
+            error.NoSession => "not connected",
+            error.NotReady => "session not ready",
+            else => "replay failed",
+        });
+    };
+    var detail_buf: [256]u8 = undefined;
+    const cmd = if (entry.command.len > ai.audit_cmd_cap) entry.command[0..ai.audit_cmd_cap] else entry.command;
+    const detail = std.fmt.bufPrint(&detail_buf, "cmd={s} (replayed from {s})", .{ cmd, entry.id }) catch "ssh.exec";
+    sshkeysAudit(self, "ssh.exec", entry.server_id, detail);
+    var writer = std.Io.Writer.fixed(output);
+    writer.print("{{\"ok\":true,\"channel\":{d}}}", .{channel_id}) catch return output[0..0];
+    return writer.buffered();
+}
+
+const AuditListPayload = struct {
+    q: ?[]const u8 = null,
+    type: ?[]const u8 = null,
+    limit: ?usize = null,
+};
+
+fn handleAuditList(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AuditListPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    const limit = @min(payload.limit orelse history_default_limit, history_max_limit);
+    const entries = self.audit.list(self.io, payload.q, payload.type, limit) catch {
+        return respondError(output, "audit log is unreadable");
+    };
+    defer {
+        for (entries) |*e| e.deinit(self.allocator);
+        self.allocator.free(entries);
+    }
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"entries\":[") catch return output[0..0];
+    var first = true;
+    for (entries) |*e| {
+        if (!first) writer.writeAll(",") catch return output[0..0];
+        first = false;
+        writer.writeAll("{\"id\":") catch return output[0..0];
+        json.writeJsonString(&writer, e.id) catch return output[0..0];
+        writer.writeAll(",\"operation_id\":") catch return output[0..0];
+        json.writeJsonString(&writer, e.operation_id) catch return output[0..0];
+        writer.print(",\"ts\":{d},\"type\":", .{e.ts}) catch return output[0..0];
+        json.writeJsonString(&writer, e.type) catch return output[0..0];
+        writer.writeAll(",\"target\":") catch return output[0..0];
+        json.writeJsonString(&writer, e.target) catch return output[0..0];
+        writer.writeAll(",\"commands\":") catch return output[0..0];
+        json.writeJsonString(&writer, e.commands) catch return output[0..0];
+        writer.writeAll(",\"result\":") catch return output[0..0];
+        json.writeJsonString(&writer, e.result) catch return output[0..0];
+        writer.writeAll(",\"detail\":") catch return output[0..0];
+        json.writeJsonString(&writer, e.detail) catch return output[0..0];
+        writer.writeAll("}") catch return output[0..0];
+    }
+    writer.writeAll("]}") catch return output[0..0];
+    return writer.buffered();
+}
+
+const AuditClearPayload = struct {
+    confirm: []const u8 = "",
+};
+
+/// Type-to-confirm clear (spec 15 §5: `{confirm: "CLEAR"}`).
+fn handleAuditClear(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AuditClearPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.confirm, "CLEAR")) {
+        return respondError(output, "type CLEAR to confirm");
+    }
+    self.audit.clear(self.io) catch {
+        return respondError(output, "audit log could not be cleared");
+    };
+    return ok_json;
 }

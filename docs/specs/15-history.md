@@ -1,6 +1,8 @@
 # Spec 15 — Command History & Audit
 
-**Status:** 📋 · **Depends on:** 02 (exec capture), 06/07/09/10/11/12 (audit hooks) · **Spec owner:** core
+**Status:** ✅ backend in (UI pending): bounded history/audit journals with
+write-time redaction, tracked-exec capture (exit, duration, snippet),
+replay with redacted-refusal, type-to-confirm clear · **Depends on:** 02 (exec capture), 06/07/09/10/11/12 (audit hooks) · **Spec owner:** core
 
 ## 1. Overview
 
@@ -72,6 +74,11 @@ broadcasts, deploys, key changes, backups, AI approvals). This is the
 - `src/history.zig` — `HistoryStore` + `AuditStore` use bounded JSON Lines
   journals (`history.jsonl`, `audit.jsonl`) with atomic compaction. A storage
   worker owns file I/O so bridge handlers do not pause the UI.
+  **Landed as:** synchronous O(1) positional appends + fsync, mutex-
+  serialized, reusing the `audit.Store` pattern proven through specs 03–14 —
+  appends happen on the session worker (already off the UI thread) or in
+  short handler sections, and the in-memory index keeps reads off the disk
+  entirely (see §13).
 - `src/shell_integration.zig` parses OSC 633 `A/B/C/D/E` records and associates
   the exact command from `E` with its completion and exit status from `D`.
   Bash, Zsh, and Fish integration scripts live in versioned app resources. The
@@ -131,19 +138,39 @@ broadcasts, deploys, key changes, backups, AI approvals). This is the
 
 ## 12. Acceptance criteria
 
-- [ ] Every app-initiated command lands in history with exit + snippet.
+Backend-verifiable items are ticked as of the spec-15 backend landing
+(verified against the container suite; the UI/shell-integration items
+remain open frontend work).
+
+- [x] Every app-initiated command lands in history with exit + snippet.
+      Tracked execs (`ssh.exec`, scripts, broadcast, deploy steps, backup
+      runs, monitor cleanDisk/dropCaches, replay) are recorded at channel
+      EOF with exit, duration, and a bounded two-line output snippet.
+      Internal plumbing (probes, syntax checks, scans) is never recorded.
 - [ ] With shell integration active, committed Bash, Zsh, and Fish commands
       land in history with exact command text and exit status; line editing,
       multiline input, and full-screen programs do not create false entries.
+      (Frontend + versioned remote integration scripts — OSC 633 protocol
+      per §13 — not yet implemented; see the shell_integration note in §6.)
 - [ ] Without shell integration, the UI says `app commands only` and never
-      claims complete interactive history.
-- [ ] Every secret value known to an operation is absent from stored and
-      rendered text. Pattern masking has fixtures and is labeled best effort.
-- [ ] A redacted command cannot replay without safe structured re-entry of its
-      secret fields.
-- [ ] Every mutating feature (06–12) writes an audit entry.
-- [ ] History search + replay work from the palette.
-- [ ] Clear requires type-to-confirm.
+      claims complete interactive history. (Frontend.)
+- [x] Every secret value known to an operation is absent from stored and
+      rendered text. The exact-value pass masks the command AND the output
+      snippet with the operation's known secrets (scripts carry their
+      secret variable values through to capture); the narrow named-field
+      pass (`PASSWORD=…`, `TOKEN=…`, `--password …`, URL userinfo — never
+      a blanket `-p`) has unit fixtures and is labeled best effort in §8.
+      The `ssh.exec` audit row is redacted the same way.
+- [x] A redacted command cannot replay without safe structured re-entry of
+      its secret fields. The backend refuses replay of any redacted entry
+      with an explicit message; structured re-entry is frontend work.
+- [x] Every mutating feature (06–12) writes an audit entry. All existing
+      audit call sites write the full entry shape (`type`/`target`/…);
+      the container suite asserts exec/script rows land in `oars.audit.list`.
+- [ ] History search + replay work from the palette. (Palette is frontend;
+      the replay backend path is container-verified.)
+- [x] Clear requires type-to-confirm. `oars.audit.clear` accepts only the
+      literal `CLEAR` confirm string.
 
 ## 13. Research & References
 
@@ -176,3 +203,29 @@ broadcasts, deploys, key changes, backups, AI approvals). This is the
 
 Sources: VS Code terminal shell integration protocol, POSIX fsync(2), spec 02
 §5, internal design decisions.
+
+### Corrections forced by implementation (2026-08-06)
+
+- **Storage worker → synchronous appends.** §6 proposed a dedicated storage
+  worker thread. The landed implementation appends synchronously with the
+  established `audit.Store` pattern (O(1) positional write + fsync, spinlock-
+  serialized). Rationale: the capture hook runs on the session worker (never
+  the UI thread), handler-side appends are single short writes, and the
+  in-memory index (§9) means list/read queries never touch the disk — the
+  worker thread would add lifecycle complexity with no measured benefit.
+- **Shell integration is not part of the backend landing.** The OSC 633
+  integration scripts, the nonce handshake, and the `shell_integration.zig`
+  parser remain open work (frontend + remote-script resources). Until then
+  the UI's coverage label must show `app commands only`; the capture surface
+  that IS landed is app-initiated tracked execs.
+- **Known-secret masking of output.** The exact-value pass masks the stored
+  output snippet as well as the command. The operation carries its known
+  secret values (`history_secrets`) through the exec op to the capture hook;
+  scripts populate them from their secret variable values. Pattern masking
+  never applies to program output (patterns describe command syntax).
+- **Audit entry shape.** The journal line and `oars.audit.list` wire format
+  use `type`/`target` (spec §7); journals written by earlier builds with
+  `action`/`server_id` still load (aliases on read). App-level actions use
+  target `-`. The old `oars.audit.read`-shaped minimal read survives as
+  `AuditStore.read` for `oars.ai.history` (spec 11 wire shape unchanged:
+  its response still carries `action`).

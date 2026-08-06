@@ -15,7 +15,7 @@ const native_sdk = @import("native_sdk");
 const ssh = @import("ssh.zig");
 const servers = @import("servers.zig");
 const sessions = @import("sessions.zig");
-const audit = @import("audit.zig");
+const history = @import("history.zig");
 const logs = @import("logs.zig");
 const bridge = @import("bridge.zig");
 const sftpmod = @import("sftp.zig");
@@ -29,6 +29,7 @@ const integration_access = @import("integration_access.zig");
 const integration_backup = @import("integration_backup.zig");
 const integration_ai = @import("integration_ai.zig");
 const integration_vnc = @import("integration_vnc.zig");
+const integration_history = @import("integration_history.zig");
 
 comptime {
     _ = integration_keys;
@@ -36,6 +37,7 @@ comptime {
     _ = integration_backup;
     _ = integration_ai;
     _ = integration_vnc;
+    _ = integration_history;
 }
 
 /// Reads an environment variable from the process environment. The raw
@@ -96,6 +98,7 @@ pub const TestRig = struct {
     dir_buf: [128]u8 = undefined,
     path_buf: [512]u8 = undefined,
     audit_path_buf: [512]u8 = undefined,
+    history_path_buf: [512]u8 = undefined,
     logs_path_buf: [512]u8 = undefined,
     scripts_path_buf: [512]u8 = undefined,
     deploy_apps_path_buf: [512]u8 = undefined,
@@ -106,7 +109,8 @@ pub const TestRig = struct {
     ai_path_buf: [512]u8 = undefined,
     dir_name: []const u8,
     store: servers.Store,
-    audit_store: audit.Store,
+    audit_store: history.AuditStore,
+    history_store: history.HistoryStore,
     logs_store: logs.SourceStore,
     scripts_store: scripts.Store,
     deploy_apps_store: deploy.AppStore,
@@ -125,6 +129,7 @@ pub const TestRig = struct {
         self.dir_name = try std.fmt.bufPrint(&self.dir_buf, "oars-itest-{s}-{d}", .{ tag, now });
         const store_path = try std.fmt.bufPrint(&self.path_buf, "/tmp/{s}/servers.json", .{self.dir_name});
         const audit_path = try std.fmt.bufPrint(&self.audit_path_buf, "/tmp/{s}/audit.jsonl", .{self.dir_name});
+        const history_path = try std.fmt.bufPrint(&self.history_path_buf, "/tmp/{s}/history.jsonl", .{self.dir_name});
         const logs_path = try std.fmt.bufPrint(&self.logs_path_buf, "/tmp/{s}/logs.json", .{self.dir_name});
         const scripts_path = try std.fmt.bufPrint(&self.scripts_path_buf, "/tmp/{s}/scripts.json", .{self.dir_name});
         const deploy_apps_path = try std.fmt.bufPrint(&self.deploy_apps_path_buf, "/tmp/{s}/apps.json", .{self.dir_name});
@@ -135,6 +140,7 @@ pub const TestRig = struct {
         const ai_path = try std.fmt.bufPrint(&self.ai_path_buf, "/tmp/{s}/ai.json", .{self.dir_name});
         self.store = .{ .allocator = std.testing.allocator, .path = store_path };
         self.audit_store = .{ .allocator = std.testing.allocator, .path = audit_path };
+        self.history_store = .{ .allocator = std.testing.allocator, .path = history_path };
         self.logs_store = .{ .allocator = std.testing.allocator, .path = logs_path };
         self.scripts_store = .{ .allocator = std.testing.allocator, .path = scripts_path };
         self.deploy_apps_store = .{ .allocator = std.testing.allocator, .path = deploy_apps_path };
@@ -142,8 +148,8 @@ pub const TestRig = struct {
         self.access_registry = access.Registry.init(std.testing.allocator, access_path);
         self.backup_registry = backup.Registry.init(std.testing.allocator, backup_jobs_path, backup_runs_path);
         self.ai_registry = ai.Registry.init(std.testing.allocator, ai_path);
-        self.manager = sessions.Manager.init(std.testing.allocator, io, &self.store, &self.audit_store, null);
-        self.ctx = .{ .allocator = std.testing.allocator, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store, .access = &self.access_registry, .backup = &self.backup_registry, .ai = &self.ai_registry };
+        self.manager = sessions.Manager.init(std.testing.allocator, io, &self.store, &self.audit_store, &self.history_store, null);
+        self.ctx = .{ .allocator = std.testing.allocator, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .history = &self.history_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store, .access = &self.access_registry, .backup = &self.backup_registry, .ai = &self.ai_registry };
         self.dispatcher = self.ctx.dispatcher();
     }
 
@@ -152,6 +158,8 @@ pub const TestRig = struct {
         self.backup_registry.deinit();
         self.ai_registry.deinit();
         self.manager.deinit();
+        self.history_store.deinit();
+        self.audit_store.deinit();
         std.Io.Dir.cwd().deleteTree(std.testing.io, self.dir_name) catch {};
     }
 

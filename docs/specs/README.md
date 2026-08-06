@@ -25,7 +25,7 @@ already exists.
 | 12 | [Remote Desktop (VNC)](12-vnc.md) | 📋 (packaged macOS WebView transport verified; implementation planned) |
 | 13 | [Command Palette & Keyboard UX](13-command-palette.md) | 📋 (Oars+) |
 | 14 | [Server Groups & Fleet Views](14-groups.md) | 📋 (Oars+) |
-| 15 | [Command History & Audit](15-history.md) | 📋 (Oars+) |
+| 15 | [Command History & Audit](15-history.md) | ✅ backend in (UI pending): history/audit journals with write-time redaction, tracked-exec capture, replay, type-to-confirm clear |
 | 16 | [Themes & Terminal Appearance](16-themes.md) | 📋 (Oars+) |
 | 17 | [Export / Import (Vault)](17-export-import.md) | 📋 (Oars+) |
 | 18 | [SSH Agent & Jump Hosts](18-agent-jump-hosts.md) | 📋 (Oars+) |
