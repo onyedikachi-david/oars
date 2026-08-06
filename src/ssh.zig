@@ -10,6 +10,10 @@ const std = @import("std");
 pub const c = @cImport({
     @cInclude("libssh2.h");
     @cInclude("libssh2_sftp.h");
+    // Spec 18 jump tunnels: socketpair for the local tunnel bridge.
+    @cInclude("sys/socket.h");
+    @cInclude("sys/un.h");
+    @cInclude("unistd.h");
 });
 
 pub const Error = error{
@@ -19,6 +23,8 @@ pub const Error = error{
     Protocol,
     NoChannel,
     Canceled,
+    /// The server refused a channel request (spec 18: agent forwarding).
+    Refused,
 };
 
 const poll_interval_ms = 10;
@@ -163,6 +169,19 @@ pub const Session = struct {
         self.socket = stream.socket.handle;
         self.socket_open = true;
 
+        try self.handshake(io);
+    }
+
+    /// Spec 18: runs the SSH handshake over an existing socket — the
+    /// local end of a jump-host tunnel (the target's SSH runs inside
+    /// the jump's SSH). The caller owns the fd; `deinit` closes it.
+    pub fn connectFd(self: *Session, io: std.Io, fd: std.posix.socket_t) Error!void {
+        self.socket = fd;
+        self.socket_open = true;
+        try self.handshake(io);
+    }
+
+    fn handshake(self: *Session, io: std.Io) Error!void {
         self.raw = c.libssh2_session_init_ex(null, null, null, null) orelse {
             return error.Protocol;
         };
@@ -215,6 +234,28 @@ pub const Session = struct {
         @memcpy(out[0..prefix.len], prefix);
         _ = std.base64.standard_no_pad.Encoder.encode(out[prefix.len..total], &hash);
         return out[0..total];
+    }
+
+    pub fn rawSession(self: *Session) *c.LIBSSH2_SESSION {
+        return self.raw;
+    }
+
+    /// Spec 18: the auth-agent callback type (libssh2's
+    /// LIBSSH2_AUTHAGENT_FUNC). Fires on the worker thread during
+    /// packet processing when the server opens an auth-agent channel
+    /// (the channel is already confirmed by the library).
+    pub const AuthAgentCallback = *const fn (?*c.LIBSSH2_SESSION, ?*c.LIBSSH2_CHANNEL, ?*?*anyopaque) callconv(.c) void;
+
+    /// Stores `ptr` in the session's abstract slot (used by the
+    /// auth-agent callback to reach the owning Session).
+    pub fn setAbstract(self: *Session, ptr: *anyopaque) void {
+        const slot = c.libssh2_session_abstract(self.raw);
+        slot.* = ptr;
+    }
+
+    /// Registers (or clears, with null) the auth-agent callback.
+    pub fn setAuthAgentCallback(self: *Session, callback: ?AuthAgentCallback) void {
+        _ = c.libssh2_session_callback_set2(self.raw, c.LIBSSH2_CALLBACK_AUTHAGENT, @ptrCast(callback));
     }
 
     pub fn authPassword(self: *Session, io: std.Io, user: []const u8, password: []const u8) Error!void {
@@ -514,6 +555,27 @@ pub const Channel = struct {
                 try sleep(io);
                 continue;
             }
+            return error.Protocol;
+        }
+    }
+
+    /// Spec 18: requests auth-agent forwarding on this channel. The
+    /// server must allow it (AllowAgentForwarding); denial surfaces as
+    /// `error.Refused`. The request alone does not complete the data
+    /// path — the session worker proxies accepted channels to the
+    /// local agent socket.
+    pub fn requestAuthAgent(self: *Channel, io: std.Io) Error!void {
+        const deadline = deadlineFromNow(io, handshake_timeout_ms);
+        while (true) {
+            const rc = c.libssh2_channel_request_auth_agent(self.raw);
+            if (rc == 0) return;
+            if (isEagain(rc)) {
+                try checkDeadline(io, deadline);
+                try self.checkStop();
+                try sleep(io);
+                continue;
+            }
+            if (rc == c.LIBSSH2_ERROR_CHANNEL_REQUEST_DENIED) return error.Refused;
             return error.Protocol;
         }
     }

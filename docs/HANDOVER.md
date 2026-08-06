@@ -1495,3 +1495,13 @@ Notes for the next session:
 - The bridge vault handlers (sections allowlist, magic-sniff import,
   error strings) were written in-session; vault.zig `applyImport` got the
   `owned`-flag fix for the toOwnedSlice UAF.
+
+## 25. Session handover — 2026-08-06 (session 14): spec 18 SSH agent & jump hosts backend
+
+Landed: the full spec-18 backend — `src/agent.zig` (resolveSocket via explicit/SSH_AUTH_SOCK, validateSocket with fstatat no-follow + own-uid, SHA256 fingerprint, 3 unit tests), `src/ssh.zig` (connectFd/handshake over fd, socketpair/close/write via cImport for Zig 0.16), `src/sessions.zig` (via/via_name/owner fields, jump_start op + JumpStartOutcome handoff, JumpTunnel pump with cascade close, forward_queue/active + ForwardSetOutcome, authAgentCallback proxy, audited `oars.agent.forward`), `src/servers.zig` (`AuthMethod.agent`), bridge `oars.agent.list` (no-agent → ok:true, identities:[], error:"no agent" per §5) + `oars.agent.forward` (handler_count 96→97). Jump failure reports hop name (§10), cycle detection at save time.
+
+Bugs fixed this session: spec-18 dispatcher cycle test used `auth_method:"key"` without `key_path` → hit `"choose a private key file"` before via validation; changed to `password` and created `hop-b` first so forward reference is valid, then cycle is hit. Agent `validateSocket` bind failed on darwin due to missing `sun_len` and whole-struct `bind` length — fixed to set `sun_len` when present and use `@offsetOf(...,"sun_path")+len+1` (both `src/agent.zig` and `src/sessions.zig:connectAgentSocket`), plus `sys/un.h` in `src/ssh.zig`; test now degrades gracefully in sandboxes where `bind` is denied. Also fixed `sessions:connectAgentSocket` to use `ssh.c.sockaddr_un` correctly.
+
+Validation: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-global-cache zig build test --global-cache-dir /tmp/zig-cache` → `180 pass / 1 fail (181 total)` for two consecutive runs (only pre-existing `sshkeys.generate` PTY flake remains, `No user exists for uid 501` in this sandbox, documented as `164/165 once`); `npm --prefix frontend run build` clean (vite 23 modules, 123ms). Two exports with same password differ in salt/nonce (spec 17) still holds.
+
+Next: optional container jump-bastion integration test (spec 11 pattern: container A reachable only from B, connect via B, verify shell+exec) for real tunnel proof; no live ssh-agent fixture yet (agent auth needs an agent holding a key).

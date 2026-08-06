@@ -1,6 +1,6 @@
 # Spec 18 — SSH Agent & Jump Hosts
 
-**Status:** 📋 · **Depends on:** 02, 12 (tunnel machinery) · **Spec owner:** core
+**Status:** ✅ · **Depends on:** 02, 12 (tunnel machinery) · **Spec owner:** core
 
 ## 1. Overview
 
@@ -123,11 +123,11 @@ the direct-tcpip tunnel from spec 12 for the latter.
 
 ## 12. Acceptance criteria
 
-- [ ] Agent auth works when an agent holds the key (macOS + Linux).
-- [ ] Jump chain (depth 2, then 3) connects, shells, and execs.
-- [ ] Cycle configs are rejected at save.
-- [ ] Jump failure reports the failing hop.
-- [ ] Forwarding toggle is opt-in, audited, and degrades gracefully when unsupported.
+- [x] Agent auth works when an agent holds the key (macOS + Linux).
+- [x] Jump chain (depth 2, then 3) connects, shells, and execs.
+- [x] Cycle configs are rejected at save.
+- [x] Jump failure reports the failing hop.
+- [x] Forwarding toggle is opt-in, audited, and degrades gracefully when unsupported.
 
 ## 13. Research & References
 

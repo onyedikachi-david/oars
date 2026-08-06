@@ -25,10 +25,12 @@ const keygen = @import("keygen.zig");
 const access = @import("access.zig");
 const backup = @import("backup.zig");
 const vault = @import("vault.zig");
+const agent = @import("agent.zig");
+const ssh = @import("ssh.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 95;
+const handler_count = 97;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -144,6 +146,8 @@ pub const Context = struct {
             .{ .name = "oars.vault.export", .context = self, .invoke_fn = handleVaultExport },
             .{ .name = "oars.vault.import", .context = self, .invoke_fn = handleVaultImport },
             .{ .name = "oars.vault.importConfirm", .context = self, .invoke_fn = handleVaultImportConfirm },
+            .{ .name = "oars.agent.list", .context = self, .invoke_fn = handleAgentList },
+            .{ .name = "oars.agent.forward", .context = self, .invoke_fn = handleAgentForward },
         };
         self.policies = .{
             .{ .name = "oars.servers.list", .origins = &allowed_origins },
@@ -241,6 +245,8 @@ pub const Context = struct {
             .{ .name = "oars.vault.export", .origins = &allowed_origins },
             .{ .name = "oars.vault.import", .origins = &allowed_origins },
             .{ .name = "oars.vault.importConfirm", .origins = &allowed_origins },
+            .{ .name = "oars.agent.list", .origins = &allowed_origins },
+            .{ .name = "oars.agent.forward", .origins = &allowed_origins },
         };
         return .{
             .policy = .{ .enabled = true, .commands = &self.policies },
@@ -6550,5 +6556,104 @@ fn handleVaultImportConfirm(context: *anyopaque, invocation: native_sdk.bridge.I
         json.writeJsonString(&writer, note) catch return output[0..0];
     }
     writer.writeAll("]}}") catch return output[0..0];
+    return writer.buffered();
+}
+
+/// `oars.agent.list` `{path?}` → `{ok, identities:[{type, fingerprint_sha256, comment}]}`.
+/// A missing agent is NOT a failure (spec 18 §5): `{ok:true, identities:[], error:"no agent"}`.
+/// A stale or foreign socket is an explicit error with a hint — never a
+/// directory scan fallback (spec 18 §8/§13).
+fn handleAgentList(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self: *Context = @ptrCast(@alignCast(context));
+    const parsed = std.json.parseFromSlice(struct {
+        path: ?[]const u8 = null,
+    }, self.allocator, invocation.request.payload, .{ .allocate = .alloc_always, .max_value_len = 4096 }) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+
+    const path = agent.resolveSocket(self.allocator, parsed.value.path) catch {
+        // Spec 18 §5: a missing agent is NOT a failure — the UI shows an
+        // empty identity list with a hint.
+        var writer = std.Io.Writer.fixed(output);
+        const Resp = struct { ok: bool, identities: []const []const u8, @"error": []const u8 };
+        std.json.Stringify.value(Resp{ .ok = true, .identities = &.{}, .@"error" = "no agent" }, .{}, &writer) catch return error.BufferTooSmall;
+        return writer.buffered();
+    };
+    defer self.allocator.free(path);
+    agent.validateSocket(path) catch |err| {
+        // A missing socket is the same "no agent" shape (not a failure);
+        // a present-but-wrong path is an explicit error with a hint.
+        if (err == error.NoAgent) {
+            var writer = std.Io.Writer.fixed(output);
+            const Resp = struct { ok: bool, identities: []const []const u8, @"error": []const u8 };
+            std.json.Stringify.value(Resp{ .ok = true, .identities = &.{}, .@"error" = "no agent" }, .{}, &writer) catch return error.BufferTooSmall;
+            return writer.buffered();
+        }
+        return respondError(output, switch (err) {
+            error.NotASocket => "the agent path is not a socket",
+            error.NotOwned => "the agent socket is not owned by the current user",
+            else => "no agent",
+        });
+    };
+
+    // Identity listing needs a libssh2 session container, but no SSH
+    // connection: libssh2_agent_connect talks to the local socket only.
+    const raw = ssh.c.libssh2_session_init_ex(null, null, null, null) orelse {
+        return respondError(output, "could not initialize the SSH library");
+    };
+    defer _ = ssh.c.libssh2_session_free(raw);
+    var agent_conn = agent.Agent.init(raw) catch {
+        return respondError(output, "could not connect to the SSH agent");
+    };
+    defer agent_conn.deinit();
+    const identities = agent_conn.listIdentities(self.allocator) catch {
+        return respondError(output, "could not list agent identities");
+    };
+    defer {
+        for (identities) |*id| id.deinit(self.allocator);
+        self.allocator.free(identities);
+    }
+
+    var writer = std.Io.Writer.fixed(output);
+    std.json.Stringify.value(.{ .ok = true, .identities = identities }, .{}, &writer) catch return error.BufferTooSmall;
+    return writer.buffered();
+}
+
+/// `oars.agent.forward` `{server_id, on}` → `{ok}`. Enabling requests
+/// auth-agent forwarding on a NEW shell channel (the old one is
+/// closed) and registers the local proxy; disabling closes the
+/// forwarding shell and reopens without the request. Audited when
+/// enabled (spec 18 §5/§8); refusal rolls the toggle back off.
+fn handleAgentForward(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self: *Context = @ptrCast(@alignCast(context));
+    const parsed = std.json.parseFromSlice(struct {
+        server_id: []const u8,
+        on: bool,
+    }, self.allocator, invocation.request.payload, .{ .allocate = .alloc_always, .max_value_len = 4096 }) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+
+    var outcome: sessions.ForwardSetOutcome = .{};
+    self.manager.setForwarding(parsed.value.server_id, parsed.value.on, &outcome) catch |err| {
+        return respondError(output, switch (err) {
+            error.NoSession => "no session for this server",
+            error.NotReady => "server is not connected",
+            else => "could not toggle agent forwarding",
+        });
+    };
+    const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + 20 * std.time.ns_per_s;
+    outcome.wait(self.io, deadline);
+    if (!outcome.ok) {
+        return respondError(output, outcome.message());
+    }
+    if (parsed.value.on) {
+        self.audit.append(self.io, "agent.forward.enable", parsed.value.server_id, "agent forwarding enabled") catch {
+            return respondError(output, "audit failed");
+        };
+    }
+    var writer = std.Io.Writer.fixed(output);
+    std.json.Stringify.value(.{ .ok = true }, .{}, &writer) catch return error.BufferTooSmall;
     return writer.buffered();
 }

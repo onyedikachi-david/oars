@@ -18,6 +18,7 @@ const shellquote = @import("shellquote.zig");
 const broadcast = @import("broadcast.zig");
 const deploy = @import("deploy.zig");
 const wsmod = @import("ws.zig");
+const agent = @import("agent.zig");
 
 /// Blocking acquire on std.atomic.Mutex (spinlock) — 0.16's atomic.Mutex
 /// only exposes tryLock. Sections are short (buffer/cursor updates), so
@@ -273,6 +274,20 @@ const Op = union(enum) {
         outcome: *TunnelStartOutcome,
     },
     tunnel_stop: struct { id: u32 },
+    /// Spec 18: agent-forwarding toggle — reopens the shell with (or
+    /// without) the auth-agent request.
+    forward_set: struct { on: bool, outcome: *ForwardSetOutcome },
+    /// Spec 18: opens the direct-tcpip channel to the target through
+    /// this (via) session and registers the jump tunnel. `fd` is the
+    /// local socketpair end the worker pumps against. Owns `host` and
+    /// `target_server_id`.
+    jump_start: struct {
+        host: []const u8,
+        port: u16,
+        fd: std.posix.socket_t,
+        target_server_id: []const u8,
+        outcome: *JumpStartOutcome,
+    },
 };
 
 /// Completion record for synchronous SFTP ops (spec 05): the worker builds
@@ -529,6 +544,117 @@ pub const TunnelPollInfo = struct {
 /// A tunnel with no WebSocket connection auto-destroys after this long.
 const tunnel_idle_timeout_ns: i128 = 15 * std.time.ns_per_s;
 
+/// Spec 18: cross-thread handoff for opening a jump tunnel on the via
+/// session's worker (mirrors TunnelStartOutcome).
+pub const JumpStartOutcome = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    done: bool = false,
+    ok: bool = false,
+    msg_buf: [160]u8 = undefined,
+    msg_len: usize = 0,
+
+    pub fn set(self: *JumpStartOutcome, ok: bool, msg: []const u8) void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        self.ok = ok;
+        const n = @min(msg.len, self.msg_buf.len - 1);
+        @memcpy(self.msg_buf[0..n], msg[0..n]);
+        self.msg_len = n;
+        self.done = true;
+    }
+
+    pub fn message(self: *JumpStartOutcome) []const u8 {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.msg_buf[0..self.msg_len];
+    }
+
+    pub fn isDone(self: *JumpStartOutcome) bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.done;
+    }
+
+    pub fn wait(self: *JumpStartOutcome, io: std.Io) void {
+        while (true) {
+            lockSpin(&self.mutex);
+            const done = self.done;
+            self.mutex.unlock();
+            if (done) return;
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch return;
+        }
+    }
+};
+
+/// Spec 18: one jump-host tunnel on the via session — the direct-tcpip
+/// channel to the target, pumped against the local socketpair fd. The
+/// via worker owns its lifecycle; the target session's transport runs
+/// over the other socketpair end.
+pub const JumpTunnel = struct {
+    channel: *ssh.Channel,
+    fd: std.posix.socket_t,
+    /// Owned; the via worker cascades a clear close to this session
+    /// when the tunnel dies.
+    target_server_id: []const u8,
+    bytes_up: u64 = 0,
+    bytes_down: u64 = 0,
+
+    pub fn deinit(self: *JumpTunnel, allocator: std.mem.Allocator, io: std.Io) void {
+        _ = ssh.c.close(self.fd);
+        self.channel.close(io);
+        allocator.free(self.target_server_id);
+    }
+};
+
+/// Spec 18: cross-thread handoff for the agent-forwarding toggle.
+pub const ForwardSetOutcome = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    done: bool = false,
+    ok: bool = false,
+    msg_buf: [160]u8 = undefined,
+    msg_len: usize = 0,
+
+    pub fn set(self: *ForwardSetOutcome, ok: bool, msg: []const u8) void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        self.ok = ok;
+        const n = @min(msg.len, self.msg_buf.len - 1);
+        @memcpy(self.msg_buf[0..n], msg[0..n]);
+        self.msg_len = n;
+        self.done = true;
+    }
+
+    pub fn message(self: *ForwardSetOutcome) []const u8 {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.msg_buf[0..self.msg_len];
+    }
+
+    pub fn isDone(self: *ForwardSetOutcome) bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.done;
+    }
+
+    pub fn wait(self: *ForwardSetOutcome, io: std.Io, deadline_ns: i128) void {
+        while (true) {
+            lockSpin(&self.mutex);
+            const done = self.done;
+            self.mutex.unlock();
+            if (done) return;
+            if (std.Io.Timestamp.now(io, .real).nanoseconds >= deadline_ns) return;
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch return;
+        }
+    }
+};
+
+/// Spec 18: one accepted auth-agent channel being proxied to the local
+/// agent socket.
+pub const ForwardTunnel = struct {
+    channel: *ssh.Channel,
+    agent_fd: std.posix.socket_t,
+};
+
 /// Closed tunnels survive this long as tombstones so polls keep
 /// reporting `closed` before the record is pruned.
 const tunnel_tombstone_ns: i128 = 60 * std.time.ns_per_s;
@@ -590,6 +716,29 @@ pub const Session = struct {
     /// owns each tunnel's lifecycle.
     tunnels_mutex: std.atomic.Mutex = .unlocked,
     tunnels: std.ArrayList(*Tunnel) = .empty,
+    /// Jump-host tunnels (spec 18): the direct-tcpip channel to the
+    /// target, pumped against the local socketpair fd. Guarded by the
+    /// same tunnels_mutex; the worker owns each tunnel's lifecycle.
+    jump_tunnels: std.ArrayList(*JumpTunnel) = .empty,
+    /// Spec 18: the jump host this session tunnels through (owned ref).
+    /// The via session's worker pumps the tunnel; when the via dies the
+    /// cascade marks this session with a clear close state.
+    via: ?*Session = null,
+    /// Owned name of the via hop, for error messages ("<name> unreachable").
+    via_name: ?[]const u8 = null,
+    /// The manager that owns this session (for the jump cascade).
+    owner: *Manager = undefined,
+    /// Spec 18: agent forwarding is enabled for this session's shell.
+    forwarding: bool = false,
+    /// Guards forward_queue / forward_active (worker + libssh2 callback).
+    forward_mutex: std.atomic.Mutex = .unlocked,
+    /// Accepted auth-agent channels awaiting their local agent socket
+    /// connection (queued by the libssh2 callback on the worker thread).
+    forward_queue: std.ArrayList(*ssh.Channel) = .empty,
+    /// Accepted channels being pumped against the local agent socket.
+    forward_active: std.ArrayList(*ForwardTunnel) = .empty,
+    /// Owned validated agent socket path for proxy connections.
+    forward_agent_path: ?[]const u8 = null,
     /// Monotonic counter for history operation ids (`exec-<n>`); the
     /// worker is the only writer.
     history_seq: u64 = 0,
@@ -702,6 +851,7 @@ pub const Manager = struct {
             .store = self.store,
             .audit = self.audit,
             .history = self.history,
+            .owner = self,
             .monitor_interval_ns = self.monitor_interval_ns,
             .monitor_liveness_ns = self.monitor_liveness_ns,
             .started_at_ns = std.Io.Timestamp.now(self.io, .real).nanoseconds,
@@ -1324,6 +1474,17 @@ pub const Manager = struct {
         try session.ops.append(self.allocator, .{ .tunnel_stop = .{ .id = id } });
     }
 
+    /// Spec 18: queues the agent-forwarding toggle on the session's
+    /// worker (the shell is reopened with or without the auth-agent
+    /// request). `outcome` is filled by the worker.
+    pub fn setForwarding(self: *Manager, server_id: []const u8, on: bool, outcome: *ForwardSetOutcome) !void {
+        const session = self.get(server_id) orelse return error.NoSession;
+        if (session.status.load(.acquire) != .ready) return error.NotReady;
+        lockSpin(&session.ops_mutex);
+        defer session.ops_mutex.unlock();
+        try session.ops.append(self.allocator, .{ .forward_set = .{ .on = on, .outcome = outcome } });
+    }
+
     /// Copies the tunnel's stats under the lock; false when the tunnel is
     /// unknown (already removed).
     pub fn tunnelPoll(self: *Manager, server_id: []const u8, id: u32, info: *TunnelPollInfo) bool {
@@ -1406,15 +1567,119 @@ fn workerMain(session: *Session) void {
     session.transport.setStop(workerStop, session);
 
     // --- connect + handshake -------------------------------------------
-    session.transport.connect(io, session.server.host, session.server.port) catch |err| {
-        session.status.store(.@"error", .release);
-        if (err == error.Canceled) {
-            session.status.store(.closed, .release);
+    var connect_fd: ?std.posix.socket_t = null;
+    if (session.server.via_server_id) |via_id| {
+        // Jump host (spec 18): resolve the via record, ensure its session
+        // (key/agent jumps connect automatically; password jumps need the
+        // user to have connected first), wait for it to be ready, then
+        // tunnel target:22 through it and handshake over the local
+        // socketpair end. The chain recurses: the via session's own
+        // worker resolves its own via (depth ≤ 3 enforced at save).
+        const via_record = blk: {
+            var loaded = session.store.loadParsed(io) catch {
+                session.status.store(.@"error", .release);
+                session.setError("jump host lookup failed");
+                return;
+            };
+            defer loaded.deinit(allocator);
+            for (loaded.parsed.value) |s| {
+                if (std.mem.eql(u8, s.id, via_id)) break :blk s;
+            }
+            break :blk null;
+        } orelse {
+            session.status.store(.@"error", .release);
+            session.setError("jump host not found — edit the server and pick a valid jump host");
+            return;
+        };
+        var via_session = session.owner.get(via_id) orelse blk: {
+            const started = session.owner.connect(via_record, null, null) catch {
+                session.status.store(.@"error", .release);
+                session.setError(std.fmt.bufPrint(&error_buf, "jump host {s} unavailable", .{via_record.name}) catch "jump host unavailable");
+                return;
+            };
+            break :blk started;
+        };
+        // Wait for the via to finish connecting (bounded by its own
+        // transport timeouts; the target's stop flag is checked).
+        while (true) {
+            if (session.stop_flag.load(.acquire)) return;
+            const st = via_session.status.load(.acquire);
+            if (st == .ready) break;
+            if (st == .@"error" or st == .closed) {
+                session.status.store(.@"error", .release);
+                session.setError(std.fmt.bufPrint(&error_buf, "jump host {s} unreachable: {s}", .{ via_record.name, via_session.errorText() }) catch "jump host unreachable");
+                return;
+            }
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake) catch return;
+        }
+        var fds: [2]std.posix.socket_t = undefined;
+        if (ssh.c.socketpair(ssh.c.AF_UNIX, ssh.c.SOCK_STREAM, 0, &fds) != 0) {
+            session.status.store(.@"error", .release);
+            session.setError("jump host tunnel socket failed");
             return;
         }
-        session.setError(std.fmt.bufPrint(&error_buf, "connect failed: {s}", .{@errorName(err)}) catch "connect failed");
-        return;
-    };
+        var outcome: JumpStartOutcome = .{};
+        const host_owned = allocator.dupe(u8, session.server.host) catch {
+            _ = ssh.c.close(fds[0]);
+            _ = ssh.c.close(fds[1]);
+            return;
+        };
+        const target_id_owned = allocator.dupe(u8, via_id) catch {
+            allocator.free(host_owned);
+            _ = ssh.c.close(fds[0]);
+            _ = ssh.c.close(fds[1]);
+            return;
+        };
+        lockSpin(&via_session.ops_mutex);
+        via_session.ops.append(allocator, .{ .jump_start = .{
+            .host = host_owned,
+            .port = session.server.port,
+            .fd = fds[0],
+            .target_server_id = target_id_owned,
+            .outcome = &outcome,
+        } }) catch {
+            via_session.ops_mutex.unlock();
+            allocator.free(host_owned);
+            allocator.free(target_id_owned);
+            _ = ssh.c.close(fds[0]);
+            _ = ssh.c.close(fds[1]);
+            session.status.store(.@"error", .release);
+            session.setError("jump host tunnel failed (out of memory)");
+            return;
+        };
+        via_session.ops_mutex.unlock();
+        outcome.wait(io);
+        if (!outcome.ok) {
+            _ = ssh.c.close(fds[1]);
+            session.status.store(.@"error", .release);
+            session.setError(std.fmt.bufPrint(&error_buf, "jump host {s} unreachable: {s}", .{ via_record.name, outcome.message() }) catch "jump host unreachable");
+            return;
+        }
+        session.via = via_session;
+        session.via_name = allocator.dupe(u8, via_record.name) catch null;
+        connect_fd = fds[1];
+    }
+    if (connect_fd) |fd| {
+        session.transport.connectFd(io, fd) catch |err| {
+            session.status.store(.@"error", .release);
+            if (err == error.Canceled) {
+                session.status.store(.closed, .release);
+                return;
+            }
+            session.setError(std.fmt.bufPrint(&error_buf, "jump host {s} unreachable: {s}", .{ session.via_name orelse "", @errorName(err) }) catch "jump host unreachable");
+            return;
+        };
+    } else {
+        session.transport.connect(io, session.server.host, session.server.port) catch |err| {
+            session.status.store(.@"error", .release);
+            if (err == error.Canceled) {
+                session.status.store(.closed, .release);
+                return;
+            }
+            session.setError(std.fmt.bufPrint(&error_buf, "connect failed: {s}", .{@errorName(err)}) catch "connect failed");
+            return;
+        };
+    }
     session.transport.keepaliveConfig();
 
     // --- host key verification -----------------------------------------
@@ -1502,7 +1767,7 @@ fn workerMain(session: *Session) void {
             session.setError(std.fmt.bufPrint(&error_buf, "authentication failed: {s} ({s})", .{ @errorName(err), msg }) catch "authentication failed");
             return;
         };
-    } else {
+    } else if (session.server.auth_method == .key) {
         if (session.server.key_path.len == 0) {
             session.status.store(.@"error", .release);
             session.setError("no private key configured; edit the server to choose one");
@@ -1589,42 +1854,42 @@ fn workerMain(session: *Session) void {
                 return;
             },
         }
+    } else {
+        // SSH agent auth (spec 18): the private key never touches Oars —
+        // the agent performs the signing. SSH_AUTH_SOCK or an explicit
+        // socket, validated as an own Unix socket before connecting.
+        const agent_path = agent.resolveSocket(allocator, null) catch {
+            session.status.store(.@"error", .release);
+            session.setError("no SSH agent — start ssh-agent or set SSH_AUTH_SOCK");
+            return;
+        };
+        defer allocator.free(agent_path);
+        agent.validateSocket(agent_path) catch |err| {
+            session.status.store(.@"error", .release);
+            session.setError(switch (err) {
+                error.NotASocket => "SSH_AUTH_SOCK does not point to a socket",
+                error.NotOwned => "the SSH agent socket is not owned by the current user",
+                else => "no SSH agent — start ssh-agent or set SSH_AUTH_SOCK",
+            });
+            return;
+        };
+        var agent_conn = agent.Agent.init(session.transport.rawSession()) catch {
+            session.status.store(.@"error", .release);
+            session.setError("could not connect to the SSH agent");
+            return;
+        };
+        defer agent_conn.deinit();
+        agent_conn.auth(session.server.user, null) catch {
+            session.status.store(.@"error", .release);
+            var msg_buf: [256]u8 = undefined;
+            const msg = session.transport.lastErrorMessage(&msg_buf);
+            session.setError(std.fmt.bufPrint(&error_buf, "agent authentication failed: {s}", .{msg}) catch "agent authentication failed");
+            return;
+        };
     }
 
     // --- interactive shell ----------------------------------------------
-    const raw_shell = session.transport.openChannel(io) catch {
-        session.status.store(.@"error", .release);
-        session.setError("failed to open shell channel");
-        return;
-    };
-    raw_shell.requestPty(io, 120, 32) catch {};
-    raw_shell.setEnv(io, "TERM", "xterm-256color") catch {};
-    raw_shell.shell(io) catch {
-        raw_shell.close(io);
-        session.status.store(.@"error", .release);
-        session.setError("failed to start shell");
-        return;
-    };
-    const shell_stream = allocator.create(Stream) catch {
-        raw_shell.close(io);
-        return;
-    };
-    shell_stream.* = Stream.init(allocator);
-    const shell_entry = allocator.create(ChannelEntry) catch {
-        raw_shell.close(io);
-        allocator.destroy(shell_stream);
-        return;
-    };
-    shell_entry.* = .{ .id = 0, .kind = .shell, .stream = shell_stream, .raw = raw_shell };
-    lockSpin(&session.channels_mutex);
-    session.channels.append(allocator, shell_entry) catch {
-        session.channels_mutex.unlock();
-        allocator.destroy(shell_entry);
-        allocator.destroy(shell_stream);
-        return;
-    };
-    session.shell = shell_entry;
-    session.channels_mutex.unlock();
+    if (!openShellChannel(session, io)) return;
     session.status.store(.ready, .release);
 
     // --- run loop --------------------------------------------------------
@@ -1729,6 +1994,12 @@ fn workerMain(session: *Session) void {
 
         // --- VNC tunnels (spec 12) -------------------------------------
         processTunnels(session, io, std.Io.Timestamp.now(io, .real).nanoseconds);
+
+        // --- jump-host tunnels (spec 18) --------------------------------
+        processJumpTunnels(session, io);
+
+        // --- agent forwarding proxy (spec 18) ----------------------------
+        processForwardChannels(session, io);
 
         // --- monitor probe (probe-on-demand, spec 03 §6) -----------------
         // The worker probes only while monitor polls are recent (liveness
@@ -2016,6 +2287,8 @@ fn processOps(session: *Session) void {
             .sftp_cancel => |so| sftpOpCancel(session, so.transfer_id),
             .tunnel_start => |t| tunnelStartOp(session, t),
             .tunnel_stop => |s| tunnelStopOp(session, s),
+            .jump_start => |j| jumpStartOp(session, j),
+            .forward_set => |f| forwardSetOp(session, f),
         }
     }
 }
@@ -2086,6 +2359,110 @@ fn tunnelStopOp(session: *Session, s: anytype) void {
             t.state = .closing;
             return;
         }
+    }
+}
+
+/// Spec 18: opens the direct-tcpip channel to the target on this (via)
+/// session and registers the jump tunnel. Owns `j.host` and
+/// `j.target_server_id` on every path; the fd is closed on failure.
+fn jumpStartOp(session: *Session, j: anytype) void {
+    const allocator = session.allocator;
+    const raw = session.transport.openTunnel(session.io, j.host, j.port) catch {
+        allocator.free(j.host);
+        allocator.free(j.target_server_id);
+        _ = ssh.c.close(j.fd);
+        j.outcome.set(false, "could not open the SSH tunnel to the target");
+        return;
+    };
+    allocator.free(j.host);
+    const tunnel = allocator.create(JumpTunnel) catch {
+        raw.close(session.io);
+        allocator.free(j.target_server_id);
+        _ = ssh.c.close(j.fd);
+        j.outcome.set(false, "out of memory");
+        return;
+    };
+    tunnel.* = .{
+        .channel = raw,
+        .fd = j.fd,
+        .target_server_id = j.target_server_id,
+    };
+    lockSpin(&session.tunnels_mutex);
+    session.jump_tunnels.append(allocator, tunnel) catch {
+        session.tunnels_mutex.unlock();
+        tunnel.deinit(allocator, session.io);
+        allocator.destroy(tunnel);
+        j.outcome.set(false, "out of memory");
+        return;
+    };
+    session.tunnels_mutex.unlock();
+    j.outcome.set(true, "");
+}
+
+/// One pass over every jump tunnel (spec 18): pump the channel ↔ local
+/// fd in both directions with bounded frames; remove dead tunnels and
+/// cascade a clear close state to the target session.
+fn processJumpTunnels(session: *Session, io: std.Io) void {
+    const allocator = session.allocator;
+    var i: usize = 0;
+    while (true) {
+        lockSpin(&session.tunnels_mutex);
+        if (i >= session.jump_tunnels.items.len) {
+            session.tunnels_mutex.unlock();
+            return;
+        }
+        const jt = session.jump_tunnels.items[i];
+        session.tunnels_mutex.unlock();
+
+        var remove = false;
+        var buf: [16 * 1024]u8 = undefined;
+        // channel → fd
+        switch (jt.channel.read(&buf)) {
+            .eof => remove = true,
+            .again => {},
+            .data => |n| {
+                jt.bytes_down += n;
+                const written = ssh.c.write(jt.fd, buf[0..n].ptr, buf[0..n].len);
+                if (written < 0) {
+                    remove = true;
+                    continue;
+                }
+                if (@as(usize, @intCast(written)) < n) remove = true; // partial writes: v1 closes
+            },
+        }
+        // fd → channel
+        if (!remove) {
+            const n = std.posix.read(jt.fd, &buf) catch {
+                remove = true;
+                continue;
+            };
+            if (n == 0) {
+                remove = true; // peer closed
+            } else {
+                const w = jt.channel.write(buf[0..n]);
+                if (w == 0) remove = true;
+                jt.bytes_up += w;
+            }
+        }
+        if (remove) {
+            // Cascade: the target session gets a clear close state.
+            const target_id = jt.target_server_id;
+            if (session.owner.get(target_id)) |target| {
+                if (target.status.load(.acquire) == .ready) {
+                    target.status.store(.@"error", .release);
+                    var msg_buf: [256]u8 = undefined;
+                    target.setError(std.fmt.bufPrint(&msg_buf, "jump host {s} disconnected", .{session.server.name}) catch "jump host disconnected");
+                }
+            }
+            lockSpin(&session.tunnels_mutex);
+            _ = session.jump_tunnels.orderedRemove(i);
+            session.tunnels_mutex.unlock();
+            jt.deinit(allocator, io);
+            allocator.destroy(jt);
+            // Re-examine the new element at i.
+            continue;
+        }
+        i += 1;
     }
 }
 
@@ -2274,6 +2651,224 @@ fn tunnelDriveFrames(session: *Session, t: *Tunnel, now_ns: i128) void {
                 t.recv_buf.items.len -= frame_len;
             },
         }
+    }
+}
+
+/// Opens the interactive shell channel (spec 02). With agent forwarding
+/// enabled (spec 18) the auth-agent request is made before the pty, per
+/// the libssh2 forwarding flow; a server refusal closes the channel,
+/// rolls the toggle back off, and reports (the session stays usable).
+/// Returns false after setting the session error; `.ready` is set by the
+/// caller (workerMain only — the toggle reopens an already-ready session).
+fn openShellChannel(session: *Session, io: std.Io) bool {
+    const allocator = session.allocator;
+    const raw_shell = session.transport.openChannel(io) catch {
+        session.status.store(.@"error", .release);
+        session.setError("failed to open shell channel");
+        return false;
+    };
+    if (session.forwarding) {
+        raw_shell.requestAuthAgent(io) catch {
+            raw_shell.close(io);
+            session.forwarding = false;
+            session.status.store(.@"error", .release);
+            session.setError("agent forwarding refused (server policy or unsupported)");
+            return false;
+        };
+    }
+    raw_shell.requestPty(io, 120, 32) catch {};
+    raw_shell.setEnv(io, "TERM", "xterm-256color") catch {};
+    raw_shell.shell(io) catch {
+        raw_shell.close(io);
+        session.status.store(.@"error", .release);
+        session.setError("failed to start shell");
+        return false;
+    };
+    const shell_stream = allocator.create(Stream) catch {
+        raw_shell.close(io);
+        return false;
+    };
+    shell_stream.* = Stream.init(allocator);
+    const shell_entry = allocator.create(ChannelEntry) catch {
+        raw_shell.close(io);
+        allocator.destroy(shell_stream);
+        return false;
+    };
+    shell_entry.* = .{ .id = 0, .kind = .shell, .stream = shell_stream, .raw = raw_shell };
+    lockSpin(&session.channels_mutex);
+    session.channels.append(allocator, shell_entry) catch {
+        session.channels_mutex.unlock();
+        allocator.destroy(shell_entry);
+        allocator.destroy(shell_stream);
+        return false;
+    };
+    session.shell = shell_entry;
+    session.channels_mutex.unlock();
+    return true;
+}
+
+/// Closes the interactive shell channel (used by the forwarding toggle,
+/// which reopens it). Safe when no shell exists.
+fn closeShellChannel(session: *Session) void {
+    lockSpin(&session.channels_mutex);
+    var i: usize = 0;
+    while (i < session.channels.items.len) {
+        const entry = session.channels.items[i];
+        if (entry.kind == .shell) {
+            if (!entry.raw_closed) entry.raw.close(session.io);
+            entry.stdin_queue.deinit(session.allocator);
+            entry.freeCommandText(session.allocator);
+            entry.stream.deinit(session.allocator);
+            session.allocator.destroy(entry.stream);
+            session.allocator.destroy(entry);
+            _ = session.channels.orderedRemove(i);
+            continue;
+        }
+        i += 1;
+    }
+    session.shell = null;
+    session.channels_mutex.unlock();
+}
+
+/// Spec 18: the agent-forwarding toggle — resolve + validate the agent
+/// socket once, register the auth-agent callback, and reopen the shell
+/// with (or without) the request.
+fn forwardSetOp(session: *Session, f: anytype) void {
+    closeShellChannel(session);
+    session.forwarding = f.on;
+    if (f.on) {
+        const path = agent.resolveSocket(session.allocator, null) catch {
+            session.forwarding = false;
+            f.outcome.set(false, "no SSH agent — start ssh-agent or set SSH_AUTH_SOCK");
+            return;
+        };
+        agent.validateSocket(path) catch {
+            session.allocator.free(path);
+            session.forwarding = false;
+            f.outcome.set(false, "the agent socket is missing, not a socket, or not owned by the current user");
+            return;
+        };
+        session.forward_agent_path = path;
+        session.transport.setAbstract(@ptrCast(session));
+        session.transport.setAuthAgentCallback(authAgentCallback);
+    } else {
+        if (session.forward_agent_path) |p| session.allocator.free(p);
+        session.forward_agent_path = null;
+        session.transport.setAuthAgentCallback(null);
+    }
+    if (!openShellChannel(session, session.io)) {
+        f.outcome.set(false, "could not reopen the shell with agent forwarding");
+        return;
+    }
+    f.outcome.set(true, "");
+}
+
+/// Spec 18: libssh2's auth-agent callback — the library has already
+/// confirmed the incoming channel; queue it for the worker's proxy pump.
+fn authAgentCallback(session_raw: ?*ssh.c.LIBSSH2_SESSION, channel: ?*ssh.c.LIBSSH2_CHANNEL, abstract: ?*?*anyopaque) callconv(.c) void {
+    _ = session_raw;
+    const session_ptr: *Session = @ptrCast(@alignCast(abstract.?.* orelse return));
+    const ch = channel orelse return;
+    const wrapped = session_ptr.allocator.create(ssh.Channel) catch return;
+    wrapped.* = .{ .raw = ch, .allocator = session_ptr.allocator };
+    lockSpin(&session_ptr.forward_mutex);
+    session_ptr.forward_queue.append(session_ptr.allocator, wrapped) catch {
+        session_ptr.forward_mutex.unlock();
+        session_ptr.allocator.destroy(wrapped);
+        return;
+    };
+    session_ptr.forward_mutex.unlock();
+}
+
+/// Connects to the validated local agent socket for one proxy tunnel.
+fn connectAgentSocket(session: *Session) !std.posix.socket_t {
+    const path = session.forward_agent_path orelse return error.NoAgent;
+    const fd = ssh.c.socket(ssh.c.AF_UNIX, ssh.c.SOCK_STREAM, 0);
+    if (fd < 0) return error.ConnectionFailed;
+    errdefer _ = ssh.c.close(fd);
+    var addr: ssh.c.sockaddr_un = .{};
+    addr.sun_family = ssh.c.AF_UNIX;
+    if (@hasField(@TypeOf(addr), "sun_len")) {
+        addr.sun_len = @intCast(@sizeOf(@TypeOf(addr.sun_len)) + @sizeOf(@TypeOf(addr.sun_family)) + path.len + 1);
+    }
+    @memcpy(@as([*]u8, @ptrCast(&addr.sun_path))[0..path.len], path[0..path.len]);
+    const addr_len: c_uint = @intCast(@offsetOf(ssh.c.sockaddr_un, "sun_path") + path.len + 1);
+    if (ssh.c.connect(fd, @ptrCast(&addr), addr_len) != 0) return error.ConnectionFailed;
+    return fd;
+}
+
+/// One pass over the forwarding proxy (spec 18): move queued accepted
+/// channels into the active pump (each with a fresh agent-socket
+/// connection) and move bounded frames both ways.
+fn processForwardChannels(session: *Session, io: std.Io) void {
+    const allocator = session.allocator;
+    while (true) {
+        lockSpin(&session.forward_mutex);
+        if (session.forward_queue.items.len == 0) {
+            session.forward_mutex.unlock();
+            break;
+        }
+        const ch = session.forward_queue.orderedRemove(0);
+        session.forward_mutex.unlock();
+        const agent_fd = connectAgentSocket(session) catch {
+            ch.close(io);
+            continue;
+        };
+        const ft = allocator.create(ForwardTunnel) catch {
+            _ = ssh.c.close(agent_fd);
+            ch.close(io);
+            continue;
+        };
+        ft.* = .{ .channel = ch, .agent_fd = agent_fd };
+        lockSpin(&session.forward_mutex);
+        session.forward_active.append(allocator, ft) catch {
+            session.forward_mutex.unlock();
+            _ = ssh.c.close(agent_fd);
+            ch.close(io);
+            allocator.destroy(ft);
+            continue;
+        };
+        session.forward_mutex.unlock();
+    }
+    var i: usize = 0;
+    while (true) {
+        lockSpin(&session.forward_mutex);
+        if (i >= session.forward_active.items.len) {
+            session.forward_mutex.unlock();
+            return;
+        }
+        const ft = session.forward_active.items[i];
+        session.forward_mutex.unlock();
+        var remove = false;
+        var buf: [16 * 1024]u8 = undefined;
+        switch (ft.channel.read(&buf)) {
+            .eof => remove = true,
+            .again => {},
+            .data => |n| {
+                if (ssh.c.write(ft.agent_fd, buf[0..n].ptr, buf[0..n].len) < 0) remove = true;
+            },
+        }
+        if (!remove) {
+            const n = std.posix.read(ft.agent_fd, &buf) catch {
+                remove = true;
+                continue;
+            };
+            if (n == 0) {
+                remove = true;
+            } else {
+                if (ft.channel.write(buf[0..n]) == 0) remove = true;
+            }
+        }
+        if (remove) {
+            lockSpin(&session.forward_mutex);
+            _ = session.forward_active.orderedRemove(i);
+            session.forward_mutex.unlock();
+            _ = ssh.c.close(ft.agent_fd);
+            ft.channel.close(io);
+            allocator.destroy(ft);
+            continue;
+        }
+        i += 1;
     }
 }
 
@@ -3950,6 +4545,11 @@ fn sessionDone(session: *Session) void {
                 session.allocator.free(t.token);
                 session.allocator.free(t.host);
             },
+            .jump_start => |j| {
+                session.allocator.free(j.host);
+                session.allocator.free(j.target_server_id);
+                if (!j.outcome.isDone()) _ = ssh.c.close(j.fd);
+            },
             else => {},
         }
     }
@@ -3985,6 +4585,37 @@ fn sessionDone(session: *Session) void {
     session.tunnels.clearRetainingCapacity();
     session.tunnels.deinit(session.allocator);
     session.tunnels_mutex.unlock();
+
+    // Jump-host tunnels (spec 18): everything dies with the via session,
+    // and dependants get a clear cascade close state.
+    lockSpin(&session.tunnels_mutex);
+    for (session.jump_tunnels.items) |jt| {
+        if (session.owner.get(jt.target_server_id)) |target| {
+            if (target.status.load(.acquire) == .ready) {
+                target.status.store(.@"error", .release);
+                var msg_buf: [256]u8 = undefined;
+                target.setError(std.fmt.bufPrint(&msg_buf, "jump host {s} disconnected", .{session.server.name}) catch "jump host disconnected");
+            }
+        }
+        jt.deinit(session.allocator, session.io);
+        session.allocator.destroy(jt);
+    }
+    session.jump_tunnels.deinit(session.allocator);
+    session.tunnels_mutex.unlock();
+    if (session.via_name) |n| session.allocator.free(n);
+
+    // Agent forwarding (spec 18): close every accepted agent channel.
+    lockSpin(&session.forward_mutex);
+    for (session.forward_queue.items) |ch| ch.close(session.io);
+    session.forward_queue.deinit(session.allocator);
+    for (session.forward_active.items) |ft| {
+        _ = ssh.c.close(ft.agent_fd);
+        ft.channel.close(session.io);
+        session.allocator.destroy(ft);
+    }
+    session.forward_active.deinit(session.allocator);
+    session.forward_mutex.unlock();
+    if (session.forward_agent_path) |p| session.allocator.free(p);
 
     session.transport.disconnect(session.io);
     const status = session.status.load(.acquire);

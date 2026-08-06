@@ -14,6 +14,7 @@ const access = @import("access.zig");
 const backup = @import("backup.zig");
 const ai = @import("ai.zig");
 const vault = @import("vault.zig");
+const agent = @import("agent.zig");
 
 // Zig 0.16 only collects test blocks from files that are actually
 // analyzed, and an unused import is never analyzed — so the env-gated
@@ -23,6 +24,7 @@ comptime {
     _ = integration;
     _ = deploy;
     _ = vault;
+    _ = agent;
 }
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
@@ -1790,4 +1792,52 @@ test "vault export/import round trip via bridge" {
         \\{"id":"11","command":"oars.servers.list","payload":{}}
     );
     try std.testing.expect(std.mem.indexOf(u8, plain_restored, "10.0.0.1") != null);
+}
+
+test "spec 18: agent.list, agent auth method, and the forwarding toggle" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // A missing agent is not a failure: ok with an empty identity list.
+    // (Explicit nonexistent path — deterministic regardless of whether
+    // the host shell has SSH_AUTH_SOCK set.)
+    const list = app.dispatch(
+        \\{"id":"1","command":"oars.agent.list","payload":{"path":"/tmp/oars-missing-agent-socket-test"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, list, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list, "no agent") != null);
+
+    // The agent auth method saves and round-trips.
+    const save = app.dispatch(
+        \\{"id":"2","command":"oars.servers.save","payload":{"id":"srv-agent-1","name":"agent-box","host":"10.0.0.9","port":22,"user":"root","auth_method":"agent"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, save, "\"ok\":true") != null);
+    const listed = app.dispatch(
+        \\{"id":"3","command":"oars.servers.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"auth_method\":\"agent\"") != null);
+
+    // Forwarding on a server with no session is an explicit error.
+    const fwd = app.dispatch(
+        \\{"id":"4","command":"oars.agent.forward","payload":{"server_id":"srv-agent-1","on":true}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, fwd, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fwd, "no session") != null);
+
+    // A via-chain cycle is rejected at save time (spec 18 §10).
+    // Create hop-b first so the forward reference in hop-a is valid.
+    const hop_b_init = app.dispatch(
+        \\{"id":"5","command":"oars.servers.save","payload":{"id":"hop-b","name":"hop b","host":"10.0.0.2","port":22,"user":"root","auth_method":"password"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, hop_b_init, "\"ok\":true") != null);
+    const cyc1 = app.dispatch(
+        \\{"id":"6","command":"oars.servers.save","payload":{"id":"hop-a","name":"hop a","host":"10.0.0.1","port":22,"user":"root","auth_method":"password","via_server_id":"hop-b"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, cyc1, "\"ok\":true") != null);
+    const cyc2 = app.dispatch(
+        \\{"id":"7","command":"oars.servers.save","payload":{"id":"hop-b","name":"hop b","host":"10.0.0.2","port":22,"user":"root","auth_method":"password","via_server_id":"hop-a"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, cyc2, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cyc2, "cycle") != null);
 }

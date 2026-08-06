@@ -17,17 +17,22 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 pub const AuthMethod = enum {
     password,
     key,
+    /// Spec 18: authenticate through the local SSH agent (SSH_AUTH_SOCK
+    /// or an explicit socket). Private-key operations stay in the agent.
+    agent,
 
     pub fn jsonName(self: AuthMethod) []const u8 {
         return switch (self) {
             .password => "password",
             .key => "key",
+            .agent => "agent",
         };
     }
 
     pub fn fromJsonName(name: []const u8) ?AuthMethod {
         if (std.mem.eql(u8, name, "password")) return .password;
         if (std.mem.eql(u8, name, "key")) return .key;
+        if (std.mem.eql(u8, name, "agent")) return .agent;
         return null;
     }
 };
