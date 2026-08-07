@@ -226,6 +226,13 @@ pub const Session = struct {
         return fingerprintFromHash(hash[0..32].*, out);
     }
 
+    pub fn hostKeyAlgorithm(self: *Session) Error!HostKeyAlgorithm {
+        var key_len: usize = 0;
+        var key_type: c_int = c.LIBSSH2_HOSTKEY_TYPE_UNKNOWN;
+        if (c.libssh2_session_hostkey(self.raw, &key_len, &key_type) == null or key_len == 0) return error.Protocol;
+        return HostKeyAlgorithm.fromLibssh2(key_type);
+    }
+
     /// Pure encoding helper (unit-testable): `SHA256:` + unpadded base64.
     pub fn fingerprintFromHash(hash: [32]u8, out: []u8) []const u8 {
         const prefix = "SHA256:";
@@ -522,6 +529,40 @@ pub const Session = struct {
     }
 };
 
+pub const HostKeyAlgorithm = enum {
+    rsa,
+    dsa,
+    ecdsa_p256,
+    ecdsa_p384,
+    ecdsa_p521,
+    ed25519,
+    unknown,
+
+    pub fn fromLibssh2(key_type: c_int) HostKeyAlgorithm {
+        return switch (key_type) {
+            c.LIBSSH2_HOSTKEY_TYPE_RSA => .rsa,
+            c.LIBSSH2_HOSTKEY_TYPE_DSS => .dsa,
+            c.LIBSSH2_HOSTKEY_TYPE_ECDSA_256 => .ecdsa_p256,
+            c.LIBSSH2_HOSTKEY_TYPE_ECDSA_384 => .ecdsa_p384,
+            c.LIBSSH2_HOSTKEY_TYPE_ECDSA_521 => .ecdsa_p521,
+            c.LIBSSH2_HOSTKEY_TYPE_ED25519 => .ed25519,
+            else => .unknown,
+        };
+    }
+
+    pub fn label(self: HostKeyAlgorithm) []const u8 {
+        return switch (self) {
+            .rsa => "RSA",
+            .dsa => "DSA",
+            .ecdsa_p256 => "ECDSA P-256",
+            .ecdsa_p384 => "ECDSA P-384",
+            .ecdsa_p521 => "ECDSA P-521",
+            .ed25519 => "Ed25519",
+            .unknown => "Unknown",
+        };
+    }
+};
+
 pub const Channel = struct {
     raw: *c.LIBSSH2_CHANNEL,
     allocator: std.mem.Allocator,
@@ -729,4 +770,11 @@ test "fingerprint buffer fits the trust dialog budget" {
     var buf: [64]u8 = undefined;
     const fp = Session.fingerprintFromHash(digest, &buf);
     try std.testing.expectEqual(@as(usize, 50), fp.len);
+}
+
+test "host key algorithms use readable trust-dialog labels" {
+    try std.testing.expectEqual(HostKeyAlgorithm.rsa, HostKeyAlgorithm.fromLibssh2(c.LIBSSH2_HOSTKEY_TYPE_RSA));
+    try std.testing.expectEqual(HostKeyAlgorithm.ed25519, HostKeyAlgorithm.fromLibssh2(c.LIBSSH2_HOSTKEY_TYPE_ED25519));
+    try std.testing.expectEqualStrings("ECDSA P-256", HostKeyAlgorithm.ecdsa_p256.label());
+    try std.testing.expectEqualStrings("Unknown", HostKeyAlgorithm.fromLibssh2(-1).label());
 }

@@ -409,6 +409,7 @@ const TrustState = struct {
     /// it; only `fingerprint_len` bytes are ever meaningful.
     fingerprint: [64]u8 = undefined,
     fingerprint_len: usize = 0,
+    algorithm: ssh.HostKeyAlgorithm = .unknown,
     decided: bool = false,
     accept: bool = false,
 };
@@ -768,6 +769,12 @@ pub const Session = struct {
         defer self.trust.mutex.unlock();
         if (!self.trust.pending) return "";
         return self.trust.fingerprint[0..self.trust.fingerprint_len];
+    }
+
+    fn trustAlgorithm(self: *Session) []const u8 {
+        lockSpin(&self.trust.mutex);
+        defer self.trust.mutex.unlock();
+        return self.trust.algorithm.label();
     }
 };
 
@@ -1421,6 +1428,7 @@ pub const Manager = struct {
             .@"error" = if (status == .@"error") session.errorText() else "",
             .trust_pending = session.trustPending(),
             .trust_fingerprint = session.trustFingerprint(),
+            .trust_algorithm = session.trustAlgorithm(),
         };
     }
 
@@ -1554,6 +1562,7 @@ pub const SessionInfo = struct {
     @"error": []const u8,
     trust_pending: bool,
     trust_fingerprint: []const u8,
+    trust_algorithm: []const u8,
 };
 
 fn workerMain(session: *Session) void {
@@ -1691,11 +1700,13 @@ fn workerMain(session: *Session) void {
         session.setError("host key unavailable");
         return;
     };
+    const host_key_algorithm = session.transport.hostKeyAlgorithm() catch .unknown;
     if (session.server.host_fingerprint == null) {
         lockSpin(&session.trust.mutex);
         session.trust.pending = true;
         @memcpy(session.trust.fingerprint[0..fingerprint.len], fingerprint);
         session.trust.fingerprint_len = fingerprint.len;
+        session.trust.algorithm = host_key_algorithm;
         session.trust.decided = false;
         session.trust.mutex.unlock();
         session.status.store(.needs_trust, .release);

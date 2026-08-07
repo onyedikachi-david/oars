@@ -1,9 +1,8 @@
 # Spec 01 — Multi-Server Management
 
-**Status:** Partial (CRUD, Keychain flow, session tabs, and store hardening
-landed 2026-08-03 — owner-only permissions, corrupt-file quarantine, save
-semantics, tags/via validation; `SHA256:` base64 fingerprint migration (spec
-02) and grouping pending) · **Depends on:** — · **Spec owner:** core
+**Status:** Partial (CRUD, Keychain flow, grouped fleet navigation, filtering,
+session tabs, canonical host fingerprints, and store recovery are implemented;
+500-profile performance measurement remains) · **Depends on:** — · **Spec owner:** core
 
 ## 1. Overview
 
@@ -59,7 +58,7 @@ feature request.
 | Host | text | IP or hostname |
 | Port | number | default 22 |
 | User | text | default root |
-| Auth method | segmented | Password / SSH key |
+| Auth method | segmented | Password / SSH key / Agent |
 | Password | password | only for password auth; blank = keep existing (edit) |
 | Private key path | text + Browse… | `native-sdk.dialog.openFile` picker |
 | Key passphrase | checkbox + password | stored in Keychain |
@@ -101,7 +100,7 @@ feature request.
   zero-copy parse strings — see ROADMAP §3 decision 6).
 - `src/sessions.zig` — `Manager` maps server_id → live `Session`; ensures
   one connection per server; `disconnect` joins the worker thread.
-- Groups and tags (target): the frontend derives folder paths and tag filters
+- Groups and tags: the frontend derives folder paths and tag filters
   from the canonical `group` and `tags` fields returned by
   `oars.servers.list`; there is no separate groups store in v1.
 
@@ -127,16 +126,12 @@ feature request.
 ## 10. Edge cases
 
 - Corrupt `servers.json` → do not replace it. Move it to a timestamped
-  `servers.json.corrupt-*` file, show a recovery error, and start with an empty
-  in-memory list. The current code only returns an empty list; quarantine and
-  user-visible recovery remain implementation gaps.
+  `servers.json.corrupt-*` file, show the bridge `recovery_error`, and start
+  with an empty in-memory list.
 - Hostname whitespace is trimmed on save. A trailing slash is rejected because
   it is not part of an SSH host name.
 - Port outside 1–65535 is rejected. It is never clamped silently.
 - Duplicate connect attempt → idempotent success with the live session status.
-  The current bridge returns `ok:false` with "already connected" and the
-  frontend catches that text; replacing this text-coupled path is an
-  implementation gap.
 - Server deleted while tabs are open → all of its tabs show "server removed"
   and the shared session is torn down.
 
@@ -161,11 +156,13 @@ feature request.
 - [x] `zig build test` passes with store/bridge coverage.
 - [x] Editing a profile preserves `created_at` and preserves or clears the
       host fingerprint according to the endpoint rule above.
-- [ ] Stored and displayed host fingerprints match OpenSSH's
+- [x] Stored and displayed host fingerprints match OpenSSH's
       `SHA256:<base64-without-padding>` form. Existing hex records migrate only
-      after the same host key verifies. — backend session-side work is spec 02.
+      after the same host key verifies.
 - [x] `servers.json` is written with owner-only permissions and a corrupt file
       is quarantined before the app continues.
+- [x] The sidebar derives collapsible groups from canonical profile data and
+      filters by name, host, group, or tag without changing the saved records.
 
 ## 13. Research & References
 
@@ -181,7 +178,7 @@ installed Native SDK) rather than assumed.
   Zig 0.16 `std.json` parses strings with `.alloc_if_needed` (strings may
   point into the input buffer) — this design decision is required by the
   std.json semantics, not a style choice.
-  Current gaps found in this review: `servers.save` rebuilds an edited record,
+  The 2026-08-03 review found that `servers.save` rebuilt an edited record,
   so it resets `created_at` and clears `host_fingerprint`; malformed JSON is
   treated as empty but is not quarantined; and the store does not explicitly
   set owner-only file permissions.
@@ -195,7 +192,7 @@ installed Native SDK) rather than assumed.
   `Store.upsert` never released its deep-copied server after `save`, and
   `loadParsed` built its empty `Loaded` eagerly, leaking the parse arena on
   every successful load. The `SHA256:` base64 fingerprint migration and
-  duplicate-connect idempotence are spec 02 session-side work.
+  duplicate-connect idempotence later landed with the spec 02 session work.
 - **Bridge protocol (invoke/response, no native→JS push)** — verified in
   the installed SDK at
   `node_modules/@native-sdk/cli/src/bridge/root.zig`: `Handler` with

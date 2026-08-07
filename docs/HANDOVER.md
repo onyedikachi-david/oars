@@ -165,10 +165,13 @@ raw-result wrapping at L163/L223), `src/runtime/flow.zig` (dispatch),
 - **Commands to servers:** build argv arrays or quote properly; never
   shell-interpolate user strings. Single-quote escaping for `{{vars}}`
   (Bash §3.1.2.2). Fixed-string probe commands (specs 03/04).
-- **UI:** dark ops theme, **electric-blue accent — no teal/green in the
-  UI palette** (terminal ANSI keeps standard green: it renders remote
-  content). Status vocabulary: amber pulse = connecting, blue = ready,
-  red = error. Keyboard-first, `⌘K`-reachable.
+- **UI:** governed by `docs/DESIGN.md` — calm infrastructure studio
+  (mineral paper light / paper night dark, brass/cobalt primary, not
+  electric-blue or neon). Terminal ANSI keeps standard green (it renders
+  remote content). Status vocabulary: amber pulse = connecting, brass/cobalt
+  = ready, clay red = error. Human language, progressive disclosure,
+  `Geist Sans` for UI / `Geist Mono` only for technical metadata, keyboard-first,
+  `⌘K`-reachable. **Read `docs/DESIGN.md` before touching any frontend file.**
 - **Errors in UI:** never a spinner where state can be shown; unreadable
   files/servers produce explicit reasons (specs 03/04/09 `sync_error`s).
 
@@ -1505,3 +1508,36 @@ Bugs fixed this session: spec-18 dispatcher cycle test used `auth_method:"key"` 
 Validation: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-global-cache zig build test --global-cache-dir /tmp/zig-cache` → `180 pass / 1 fail (181 total)` for two consecutive runs (only pre-existing `sshkeys.generate` PTY flake remains, `No user exists for uid 501` in this sandbox, documented as `164/165 once`); `npm --prefix frontend run build` clean (vite 23 modules, 123ms). Two exports with same password differ in salt/nonce (spec 17) still holds.
 
 Next: optional container jump-bastion integration test (spec 11 pattern: container A reachable only from B, connect via B, verify shell+exec) for real tunnel proof; no live ssh-agent fixture yet (agent auth needs an agent holding a key).
+---
+
+## 14. Session handover — 2026-08-07 (session 4): spec 03 frontend (monitoring)
+
+**What landed:** `frontend/src/bridge.ts` gained `oars.monitor.{probe,cleanDiskEstimate,cleanDisk,dropCaches}` (types match `src/bridge.zig` — `journal|apt` plans, `1|2|3` drop level); `frontend/src/MonitorTab.tsx` rewritten to spec 03 §4.1 as a calm studio view — three `Processor`/`Memory`/`Storage` gauge cards with health/watch/tight/critical bands (shared tokens for spec 16), `cpu_warming` state, `probe_error` honest banner, `not_ready` → "Waiting for connection…", per-process table sortable by CPU%/Mem% with busybox `null` → `—` and a per-row `→ AI` that copies `PID — name` to the clipboard, a 120-sample ring-buffer sparkline (canvas, no DOM churn), itemized "Analyze disk space" diagnostics (journal/apt) with read-only preview → approval-gated cleanup via `oars.ssh.poll` cursors, and the "Drop filesystem caches" diagnostic hidden under Advanced with explicit kernel warning prose and before/after audit semantics. `frontend/src/index.css` added the studio monitor chrome (gauges, sparkline, proc panel, diagnostics).
+
+**Constraints respected:** `api.ssh.poll(cursors)` per-channel stream contract (`src/sessions.zig`); gauge thresholds `0–60/60–80/80–90/90+` and audit discipline (`monitor.clean_disk`, `monitor.drop_caches`/`.after`); Geist Mono only for mono/host/meta; deterministic ad-hoc checks pass; `tsc --noEmit` + `npm run build` green (held per creative rule until visual sign-off, now verified).
+
+**Still deferred:** `zig build` / `zig build test` + full validation, and the manual flow (not_ready → warming → utilization, sort, estimate→cleanup→audit, drop caches warning copy, sparkline) — stage before the spec 03 commit.
+
+## 26. Session handover — 2026-08-07: specs 01–02 frontend and recovery
+
+Landed the grouped fleet and terminal contract against the existing backend.
+The sidebar now derives collapsible groups from `Server.group`, filters the
+full profile set, exposes open/mirror/edit actions, reports real session state,
+and keeps all tabs for a shared session until the last tab closes. The profile
+modal validates the backend's host, port, group, tag, jump-host, and secret
+rules, uses the Keychain without silent failures, and reports corrupt-store
+recovery from `servers.list`.
+
+The terminal now keeps one xterm instance and cursor map per tab across view
+and workspace navigation. It buffers ordered input until `ready`, renders only
+the shell channel, and leaves exec output for its own pane. First trust shows
+the backend key algorithm and canonical fingerprint. Changed-key recovery uses
+the new `oars.ssh.retrust` command, exact profile-name confirmation, a fresh
+trust prompt, and an `ssh.retrust` audit entry.
+
+Validation: `npm --prefix frontend run build`, `zig build test`, and
+`git diff --check` after cleanup. Browser checks at 1440×1000 and 390×844
+covered grouped navigation, action-menu hit targets, delayed input, shell/exec
+separation, first trust, changed-key recovery, mirrored-tab close behavior,
+persistent terminal state, profile validation, and responsive layout. Keep
+`frontend/preview.html` as the reusable bridge-state harness for later specs.

@@ -1,16 +1,20 @@
 // Shared types for the Oars bridge protocol.
 
+export type AuthMethod = "password" | "key" | "agent";
+
 export interface Server {
   id: string;
   name: string;
   host: string;
   port: number;
   user: string;
-  auth_method: "password" | "key";
+  auth_method: AuthMethod;
   key_path: string;
   key_has_passphrase: boolean;
   host_fingerprint: string | null;
   group: string;
+  tags: string[];
+  via_server_id: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -21,10 +25,12 @@ export interface ServerDraft {
   host: string;
   port: number;
   user: string;
-  auth_method: "password" | "key";
+  auth_method: AuthMethod;
   key_path?: string;
   key_has_passphrase?: boolean;
   group?: string;
+  tags?: string[];
+  via_server_id?: string | null;
 }
 
 export type SessionStatus =
@@ -51,7 +57,7 @@ export interface PollResult {
   ok: boolean;
   status: SessionStatus;
   error?: string;
-  trust?: { pending: boolean; fingerprint?: string };
+  trust?: { pending: boolean; algorithm?: string; fingerprint?: string };
   channels: ChannelInfo[];
 }
 

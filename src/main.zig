@@ -468,6 +468,52 @@ test "servers.save preserves created_at and fingerprint by endpoint rule" {
     try std.testing.expect(port_parsed.value.result.server.host_fingerprint == null);
 }
 
+test "ssh.retrust requires the exact profile name before clearing the fingerprint" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+    const store_alloc = app.arena.allocator();
+
+    const saved = app.dispatch(
+        \\{"id":"1","command":"oars.servers.save","payload":{"id":"retrust-1","name":"Production API","host":"10.0.0.8","port":22,"user":"deploy","auth_method":"password"}}
+    );
+    var saved_parsed = try parseSaveResponse(store_alloc, saved);
+    defer saved_parsed.deinit();
+
+    const trusted = servers.Server{
+        .id = "retrust-1",
+        .name = "Production API",
+        .host = "10.0.0.8",
+        .port = 22,
+        .user = "deploy",
+        .host_fingerprint = "SHA256:old-host-key",
+        .created_at = saved_parsed.value.result.server.created_at,
+    };
+    try app.store.upsert(std.testing.io, trusted);
+
+    const wrong_name = app.dispatch(
+        \\{"id":"2","command":"oars.ssh.retrust","payload":{"server_id":"retrust-1","confirm_name":"production api"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, wrong_name, "\"ok\":false") != null);
+    var after_wrong = (try app.store.find(std.testing.io, "retrust-1")).?;
+    defer after_wrong.deinit(store_alloc);
+    try std.testing.expectEqualStrings("SHA256:old-host-key", after_wrong.host_fingerprint.?);
+
+    const exact_name = app.dispatch(
+        \\{"id":"3","command":"oars.ssh.retrust","payload":{"server_id":"retrust-1","confirm_name":"Production API"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, exact_name, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exact_name, "\"host_fingerprint\":null") != null);
+    var after_exact = (try app.store.find(std.testing.io, "retrust-1")).?;
+    defer after_exact.deinit(store_alloc);
+    try std.testing.expect(after_exact.host_fingerprint == null);
+
+    const audit_list = app.dispatch(
+        \\{"id":"4","command":"oars.audit.list","payload":{"type":"ssh.retrust"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, audit_list, "\"type\":\"ssh.retrust\"") != null);
+}
+
 test "servers.save normalizes tags and validates host, port, and via chains" {
     var app: TestApp = undefined;
     try app.init();

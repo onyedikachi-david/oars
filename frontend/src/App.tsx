@@ -5,6 +5,7 @@ import {
   ArrowUpRight,
   Bot,
   Check,
+  ChevronDown,
   ChevronRight,
   CircleHelp,
   Cloud,
@@ -20,6 +21,7 @@ import {
   Moon,
   MoreHorizontal,
   Network,
+  Pencil,
   Plus,
   RefreshCw,
   Search,
@@ -88,30 +90,28 @@ const navGroups = [
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
-function statusDotClass(s: string) {
-  if (s === "ready") return "status-dot";
-  if (s === "error" || s === "closed") return "status-dot status-offline";
-  return "status-dot";
-}
 function sessionStatusClass(s?: SessionStatus) {
-  if (!s || s === "closed" || s === "error") return "closed";
+  if (!s || s === "closed") return "closed";
   return s;
+}
+function fleetDotClass(s?: SessionStatus): string {
+  if (s === "ready") return "fleet-dot fleet-dot-ready";
+  if (s === "connecting" || s === "authenticating") return "fleet-dot fleet-dot-connecting";
+  if (s === "needs_trust") return "fleet-dot fleet-dot-needs_trust";
+  if (s === "error") return "fleet-dot fleet-dot-error";
+  return "fleet-dot fleet-dot-offline";
+}
+function fleetLabel(s?: SessionStatus): string {
+  if (!s || s === "closed") return "Offline";
+  if (s === "ready") return "Connected";
+  if (s === "needs_trust") return "Needs attention";
+  if (s === "error") return "Failed";
+  return "Connecting";
 }
 function initials(name: string) {
   const parts = name.split(/[-_\s]+/).filter(Boolean);
   if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
   return name.slice(0, 2).toUpperCase();
-}
-function StatusDot({ status }: { status: string }) {
-  const cls = status === "Online" ? "status-dot" : status === "Degraded" ? "status-dot status-degraded" : "status-dot status-offline";
-  return <span className={cls} aria-label={status} />;
-}
-function MetricBar({ value, tone = "primary" }: { value: number; tone?: "primary" | "warning" }) {
-  return (
-    <div className="metric-track">
-      <div className={`metric-fill ${tone === "warning" ? "metric-warning" : ""}`} style={{ width: `${Math.min(100, Math.max(0, value))}%` }} />
-    </div>
-  );
 }
 function SectionTitle({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: React.ReactNode }) {
   return (
@@ -189,8 +189,8 @@ function Overview({
     <div className="content-stack">
       <SectionTitle
         eyebrow="Fleet overview"
-        title="Good morning, operator"
-        description={`A calm view of your local infrastructure. ${total === 0 ? "No servers yet — add one to get started." : `Last refresh moments ago · ${online} of ${total} online.`}`}
+        title="Local infrastructure"
+        description={total === 0 ? "No servers yet. Add one to get started." : `${online} of ${total} connection profiles are connected.`}
         action={
           <Button onClick={onAdd}>
             <Plus data-icon="inline-start" /> Add server
@@ -277,7 +277,7 @@ function Overview({
           {[
             { label: "Open shell", icon: Terminal },
             { label: "Run a script", icon: ListChecks },
-            { label: "Scan fleet", icon: RefreshCw },
+            { label: "Refresh profiles", icon: RefreshCw },
           ].map((action) => (
             <Button key={action.label} variant="outline" onClick={() => onAction(action.label)}>
               <action.icon data-icon="inline-start" />
@@ -307,7 +307,7 @@ function LiveServerTable({
           <tr>
             <th>Server</th>
             <th>Status</th>
-            <th>Connection</th>
+            <th>Endpoint</th>
             <th>Group</th>
             <th />
           </tr>
@@ -315,9 +315,6 @@ function LiveServerTable({
         <tbody>
           {servers.map((s) => {
             const st = statuses.get(s.id);
-            const label = st === "ready" ? "Online" : st === "connecting" || st === "authenticating" || st === "needs_trust" ? "Connecting" : st === "error" ? "Error" : "Offline";
-            const pct = st === "ready" ? 72 : st ? 40 : 8;
-            const tone = st === "ready" ? "primary" as const : "warning" as const;
             return (
               <tr key={s.id}>
                 <td>
@@ -333,15 +330,12 @@ function LiveServerTable({
                 </td>
                 <td>
                   <span className="status-label">
-                    <span className={st === "ready" ? "status-dot" : st === "error" ? "status-dot status-offline" : "status-dot status-offline"} />
-                    {label}
+                    <span className={fleetDotClass(st)} aria-hidden />
+                    {fleetLabel(st)}
                   </span>
                 </td>
                 <td>
-                  <div className="bar-cell">
-                    <span>{st ?? "—"}</span>
-                    <MetricBar value={pct} tone={st === "ready" ? "primary" : "warning"} />
-                  </div>
+                  <span className="technical-meta">{s.user}@{s.host}:{s.port}</span>
                 </td>
                 <td>
                   <span className="latency">{s.group || "Ungrouped"}</span>
@@ -428,13 +422,12 @@ function ServersView({
                   <tbody>
                     {list.map((s) => {
                       const st = statuses.get(s.id);
-                      const label = st === "ready" ? "Online" : st ? st : "Offline";
                       return (
                         <tr key={s.id}>
                           <td><div className="server-cell"><span className="server-avatar">{initials(s.name)}</span><div><strong>{s.name}</strong><span>{s.host}:{s.port}</span></div></div></td>
                           <td style={{ color: "var(--muted-foreground)", fontSize: 11 }}>{s.user}</td>
                           <td><span className="pill" style={{ textTransform: "capitalize" }}>{s.auth_method}</span></td>
-                          <td><span className="status-label"><span className={statusDotClass(label)} />{label}</span></td>
+                          <td><span className="status-label"><span className={fleetDotClass(st)} aria-hidden />{fleetLabel(st)}</span></td>
                           <td style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
                             <Button variant="outline" size="sm" onClick={() => onOpen(s)}>Open <ArrowUpRight data-icon="inline-end" /></Button>
                             <Button variant="ghost" size="sm" onClick={() => onEdit(s)}>Edit</Button>
@@ -473,16 +466,21 @@ export default function App() {
     }
   });
   const [search, setSearch] = useState("");
+  const [fleetFilter, setFleetFilter] = useState("");
+  const fleetCountRef = useRef(0);
+  const [collapsedFleetGroups, setCollapsedFleetGroups] = useState<Set<string>>(new Set());
+  const [serverMenuId, setServerMenuId] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState<Section>("Overview");
   const [mobileNav, setMobileNav] = useState(false);
   const [toast, setToast] = useState("");
   const searchRef = useRef<HTMLInputElement>(null);
+  const fleetSearchRef = useRef<HTMLInputElement>(null);
 
   const refreshServers = useCallback(async () => {
     try {
       const r = await api.servers.list();
       setServers(r.servers);
-      setLoadError(null);
+      setLoadError(r.recovery_error ?? null);
     } catch (e) {
       setLoadError(e instanceof BridgeError ? e.message : String(e));
     }
@@ -526,17 +524,7 @@ export default function App() {
 
   useEffect(() => { applyTheme(theme); }, [theme, applyTheme]);
 
-  useEffect(() => {
-    const h = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        setPaletteOpen((o) => !o);
-      }
-      if (e.key === "Escape" && paletteOpen) setPaletteOpen(false);
-    };
-    window.addEventListener("keydown", h);
-    return () => window.removeEventListener("keydown", h);
-  }, [paletteOpen]);
+
 
   const setStatus = useCallback((serverId: string, status: SessionStatus) => {
     setStatuses((prev) => {
@@ -553,10 +541,30 @@ export default function App() {
         setActiveKey(existing.key);
         return prev;
       }
-      const tab: Tab = { server, key: server.id, view: "monitor" };
+      const tab: Tab = { server, key: server.id, view: "terminal" };
       setActiveKey(tab.key);
       return [...prev, tab];
     });
+  }, []);
+
+  const openServerView = useCallback((server: OarsServer, view: View) => {
+    setTabs((prev) => {
+      const existing = prev.find((t) => t.server.id === server.id);
+      if (existing) {
+        setActiveKey(existing.key);
+        return prev.map((tab) => tab.key === existing.key ? { ...tab, view } : tab);
+      }
+      const tab: Tab = { server, key: server.id, view };
+      setActiveKey(tab.key);
+      return [...prev, tab];
+    });
+  }, []);
+
+  const openMirrored = useCallback((server: OarsServer, view: View = "terminal") => {
+    fleetCountRef.current += 1;
+    const tab: Tab = { server, key: `${server.id}#${fleetCountRef.current}`, view };
+    setTabs((prev) => [...prev, tab]);
+    setActiveKey(tab.key);
   }, []);
 
   const setView = useCallback((view: View) => {
@@ -564,14 +572,16 @@ export default function App() {
   }, [activeKey]);
 
   const closeTab = useCallback((key: string) => {
-    setTabs((prev) => {
-      const tab = prev.find((t) => t.key === key);
-      if (tab) api.ssh.disconnect(tab.server.id).catch(() => {});
-      const next = prev.filter((t) => t.key !== key);
-      setActiveKey((active) => (active === key ? (next[next.length - 1]?.key ?? null) : active));
-      return next;
+    const tab = tabs.find((item) => item.key === key);
+    const hasAnotherView = tab ? tabs.some((item) => item.key !== key && item.server.id === tab.server.id) : false;
+    setTabs((prev) => prev.filter((item) => item.key !== key));
+    setActiveKey((active) => {
+      if (active !== key) return active;
+      const remaining = tabs.filter((item) => item.key !== key);
+      return remaining[remaining.length - 1]?.key ?? null;
     });
-  }, []);
+    if (tab && !hasAnotherView) api.ssh.disconnect(tab.server.id).catch(() => {});
+  }, [tabs]);
 
   const handleSaved = useCallback((saved: OarsServer) => {
     setModal(null);
@@ -580,7 +590,119 @@ export default function App() {
     openServer(saved);
   }, [refreshServers, openServer]);
 
+  const handleServerUpdated = useCallback((saved: OarsServer) => {
+    setServers((current) => current.map((server) => server.id === saved.id ? saved : server));
+    setTabs((current) => current.map((tab) => tab.server.id === saved.id ? { ...tab, server: saved } : tab));
+  }, []);
+
+  const handleDeleted = useCallback((id: string, warning?: string) => {
+    // Close all tabs for the removed profile and disconnect the session.
+    setTabs((prev) => {
+      const remaining = prev.filter((t) => t.server.id !== id);
+      setActiveKey((active) => {
+        if (!active) return null;
+        const stillThere = remaining.some((r) => r.key === active);
+        return stillThere ? active : (remaining[remaining.length - 1]?.key ?? null);
+      });
+      return remaining;
+    });
+    setStatuses((prev) => {
+      const next = new Map(prev);
+      next.delete(id);
+      return next;
+    });
+    refreshServers();
+    setToast(warning ?? "Connection profile removed.");
+    setTimeout(() => setToast(""), warning ? 5000 : 2200);
+  }, [refreshServers]);
+
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPaletteOpen((o) => !o);
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "t") {
+        const active = tabs.find((t) => t.key === activeKey);
+        if (active) {
+          e.preventDefault();
+          openMirrored(active.server);
+          return;
+        }
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+        // Fleet search — don't hijack when the terminal or an input is focused.
+        const tag = (document.activeElement?.tagName ?? "").toLowerCase();
+        const inField = tag === "input" || tag === "textarea" || (document.activeElement as HTMLElement | null)?.isContentEditable;
+        if (!inField) {
+          e.preventDefault();
+          fleetSearchRef.current?.focus();
+          return;
+        }
+      }
+      if (e.key === "/" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        const tag = (document.activeElement?.tagName ?? "").toLowerCase();
+        const inField = tag === "input" || tag === "textarea" || (document.activeElement as HTMLElement | null)?.isContentEditable;
+        if (!inField) {
+          e.preventDefault();
+          fleetSearchRef.current?.focus();
+        }
+      }
+      if (e.key === "Escape" && paletteOpen) setPaletteOpen(false);
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [paletteOpen, tabs, activeKey, openMirrored]);
+
   const activeTab = tabs.find((t) => t.key === activeKey) ?? null;
+  const fleetGroups = useMemo(() => {
+    const query = fleetFilter.trim().toLowerCase();
+    const filtered = !query
+      ? servers
+      : servers.filter((server) => `${server.name} ${server.host} ${server.group ?? ""} ${(server.tags ?? []).join(" ")}`.toLowerCase().includes(query));
+    const grouped = new Map<string, OarsServer[]>();
+    for (const server of filtered) {
+      const group = server.group?.trim() || "";
+      grouped.set(group, [...(grouped.get(group) ?? []), server]);
+    }
+    return Array.from(grouped.entries())
+      .sort(([a], [b]) => {
+        if (!a) return 1;
+        if (!b) return -1;
+        return a.localeCompare(b);
+      })
+      .map(([group, entries]) => ({
+        key: group || "__ungrouped__",
+        label: group || "Ungrouped",
+        entries: entries.sort((a, b) => a.name.localeCompare(b.name)),
+      }));
+  }, [servers, fleetFilter]);
+
+  useEffect(() => {
+    if (!serverMenuId) return;
+    const closeMenu = (event: PointerEvent) => {
+      if (!(event.target as HTMLElement | null)?.closest("[data-server-menu]")) setServerMenuId(null);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setServerMenuId(null);
+    };
+    window.addEventListener("pointerdown", closeMenu);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeMenu);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [serverMenuId]);
+
+  const toggleFleetGroup = useCallback((group: string) => {
+    setCollapsedFleetGroups((current) => {
+      const next = new Set(current);
+      if (next.has(group)) next.delete(group);
+      else next.add(group);
+      return next;
+    });
+  }, []);
 
   function onAction(label: string) {
     // fleet-level quick actions map to real UX
@@ -590,9 +712,9 @@ export default function App() {
       else setToast("Add a server first to open a shell.");
     } else if (label === "Run a script") {
       if (activeTab) setView("scripts");
-      else if (servers[0]) openServer(servers[0]);
+      else if (servers[0]) openServerView(servers[0], "scripts");
       else setToast("Add a server first to run scripts.");
-    } else if (label === "Scan fleet" || label === "Fleet refresh") {
+    } else if (label === "Refresh profiles" || label === "Fleet refresh") {
       refreshServers();
       setToast("Fleet refreshed.");
       setTimeout(() => setToast(""), 2500);
@@ -606,7 +728,7 @@ export default function App() {
     } else {
       setToast(`${label} — available in the server workspace.`);
     }
-    if (label !== "Fleet refresh" && label !== "Scan fleet") {
+    if (label !== "Fleet refresh" && label !== "Refresh profiles") {
       setToast((t) => t || `${label} — opened.`);
       setTimeout(() => setToast(""), 2600);
     } else {
@@ -620,7 +742,8 @@ export default function App() {
     for (const g of navGroups) for (const it of g.items) items.push({ label: `Go to ${it.label}`, action: () => { setActiveSection(it.label as Section); setActiveKey(null); setPaletteOpen(false); } });
     for (const s of servers) {
       items.push({ label: `Open ${s.name} (${s.host})`, action: () => { openServer(s); setPaletteOpen(false); } });
-      for (const v of VIEWS) items.push({ label: `${s.name} → ${v.label}`, action: () => { openServer(s); setTimeout(() => setView(v.id), 30); setPaletteOpen(false); } });
+      items.push({ label: `Mirror ${s.name} in new tab`, action: () => { openMirrored(s); setPaletteOpen(false); } });
+      for (const v of VIEWS) items.push({ label: `${s.name} → ${v.label}`, action: () => { openServerView(s, v.id); setPaletteOpen(false); } });
     }
     items.push({ label: "Add server…", action: () => { setModal({}); setPaletteOpen(false); } });
     items.push({ label: `Theme: switch to ${theme === "dark" ? "light" : "dark"}`, action: () => { setTheme(theme === "dark" ? "light" : "dark"); setPaletteOpen(false); } });
@@ -629,10 +752,17 @@ export default function App() {
     return items.filter((i) => i.label.toLowerCase().includes(q)).slice(0, 20);
   })();
 
-  const topStatusOnline = activeTab ? statuses.get(activeTab.server.id) === "ready" : servers.length > 0;
+  const activeStatus = activeTab ? statuses.get(activeTab.server.id) : undefined;
+  const connectedCount = Array.from(statuses.values()).filter((status) => status === "ready").length;
+  const failedCount = Array.from(statuses.values()).filter((status) => status === "error").length;
+  const fleetStatus: SessionStatus | undefined = failedCount > 0 ? "error" : connectedCount > 0 ? "ready" : undefined;
   const topStatusText = activeTab
-    ? (statuses.get(activeTab.server.id) ?? "closed")
-    : topStatusOnline ? "All systems normal" : servers.length === 0 ? "No servers" : "Fleet idle";
+    ? fleetLabel(activeStatus)
+    : failedCount > 0
+      ? `${failedCount} need${failedCount === 1 ? "s" : ""} attention`
+      : connectedCount > 0
+        ? `${connectedCount} connected`
+        : servers.length === 0 ? "No servers" : "Fleet idle";
 
   return (
     <main className="oars-app">
@@ -659,12 +789,82 @@ export default function App() {
                 >
                   <item.icon />
                   {item.label}
-                  {item.label === "Activity" && <span className="nav-count">5</span>}
                 </button>
               ))}
             </div>
           ))}
         </nav>
+        <div className="sidebar-fleet" aria-label="Fleet">
+          <div className="sidebar-fleet-head">
+            <span className="sidebar-fleet-title"><HardDrive size={13} aria-hidden /> Fleet</span>
+            <span className="sidebar-fleet-count">{servers.length} {servers.length === 1 ? "profile" : "profiles"}</span>
+          </div>
+          <label className="sidebar-fleet-search" aria-label="Filter fleet">
+            <Search size={12} aria-hidden />
+            <input ref={fleetSearchRef} value={fleetFilter} onChange={(e) => setFleetFilter(e.target.value)} placeholder="Filter by name, host or group" aria-label="Filter fleet" />
+            {fleetFilter && <button type="button" aria-label="Clear filter" onClick={() => setFleetFilter("")} style={{ border: 0, background: "transparent", color: "var(--muted-foreground)", cursor: "pointer", padding: 2 }}><X size={12} /></button>}
+          </label>
+          <div className="sidebar-fleet-list" role="list">
+            {fleetGroups.length === 0 ? (
+              <div className="sidebar-fleet-empty">{servers.length === 0 ? "No connection profiles yet." : "No matches."}</div>
+            ) : fleetGroups.map((group) => {
+              const collapsed = collapsedFleetGroups.has(group.key);
+              return (
+                <div className="sidebar-fleet-group" key={group.key}>
+                  <button
+                    type="button"
+                    className="sidebar-fleet-group-toggle"
+                    aria-expanded={!collapsed}
+                    onClick={() => toggleFleetGroup(group.key)}
+                  >
+                    <ChevronDown className={collapsed ? "is-collapsed" : ""} aria-hidden />
+                    <span>{group.label}</span>
+                    <span>{group.entries.length}</span>
+                  </button>
+                  {!collapsed && group.entries.map((s) => {
+                    const st = statuses.get(s.id);
+                    const isActive = tabs.some((t) => t.server.id === s.id && t.key === activeKey);
+                    return (
+                      <div key={s.id} className={`sidebar-fleet-row ${isActive ? "is-active" : ""}`} role="listitem" data-server-menu>
+                        <button type="button" className="sidebar-fleet-open" onClick={() => { openServer(s); setServerMenuId(null); }} title={`${s.name} — ${s.host}:${s.port}`}>
+                          <span className={fleetDotClass(st)} aria-hidden />
+                          <span className="sidebar-fleet-meta">
+                            <span className="sidebar-fleet-name">{s.name}</span>
+                            <span className="sidebar-fleet-host">{s.host}:{s.port} · {s.user}</span>
+                          </span>
+                          <span className="sidebar-fleet-status">{fleetLabel(st)}</span>
+                        </button>
+                        <div className="sidebar-fleet-actions">
+                          <Button
+                            variant="ghost"
+                            size="icon-xs"
+                            aria-label={`Actions for ${s.name}`}
+                            aria-haspopup="menu"
+                            aria-expanded={serverMenuId === s.id}
+                            title="Server actions"
+                            onClick={() => setServerMenuId((current) => current === s.id ? null : s.id)}
+                          >
+                            <MoreHorizontal />
+                          </Button>
+                          {serverMenuId === s.id && (
+                            <div className="sidebar-server-menu" role="menu" aria-label={`Actions for ${s.name}`}>
+                              <button type="button" role="menuitem" onClick={() => { openServerView(s, "terminal"); setServerMenuId(null); }}><Terminal /> Open terminal</button>
+                              <button type="button" role="menuitem" onClick={() => { openMirrored(s); setServerMenuId(null); }}><Plus /> New mirrored tab</button>
+                              <button type="button" role="menuitem" onClick={() => { setModal({ server: s }); setServerMenuId(null); }}><Pencil /> Edit profile</button>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })}
+          </div>
+          <div className="sidebar-fleet-add">
+            <Button size="sm" onClick={() => setModal({})}><Plus data-icon="inline-start" /> Add server</Button>
+          </div>
+        </div>
         <div className="sidebar-bottom">
           <div className="connection-card">
             <span className="connection-pulse" />
@@ -703,29 +903,41 @@ export default function App() {
               <span className="theme-toggle-thumb">{theme === "dark" ? <Moon /> : <Sun />}</span>
             </button>
             <Button variant="ghost" size="icon-sm" aria-label="Refresh fleet" onClick={() => { refreshServers(); setToast("Fleet refreshed."); setTimeout(() => setToast(""), 2000); }}><RefreshCw /></Button>
-            <div className="top-status"><span className={topStatusOnline ? "status-dot" : "status-dot status-offline"} /> {topStatusText}</div>
+            <div className="top-status"><span className={fleetDotClass(activeTab ? activeStatus : fleetStatus)} aria-hidden /> {topStatusText}</div>
           </div>
         </header>
 
         {tabs.length > 0 && (
-          <div className="tabbar">
-            {tabs.map((tab) => (
-              <button key={tab.key} className={`tab ${tab.key === activeKey ? "active" : ""}`} onClick={() => setActiveKey(tab.key)}>
-                <span className={`dot ${sessionStatusClass(statuses.get(tab.server.id))}`} />
-                {tab.server.name}
-                <span className="close" role="button" tabIndex={0} onClick={(e) => { e.stopPropagation(); closeTab(tab.key); }}>×</span>
-              </button>
-            ))}
+          <div className="tabbar" role="tablist" aria-label="Open server views">
+            {tabs.map((tab) => {
+              const isMirror = tab.key.includes("#");
+              return (
+                <div key={tab.key} className={`tab ${tab.key === activeKey ? "active" : ""}`}>
+                  <button
+                    type="button"
+                    className="tab-select"
+                    role="tab"
+                    aria-selected={tab.key === activeKey}
+                    onClick={() => setActiveKey(tab.key)}
+                    title={isMirror ? `${tab.server.name} — mirrored view` : tab.server.name}
+                  >
+                    <span className={`dot ${sessionStatusClass(statuses.get(tab.server.id))}`} aria-hidden />
+                    <span>{tab.server.name}{isMirror ? " · mirror" : ""}</span>
+                  </button>
+                  <button type="button" className="tab-close" aria-label={`Close ${tab.server.name}${isMirror ? " mirror" : ""}`} title="Close tab" onClick={() => closeTab(tab.key)}><X /></button>
+                </div>
+              );
+            })}
           </div>
         )}
 
         <div className="workspace">
           {activeTab ? (
-            <div className="workspace" style={{ padding: 0, maxWidth: "none", margin: 0 }}>
+            <div className="workspace-inner">
               <div className="workspace-header">
                 <div className="ws-title">
                   <span className="ws-name">{activeTab.server.name}</span>
-                  <span className="ws-meta">{activeTab.server.host}:{activeTab.server.port} · {activeTab.server.user}{activeTab.server.group ? ` · ${activeTab.server.group}` : ""}</span>
+                  <span className="ws-meta">{activeTab.server.user}@{activeTab.server.host}:{activeTab.server.port}{activeTab.server.group ? ` · ${activeTab.server.group}` : ""}</span>
                 </div>
                 <div className="ws-actions">
                   <span className={`dot ${sessionStatusClass(statuses.get(activeTab.server.id))}`} />
@@ -733,14 +945,13 @@ export default function App() {
                   <Button variant="ghost" size="sm" onClick={() => setModal({ server: activeTab.server })}>Edit</Button>
                 </div>
               </div>
-              <nav className="subnav">
+              <nav className="subnav" role="tablist">
                 {VIEWS.map((v) => (
-                  <button key={v.id} className={`subnav-item ${activeTab.view === v.id ? "active" : ""}`} onClick={() => setView(v.id)}>{v.label}</button>
+                  <button key={v.id} role="tab" aria-selected={activeTab.view === v.id} className={`subnav-item ${activeTab.view === v.id ? "active" : ""}`} onClick={() => setView(v.id)}>{v.label}</button>
                 ))}
               </nav>
-              <div className="content">
+              {activeTab.view !== "terminal" && <div className="content">
                 {activeTab.view === "monitor" ? <MonitorTab key={activeTab.key} serverId={activeTab.server.id} />
-                  : activeTab.view === "terminal" ? <TerminalTab key={activeTab.key} server={activeTab.server} onStatus={setStatus} />
                   : activeTab.view === "logs" ? <LogsTab key={activeTab.key} serverId={activeTab.server.id} />
                   : activeTab.view === "files" ? <FilesTab key={activeTab.key} serverId={activeTab.server.id} />
                   : activeTab.view === "scripts" ? <ScriptsTab key={activeTab.key} serverId={activeTab.server.id} />
@@ -754,7 +965,7 @@ export default function App() {
                   : activeTab.view === "vault" ? <VaultTab key={activeTab.key} />
                   : activeTab.view === "agent" ? <AgentTab key={activeTab.key} />
                   : <div className="empty"><h3>{VIEWS.find((x) => x.id === activeTab.view)?.label}</h3><p className="muted">Coming in the next spec — backend is ready.</p></div>}
-              </div>
+              </div>}
             </div>
           ) : activeSection === "Overview" ? (
             <Overview servers={servers} statuses={statuses} search={search} onAdd={() => setModal({})} onOpenServer={openServer} onAction={onAction} />
@@ -797,11 +1008,18 @@ export default function App() {
               {servers[0] ? <div className="panel" style={{ padding: 0, overflow: "hidden" }}><AiTab serverId={servers[0].id} /></div> : <div className="panel muted" style={{ padding: 22 }}>Add a server to see AI context.</div>}
             </div>
           )}
+          <div className="terminal-deck" hidden={!activeTab || activeTab.view !== "terminal"}>
+            {tabs.map((tab) => (
+              <div key={tab.key} className="terminal-pane" hidden={tab.key !== activeKey || activeTab?.view !== "terminal"}>
+                <TerminalTab server={tab.server} onStatus={setStatus} onServerUpdated={handleServerUpdated} />
+              </div>
+            ))}
+          </div>
           {loadError && <div className="form-error" style={{ marginTop: 14 }}>{loadError}</div>}
         </div>
       </section>
 
-      {modal && <ServerModal server={modal.server} onClose={() => setModal(null)} onSaved={handleSaved} />}
+      {modal && <ServerModal server={modal.server} servers={servers} onClose={() => setModal(null)} onSaved={handleSaved} onDeleted={handleDeleted} />}
 
       {paletteOpen && (
         <div className="overlay" onClick={() => setPaletteOpen(false)}>

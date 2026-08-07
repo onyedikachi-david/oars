@@ -1,3 +1,5 @@
+import type { Server, ServerDraft, PollResult, MonitorSnapshot, LogSource, LogReadResult } from "./types";
+
 // Typed bridge client over window.zero.
 
 declare global {
@@ -83,7 +85,7 @@ export async function pickFile(title: string, allowDirectories = false): Promise
 
 export const api = {
   servers: {
-    list: () => invoke<{ servers: Server[] }>("oars.servers.list", {}),
+    list: () => invoke<{ servers: Server[]; recovery_error?: string }>("oars.servers.list", {}),
     save: (server: ServerDraft) => invoke<{ server: Server }>("oars.servers.save", server),
     delete: (id: string) => invoke<{ ok: boolean }>("oars.servers.delete", { id }),
   },
@@ -93,14 +95,24 @@ export const api = {
     disconnect: (serverId: string) => invoke("oars.ssh.disconnect", { server_id: serverId }),
     input: (serverId: string, data: string) => invoke("oars.ssh.input", { server_id: serverId, data }),
     exec: (serverId: string, command: string) => invoke<{ channel: number }>("oars.ssh.exec", { server_id: serverId, command }),
+    closeChannel: (serverId: string, channel: number) => invoke("oars.ssh.closeChannel", { server_id: serverId, channel }),
     resize: (serverId: string, cols: number, rows: number) =>
       invoke("oars.ssh.resize", { server_id: serverId, cols, rows }),
     trust: (serverId: string, accept: boolean) => invoke("oars.ssh.trust", { server_id: serverId, accept }),
-    poll: (serverId: string, rewind: boolean) =>
-      invoke<PollResult>("oars.ssh.poll", { server_id: serverId, rewind }),
+    retrust: (serverId: string, confirmName: string) =>
+      invoke<{ server: Server }>("oars.ssh.retrust", { server_id: serverId, confirm_name: confirmName }),
+    poll: (serverId: string, cursors?: Array<{ channel: number; cursor: number }>, rewind?: boolean) =>
+      invoke<PollResult>("oars.ssh.poll", { server_id: serverId, cursors: cursors ?? null, rewind: rewind ?? false }),
   },
   monitor: {
     poll: (serverId: string) => invoke<MonitorSnapshot>("oars.monitor.poll", { server_id: serverId }),
+    probe: (serverId: string) => invoke<{ ok: boolean }>("oars.monitor.probe", { server_id: serverId }),
+    cleanDiskEstimate: (serverId: string, plan: "journal" | "apt") =>
+      invoke<{ ok: boolean; channel: number }>("oars.monitor.cleanDiskEstimate", { server_id: serverId, plan }),
+    cleanDisk: (serverId: string, plan: "journal" | "apt") =>
+      invoke<{ ok: boolean; channel: number }>("oars.monitor.cleanDisk", { server_id: serverId, plan }),
+    dropCaches: (serverId: string, level: 1 | 2 | 3 = 3) =>
+      invoke<{ ok: boolean; channel: number }>("oars.monitor.dropCaches", { server_id: serverId, level }),
   },
   logs: {
     scan: (serverId: string) => invoke<{ sources: LogSource[]; partial: boolean; reason: string }>("oars.logs.scan", { server_id: serverId }),

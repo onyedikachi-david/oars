@@ -1,10 +1,10 @@
 # Spec 02 — Terminal (SSH)
 
-**Status:** Partial (shell, exec, trust, Keychain auth, per-tab poll cursors,
-PTY resize, canonical fingerprints, idempotent connect, and stop-aware
-cancellation landed 2026-08-03; the container pass is green — see §11; the
-kernel-bounded TCP connect remains a documented std limit; exec/trust UI and
-mirrored-tab frontend verification pending) · **Depends on:** 01 · **Spec owner:** core
+**Status:** Partial (shell, exec, trust and re-trust UI, Keychain auth, buffered
+input, persistent mirrored tabs, per-tab poll cursors, PTY resize, canonical
+fingerprints, idempotent connect, and stop-aware cancellation are implemented;
+the exec output pane, live latency measurement, and dead-server bound remain) ·
+**Depends on:** 01 · **Spec owner:** core
 
 ## 1. Overview
 
@@ -83,7 +83,7 @@ is bounded only by the kernel SYN timeout (~75 s on macOS) — see §13.
 
 ### `oars.ssh.poll` `{server_id, cursors?, rewind?}` → poll result
 ```json
-{"ok":true,"status":"ready","error":"","trust":{"pending":true,"fingerprint":"SHA256:…"},
+{"ok":true,"status":"ready","error":"","trust":{"pending":true,"algorithm":"Ed25519","fingerprint":"SHA256:…"},
  "channels":[
    {"id":0,"kind":"shell","command":"","cursor":1200,"dropped":0,"pending":96,"eof":false,"exit":null,"data":"…delta…"}
  ]}
@@ -117,6 +117,12 @@ is bounded only by the kernel SYN timeout (~75 s on macOS) — see §13.
   `stty size` prints "rows cols": after resize(cols=100, rows=40) it reads
   "40 100".
 ### `oars.ssh.trust` `{server_id, accept}` → `{ok}`
+
+### `oars.ssh.retrust` `{server_id, confirm_name}` → `{ok, server}`
+- Requires an exact profile-name match and an existing stored fingerprint.
+- Disconnects the live session, clears only the stored host fingerprint, and
+  records `ssh.retrust` in the audit log. The next connection returns to
+  `needs_trust` and presents the new key for explicit approval.
 
 ## 6. Zig core design
 
@@ -161,8 +167,9 @@ connecting → needs_trust → authenticating → ready → closed
 
 ## 7. Data model & persistence
 
-- Nothing persisted per-session except the host-key fingerprint (server config).
-- History recording is specified in spec 15 and is not yet implemented.
+- Nothing in the live session state is persisted except the host-key
+  fingerprint in the server config. Spec 15 records command history and audit
+  events separately from the SSH session.
 
 ## 8. Security
 
@@ -182,7 +189,8 @@ connecting → needs_trust → authenticating → ready → closed
 - Server dead / DNS fails → explicit error status with message, connect button returns.
 - Host key changed → hard error (see §4.2).
 - Auth failure → message from libssh2 (e.g. "Permission denied (publickey,password)").
-- Input during connecting → queued? No: input returns `not ready`; frontend buffers keystrokes until `ready` (xterm writes are held by the poll loop — frontend responsibility).
+- Input during connecting → the backend returns `not ready`; the frontend keeps
+  an ordered, bounded input queue and sends it in chunks only after `ready`.
 - Channel read error mid-session → status `error` "connection lost", cleanup.
 - Window minimized → ResizeObserver still fires on restore; PTY resized then.
 - Multiple tabs for the same server share one SSH session and its channels.
@@ -204,7 +212,12 @@ connecting → needs_trust → authenticating → ready → closed
   passphrase; changed host key rejected with both fingerprints; disconnect
   during `needs_trust` returns promptly. **Container pass: green 2026-08-03**
   (spec 04 session — the suite actually ran; see HANDOVER §13.1).
-- Manual (frontend): typing latency, overflow toast, mirrored tabs, reconnect.
+- Frontend bridge simulation: input entered during `connecting` is sent only
+  after `ready`; exec bytes do not enter the shell canvas; terminal instances
+  stay mounted across navigation; closing one mirrored tab does not disconnect
+  the shared session; trust and changed-key dialogs show the backend identity.
+- Manual (live SSH): typing latency, overflow toast, reconnect, and slow-reader
+  behavior.
 
 ## 12. Acceptance criteria
 
@@ -224,24 +237,21 @@ connecting → needs_trust → authenticating → ready → closed
       progress (cancelable DNS + stop-aware loops; verified for the trust
       phase; the kernel-bounded TCP connect remains a documented std limit).
 - [x] Duplicate connect is an idempotent success carrying the live status.
-- [ ] Two tabs for the same server share one SSH session, replay retained
+- [x] Two tabs for the same server share one SSH session, replay retained
       output on the second tab, and then receive identical new output
-      independently — backend contract implemented and unit-tested; the
-      frontend tab wiring is pending.
+      independently — the backend cursor contract is unit-tested and the
+      persistent frontend tab lifecycle is browser-verified.
 - [ ] A slow mirrored tab reports its own dropped-byte gap after buffer
       overflow without changing the output seen by another tab — unit-tested
       at the stream level (`Stream.view`); frontend verification pending.
-- [x] All existing tests pass (`zig build test`) — 21 tests, container pass
-      green.
+- [x] All existing tests pass (`zig build test`); the container pass is green.
 
 ## 13. Research & References
 
-- **Current session state machine** — implemented in `src/sessions.zig`: `Status`
-  enum L21 (connecting/needs_trust/authenticating/ready/closed/error),
-  `ChannelKind` L41, `Stream` (cursor-delta buffer) L56–66 with `append`
-  L80, `readAvailable` L99, `snapshot` L119, `ChannelEntry` L136,
-  `Session` L165, `Manager` L221 with `connect` L253, `disconnect` L300
-  (joins the worker thread), `input` L333, `exec` L343, `resize` L355.
+- **Current session state machine** — implemented in `src/sessions.zig`:
+  `Status` covers connecting, trust, authentication, ready, closed, and error;
+  `Stream.append`, `readAt`, `view`, and `snapshot` implement retained absolute
+  cursor reads; `Manager` owns connect, disconnect, input, exec, and resize.
   One worker thread per session owns all calls for that session. The libssh2
   project guidance is more precise than the previous blanket statement:
   `libssh2_init` uses global state and must not run concurrently, while only
@@ -258,7 +268,7 @@ connecting → needs_trust → authenticating → ready → closed
   6.8; `ssh-keygen -l` uses them by default — see ssh(1) VERIFYING HOST
   KEYS, `https://man.openbsd.org/ssh.1`, which also documents the
   `-E` flag to select the hash algorithm).
-  **Correction:** the current Zig code hex-encodes the 32-byte hash, while
+  **Correction from the earlier review:** the Zig code hex-encoded the 32-byte hash, while
   OpenSSH displays base64 without padding after `SHA256:`. The target contract
   now requires the canonical form and a verified migration for saved hex
   values.
@@ -269,10 +279,9 @@ connecting → needs_trust → authenticating → ready → closed
   key fails with both fingerprints in the message.
 - **Bridge/stream protocol** — see spec 01 §13: dispatch wraps raw JSON
   (`bridge/root.zig` L142–163); the frontend polls because the SDK bridge
-  is invoke/response only (no native→JS push). **Current gap:** the installed
-  implementation advances `Stream.cursor` in `readAvailable`, which supports
-  one reader only. The per-consumer cursor request in §5 is a product contract
-  still to implement, not a statement about the current source.
+  is invoke/response only (no native→JS push). `Stream.view` reads from the
+  absolute cursor supplied by each tab, so one reader never advances another
+  reader's position.
 - **PTY + TERM=xterm-256color + resize** — libssh2 request_pty_ex is
   invoked via `libssh2_channel_request_pty_ex` (libssh2.h L879+);
   terminal resize semantics (SIGWINCH, cols/rows) are the client-side
@@ -280,7 +289,7 @@ connecting → needs_trust → authenticating → ready → closed
   Pseudo-Terminal"). xterm-256color is the conventional TERM for
   modern xterm.js rendering (frontend uses xterm.js 5.3.0 — see spec 16
   §13).
-  **Correction:** PTY creation is implemented, but resize is not. The current
+  **Correction from the earlier review:** PTY creation was implemented, but resize was not. The
   `resizePty` body discards all arguments. The spec now marks this feature as
   partial and requires a live `stty size` check.
   **Landed 2026-08-03:** `Channel.resizePty` calls

@@ -70,11 +70,12 @@ export function ScriptsTab({ serverId }: { serverId: string }) {
     setOutput("");
     try {
       const r = await api.scripts.run(serverId, s.id, vars);
-      // Poll output via ssh.poll
+      // Poll output via ssh.poll (per-tab cursors; exec channel)
       let cursor = 0;
       const poll = async () => {
         try {
-          const pr = await api.ssh.poll(serverId, false);
+          const cur = cursor ? [{ channel: r.channel, cursor }] : undefined;
+          const pr = await api.ssh.poll(serverId, cur, false);
           const ch = pr.channels.find((c: any) => c.id === r.channel);
           if (ch) {
             setOutput(ch.data ?? "");

@@ -30,7 +30,7 @@ const ssh = @import("ssh.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 97;
+const handler_count = 98;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -61,6 +61,7 @@ pub const Context = struct {
             .{ .name = "oars.ssh.closeChannel", .context = self, .invoke_fn = handleSshCloseChannel },
             .{ .name = "oars.ssh.resize", .context = self, .invoke_fn = handleSshResize },
             .{ .name = "oars.ssh.trust", .context = self, .invoke_fn = handleSshTrust },
+            .{ .name = "oars.ssh.retrust", .context = self, .invoke_fn = handleSshRetrust },
             .{ .name = "oars.ssh.poll", .context = self, .invoke_fn = handleSshPoll },
             .{ .name = "oars.monitor.poll", .context = self, .invoke_fn = handleMonitorPoll },
             .{ .name = "oars.monitor.probe", .context = self, .invoke_fn = handleMonitorProbe },
@@ -160,6 +161,7 @@ pub const Context = struct {
             .{ .name = "oars.ssh.closeChannel", .origins = &allowed_origins },
             .{ .name = "oars.ssh.resize", .origins = &allowed_origins },
             .{ .name = "oars.ssh.trust", .origins = &allowed_origins },
+            .{ .name = "oars.ssh.retrust", .origins = &allowed_origins },
             .{ .name = "oars.ssh.poll", .origins = &allowed_origins },
             .{ .name = "oars.monitor.poll", .origins = &allowed_origins },
             .{ .name = "oars.monitor.probe", .origins = &allowed_origins },
@@ -677,6 +679,48 @@ fn handleSshTrust(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
     return ok_json;
 }
 
+const RetrustPayload = struct {
+    server_id: []const u8,
+    confirm_name: []const u8,
+};
+
+/// Clears a stored host identity only after exact profile-name confirmation.
+/// The next connection returns to `needs_trust` with the new fingerprint.
+fn handleSshRetrust(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(RetrustPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+
+    var server = self.store.find(self.io, parsed.value.server_id) catch {
+        return respondError(output, "failed to load server");
+    } orelse return respondError(output, "server not found");
+    defer server.deinit(self.allocator);
+
+    if (!std.mem.eql(u8, parsed.value.confirm_name, server.name)) {
+        return respondError(output, "type the connection name exactly to clear the stored host key");
+    }
+    const old_fingerprint = server.host_fingerprint orelse {
+        return respondError(output, "this connection profile has no stored host key");
+    };
+
+    self.manager.disconnect(server.id);
+    self.allocator.free(old_fingerprint);
+    server.host_fingerprint = null;
+    server.updated_at = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds);
+    self.store.upsert(self.io, server) catch {
+        return respondError(output, "failed to clear the stored host key");
+    };
+    self.audit.append(self.io, "ssh.retrust", server.id, "stored host key cleared after exact name confirmation") catch {};
+
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"server\":") catch return output[0..0];
+    writeServer(&writer, server) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
 const PollPayload = struct {
     server_id: []const u8,
     /// Per-channel absolute cursors for the requesting tab (spec 02 §5),
@@ -734,7 +778,9 @@ fn handleSshPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
     json.writeJsonString(&writer, info.@"error") catch return output[0..0];
     writer.writeAll(",\"trust\":{") catch return output[0..0];
     if (info.trust_pending) {
-        writer.writeAll("\"pending\":true,\"fingerprint\":") catch return output[0..0];
+        writer.writeAll("\"pending\":true,\"algorithm\":") catch return output[0..0];
+        json.writeJsonString(&writer, info.trust_algorithm) catch return output[0..0];
+        writer.writeAll(",\"fingerprint\":") catch return output[0..0];
         json.writeJsonString(&writer, info.trust_fingerprint) catch return output[0..0];
     } else {
         writer.writeAll("\"pending\":false") catch return output[0..0];
