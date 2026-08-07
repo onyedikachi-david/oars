@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Oars UI preview</title>
+    <script>
+	      (() => {
+	        const now = Date.now();
+	        const monitorMode = new URLSearchParams(window.location.search).get("monitor") || "healthy";
+	        let nextDiagnosticChannel = 900;
+        const servers = [
+          {
+            id: "prod-api",
+            name: "Production API",
+            host: "api.internal.example",
+            port: 22,
+            user: "deploy",
+            auth_method: "password",
+            key_path: "",
+            key_has_passphrase: false,
+            host_fingerprint: "SHA256:uYNQ7k9gM4xqM+0B8QHxA5z6wEHlDCq3lKl7T0P9f+E",
+            group: "Production/Core",
+            tags: ["api", "critical"],
+            via_server_id: null,
+            created_at: now - 100000,
+            updated_at: now,
+          },
+          {
+            id: "staging-web",
+            name: "Staging Web",
+            host: "10.24.8.17",
+            port: 2222,
+            user: "ubuntu",
+            auth_method: "key",
+            key_path: "~/.ssh/id_ed25519",
+            key_has_passphrase: false,
+            host_fingerprint: null,
+            group: "Staging",
+            tags: ["web"],
+            via_server_id: null,
+            created_at: now - 80000,
+            updated_at: now,
+          },
+          {
+            id: "changed-host",
+            name: "Legacy Database",
+            host: "db-01.internal.example",
+            port: 22,
+            user: "dba",
+            auth_method: "agent",
+            key_path: "",
+            key_has_passphrase: false,
+            host_fingerprint: "SHA256:OLDKEY",
+            group: "Production/Data",
+            tags: ["database"],
+            via_server_id: null,
+            created_at: now - 60000,
+            updated_at: now,
+          },
+        ];
+        const calls = [];
+        const polls = new Map();
+        window.__oarsMock = { calls, servers };
+        window.zero = {
+          async invoke(command, payload = {}) {
+            calls.push({ command, payload, at: performance.now() });
+            document.documentElement.dataset.oarsCalls = JSON.stringify(calls);
+            if (command === "oars.servers.list") return { servers };
+            if (command === "oars.servers.save") {
+              const current = servers.find((server) => server.id === payload.id);
+              const saved = { ...(current || servers[0]), ...payload, id: payload.id || "new-profile", updated_at: Date.now() };
+              if (current) Object.assign(current, saved); else servers.push(saved);
+              return { server: saved };
+            }
+            if (command === "oars.servers.delete") return { ok: true };
+            if (command.startsWith("native-sdk.credentials.")) {
+              return command.endsWith(".get") ? "preview-secret" : { ok: true };
+            }
+            if (command === "oars.ssh.connect" || command === "oars.ssh.disconnect" || command === "oars.ssh.resize" || command === "oars.ssh.input" || command === "oars.ssh.trust") return { ok: true };
+            if (command === "oars.ssh.retrust") {
+              const server = servers.find((item) => item.id === payload.server_id);
+              server.host_fingerprint = null;
+              return { server };
+            }
+            if (command === "oars.ssh.poll") {
+              const count = (polls.get(payload.server_id) || 0) + 1;
+              polls.set(payload.server_id, count);
+              if (payload.server_id === "staging-web") {
+                return { ok: true, status: "needs_trust", trust: { pending: true, algorithm: "Ed25519", fingerprint: "SHA256:zxM8slJ7bI2bSWWi0i7o8eHIKnTe0iT5Qq6Vt8jz6LQ" }, channels: [] };
+              }
+              if (payload.server_id === "changed-host") {
+                return { ok: true, status: "error", error: "host key changed (old: SHA256:OLDKEY, new: SHA256:NEWKEY); connection blocked", channels: [] };
+              }
+              if (count < 20) return { ok: true, status: "connecting", channels: [] };
+              return {
+                ok: true,
+                status: "ready",
+                channels: [
+                  { id: 0, kind: "shell", command: "", cursor: 73, dropped: 0, pending: 0, eof: false, exit: null, data: count === 20 ? "Last login: Fri Aug 7 12:58:04\r\ndeploy@prod-api:~$ " : "" },
+                  { id: 8, kind: "exec", command: "uptime", cursor: 22, dropped: 0, pending: 0, eof: true, exit: 0, data: "EXEC_MUST_NOT_RENDER" },
+                ],
+              };
+            }
+	            if (command === "oars.monitor.poll") {
+	              const c = (polls.get(payload.server_id + ":mon") || 0) + 1;
+	              polls.set(payload.server_id + ":mon", c);
+	              if (monitorMode === "not-ready") return { ok: true, status: "not_ready" };
+	              if (monitorMode === "sampling") {
+	                return { ok: true, ts: 0, cpu: null, mem: null, disk: null, processes: [], probe_error: "no sample yet" };
+	              }
+	              if (payload.server_id === "changed-host") {
+	                return { ok: true, ts: 0, cpu: null, mem: null, disk: null, processes: [], probe_error: "no /proc readable (loadavg empty)" };
+	              }
+	              const warming = c < 2;
+	              const degraded = monitorMode === "degraded";
+	              const cpuPct = warming ? null : degraded ? 92.4 : 24 + Math.sin(c / 5) * 8;
+	              return {
+	                ok: true,
+	                ts: Date.now() * 1000000,
+	                cpu: { utilization_pct: cpuPct, cpu_warming: warming, load_1: 0.42, load_5: 0.31, load_15: 0.22, uptime_sec: 86400*3 + 3600*5, cores: 4 },
+	                mem: degraded
+	                  ? { used_bytes: 7.1*1024**3, total_bytes: 7.8*1024**3, available_bytes: 0.7*1024**3, swap_used_bytes: 1.4*1024**3, swap_total_bytes: 2*1024**3 }
+	                  : { used_bytes: 4.2*1024**3, total_bytes: 7.8*1024**3, available_bytes: 3.1*1024**3, swap_used_bytes: 0.2*1024**3, swap_total_bytes: 2*1024**3 },
+	                disk: degraded
+	                  ? { used_bytes: 25.7*1024**3, total_bytes: 29*1024**3, available_bytes: 3.3*1024**3 }
+	                  : { used_bytes: 15*1024**3, total_bytes: 29*1024**3, available_bytes: 14*1024**3 },
+                processes: [
+                  { pid: 1842, name: "node", cpu: 4.2, mem: 3.1 },
+                  { pid: 912, name: "postgres", cpu: 2.8, mem: 5.4 },
+                  { pid: 441, name: "nginx", cpu: 0.6, mem: 0.8 },
+                  { pid: 2011, name: "oars", cpu: cpuPct ?? 0.2, mem: 1.2 },
+                ],
+	                probe_error: degraded ? "Process details are incomplete because one /proc entry could not be read." : null,
+	              };
+            }
+            if (command === "oars.monitor.probe") {
+              polls.set(payload.server_id + ":mon", (polls.get(payload.server_id + ":mon")||0)+1);
+              return { ok: true };
+	            }
+	            if (command === "oars.monitor.cleanDiskEstimate" || command === "oars.monitor.cleanDisk" || command === "oars.monitor.dropCaches") {
+	              const ch = nextDiagnosticChannel++;
+	              if (!window.__oarsMock.diagChannels) window.__oarsMock.diagChannels = new Map();
+	              const label = command.includes("cleanDiskEstimate")
+	                ? payload.plan === "journal"
+	                  ? "Archived and active journals take up 1.2G in the file system.\n"
+	                  : "356515840 /var/cache/apt\n"
+	                : command.includes("cleanDisk")
+	                  ? payload.plan === "journal"
+	                    ? "Vacuuming done, freed 1.1G of archived journals.\n"
+	                    : "APT package cache cleaned.\n"
+	                  : "sync complete; wrote drop_caches level "+payload.level+".\n";
+	              window.__oarsMock.diagChannels.set(ch, { label, done: false });
+	              return { ok: true, channel: ch };
+	            }
+            return { ok: true };
+          },
+        };
+        // Wrap ssh.poll to stream diag channel output
+        (() => {
+          const origInvoke = window.zero.invoke.bind(window.zero);
+          window.zero.invoke = async (command, payload={}) => {
+            if (command === "oars.ssh.poll" && window.__oarsMock.diagChannels) {
+              const cur = payload.cursors && payload.cursors[0];
+              const chId = cur ? cur.channel : null;
+              if (chId !== null && window.__oarsMock.diagChannels.has(chId)) {
+                const entry = window.__oarsMock.diagChannels.get(chId);
+                if (!entry.done) {
+                  entry.done = true;
+                  return { ok: true, status: "ready", channels: [{ id: chId, kind: "exec", command: "diag", cursor: entry.label.length, dropped: 0, pending: 0, eof: true, exit: 0, data: entry.label }] };
+                }
+                return { ok: true, status: "ready", channels: [{ id: chId, kind: "exec", command: "diag", cursor: entry.label.length, dropped: 0, pending: 0, eof: true, exit: 0, data: "" }] };
+              }
+            }
+            return origInvoke(command, payload);
+          };
+        })();
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

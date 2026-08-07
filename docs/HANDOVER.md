@@ -1512,11 +1512,27 @@ Next: optional container jump-bastion integration test (spec 11 pattern: contain
 
 ## 14. Session handover — 2026-08-07 (session 4): spec 03 frontend (monitoring)
 
-**What landed:** `frontend/src/bridge.ts` gained `oars.monitor.{probe,cleanDiskEstimate,cleanDisk,dropCaches}` (types match `src/bridge.zig` — `journal|apt` plans, `1|2|3` drop level); `frontend/src/MonitorTab.tsx` rewritten to spec 03 §4.1 as a calm studio view — three `Processor`/`Memory`/`Storage` gauge cards with health/watch/tight/critical bands (shared tokens for spec 16), `cpu_warming` state, `probe_error` honest banner, `not_ready` → "Waiting for connection…", per-process table sortable by CPU%/Mem% with busybox `null` → `—` and a per-row `→ AI` that copies `PID — name` to the clipboard, a 120-sample ring-buffer sparkline (canvas, no DOM churn), itemized "Analyze disk space" diagnostics (journal/apt) with read-only preview → approval-gated cleanup via `oars.ssh.poll` cursors, and the "Drop filesystem caches" diagnostic hidden under Advanced with explicit kernel warning prose and before/after audit semantics. `frontend/src/index.css` added the studio monitor chrome (gauges, sparkline, proc panel, diagnostics).
+**What landed:** the Monitor tab now follows `docs/DESIGN.md` and the full
+spec 03 v1 contract. It has three quiet resource cards with the documented
+threshold bands, honest warming/degraded/disconnected states, manual and
+two-second refresh, a 120-sample canvas for processor, memory, and storage,
+a sortable desktop table that becomes a labeled process list on mobile, and
+an exact `PID — process` Copy for AI action.
 
-**Constraints respected:** `api.ssh.poll(cursors)` per-channel stream contract (`src/sessions.zig`); gauge thresholds `0–60/60–80/80–90/90+` and audit discipline (`monitor.clean_disk`, `monitor.drop_caches`/`.after`); Geist Mono only for mono/host/meta; deterministic ad-hoc checks pass; `tsc --noEmit` + `npm run build` green (held per creative rule until visual sign-off, now verified).
+Storage diagnostics keep journal and APT estimates and results isolated. A
+cleanup stays disabled until its own estimate succeeds. The Oars approval
+dialog names the affected server and fixed command before it calls the
+existing audited backend action. Drop caches stays under Advanced diagnostics
+with the kernel warning, selected level, exact command, and before/latest
+memory values. Command output uses the existing per-channel cursor contract.
 
-**Still deferred:** `zig build` / `zig build test` + full validation, and the manual flow (not_ready → warming → utilization, sort, estimate→cleanup→audit, drop caches warning copy, sparkline) — stage before the spec 03 commit.
+**Validation:** `npm --prefix frontend run build` passes. The reusable
+`frontend/preview.html` harness now has deterministic `healthy`, `degraded`,
+`sampling`, and `not-ready` monitor modes. Browser checks at 1440×1000 and
+390×844 covered all four states, light and dark themes, all threshold bands,
+process sorting, copy feedback, estimate gating and isolation, cleanup
+approval and output, advanced warning copy, responsive process rows, and a
+clean console. PM2 actions and alerts remain planned Oars+ work.
 
 ## 26. Session handover — 2026-08-07: specs 01–02 frontend and recovery
 
@@ -1541,3 +1557,10 @@ covered grouped navigation, action-menu hit targets, delayed input, shell/exec
 separation, first trust, changed-key recovery, mirrored-tab close behavior,
 persistent terminal state, profile validation, and responsive layout. Keep
 `frontend/preview.html` as the reusable bridge-state harness for later specs.
+
+## 27. Next implementation target
+
+Implement the spec 04 Log Management frontend. Follow
+`docs/NEXT-SPEC.md`; it records the verified backend commands, current client
+contract gaps, safe clear and download flows, preview fixtures, and the full
+validation gate for the next model.

@@ -1,6 +1,6 @@
 # Spec 03 — Infra Monitoring
 
-**Status:** ✅ backend in (frontend UI pending) · **Depends on:** 02 (exec) · **Spec owner:** core + frontend
+**Status:** ✅ v1 frontend + backend implemented · 🗓️ Oars+ PM2 and alerts planned · **Depends on:** 02 (exec) · **Spec owner:** core + frontend
 
 ## 1. Overview
 
@@ -25,7 +25,7 @@ type, parses them, and serves a cached snapshot to the UI on demand.
 
 ## 3. User stories
 
-- I glance at my server list and see which box is at 95% disk without opening anything.
+- I open a server's Monitor tab and see at a glance when its disk reaches 95%.
 - A runaway process appears in the top-10 with its PID; I hand it to the AI terminal.
 - My disk fills up; one click (after confirm) reclaims space.
 
@@ -36,7 +36,7 @@ type, parses them, and serves a cached snapshot to the UI on demand.
   load average, uptime, cores), **Memory** (used/total, available, swap), and
   **Storage** (used/total, available).
 - Below: **Top Processes** table (PID, process, CPU%, Mem%) — click column header to sort; and a sparkline strip (last 120 samples, canvas).
-- Refresh indicator: "auto-refresh · 2s" with manual Refresh button.
+- Refresh indicator: "Refreshes every 2 seconds" with a manual Refresh button.
 - Gauge band colors (shared token set, spec 16):
   `0–60 healthy (accent/blue) · 60–80 watch (amber) · 80–90 tight (orange) · 90+ critical (red)`
 - **Drop filesystem caches** remains available under Advanced diagnostics. It
@@ -47,7 +47,7 @@ type, parses them, and serves a cached snapshot to the UI on demand.
 - **Analyze disk space** lists candidates and estimated reclaim size. The user
   selects exact categories before Oars runs any cleanup. Oars never deletes
   `/tmp`, application logs, or package data by age from one broad command.
-- Per-process **→ AI** affordance (copies PID into the AI terminal prompt).
+- Per-process **Copy for AI** affordance (copies `PID — process name` for an AI prompt).
 
 ### 4.2 Oars+ PM2 panel (planned)
 - Card listing PM2 processes: name, id, status, restarts, cpu/mem, uptime; actions Restart / Stop / Start (confirm for stop). Built from `pm2 jlist`.
@@ -182,22 +182,25 @@ printf '%%BEGIN_PS%%\n'; (ps -eo pid=,comm=,%cpu=,%mem= --sort=-%cpu 2>/dev/null
   probe advances it; `cleanDiskEstimate`/`cleanDisk`/`dropCaches` run through
   the bridge and every mutation lands in `audit.jsonl` (before + after for
   drop-caches). **Container pass green 2026-08-03.**
-- Manual (frontend): gauge color transitions, sort, drop-caches warning and result,
-  disk-analysis preview, PM2 actions.
+- Manual (frontend): gauge color transitions, process sort, itemized estimate and
+  cleanup output, cleanup approval, drop-caches warning, first-sample and
+  disconnected states, and responsive light/dark layouts. **Verified in the
+  reusable preview harness at 1440×1000 and 390×844 on 2026-08-07.** PM2
+  actions remain planned Oars+ work.
 
 ## 12. Acceptance criteria
 
-- [ ] Gauges + top-10 render live for a connected server, refresh ≤ 2 s —
-      backend snapshot pipeline lands and is container-verified; the gauge
-      UI is frontend work (pending).
+- [x] Gauges + top-10 render live for a connected server, refresh ≤ 2 s —
+      backend snapshot pipeline is container-verified; the frontend renders
+      all threshold bands, nullable BusyBox metrics, manual refresh, and a
+      120-sample three-metric canvas history.
 - [x] Parser fixtures green for procps + busybox variants (unit suite).
 - [x] Disk analysis is read-only. Each selected cleanup runs only after
-      confirm and writes an audit entry — backend: fixed plans, channel
-      output, `monitor.clean_disk` audit; the confirmation dialog is
-      frontend (pending).
+      its own successful estimate and an Oars approval dialog; fixed backend
+      plans stream isolated results and write `monitor.clean_disk` audit rows.
 - [x] Drop filesystem caches records the exact operation and before/after
-      snapshot — backend audited before + after; the hidden-under-Advanced
-      UI and warning copy are frontend (pending).
+      snapshot; the UI keeps it under Advanced diagnostics, shows the exact
+      command and affected server, and explains the rebuild I/O and CPU cost.
 - [x] Idle servers consume no probe traffic (no poll → no exec) —
       container-verified.
 - [ ] PM2 list/restart/stop work against a container running PM2 — Oars+,

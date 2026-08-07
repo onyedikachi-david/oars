@@ -951,7 +951,7 @@ export default function App() {
                 ))}
               </nav>
               {activeTab.view !== "terminal" && <div className="content">
-                {activeTab.view === "monitor" ? <MonitorTab key={activeTab.key} serverId={activeTab.server.id} />
+                {activeTab.view === "monitor" ? <MonitorTab key={activeTab.key} server={activeTab.server} />
                   : activeTab.view === "logs" ? <LogsTab key={activeTab.key} serverId={activeTab.server.id} />
                   : activeTab.view === "files" ? <FilesTab key={activeTab.key} serverId={activeTab.server.id} />
                   : activeTab.view === "scripts" ? <ScriptsTab key={activeTab.key} serverId={activeTab.server.id} />
