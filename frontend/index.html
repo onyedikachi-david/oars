@@ -3,7 +3,34 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f4f1e8" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#332f29" />
     <title>Oars</title>
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem("oars:theme");
+          var html = document.documentElement;
+          var metaLight = document.querySelector('meta[name="theme-color"][media*="light"]');
+          var metaDark = document.querySelector('meta[name="theme-color"][media*="dark"]');
+          function syncMeta(theme) {
+            // Keep PWA / browser chrome in sync with the actual theme, not just media query
+            if (metaLight) metaLight.content = theme === "dark" ? "#332f29" : "#f4f1e8";
+          }
+          if (t === "dark" || t === "light") {
+            html.classList.remove("light", "dark");
+            html.classList.add(t);
+            html.style.colorScheme = t;
+            syncMeta(t);
+          } else {
+            html.classList.add("light");
+            html.style.colorScheme = "light";
+            syncMeta("light");
+          }
+        } catch {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
