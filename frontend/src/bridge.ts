@@ -229,13 +229,14 @@ export const api = {
       invoke<VncStartResult>("oars.vnc.start", { server_id: serverId, host: opts?.host, port: opts?.port }),
     stop: (serverId: string, tunnelId: number) =>
       invoke<{ ok: boolean }>("oars.vnc.stop", { server_id: serverId, tunnel_id: tunnelId }),
-    probe: (serverId: string) => invoke<VncProbeResult>("oars.vnc.probe", { server_id: serverId }),
-    setup: (serverId: string, opts?: { display?: number; dry_run?: boolean; password?: string }) =>
+    probe: (serverId: string, display?: number) => invoke<VncProbeResult>("oars.vnc.probe", { server_id: serverId, display }),
+    setup: (serverId: string, opts?: { display?: number; dry_run?: boolean; password?: string; installDesktop?: boolean }) =>
       invoke<VncSetupResult>("oars.vnc.setup", {
         server_id: serverId,
         display: opts?.display,
         dry_run: opts?.dry_run,
         ...(opts?.password === undefined ? {} : { password: opts.password }),
+        ...(opts?.installDesktop === undefined ? {} : { install_desktop: opts.installDesktop }),
       }),
     poll: (serverId: string, tunnelId: number) =>
       invoke<VncPollResult>("oars.vnc.poll", { server_id: serverId, tunnel_id: tunnelId }),

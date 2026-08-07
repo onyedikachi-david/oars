@@ -17,13 +17,13 @@
 # the bucket side lives in a separate minio/minio container on the shared
 # oars-dev-net network (see scripts/dev-sshd.sh).
 #
-# Spec 12 adds x11vnc/Xvfb plus xterm/xdotool. The VNC integration test uses
-# the latter pair to prove framebuffer, pointer, and keyboard behavior.
+# Spec 12 adds x11vnc/Xvfb, XFCE, and its test tools. The VNC integration test
+# proves a real desktop, framebuffer, pointer, and keyboard path.
 
 FROM alpine:3.20
 
 RUN apk add --no-cache openssh bash zip unzip git nodejs npm nginx curl shadow sudo rclone \
-        x11vnc xvfb xterm xdotool \
+        x11vnc xvfb xterm xdotool xfce4 dbus xprop \
     && ssh-keygen -A \
     && echo 'root:oars-test-password' | chpasswd \
     && mkdir -p /root/.ssh \

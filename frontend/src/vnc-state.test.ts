@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { api, vault } from "./bridge";
 import {
   closedTunnelReason,
+  desktopProbeLabel,
   legacyVncAuthWarning,
   validateSetupPasswords,
   validateVncPort,
@@ -31,6 +32,13 @@ describe("VNC input contracts", () => {
     expect(closedTunnelReason({ state: "closed", error: "channel open failed" })).toBe("channel open failed");
     expect(closedTunnelReason({ state: "closed", error: "" })).toBe("The VNC tunnel closed");
   });
+
+  it("separates installed desktop state from the selected display", () => {
+    expect(desktopProbeLabel({ desktop_installed: true, window_manager_running: true, desktop_surface_running: true, desktop_panel_running: true, desktop_running: true, desktop_name: "XFCE" }, 1)).toBe("XFCE installed · display :1 running");
+    expect(desktopProbeLabel({ desktop_installed: true, window_manager_running: false, desktop_surface_running: false, desktop_panel_running: false, desktop_running: false, desktop_name: "XFCE" }, 0)).toBe("XFCE installed · display :0 stopped");
+    expect(desktopProbeLabel({ desktop_installed: true, window_manager_running: true, desktop_surface_running: false, desktop_panel_running: false, desktop_running: false, desktop_name: "XFCE" }, 0)).toBe("XFCE installed · display :0 incomplete (missing desktop and panel)");
+    expect(desktopProbeLabel({ desktop_installed: false, window_manager_running: false, desktop_surface_running: false, desktop_panel_running: false, desktop_running: false, desktop_name: "" }, 2)).toBe("not installed · display :2 stopped");
+  });
 });
 
 describe("VNC bridge and Keychain contracts", () => {
@@ -39,7 +47,7 @@ describe("VNC bridge and Keychain contracts", () => {
     Object.defineProperty(globalThis, "window", { configurable: true, value: { zero: { invoke } } });
 
     await api.vnc.setup("server-1", { display: 1, dry_run: true });
-    await api.vnc.setup("server-1", { display: 1, dry_run: false, password: "vnc-secret" });
+    await api.vnc.setup("server-1", { display: 1, dry_run: false, password: "vnc-secret", installDesktop: true });
 
     expect(invoke).toHaveBeenNthCalledWith(1, "oars.vnc.setup", {
       server_id: "server-1",
@@ -51,7 +59,17 @@ describe("VNC bridge and Keychain contracts", () => {
       display: 1,
       dry_run: false,
       password: "vnc-secret",
+      install_desktop: true,
     });
+  });
+
+  it("probes desktop state on the selected display", async () => {
+    const invoke = vi.fn(async () => ({ ok: true }));
+    Object.defineProperty(globalThis, "window", { configurable: true, value: { zero: { invoke } } });
+
+    await api.vnc.probe("server-1", 2);
+
+    expect(invoke).toHaveBeenCalledWith("oars.vnc.probe", { server_id: "server-1", display: 2 });
   });
 
   it("replaces and removes the cached Keychain password", async () => {

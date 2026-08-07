@@ -164,6 +164,13 @@ export interface VncProbeResult {
   ok: boolean;
   x11vnc: boolean;
   tigervnc: boolean;
+  desktop_installed: boolean;
+  window_manager_running: boolean;
+  desktop_surface_running: boolean;
+  desktop_panel_running: boolean;
+  desktop_running: boolean;
+  desktop_name: string;
+  setup_state: "idle" | "installing" | "installed" | "ready" | "failed";
   listening: Array<{ port: number; process: string }>;
 }
 
@@ -173,6 +180,8 @@ export interface VncSetupResult {
   plan: string;
   hint: string;
   executed: boolean;
+  desktop_action: "none" | "install" | "start" | "running" | "manual";
+  desktop_name: string;
 }
 
 export interface VncPollResult {

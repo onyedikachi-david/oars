@@ -815,7 +815,7 @@ fn handleSshPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
 
 const vnc_exec_cap: usize = 256 * 1024;
 const vnc_exec_timeout_ns = 20 * std.time.ns_per_s;
-const vnc_install_timeout_ns = 5 * std.time.ns_per_min;
+const vnc_install_timeout_ns = 30 * std.time.ns_per_min;
 const vnc_start_timeout_ns = 5 * std.time.ns_per_s;
 
 const VncStartPayload = struct {
@@ -827,12 +827,16 @@ const VncStopPayload = struct {
     server_id: []const u8,
     tunnel_id: u32,
 };
-const VncProbePayload = struct { server_id: []const u8 };
+const VncProbePayload = struct {
+    server_id: []const u8,
+    display: ?u16 = null,
+};
 const VncSetupPayload = struct {
     server_id: []const u8,
     display: ?u16 = null,
     dry_run: bool = false,
     password: ?[]const u8 = null,
+    install_desktop: bool = false,
 };
 const VncPollPayload = struct {
     server_id: []const u8,
@@ -844,7 +848,7 @@ fn vncExec(self: *Context, server_id: []const u8, cmd: []const u8) ?sessions.Exe
 }
 
 fn vncExecWithInput(self: *Context, server_id: []const u8, cmd: []const u8, input: []const u8) ?sessions.ExecOutcome {
-    return self.manager.execWaitWithInput(server_id, cmd, input, 64 * 1024, 30 * std.time.ns_per_s) catch null;
+    return self.manager.execWaitWithInput(server_id, cmd, input, 64 * 1024, 90 * std.time.ns_per_s) catch null;
 }
 
 fn vncCheck(self: *Context, server_id: []const u8, cmd: []const u8) bool {
@@ -853,10 +857,28 @@ fn vncCheck(self: *Context, server_id: []const u8, cmd: []const u8) bool {
     return !out.limited and out.exit == 0;
 }
 
-fn vncInstall(self: *Context, server_id: []const u8, cmd: []const u8) bool {
-    var out = self.manager.execWait(server_id, cmd, vnc_exec_cap, vnc_install_timeout_ns) catch return false;
-    defer out.output.deinit(self.allocator);
-    return !out.limited and out.exit == 0;
+const VncInstallResult = enum { installed, pending, failed };
+
+fn vncInstall(self: *Context, server_id: []const u8, display: u16, plan: []const u8) VncInstallResult {
+    const start_command = vncmod.installStartCommand(self.allocator, display, plan) catch return .failed;
+    defer self.allocator.free(start_command);
+    var started = vncExec(self, server_id, start_command) orelse return .failed;
+    defer started.output.deinit(self.allocator);
+    if (started.limited or started.exit != 0) return .failed;
+
+    const wait_command = vncmod.installWaitCommand(self.allocator, display) catch return .failed;
+    defer self.allocator.free(wait_command);
+    var waited = self.manager.execWait(server_id, wait_command, vnc_exec_cap, vnc_install_timeout_ns) catch return .pending;
+    defer waited.output.deinit(self.allocator);
+    if (waited.limited) return .pending;
+    return if (waited.exit == 0) .installed else .failed;
+}
+
+fn vncMarkSetupState(self: *Context, server_id: []const u8, display: u16, state: []const u8) void {
+    const command = vncmod.setupStateCommand(self.allocator, display, state) catch return;
+    defer self.allocator.free(command);
+    var outcome = vncExec(self, server_id, command) orelse return;
+    outcome.output.deinit(self.allocator);
 }
 
 fn vncSetupFailure(output: []u8, captured: []const u8, timed_out: bool) []const u8 {
@@ -944,13 +966,28 @@ fn handleVncProbe(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
     };
     defer parsed.deinit();
     const server_id = parsed.value.server_id;
+    const display = parsed.value.display orelse 0;
     if (vncSessionReady(self, output, server_id)) |err| return err;
-    var outcome = vncExec(self, server_id, vncmod.probe_command) orelse return respondError(output, "probe failed");
+    const command = vncmod.probeCommand(self.allocator, display) catch return respondError(output, "display must be between 0 and 99");
+    defer self.allocator.free(command);
+    var outcome = vncExec(self, server_id, command) orelse return respondError(output, "probe failed");
     defer outcome.output.deinit(self.allocator);
     var result = vncmod.parseProbeOutput(self.allocator, outcome.output.items);
     defer result.deinit(self.allocator);
     var writer = std.Io.Writer.fixed(output);
-    writer.print("{{\"ok\":true,\"x11vnc\":{s},\"tigervnc\":{s},\"listening\":[", .{ if (result.x11vnc) "true" else "false", if (result.tigervnc) "true" else "false" }) catch return output[0..0];
+    writer.print("{{\"ok\":true,\"x11vnc\":{s},\"tigervnc\":{s},\"desktop_installed\":{s},\"window_manager_running\":{s},\"desktop_surface_running\":{s},\"desktop_panel_running\":{s},\"desktop_running\":{s},\"desktop_name\":", .{
+        if (result.x11vnc) "true" else "false",
+        if (result.tigervnc) "true" else "false",
+        if (result.desktop_installed) "true" else "false",
+        if (result.window_manager_running) "true" else "false",
+        if (result.desktop_surface_running) "true" else "false",
+        if (result.desktop_panel_running) "true" else "false",
+        if (result.desktop_running) "true" else "false",
+    }) catch return output[0..0];
+    json.writeJsonString(&writer, result.desktop_name) catch return output[0..0];
+    writer.writeAll(",\"setup_state\":") catch return output[0..0];
+    json.writeJsonString(&writer, result.setup_state) catch return output[0..0];
+    writer.writeAll(",\"listening\":[") catch return output[0..0];
     var first = true;
     for (result.listening) |l| {
         if (!first) writer.writeAll(",") catch return output[0..0];
@@ -980,8 +1017,21 @@ fn handleVncSetup(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
 
     var os_out = vncExec(self, payload.server_id, "cat /etc/os-release 2>/dev/null") orelse return respondError(output, "cannot detect the server OS");
     defer os_out.output.deinit(self.allocator);
-    const installed = vncCheck(self, payload.server_id, "command -v x11vnc >/dev/null 2>&1");
-    var plan = vncmod.setupPlan(self.allocator, os_out.output.items, display, installed);
+    const probe_command = vncmod.probeCommand(self.allocator, display) catch return respondError(output, "cannot build the VNC probe command");
+    defer self.allocator.free(probe_command);
+    var probe_out = vncExec(self, payload.server_id, probe_command) orelse return respondError(output, "cannot inspect the remote desktop");
+    defer probe_out.output.deinit(self.allocator);
+    var probe = vncmod.parseProbeOutput(self.allocator, probe_out.output.items);
+    defer probe.deinit(self.allocator);
+    var plan = vncmod.setupPlan(
+        self.allocator,
+        os_out.output.items,
+        display,
+        probe.x11vnc,
+        probe.xfce_ready,
+        probe.desktop_running,
+        payload.install_desktop,
+    );
     defer plan.deinit(self.allocator);
 
     if (payload.dry_run or std.mem.eql(u8, plan.action, "manual")) {
@@ -991,16 +1041,21 @@ fn handleVncSetup(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
     if (password.len == 0 or password.len > 1024) return respondError(output, "VNC password must be between 1 and 1024 bytes");
     if (std.mem.indexOfAny(u8, password, "\r\n") != null) return respondError(output, "VNC password cannot contain a line break");
 
-    if (std.mem.eql(u8, plan.action, "install")) {
+    if (plan.plan.len > 0) {
         var idc = vncExec(self, payload.server_id, "id -u") orelse return respondError(output, "not connected");
         defer idc.output.deinit(self.allocator);
         if (idc.exit != 0 or !std.mem.eql(u8, std.mem.trim(u8, idc.output.items, " \t\r\n"), "0")) {
-            return respondError(output, "installing a VNC server requires root access on the server");
+            return respondError(output, "installing VNC or desktop packages requires root access on the server");
         }
-        if (!vncInstall(self, payload.server_id, plan.plan)) return respondError(output, "installation failed or timed out");
+        switch (vncInstall(self, payload.server_id, display, plan.plan)) {
+            .installed => {},
+            .pending => return respondError(output, "Package installation is still running on the server. Oars will detect it after reconnect; re-probe this display before retrying."),
+            .failed => return respondError(output, "VNC or desktop package installation failed; review the owner-only install log in $HOME/.local/share/oars/vnc"),
+        }
     }
 
-    const start_command = vncmod.secureStartCommand(self.allocator, display) catch return respondError(output, "cannot build the VNC start command");
+    const start_desktop = std.mem.eql(u8, plan.desktop_action, "install") or std.mem.eql(u8, plan.desktop_action, "start");
+    const start_command = vncmod.secureStartCommand(self.allocator, display, start_desktop) catch return respondError(output, "cannot build the VNC start command");
     defer self.allocator.free(start_command);
     const input_len = password.len * 2 + 4;
     const password_input = self.allocator.alloc(u8, input_len) catch return respondError(output, "out of memory");
@@ -1016,10 +1071,14 @@ fn handleVncSetup(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
     password_input[input_len - 1] = '\n';
     var started = vncExecWithInput(self, payload.server_id, start_command, password_input) orelse return respondError(output, "VNC configuration failed");
     defer started.output.deinit(self.allocator);
-    if (started.limited or started.exit != 0) return vncSetupFailure(output, started.output.items, started.limited);
+    if (started.limited or started.exit != 0) {
+        vncMarkSetupState(self, payload.server_id, display, "failed");
+        return vncSetupFailure(output, started.output.items, started.limited);
+    }
+    vncMarkSetupState(self, payload.server_id, display, "ready");
 
-    var detail_buf: [64]u8 = undefined;
-    const detail = std.fmt.bufPrint(&detail_buf, "display={d} action={s}", .{ display, plan.action }) catch "vnc.setup";
+    var detail_buf: [128]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "display={d} action={s} desktop={s}", .{ display, plan.action, plan.desktop_action }) catch "vnc.setup";
     sshkeysAudit(self, "vnc.setup", payload.server_id, detail);
     return vncSetupResponse(output, &plan, true);
 }
@@ -1034,6 +1093,10 @@ fn vncSetupResponse(output: []u8, plan: *const vncmod.SetupPlan, executed: bool)
     json.writeJsonString(&writer, plan.plan) catch return output[0..0];
     writer.writeAll(",\"hint\":") catch return output[0..0];
     json.writeJsonString(&writer, plan.hint) catch return output[0..0];
+    writer.writeAll(",\"desktop_action\":") catch return output[0..0];
+    json.writeJsonString(&writer, plan.desktop_action) catch return output[0..0];
+    writer.writeAll(",\"desktop_name\":") catch return output[0..0];
+    json.writeJsonString(&writer, plan.desktop_name) catch return output[0..0];
     writer.writeAll("}") catch return output[0..0];
     return writer.buffered();
 }

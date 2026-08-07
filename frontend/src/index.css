@@ -309,6 +309,11 @@ nav { padding: 8px 10px; flex: 0 0 auto; }.nav-group { margin: 18px 0 24px; }.na
 .oars-loading-copy { display: flex; flex-direction: column; align-items: center; gap: 6px; }
 .oars-loading-copy strong { font-size: 14px; font-weight: 650; letter-spacing: 0; }
 .oars-loading-copy span { max-width: 430px; color: var(--muted-foreground); font-size: 11px; line-height: 1.55; }
+.vnc-setup-progress.oars-loading-state { min-height: 0; padding: 11px 12px; flex-direction: row; align-items: center; justify-content: flex-start; gap: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--muted); text-align: left; }
+.vnc-setup-progress .oars-loading-signal { height: 26px; flex: 0 0 auto; }
+.vnc-setup-progress .oars-loading-copy { align-items: flex-start; gap: 2px; }
+.vnc-setup-progress .oars-loading-copy strong { font-size: 11px; }
+.vnc-setup-progress .oars-loading-rails { display: none; }
 .oars-loading-rails { width: min(420px, 78vw); display: grid; gap: 8px; margin-top: 3px; }
 .oars-loading-rails span { height: 7px; border-radius: 4px; background: var(--muted); transform-origin: left center; animation: oars-loading-rail 1.35s ease-in-out infinite; }
 .oars-loading-rails span:nth-child(1) { width: 100%; }

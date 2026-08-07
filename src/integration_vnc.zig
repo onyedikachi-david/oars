@@ -1,6 +1,6 @@
 //! Spec 12 integration coverage (container): the full VNC-over-SSH
-//! tunnel. The setup helper installs x11vnc + Xvfb (approval-gated and
-//! audited), the test starts a real VNC server on display :1 (port
+//! tunnel. The fixture includes x11vnc, Xvfb, and XFCE; the approval-gated
+//! setup helper configures and starts them on display :1 (port
 //! 5901), `oars.vnc.start` opens a loopback WebSocket → SSH direct-tcpip
 //! tunnel, and a Zig WebSocket/RFB client performs VNC authentication,
 //! receives live raw framebuffer pixels, moves the X pointer, and types into
@@ -15,6 +15,7 @@
 const std = @import("std");
 const servers = @import("servers.zig");
 const wsmod = @import("ws.zig");
+const vncmod = @import("vnc.zig");
 const rig_mod = @import("integration.zig");
 const mbedtls = @cImport({
     @cInclude("mbedtls/des.h");
@@ -36,6 +37,8 @@ const VncSetupResp = struct {
         executed: bool = false,
         plan: []const u8 = "",
         hint: []const u8 = "",
+        desktop_action: []const u8 = "",
+        desktop_name: []const u8 = "",
     },
 };
 
@@ -44,6 +47,13 @@ const VncProbeResp = struct {
         ok: bool = false,
         x11vnc: bool = false,
         tigervnc: bool = false,
+        desktop_installed: bool = false,
+        window_manager_running: bool = false,
+        desktop_surface_running: bool = false,
+        desktop_panel_running: bool = false,
+        desktop_running: bool = false,
+        desktop_name: []const u8 = "",
+        setup_state: []const u8 = "idle",
         listening: []const struct {
             port: u16 = 0,
             process: []const u8 = "",
@@ -372,15 +382,35 @@ test "integration: vnc setup, framebuffer, pointer, keyboard, tunnel teardown" {
     try rig.manager.trust(server_id, true);
     try waitForStatus(&rig.manager, server_id, .ready, 20 * std.time.ns_per_s);
 
+    // A detached install survives the exec channel that starts it. A later
+    // probe and waiter recover its state without starting a duplicate job.
+    try execWait(&rig.manager, server_id, "rm -f /tmp/oars-vnc-install-release", 0, "");
+    const install_start = try vncmod.installStartCommand(std.testing.allocator, 2, "while [ ! -f /tmp/oars-vnc-install-release ]; do sleep 1; done");
+    defer std.testing.allocator.free(install_start);
+    try execWait(&rig.manager, server_id, install_start, 0, "");
+    var installing_probe = try dispatchParsed(&rig, VncProbeResp, "{\"id\":\"pi1\",\"command\":\"oars.vnc.probe\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\",\"display\":2}}");
+    defer installing_probe.deinit();
+    try std.testing.expectEqualStrings("installing", installing_probe.value.result.setup_state);
+    try execWait(&rig.manager, server_id, "touch /tmp/oars-vnc-install-release", 0, "");
+    const install_wait = try vncmod.installWaitCommand(std.testing.allocator, 2);
+    defer std.testing.allocator.free(install_wait);
+    try execWait(&rig.manager, server_id, install_wait, 0, "setup_state=installed");
+    const mark_ready = try vncmod.setupStateCommand(std.testing.allocator, 2, "ready");
+    defer std.testing.allocator.free(mark_ready);
+    try execWait(&rig.manager, server_id, mark_ready, 0, "");
+    var ready_probe = try dispatchParsed(&rig, VncProbeResp, "{\"id\":\"pi2\",\"command\":\"oars.vnc.probe\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\",\"display\":2}}");
+    defer ready_probe.deinit();
+    try std.testing.expectEqualStrings("ready", ready_probe.value.result.setup_state);
+
     // --- setup helper: plan first (approval), then execute + audit --------
-    var dry = try dispatchParsed(&rig, VncSetupResp, "{\"id\":\"s1\",\"command\":\"oars.vnc.setup\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\",\"display\":1,\"dry_run\":true}}");
+    var dry = try dispatchParsed(&rig, VncSetupResp, "{\"id\":\"s1\",\"command\":\"oars.vnc.setup\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\",\"display\":1,\"dry_run\":true,\"install_desktop\":true}}");
     defer dry.deinit();
     try std.testing.expect(dry.value.result.ok);
     try std.testing.expect(!dry.value.result.executed);
     const action = dry.value.result.action;
 
     if (std.mem.eql(u8, action, "install") or std.mem.eql(u8, action, "configure")) {
-        var install = try dispatchParsed(&rig, VncSetupResp, "{\"id\":\"s2\",\"command\":\"oars.vnc.setup\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\",\"display\":1,\"password\":\"oars-test-password\"}}");
+        var install = try dispatchParsed(&rig, VncSetupResp, "{\"id\":\"s2\",\"command\":\"oars.vnc.setup\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\",\"display\":1,\"password\":\"oars-test-password\",\"install_desktop\":true}}");
         defer install.deinit();
         if (!install.value.result.ok) std.debug.print("VNC setup error: {s}\n", .{install.value.result.@"error"});
         try std.testing.expect(install.value.result.ok);
@@ -389,6 +419,10 @@ test "integration: vnc setup, framebuffer, pointer, keyboard, tunnel teardown" {
         try std.testing.expect(std.mem.indexOf(u8, install.value.result.hint, "-localhost") != null);
         try std.testing.expect(std.mem.indexOf(u8, install.value.result.hint, "-rfbauth") != null);
         try std.testing.expect(std.mem.indexOf(u8, install.value.result.hint, "-nopw") == null);
+        try std.testing.expectEqualStrings("XFCE", install.value.result.desktop_name);
+        try std.testing.expect(std.mem.eql(u8, install.value.result.desktop_action, "start") or
+            std.mem.eql(u8, install.value.result.desktop_action, "install") or
+            std.mem.eql(u8, install.value.result.desktop_action, "running"));
         // Audited.
         const entries = try rig.audit_store.read(io, server_id, "vnc.setup", 10);
         defer {
@@ -400,37 +434,22 @@ test "integration: vnc setup, framebuffer, pointer, keyboard, tunnel teardown" {
         return error.TestUnexpectedResult; // the container is Alpine
     }
 
-    // Start a real X client. The raw framebuffer must contain its pixels, and
-    // its stdin gives keyboard input an observable remote effect.
-    try execWait(
-        &rig.manager,
-        server_id,
-        "pkill -x xterm 2>/dev/null || true; rm -f /tmp/oars-vnc-keyboard /tmp/oars-vnc-xterm.log; " ++
-            "DISPLAY=:1 setsid xterm -geometry 80x24+20+20 -T OarsVncInput " ++
-            "-e sh -c 'IFS= read -r line; printf \"%s\" \"$line\" >/tmp/oars-vnc-keyboard; sleep 2' " ++
-            "</dev/null >/tmp/oars-vnc-xterm.log 2>&1 &",
-        0,
-        "",
-    );
-    try execWait(
-        &rig.manager,
-        server_id,
-        "i=0; while [ \"$i\" -lt 50 ]; do " ++
-            "wid=$(DISPLAY=:1 xdotool search --name OarsVncInput 2>/dev/null | head -n1); " ++
-            "if [ -n \"$wid\" ] && DISPLAY=:1 xdotool windowfocus \"$wid\" 2>/dev/null; then exit 0; fi; " ++
-            "sleep 0.2; i=$((i + 1)); done; exit 1",
-        0,
-        "",
-    );
     // --- probe: x11vnc installed and listening on 5901 ----------------------
     // The daemons bind asynchronously; poll the probe until the listener
     // shows up (with a bounded deadline) instead of trusting fixed sleeps.
-    var probe = try dispatchParsed(&rig, VncProbeResp, "{\"id\":\"p1\",\"command\":\"oars.vnc.probe\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\"}}");
+    var probe = try dispatchParsed(&rig, VncProbeResp, "{\"id\":\"p1\",\"command\":\"oars.vnc.probe\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\",\"display\":1}}");
     defer probe.deinit();
     const probe_deadline = std.Io.Timestamp.now(io, .real).nanoseconds + 15 * std.time.ns_per_s;
     while (true) {
         try std.testing.expect(probe.value.result.ok);
         try std.testing.expect(probe.value.result.x11vnc);
+        try std.testing.expect(probe.value.result.desktop_installed);
+        try std.testing.expect(probe.value.result.window_manager_running);
+        try std.testing.expect(probe.value.result.desktop_surface_running);
+        try std.testing.expect(probe.value.result.desktop_panel_running);
+        try std.testing.expect(probe.value.result.desktop_running);
+        try std.testing.expectEqualStrings("XFCE", probe.value.result.desktop_name);
+        try std.testing.expectEqualStrings("ready", probe.value.result.setup_state);
         var found_5901 = false;
         for (probe.value.result.listening) |l| {
             if (l.port == vnc_port) {
@@ -444,8 +463,44 @@ test "integration: vnc setup, framebuffer, pointer, keyboard, tunnel teardown" {
         }
         probe.deinit();
         testSleep(500);
-        probe = try dispatchParsed(&rig, VncProbeResp, "{\"id\":\"p1\",\"command\":\"oars.vnc.probe\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\"}}");
+        probe = try dispatchParsed(&rig, VncProbeResp, "{\"id\":\"p1\",\"command\":\"oars.vnc.probe\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\",\"display\":1}}");
     }
+
+    // A window manager alone can export a valid but black framebuffer. Remove
+    // the XFCE desktop and panel, prove the probe reports an incomplete
+    // session, then exercise the setup helper's repair path.
+    try execWait(
+        &rig.manager,
+        server_id,
+        "pkill -x xfdesktop 2>/dev/null || true; pkill -x xfce4-panel 2>/dev/null || true; " ++
+            "i=0; while [ \"$i\" -lt 50 ]; do " ++
+            "found=0; clients=$(DISPLAY=:1 xprop -root _NET_CLIENT_LIST 2>/dev/null | sed -n 's/.*# //p' | tr -d ','); " ++
+            "for window in $clients; do class=$(DISPLAY=:1 xprop -id $window WM_CLASS 2>/dev/null || true); " ++
+            "case \"$class\" in *xfdesktop*|*xfce4-panel*) found=1 ;; esac; done; [ \"$found\" -eq 0 ] && exit 0; " ++
+            "sleep 0.2; i=$((i + 1)); done; exit 1",
+        0,
+        "",
+    );
+    var incomplete = try dispatchParsed(&rig, VncProbeResp, "{\"id\":\"p2\",\"command\":\"oars.vnc.probe\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\",\"display\":1}}");
+    defer incomplete.deinit();
+    try std.testing.expect(incomplete.value.result.window_manager_running);
+    try std.testing.expect(!incomplete.value.result.desktop_surface_running);
+    try std.testing.expect(!incomplete.value.result.desktop_panel_running);
+    try std.testing.expect(!incomplete.value.result.desktop_running);
+
+    var repair = try dispatchParsed(&rig, VncSetupResp, "{\"id\":\"s3\",\"command\":\"oars.vnc.setup\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\",\"display\":1,\"password\":\"oars-test-password\",\"install_desktop\":true}}");
+    defer repair.deinit();
+    if (!repair.value.result.ok) std.debug.print("VNC desktop repair error: {s}\n", .{repair.value.result.@"error"});
+    try std.testing.expect(repair.value.result.ok);
+    try std.testing.expect(repair.value.result.executed);
+    try std.testing.expectEqualStrings("start", repair.value.result.desktop_action);
+
+    var repaired = try dispatchParsed(&rig, VncProbeResp, "{\"id\":\"p3\",\"command\":\"oars.vnc.probe\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\",\"display\":1}}");
+    defer repaired.deinit();
+    try std.testing.expect(repaired.value.result.window_manager_running);
+    try std.testing.expect(repaired.value.result.desktop_surface_running);
+    try std.testing.expect(repaired.value.result.desktop_panel_running);
+    try std.testing.expect(repaired.value.result.desktop_running);
 
     // --- start the tunnel ----------------------------------------------------
     var start_buf: [256]u8 = undefined;
@@ -470,6 +525,30 @@ test "integration: vnc setup, framebuffer, pointer, keyboard, tunnel teardown" {
     try std.testing.expectEqual(@as(u16, 800), desktop.height);
     try requestRawFramebuffer(&client, desktop.width, desktop.height);
     try expectRawFramebuffer(&client);
+
+    // The framebuffer check above runs before any test window is added, so its
+    // varied pixels must come from the XFCE desktop and panel. Add an xterm now
+    // to make pointer and keyboard input observable.
+    try execWait(
+        &rig.manager,
+        server_id,
+        "pkill -x xterm 2>/dev/null || true; rm -f /tmp/oars-vnc-keyboard /tmp/oars-vnc-xterm.log; " ++
+            "DISPLAY=:1 setsid xterm -geometry 80x24+20+20 -T OarsVncInput " ++
+            "-e sh -c 'IFS= read -r line; printf \"%s\" \"$line\" >/tmp/oars-vnc-keyboard; sleep 2' " ++
+            "</dev/null >/tmp/oars-vnc-xterm.log 2>&1 &",
+        0,
+        "",
+    );
+    try execWait(
+        &rig.manager,
+        server_id,
+        "i=0; while [ \"$i\" -lt 50 ]; do " ++
+            "wid=$(DISPLAY=:1 xdotool search --name OarsVncInput 2>/dev/null | head -n1); " ++
+            "if [ -n \"$wid\" ] && DISPLAY=:1 xdotool windowfocus \"$wid\" 2>/dev/null; then exit 0; fi; " ++
+            "sleep 0.2; i=$((i + 1)); done; exit 1",
+        0,
+        "",
+    );
 
     try sendPointer(&client, 123, 234);
     var pointer_moved = false;
@@ -527,5 +606,5 @@ test "integration: vnc setup, framebuffer, pointer, keyboard, tunnel teardown" {
     try std.testing.expectEqualStrings("closed", poll2.value.result.state);
 
     // --- cleanup ---------------------------------------------------------------
-    try execWait(&rig.manager, server_id, "pkill -x x11vnc 2>/dev/null; pkill -x Xvfb 2>/dev/null; true", 0, "");
+    try execWait(&rig.manager, server_id, "pkill -x xterm 2>/dev/null; pkill -x xfce4-session 2>/dev/null; pkill -x xfwm4 2>/dev/null; pkill -x xfdesktop 2>/dev/null; pkill -x xfce4-panel 2>/dev/null; pkill -x x11vnc 2>/dev/null; pkill -x Xvfb 2>/dev/null; true", 0, "");
 }

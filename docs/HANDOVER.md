@@ -1580,13 +1580,59 @@ preview flows passed. The preview proved redacted setup/Keychain payloads,
 responsive dialogs and loading, and one-stop tunnel cleanup.
 
 The final container check now completes VNC authentication against live
-x11vnc, reads a varied 1280x800 framebuffer from xterm, moves the X pointer,
-types into xterm, verifies tunnel byte counters, and tears the tunnel down. The
-setup path also handles x11vnc's password confirmation through non-blocking SSH
+x11vnc, reads a varied 1280x800 XFCE framebuffer before xterm starts, moves the
+X pointer, types into xterm, verifies tunnel byte counters, and tears the tunnel
+down. The setup path also handles x11vnc's password confirmation through non-blocking SSH
 stdin, uses supported readiness and log files, and returns bounded diagnostics.
 The fresh serialized run passes all 186 tests. Spec 12 is complete.
 
-## 28. Next implementation target
+## 28. Session handover — 2026-08-07: headless desktop setup for spec 12
+
+The VNC probe now accepts the selected display and separates three conditions:
+desktop packages installed, a window manager running on that display, and a
+VNC listener. It recognizes common desktop commands, but the supported setup
+path is XFCE. The probe distinguishes the XFCE window manager, desktop surface,
+and panel through X11 properties. A black Xvfb framebuffer or a window manager
+without `xfdesktop` and `xfce4-panel` no longer counts as a desktop.
+The window-manager check validates the returned window ID because `xprop` can
+exit successfully while it reports that `_NET_SUPPORTING_WM_CHECK` is absent.
+
+The setup dialog has an explicit XFCE checkbox. Its dry run shows the exact
+Debian/Ubuntu or Alpine package plan and a password-redacted start command.
+Clearing the checkbox produces a VNC-only plan. Approved desktop setup starts
+XFCE with `dbus-run-session` under the connected SSH account, keeps its PID and
+owner-only log under `$HOME/.local/share/oars/vnc`, returns a bounded log tail
+on failure, and starts loopback-only x11vnc only after all three XFCE components
+are ready. If the window manager is already running, setup repairs missing
+desktop or panel components in its D-Bus session. Package installation still
+requires remote root access.
+
+The Alpine SSH fixture now includes XFCE. The serialized integration suite
+proved the full setup path against a real XFCE session, then completed VNC
+authentication, clean-desktop framebuffer, pointer, keyboard, byte-counter,
+and teardown checks. It removes `xfdesktop` and `xfce4-panel` to prove that the
+probe rejects the incomplete display and setup repairs it. Desktop and mobile
+preview checks covered the explicit choice, exact plan changes, command
+wrapping, and responsive approval dialog.
+
+Follow-up recovery fixes from a real Contabo Ubuntu run: package installation
+now starts as a detached process with owner-only PID, status, and log files. A
+restart or 30-minute bridge deadline does not kill it. The display probe reports
+`installing`, `installed`, `ready`, or `failed`, and setup cannot start a second
+package manager while the first is live, even when the user changes displays.
+Quoted `ID="ubuntu"` and Debian-like
+OS-release values use the supported APT plan instead of manual setup.
+
+The VNC strip now says, for example, `XFCE installed · display :1 running`.
+If only the XFCE window manager remains, it states which desktop components are
+missing and changes the action to **Repair desktop**.
+It saves `:0` or `:1` as soon as the user selects it, so setup on `:1` cannot
+reopen on the black `:0` framebuffer after an app restart. The setup dialog
+shows compact long-install feedback, and the manual dialog has one Close
+action. The fixture validates the detached state lifecycle through separate SSH
+exec channels in addition to the full XFCE framebuffer and input path.
+
+## 29. Next implementation target
 
 Implement the spec 05 File Manager frontend. Follow `docs/NEXT-SPEC.md`; it
 records the exact SFTP backend contract, the raw-path identity rule, the editor

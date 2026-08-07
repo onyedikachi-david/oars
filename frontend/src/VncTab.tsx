@@ -17,6 +17,7 @@ import { Button } from "./components/ui/button";
 import { OarsLoadingState } from "./components/OarsLoadingState";
 import {
   closedTunnelReason,
+  desktopProbeLabel,
   legacyVncAuthWarning,
   VALID_VNC_PORT_MAX,
   VALID_VNC_PORT_MIN,
@@ -135,9 +136,11 @@ export function VncTab({ serverId }: { serverId: string }) {
   const [setup, setSetup] = useState<SetupState>({ kind: "idle" });
   const [setupApprovalOpen, setSetupApprovalOpen] = useState(false);
   const [setupBusy, setSetupBusy] = useState(false);
+  const [setupExecuting, setSetupExecuting] = useState(false);
   const [setupPassword, setSetupPassword] = useState("");
   const [setupPasswordConfirm, setSetupPasswordConfirm] = useState("");
   const [setupPasswordError, setSetupPasswordError] = useState<string | null>(null);
+  const [setupDesktop, setSetupDesktop] = useState(true);
   const [setupAutoConnect, setSetupAutoConnect] = useState(false);
 
   // ── Display memory + custom port sync
@@ -233,22 +236,25 @@ export function VncTab({ serverId }: { serverId: string }) {
   const runProbe = useCallback(async () => {
     setProbe({ kind: "loading" });
     try {
-      const r = await api.vnc.probe(serverId);
+      const r = await api.vnc.probe(serverId, display);
       setProbe({ kind: "ready", data: r });
     } catch (e) {
       setProbe({ kind: "error", message: messageOf(e) });
     }
-  }, [serverId]);
+  }, [serverId, display]);
 
   useEffect(() => { void runProbe(); }, [runProbe]);
 
   // ── Setup: probe before setup (spec), then dry_run to approval
   const runSetupDry = useCallback(async () => {
+    const installDesktop = probe.kind === "ready" ? !probe.data.desktop_running : true;
+    rememberDisplay(serverId, display);
+    setSetupDesktop(installDesktop);
     setSetup({ kind: "loading" });
     try {
       // Re-probe to avoid stale plan (spec says probe before setup)
       await runProbe();
-      const r = await api.vnc.setup(serverId, { display, dry_run: true });
+      const r = await api.vnc.setup(serverId, { display, dry_run: true, installDesktop });
       setSetup({ kind: "plan", data: r });
       setSetupPassword("");
       setSetupPasswordConfirm("");
@@ -257,30 +263,48 @@ export function VncTab({ serverId }: { serverId: string }) {
     } catch (e) {
       setSetup({ kind: "error", message: messageOf(e) });
     }
-  }, [serverId, display, runProbe]);
+  }, [serverId, display, probe, runProbe]);
+
+  const updateDesktopChoice = useCallback(async (installDesktop: boolean) => {
+    setSetupDesktop(installDesktop);
+    setSetupBusy(true);
+    setSetupPasswordError(null);
+    try {
+      const r = await api.vnc.setup(serverId, { display, dry_run: true, installDesktop });
+      setSetup({ kind: "plan", data: r });
+    } catch (e) {
+      setSetup({ kind: "error", message: messageOf(e) });
+      setSetupApprovalOpen(false);
+    } finally {
+      setSetupBusy(false);
+    }
+  }, [serverId, display]);
 
   const executeSetup = useCallback(async () => {
     const passwordError = validateSetupPasswords(setupPassword, setupPasswordConfirm);
     if (passwordError) { setSetupPasswordError(passwordError); return; }
     setSetupBusy(true);
+    setSetupExecuting(true);
     setSetupPasswordError(null);
     try {
       if (tunnelRef.current) await disconnect();
-      const r = await api.vnc.setup(serverId, { display, dry_run: false, password: setupPassword });
+      const r = await api.vnc.setup(serverId, { display, dry_run: false, password: setupPassword, installDesktop: setupDesktop });
       await vault.set(VNC_VAULT_PREFIX + serverId, setupPassword);
       setSetup({ kind: "executed", data: r });
       setSetupApprovalOpen(false);
       setSetupPassword("");
       setSetupPasswordConfirm("");
-      setCredentialNotice("Server password configured and saved in Keychain");
+      setCredentialNotice(setupDesktop ? "XFCE desktop configured; server password saved in Keychain" : "Server password configured and saved in Keychain");
       await runProbe();
       setSetupAutoConnect(true);
     } catch (e) {
       setSetup({ kind: "error", message: messageOf(e) });
+      await runProbe();
     } finally {
+      setSetupExecuting(false);
       setSetupBusy(false);
     }
-  }, [serverId, display, runProbe, setupPassword, setupPasswordConfirm, disconnect]);
+  }, [serverId, display, runProbe, setupPassword, setupPasswordConfirm, setupDesktop, disconnect]);
 
   // ── Start tunnel + wire noVNC
   const start = useCallback(async (passwordOverride?: string) => {
@@ -533,7 +557,7 @@ export function VncTab({ serverId }: { serverId: string }) {
               key={preset.label}
               data-testid={`vnc-display-${preset.label}`}
               aria-pressed={!useCustomPort && display === preset.value}
-              onClick={() => { setUseCustomPort(false); setDisplay(preset.value); setPortError(null); }}
+              onClick={() => { setUseCustomPort(false); setDisplay(preset.value); rememberDisplay(serverId, preset.value); setPortError(null); }}
               style={{
                 height: 28, padding: "0 10px", borderRadius: 6, border: "1px solid transparent",
                 background: (!useCustomPort && display === preset.value) ? "var(--card)" : "transparent",
@@ -719,11 +743,19 @@ export function VncTab({ serverId }: { serverId: string }) {
         ) : (
           <>
             <span data-testid="vnc-probe-summary" style={{ fontSize: 11, color: "var(--foreground)" }}>
-              VNC server: {probe.data.x11vnc && probe.data.tigervnc ? "x11vnc + TigerVNC" : probe.data.x11vnc ? "x11vnc" : probe.data.tigervnc ? "TigerVNC" : "not found"} · listening: {probe.data.listening.length ? probe.data.listening.map((l) => `${l.port}${l.process ? ` (${l.process})` : ""}`).join(", ") : "none"}
+              VNC server: {probe.data.x11vnc && probe.data.tigervnc ? "x11vnc + TigerVNC" : probe.data.x11vnc ? "x11vnc" : probe.data.tigervnc ? "TigerVNC" : "not found"} · Desktop: {desktopProbeLabel(probe.data, display)} · listening: {probe.data.listening.length ? probe.data.listening.map((l) => `${l.port}${l.process ? ` (${l.process})` : ""}`).join(", ") : "none"}
             </span>
+            {probe.data.setup_state === "installing" && (
+              <span data-testid="vnc-setup-running" role="status" style={{ color: "var(--primary)", fontSize: 11, display: "inline-flex", alignItems: "center", gap: 6 }}>
+                <RefreshCw size={12} className="spin" aria-hidden /> Package installation is still running
+              </span>
+            )}
+            {probe.data.setup_state === "failed" && (
+              <span data-testid="vnc-setup-failed-state" role="status" style={{ color: "var(--destructive)", fontSize: 11 }}>Last remote desktop setup failed</span>
+            )}
             <Button size="xs" variant="ghost" onClick={() => void runProbe()}>Re-probe</Button>
-            <Button data-testid="vnc-setup-cta" size="xs" variant="outline" onClick={() => void runSetupDry()}>
-              {probe.data.x11vnc ? "Configure server" : "Set up VNC"}
+            <Button data-testid="vnc-setup-cta" size="xs" variant="outline" onClick={() => void runSetupDry()} disabled={probe.data.setup_state === "installing"}>
+              {probe.data.setup_state === "installing" ? "Installing packages" : probe.data.desktop_running ? "Configure server" : probe.data.window_manager_running ? "Repair desktop" : probe.data.desktop_installed && probe.data.desktop_name === "XFCE" ? "Start desktop" : "Set up desktop"}
             </Button>
           </>
         )}
@@ -737,7 +769,7 @@ export function VncTab({ serverId }: { serverId: string }) {
       )}
       {setup.kind === "executed" && (
         <div data-testid="vnc-setup-executed" style={{ margin: "8px 12px 0", padding: "10px 12px", border: "1px solid var(--border)", borderRadius: 8, background: "var(--card)", color: "var(--foreground)", fontSize: 11, display: "flex", alignItems: "center", gap: 8 }}>
-          VNC is configured on display :{display} and bound to remote loopback.
+          {setup.data.desktop_action === "none" ? "VNC" : setup.data.desktop_name || "Desktop"} is configured on display :{display}; VNC remains bound to remote loopback.
         </div>
       )}
       {credentialNotice && (
@@ -879,11 +911,21 @@ export function VncTab({ serverId }: { serverId: string }) {
                 <span className="oars-modal-icon oars-modal-icon-danger" aria-hidden><AlertTriangle size={15} /></span>
                 <div>
                   <h2 id="vnc-setup-title">
-                    {setup.data.action === "manual" ? "Manual VNC setup required" : setup.data.action === "configure" ? "Configure VNC server?" : "Install and configure VNC?"}
+                    {setup.data.action === "manual"
+                      ? "Manual remote desktop setup"
+                      : setup.data.desktop_action === "install"
+                        ? "Install XFCE desktop?"
+                        : setup.data.desktop_action === "start"
+                          ? "Start XFCE desktop?"
+                          : setup.data.action === "configure" ? "Configure VNC server?" : "Install and configure VNC?"}
                   </h2>
                   <p className="oars-modal-subtitle">
                     {setup.data.action === "manual"
                       ? "Oars could not determine an install command for this server. Follow the guidance below."
+                      : setup.data.desktop_action === "install"
+                        ? "Oars will install a lightweight XFCE desktop, configure VNC, and start both on the selected display."
+                        : setup.data.desktop_action === "start"
+                          ? "Oars will start the installed XFCE desktop and configure VNC on the selected display."
                       : setup.data.action === "configure"
                         ? "Oars will set the server password and restart x11vnc on remote loopback."
                         : "Oars will install x11vnc, set its password, and start it on remote loopback. This action is audited."}
@@ -893,6 +935,21 @@ export function VncTab({ serverId }: { serverId: string }) {
               </div>
             </header>
             <div className="oars-modal-body" style={{ gap: 12 }}>
+              <label className="oars-check" style={{ alignItems: "flex-start", gap: 10 }}>
+                <input
+                  data-testid="vnc-setup-desktop"
+                  type="checkbox"
+                  checked={setupDesktop}
+                  disabled={setupBusy}
+                  onChange={(e) => void updateDesktopChoice(e.target.checked)}
+                />
+                <span style={{ display: "grid", gap: 2 }}>
+                  <span style={{ color: "var(--foreground)", fontSize: 11, fontWeight: 600 }}>Install or start XFCE desktop</span>
+                  <span style={{ color: "var(--muted-foreground)", fontSize: 10, lineHeight: 1.45 }}>
+                    Recommended for headless servers. This adds desktop packages and runs them under the connected SSH account.
+                  </span>
+                </span>
+              </label>
               {setup.data.action === "install" && (
                 <div className="monitor-command-preview">
                   <span>Install command</span>
@@ -939,15 +996,31 @@ export function VncTab({ serverId }: { serverId: string }) {
                   <p style={{ margin: 0, color: "var(--muted-foreground)", fontSize: 10, lineHeight: 1.5 }}>
                     Oars sends the password through command input, creates a mode-0600 authentication file, and starts x11vnc with <code>-localhost -rfbauth</code>. The password is also saved in Keychain for this server.
                   </p>
+                  {setupExecuting && (
+                    <OarsLoadingState
+                      compact
+                      className="vnc-setup-progress"
+                      title={setup.data.desktop_action === "install" ? "Installing XFCE desktop" : "Configuring remote desktop"}
+                      detail={setup.data.desktop_action === "install" ? "Package installation can take up to 30 minutes and continues if Oars restarts." : `Oars is preparing display :${display}.`}
+                    />
+                  )}
                 </>
               )}
             </div>
             <footer className="oars-modal-actions oars-modal-footer">
               <div className="oars-modal-actions-right">
-                <Button variant="ghost" onClick={() => setSetupApprovalOpen(false)} disabled={setupBusy}>Cancel</Button>
+                {setup.data.action !== "manual" && <Button variant="ghost" onClick={() => setSetupApprovalOpen(false)} disabled={setupBusy}>Cancel</Button>}
                 {(setup.data.action === "install" || setup.data.action === "configure") && (
                   <Button data-testid="vnc-setup-run" onClick={() => void executeSetup()} disabled={setupBusy}>
-                    {setupBusy ? "Configuring…" : setup.data.action === "install" ? "Install and configure" : "Configure and restart"}
+                    {setupExecuting
+                      ? setup.data.desktop_action === "install" ? "Installing desktop…" : "Configuring…"
+                      : setupBusy
+                        ? "Updating plan…"
+                      : setup.data.desktop_action === "install"
+                        ? "Install desktop"
+                        : setup.data.desktop_action === "start"
+                          ? "Start desktop"
+                          : setup.data.action === "install" ? "Install and configure" : "Configure and restart"}
                   </Button>
                 )}
                 {setup.data.action === "manual" && (

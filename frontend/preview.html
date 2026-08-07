@@ -11,6 +11,9 @@
         const logsMode = new URLSearchParams(window.location.search).get("logs") || "default";
         const vncProbeMode = new URLSearchParams(window.location.search).get("vncProbe") || "ready";
         const vncSetupMode = new URLSearchParams(window.location.search).get("vncSetup") || "install";
+        const vncDesktopMode = new URLSearchParams(window.location.search).get("vncDesktop") || (vncProbeMode === "ready" ? "running" : "missing");
+        const initialVncSetupState = new URLSearchParams(window.location.search).get("vncSetupState") || "idle";
+        const vncSetupDelay = Math.min(30000, Math.max(0, Number(new URLSearchParams(window.location.search).get("vncSetupDelay")) || 0));
         const vncPollMode = new URLSearchParams(window.location.search).get("vncPoll") || "listening";
         const vncCredsMode = new URLSearchParams(window.location.search).get("vncCreds") || "none";
         const vncTunnelMode = new URLSearchParams(window.location.search).get("vncTunnel") || "ok";
@@ -63,32 +66,57 @@
         let vncNextTunnelId = 2001;
         let vncNextPort = 48181;
         let vncConfigured = false;
+        let vncDesktopInstalled = vncDesktopMode === "installed" || vncDesktopMode === "incomplete" || vncDesktopMode === "running";
+        let vncDesktopRunning = vncDesktopMode === "running";
+        let vncSetupState = initialVncSetupState;
         const vncTunnels = new Map(); // tunnel_id -> { port, token, state, bytes_up, bytes_down, error }
         function vncProbePayload() {
-          if (vncConfigured) return { ok: true, x11vnc: true, tigervnc: false, listening: [{ port: 5900, process: "x11vnc" }] };
-          if (vncProbeMode === "missing") return { ok: true, x11vnc: false, tigervnc: false, listening: [] };
-          if (vncProbeMode === "partial") return { ok: true, x11vnc: true, tigervnc: false, listening: [{ port: 5901, process: "Xvnc" }] };
+          const desktop = {
+            desktop_installed: vncDesktopInstalled,
+            window_manager_running: vncDesktopMode === "incomplete" || vncDesktopRunning,
+            desktop_surface_running: vncDesktopRunning,
+            desktop_panel_running: vncDesktopRunning,
+            desktop_running: vncDesktopRunning,
+            desktop_name: vncDesktopInstalled ? "XFCE" : "",
+            setup_state: vncSetupState,
+          };
+          if (vncConfigured) return { ok: true, x11vnc: true, tigervnc: false, ...desktop, listening: [{ port: 5900, process: "x11vnc" }] };
+          if (vncProbeMode === "missing") return { ok: true, x11vnc: false, tigervnc: false, ...desktop, listening: [] };
+          if (vncProbeMode === "partial") return { ok: true, x11vnc: true, tigervnc: false, ...desktop, listening: [{ port: 5901, process: "Xvnc" }] };
           // ready: x11vnc installed + one listener
-          return { ok: true, x11vnc: true, tigervnc: true, listening: [{ port: 5901, process: "x11vnc" }] };
+          return { ok: true, x11vnc: true, tigervnc: true, ...desktop, listening: [{ port: 5901, process: "x11vnc" }] };
         }
-        function vncSetupHint(display) {
+        function vncSetupHint(display, installDesktop) {
           const port = 5900 + display;
-          return "x11vnc -storepasswd $HOME/.local/share/oars/vnc/display-" + display + ".passwd; x11vnc -display :" + display + " -rfbport " + port + " -localhost -forever -shared -rfbauth $HOME/.local/share/oars/vnc/display-" + display + ".passwd";
+          const desktop = installDesktop ? "DISPLAY=:" + display + " dbus-run-session -- startxfce4; " : "";
+          return "x11vnc -storepasswd $HOME/.local/share/oars/vnc/display-" + display + ".passwd; " + desktop + "x11vnc -display :" + display + " -rfbport " + port + " -localhost -forever -shared -rfbauth $HOME/.local/share/oars/vnc/display-" + display + ".passwd";
         }
-        function vncSetupPayload(display, dryRun, password) {
+        function vncSetupPayload(display, dryRun, password, installDesktop) {
           const d = display ?? 0;
-          const action = vncSetupMode === "already" || vncConfigured ? "configure" : "install";
-          if (vncSetupMode === "already" && dryRun) return { ok: true, action, plan: "", hint: vncSetupHint(d), executed: false };
-          if (vncSetupMode === "manual") return { ok: true, action: "manual", plan: "", hint: "install x11vnc for your distribution, then start it bound to 127.0.0.1 with a password", executed: false };
+          const action = vncSetupMode === "already" || vncConfigured || vncDesktopMode === "incomplete" ? "configure" : "install";
+          const desktopAction = !installDesktop ? "none" : vncDesktopRunning ? "running" : vncDesktopInstalled ? "start" : "install";
+          const desktopName = installDesktop ? "XFCE" : "";
+          const needsVnc = action === "install";
+          const needsDesktop = desktopAction === "install";
+          const installPlan = needsVnc && needsDesktop
+            ? "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y x11vnc xvfb xfce4 dbus-x11 x11-utils"
+            : needsDesktop
+              ? "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 dbus-x11 x11-utils"
+              : needsVnc
+                ? "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y x11vnc xvfb"
+                : "";
+          if (vncSetupMode === "already" && dryRun) return { ok: true, action, plan: installPlan, hint: vncSetupHint(d, installDesktop), desktop_action: desktopAction, desktop_name: desktopName, executed: false };
+          if (vncSetupMode === "manual") return { ok: true, action: "manual", plan: "", hint: "install x11vnc, Xvfb, XFCE, D-Bus, and xprop for this distribution", desktop_action: "manual", desktop_name: desktopName, executed: false };
           if (vncSetupMode === "fail") {
             // dry_run preview still returns a plan; installed path would error — emulate as ok:false rejected by handler
-            if (dryRun) return { ok: true, action: "install", plan: "apt-get update && apt-get install -y x11vnc xvfb", hint: vncSetupHint(d), executed: false };
+            if (dryRun) return { ok: true, action: "install", plan: installPlan, hint: vncSetupHint(d, installDesktop), desktop_action: desktopAction, desktop_name: desktopName, executed: false };
             return { ok: false, error: "VNC configuration failed" };
           }
-          if (dryRun) return { ok: true, action, plan: action === "install" ? "apt-get update && apt-get install -y x11vnc xvfb" : "", hint: vncSetupHint(d), executed: false };
+          if (dryRun) return { ok: true, action: installPlan ? "install" : action, plan: installPlan, hint: vncSetupHint(d, installDesktop), desktop_action: desktopAction, desktop_name: desktopName, executed: false };
           if (!password) return { ok: false, error: "enter a VNC password" };
           vncConfigured = true;
-          return { ok: true, action, plan: action === "install" ? "apt-get update && apt-get install -y x11vnc xvfb" : "", hint: vncSetupHint(d), executed: true };
+          if (installDesktop) { vncSetupState = "ready"; vncDesktopInstalled = true; vncDesktopRunning = true; }
+          return { ok: true, action: installPlan ? "install" : action, plan: installPlan, hint: vncSetupHint(d, installDesktop), desktop_action: desktopAction, desktop_name: desktopName, executed: true };
         }
 
         const servers = [
@@ -328,7 +356,8 @@
               return vncProbePayload();
             }
             if (command === "oars.vnc.setup") {
-              const result = vncSetupPayload(payload.display ?? 0, !!payload.dry_run, payload.password);
+              if (!payload.dry_run && vncSetupDelay) await delay(vncSetupDelay);
+              const result = vncSetupPayload(payload.display ?? 0, !!payload.dry_run, payload.password, !!payload.install_desktop);
               if (result.ok === false) return result;
               return result;
             }

@@ -5,28 +5,37 @@ worker), `src/ws.zig` · **Spec owner:** core + frontend
 
 ## 1. Overview
 
-A GUI console for any server that runs a VNC server — tunneled through
-the SSH session we already own, rendered by noVNC in a per-server tab.
-Agentless: the remote VNC server already exists (x11vnc, TigerVNC, a
-desktop's built-in sharing). One-click setup helper can install one,
-approval-gated.
+A GUI console for a server that runs a VNC server. Oars tunnels the connection
+through the SSH session and renders it with noVNC in a per-server tab. The
+remote server can provide x11vnc, TigerVNC, or built-in desktop sharing. An
+approval-gated helper can install x11vnc and can also install and start an XFCE
+desktop on a headless server.
 
 ## 2. Goals / non-goals
 
 **Goals**
 - Connect to a remote VNC server over an SSH direct-tcpip tunnel: `ws://127.0.0.1:<port>/<token>` → Zig RFC 6455 WebSocket server → SSH channel → remote TCP.
 - Display picker (`:0`, `:1`, custom port), password from Keychain (`vnc:<server_id>`), fit-window scaling, clipboard, Ctrl+Alt+Del menu.
-- Setup helper: probe for x11vnc/TigerVNC/listening ports; suggest install+start command in an approval card.
+- Setup helper: probe x11vnc, TigerVNC, listening ports, installed desktop
+  commands, and a usable desktop on the selected display. For XFCE, usable
+  means the window manager, desktop surface, and panel are all present. Show
+  the exact VNC-only or VNC+XFCE plan in an approval dialog.
 - Reuse the tunnel machinery for future DB tunnels.
 
 **Non-goals**
 - No VNC *server* implementation, no SSH X11 forwarding, no RDP, no
   audio, no clipboard file-transfer (v1), no multi-monitor layout mapping (v1).
+- No automatic desktop package installation. The user must select the desktop
+  option and approve the exact command.
 
 ## 3. User stories
 
 - My VPS has a desktop environment; I open the Remote tab, pick `:1`, enter the VNC password once (stored), and get a working GUI.
 - No VNC installed → I click "Set up VNC" and approve the suggested x11vnc command; the tab reconnects.
+- My Ubuntu VPS is headless → I click "Set up desktop", keep the XFCE option
+  selected, review the package and start commands, and approve them. Oars waits
+  for the XFCE window manager, desktop surface, and panel before it reports
+  success.
 - I resize the window; the desktop scales to fit.
 
 ## 4. UI/UX
@@ -43,7 +52,17 @@ approval-gated.
 - If the negotiated scheme is legacy VNC Authentication, explain that only the
   first eight password characters participate. Do not show that warning for a
   stronger negotiated scheme.
-- Setup helper card (when probe finds nothing): suggested command block + Approve/Run + Cancel (exact same approval-card pattern as spec 11).
+- The probe strip reports the VNC server, desktop state, and listening ports for
+  the selected display. A missing or stopped desktop changes the setup action
+  to **Set up desktop** or **Start desktop**.
+- The strip states package presence and display readiness separately, for
+  example `XFCE installed · display :1 running`. Selecting a display stores it
+  immediately, so setup, restart, and reconnect use the same display.
+- The setup dialog contains an explicit **Install or start XFCE desktop**
+  checkbox. It shows the exact package command and a password-redacted secure
+  start preview. Clearing the checkbox produces a VNC-only plan.
+- The dialog explains that desktop processes run as the connected SSH account.
+  Package installation still requires remote root access.
 
 ### 4.2 Fingerprint/trust
 - Uses the session's existing host-key trust (spec 02) — no new trust surface.
@@ -58,19 +77,57 @@ approval-gated.
   from the OS cryptographic random source.
 - Tunnel auto-destroys after 15 s if no WebSocket connection arrives; always destroyed on `stop`/disconnect.
 ### `oars.vnc.stop` `{server_id, tunnel_id}` → `{ok}`
-### `oars.vnc.probe` `{server_id}` → `{ok, x11vnc: bool, tigervnc: bool, listening:[{port, process?}]}`
-- Exec: `command -v x11vnc tigervncserver Xvnc; ss -tlnp 2>/dev/null | grep -E ':59[0-9][0-9]'`.
-### `oars.vnc.setup` `{server_id, display?, dry_run, password?}` → `{ok, action, executed, plan, hint}`
+### `oars.vnc.probe` `{server_id, display?}` → `{ok, x11vnc, tigervnc, desktop_installed, window_manager_running, desktop_surface_running, desktop_panel_running, desktop_running, desktop_name, setup_state, listening}`
+- The probe checks `x11vnc`, `tigervncserver`, and `Xvnc`, then reads listening
+  `59xx` ports.
+- It checks known desktop commands for XFCE, GNOME, KDE Plasma, MATE, and LXQt.
+  For XFCE setup readiness, it also requires `dbus-run-session` and `xprop`.
+- The probe reads X11 properties on the selected display. It reports the
+  window-manager property separately from visible `xfdesktop` and
+  `xfce4-panel` client windows.
+- The probe validates that `_NET_SUPPORTING_WM_CHECK` contains a window ID.
+  It does not trust `xprop`'s exit status because `xprop` can return success
+  while it reports that the property is not found.
+- For an XFCE session, `desktop_running` is true only when all three components
+  are present. A window manager on a black root window, an active Xvfb process,
+  or a VNC listener does not count as a usable desktop.
+- `setup_state` is `idle`, `installing`, `installed`, `ready`, or `failed`.
+  It comes from owner-only state and PID files below
+  `$HOME/.local/share/oars/vnc`. A stale `installing` state becomes `failed`
+  when its process no longer exists.
+### `oars.vnc.setup` `{server_id, display?, dry_run, password?, install_desktop?}` → `{ok, action, executed, plan, hint, desktop_action, desktop_name}`
 - A dry run returns an exact `install`, `configure`, or `manual` plan and never
   accepts or returns a password. Unknown targets get manual guidance rather
   than a guessed command.
-- Execution requires a password for install/configure plans. Supported
-  Debian/Ubuntu and Alpine targets install `x11vnc` and `Xvfb` when needed,
-  then write the password through command input to an owner-only auth file and
-  start `x11vnc` with `-localhost -rfbauth`. The password never enters the
+- `install_desktop` defaults to false in the bridge contract. The frontend sets
+  it only from the visible checkbox. `desktop_action` is `none`, `install`,
+  `start`, `running`, or `manual`.
+- Debian and Ubuntu use `apt-get update && DEBIAN_FRONTEND=noninteractive
+  apt-get install -y` with the needed subset of `x11vnc xvfb xfce4 dbus-x11
+  x11-utils`. Alpine uses `apk add --no-cache` with the needed subset of
+  `x11vnc xvfb xfce4 dbus xprop`.
+- The OS-release parser accepts quoted `ID` values and Debian/Ubuntu values in
+  `ID_LIKE`. Supported images do not fall into manual setup because their
+  `/etc/os-release` file uses quotes.
+- Package installation runs in a detached process with mode-0600 status, PID,
+  and log files. A repeated setup attaches to the existing process instead of
+  starting a second package manager. This lock is server-wide because packages
+  are not display-specific. The bridge waits up to 30 minutes. If the app
+  restarts or that wait expires, installation continues and the next probe
+  reports its durable state on every display.
+- Execution requires a VNC password. It writes the password through bounded
+  command input to an owner-only auth file. It never puts the password in the
   command string, process arguments, output, or audit record.
-- Package installation requires remote root access. Every successful execution
-  records only the display and action in the audit journal.
+- When desktop setup is selected, Oars starts XFCE on the selected display with
+  `dbus-run-session -- startxfce4`. It stores the PID and log below
+  `$HOME/.local/share/oars/vnc`. It waits up to 60 seconds for the window
+  manager, `xfdesktop`, and `xfce4-panel`. If the window manager is already
+  running but a shell component is missing, Oars starts the missing XFCE
+  components in that window manager's D-Bus session. It starts x11vnc only
+  after the full readiness check passes.
+- x11vnc always uses `-localhost -rfbauth`. Package installation requires
+  remote root access. The desktop and VNC processes run as the connected SSH
+  account. The audit journal records only the display and approved actions.
 ### `oars.vnc.poll` `{server_id, tunnel_id}` → `{ok, state: listening|connected|closed, bytes_up, bytes_down, error?}` (stats for the tab footer)
 
 ## 6. Zig core design
@@ -142,6 +199,8 @@ approval-gated.
   legacy VNC authentication remains weak. The setup helper binds VNC to remote
   loopback and always configures authentication.
 - Setup helper is approval-gated and audited (installing software on the server).
+- A desktop is an explicit setup choice. Probe results cannot trigger package
+  installation or process start by themselves.
 
 ## 9. Performance
 
@@ -154,6 +213,20 @@ approval-gated.
 
 - VNC server requires auth type noVNC can't do (e.g., Unix login) → `securityfailure` surfaced with the server's message.
 - Remote VNC unreachable (channel open fails) → tunnel reports error; UI shows "no VNC server on <host>:<port> — try the setup helper".
+- X is running but no window manager accepts the selected display → show the
+  desktop as stopped and offer the approval-gated XFCE path.
+- The XFCE window manager is running but `xfdesktop` or `xfce4-panel` is absent
+  → show the display as incomplete, name the missing components, and offer
+  **Repair desktop**.
+- XFCE does not publish all required X11 windows within the readiness deadline
+  → fail setup and return the bounded end of the desktop log. Do not report a
+  blank framebuffer as successful desktop setup.
+- A different desktop is installed but stopped → report its name. Oars still
+  offers its supported XFCE setup path and names XFCE in the approval dialog.
+- App restart during package download → keep the selected display, report
+  `setup_state=installing`, disable duplicate setup, and let the detached
+  package process continue. A failed process exposes retry state and keeps its
+  owner-only install log for diagnosis.
 - WebSocket never connects → 15 s auto-teardown; `poll` reports closed.
 - Tab closed mid-session → `oars.vnc.stop`; session disconnect cleans all tunnels.
 - noVNC focus/keyboard behavior in WKWebView → verify app-reserved shortcuts
@@ -163,10 +236,14 @@ approval-gated.
 ## 11. Testing
 
 - Unit: WS handshake (valid/invalid key, bad Origin, bad token path), frame codec round-trip (masked client frames, fragmentation, ping/pong), channel-bridge byte fidelity.
-- Integration (container): start Xvfb, xterm, and `x11vnc`; run
+- Integration (container): verify the detached install state lifecycle across
+  separate SSH exec channels. The fixture includes XFCE packages; let the setup
+  path start Xvfb, XFCE, and `x11vnc`; assert the window manager, desktop, and
+  panel are visible; run
   `oars.vnc.start`; complete RFB 3.8 and VNC authentication through the
-  WebSocket tunnel; read a 1280x800 raw framebuffer with varied pixels; move
-  the remote pointer; type into xterm; verify byte counters and teardown.
+  WebSocket tunnel; read a 1280x800 raw framebuffer with varied pixels before
+  adding a test window; then move the remote pointer, type into xterm, and
+  verify byte counters and teardown.
 - Manual: real desktop session, resize, clipboard, Ctrl+Alt+Del, disconnect mid-session.
 
 ## 12. Acceptance criteria
@@ -191,6 +268,16 @@ approval-gated.
 - [x] Setup helper installs, configures, and starts loopback-only x11vnc only
       after approval and audit. Password bytes travel through bounded command
       input and are cleared after use.
+- [x] On a headless Debian/Ubuntu or Alpine target, an explicit approved setup
+      installs, starts, or repairs XFCE, waits for its window manager, desktop,
+      and panel on the selected display, and then exposes that display through
+      loopback-only x11vnc.
+- [x] The real container path rejects and repairs an incomplete XFCE session,
+      then verifies the clean desktop framebuffer before pointer, keyboard,
+      byte-counter, and teardown checks.
+- [x] The real SSH fixture starts a detached package job, observes
+      `installing`, releases it from another exec channel, observes `installed`,
+      marks `ready`, and confirms that state through the display probe.
 - [x] Codec/handshake unit tests green.
 
 ## 13. Research & References
@@ -291,6 +378,14 @@ approval-gated.
     loopback.
   - `-forever` keeps listening after disconnect; `-N`/`-rfbport` set
     the port; `-display :N` selects the display.
+- **XFCE and distribution packages** — the official Xfce getting-started page
+  documents `startxfce4` as the command that starts the session, panel, window
+  manager, and desktop (`https://docs.xfce.org/xfce/getting-started`). Ubuntu
+  Noble publishes the `xfce4` metapackage and `dbus-x11` package at
+  `https://packages.ubuntu.com/noble/all/xfce4` and
+  `https://packages.ubuntu.com/noble/dbus-x11`. Alpine v3.20 publishes `xfce4`
+  and `dbus` at `https://pkgs.alpinelinux.org/package/v3.20/community/x86_64/xfce4`
+  and `https://pkgs.alpinelinux.org/package/v3.20/main/x86_64/dbus`.
 - **TigerVNC** — verified at `https://www.tigervnc.org/`: Xvnc (server),
   vncpasswd, vncsession, vncviewer man pages hosted there; TigerVNC is
   packaged by Fedora/RHEL/Arch/etc. The setup helper probes

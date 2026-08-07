@@ -182,10 +182,12 @@ graph LR
   the tunnel if no WebSocket connection arrives within 15s. SSH encrypts the
   client-to-server transport, but the short remote loopback hop to the VNC
   service is plaintext.
-- **Oars+ one-click setup helper (approval-gated):** `oars.vnc.probe` checks for x11vnc /
-  TigerVNC and listening 59xx ports; if missing, suggests an install+start command presented
-  in an approval card (same pattern as the AI terminal) — we never mutate the server
-  without a click.
+- **Oars+ one-click setup helper (approval-gated):** `oars.vnc.probe` checks
+  x11vnc, TigerVNC, listening 59xx ports, installed desktops, and a real window
+  manager on the selected display. The approval dialog can configure VNC only
+  or install and start XFCE on a headless Debian/Ubuntu or Alpine server. Oars
+  never installs packages or starts a desktop without the explicit checkbox
+  and approval.
 - **Bonus reuse:** the same direct-tcpip machinery is exactly what their *planned* Database
   Manager needs (Postgres/MySQL over SSH tunnels) — building VNC builds the tunnel
   foundation for that too.
@@ -319,9 +321,16 @@ primitive in the used `std.Io` path.
   clipboard paste, loading and failure states, and tunnel cleanup.
 - The setup helper now installs when required, creates an owner-only password
   file through bounded stdin, and starts loopback-only x11vnc after approval.
-- Container acceptance completes RFB 3.8 authentication against live x11vnc,
-  verifies varied 1280x800 framebuffer pixels, moves the remote pointer, and
-  types into xterm through the tunnel.
+  It can also install, start, or repair XFCE on a headless server. It requires
+  the window manager, desktop surface, and panel on the selected display before
+  it reports success or starts x11vnc. Package installs keep owner-only state
+  and logs, survive an app restart, and prevent duplicate package-manager runs.
+  The selected display persists before setup starts.
+- Container acceptance starts a real XFCE session, completes RFB 3.8
+  authentication against live x11vnc, verifies the clean desktop framebuffer
+  before adding xterm, then moves the remote pointer and types through the
+  tunnel. It also removes the XFCE desktop and panel and proves setup repairs
+  the incomplete session.
 - **Reusable for:** DB tunnels (their planned Database Manager), SSH-agent forwarding,
   any local-port ↔ remote-service bridge.
 
