@@ -1,5 +1,6 @@
 import { useCallback, useState } from "react";
 import { api, BridgeError } from "./bridge";
+import { OarsLoadingState } from "./components/OarsLoadingState";
 
 export function AccessTab() {
   const [scanId, setScanId] = useState<number | null>(null);
@@ -38,6 +39,10 @@ export function AccessTab() {
       loadIdentities();
     } catch (e) { setBusy(false); setError(e instanceof BridgeError ? e.message : String(e)); }
   };
+
+  if (busy && people.length === 0 && unassigned.length === 0) {
+    return <OarsLoadingState title="Reviewing fleet access" detail="Oars is matching people, keys, roles, and sudo access across the fleet." />;
+  }
 
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>

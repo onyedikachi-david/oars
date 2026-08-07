@@ -1,6 +1,6 @@
 # Spec 04 — Log Management
 
-**Status:** ✅ backend in (frontend UI pending) · **Depends on:** 02 (exec/follow) · **Spec owner:** core + frontend
+**Status:** ✅ v1 frontend + backend implemented · **Depends on:** 02 (exec/follow) · **Spec owner:** core + frontend
 
 ## 1. Overview
 
@@ -82,11 +82,14 @@ printf '%%BEGIN_DATE%%\n'; date +%s; printf '%%BEGIN_SCAN%%\n'; find <roots> -ma
 - `mode` is the permission bits (0o644 etc.); the frontend echoes it back in
   `oars.logs.clear`'s `expected` as the identity preview.
 
-### `oars.logs.read` `{server_id, path, lines}` → `{ok, path, lines: [...], limited}`
+### `oars.logs.read` `{server_id, path, lines}` → `{ok, path, lines: [...], limited, binary}`
 - `tail -n <lines>` (lines ∈ {200,500,1000,5000}); file size cap 64 MB read.
 - `limited: true` means the byte or line-size safety limit cut the response. A
   file growing after a tail read is normal and does not make that result
   truncated.
+- The backend sniffs text safety before JSON serialization. `binary:true`
+  returns no rendered lines; the frontend offers the SFTP download path and
+  disables search and Follow for that source.
 
 ### `oars.logs.follow` `{server_id, path}` → `{ok, channel}`
 - `tail -n 100 -F <quoted-path>` (name-follow with retry) so the viewer follows
@@ -103,19 +106,19 @@ printf '%%BEGIN_DATE%%\n'; date +%s; printf '%%BEGIN_SCAN%%\n'; find <roots> -ma
   audit the before/after size. Standard SFTP v3 does not expose inode/device
   identity, so this does not claim to defeat a malicious server-side race; a
   later remote `openat` helper would be needed for that stronger boundary.
-### `oars.logs.download` `{server_id, path}` → `{ok, job}` 
-- Reuse the binary SFTP transfer in spec 05. Do not stream a whole file through
-  the terminal JSON string path: logs can contain non-UTF-8 bytes and can be
-  larger than the bridge response budget.
+### Download via native dialog + SFTP transfer
+- `native-sdk.dialog.saveFile` chooses the local path. The frontend then uses
+  `oars.sftp.download`, `oars.sftp.poll`, and `oars.sftp.cancel`. It never
+  streams a whole file through the terminal JSON string path: logs can contain
+  non-UTF-8 bytes and can exceed the bridge response budget.
 
 ### `oars.logs.addSource` `{server_id, path}` → `{ok}` — persists to `logs.json` per server.
 
 ## 6. Zig core design
 
 - `src/logs.zig` — scan/group/parse logic (pure functions + fixtures), source store (`<data>/logs.json` keyed by server_id), follow-channel helper reusing the session worker's exec path.
-- Download uses a native local-file writer after a save dialog and SFTP reads
-  from the worker. The bridge carries bounded base64 chunks and never exposes
-  a general write-any-path command to untrusted origins.
+- Download uses the existing worker-owned SFTP transfer after a native save
+  dialog. The frontend receives progress metadata, not file contents.
 - No new threads: everything rides the session worker (scan/read = short execs; follow = exec channel).
 
 ## 7. Data model
@@ -157,20 +160,28 @@ printf '%%BEGIN_DATE%%\n'; date +%s; printf '%%BEGIN_SCAN%%\n'; find <roots> -ma
   append a line → verify the stream (kind `log`) → clear with a STALE preview
   → conflict refused → re-scan (addSource invalidates the cache) → clear with
   the fresh preview → verify truncated + audit entry → closeChannel.
-- Manual (pending UI): 5k-line search, download, rotation behavior.
+- Frontend unit: absolute byte cursor selection and source-bound async request
+  identity (`npm test`).
+- Browser (2026-08-07): desktop light/dark and 390×844 mobile; grouped scan,
+  5,000-line virtualization, search, Unicode follow cursors, dropped bytes,
+  EOF/source reset, stale read/follow rejection, binary download-only state,
+  and clean console.
 
 ## 12. Acceptance criteria
 
 - [x] Scan groups real log layouts and stamps size/last-write correctly
       (verified against the busybox container; the GNU `-printf` form is
       documented from findutils and shares the identical record format).
-- [x] Read/follow/clear work against the test container; download is deferred
-      to spec 05's SFTP transfer (never streamed through the JSON bridge).
+- [x] Read/follow/clear work against the test container; download uses the
+      shared SFTP transfer and never streams file contents through the JSON bridge.
 - [x] Unreadable/missing files produce explicit errors, never hangs (root
       bypasses DAC, so `chmod 000` still reads as readable on root sessions;
       the readability mapping itself is unit-tested).
 - [x] Manual paths persist across sessions (`logs.json` per server).
 - [x] Parser/validator tests green.
+- [x] Frontend source rail, separate searches, virtualized viewer, Follow,
+      download progress, identity-bound Clear, and documented failure states
+      pass desktop and mobile browser checks.
 
 ## 13. Research & References
 
@@ -228,9 +239,12 @@ documented under `%Ak`-style directives). `2>/dev/null` suppresses
   user-added sources.
 - **Readability probe** — `test -r <path>` is POSIX sh's documented
   readability check (`test(1)`, `-r` flag); run batched via exec.
-- **Download chunking** — bridge payload limit enforced at SDK
-  `bridge/root.zig` L144 (`payload_too_large`); 64 KB base64 chunks
-  (≈87 KB) stay well under the 1 MB budget (see spec 05 §13).
+- **Download transfer** — the shared SFTP worker writes the selected local
+  file and reports bounded progress metadata through the bridge. Log contents
+  never enter a JSON response.
+- **Viewer virtualization** — TanStack Virtual's React adapter supplies the
+  scroll-element virtualizer and dynamic row measurement used for 5,000-line
+  loads (`https://tanstack.com/virtual/latest/docs/framework/react/react-virtual`).
 
 Sources: GNU findutils find(1), GNU coreutils manual (tail, truncate),
-PM2 docs, SDK bridge/root.zig.
+PM2 docs, SDK bridge/root.zig, TanStack Virtual React docs.

@@ -1,4 +1,15 @@
-import type { Server, ServerDraft, PollResult, MonitorSnapshot, LogSource, LogReadResult } from "./types";
+import type {
+  Server,
+  ServerDraft,
+  PollResult,
+  MonitorSnapshot,
+  LogSource,
+  LogScanResult,
+  LogReadResult,
+  LogClearResult,
+  SftpTransferSnapshot,
+  SftpOpStart,
+} from "./types";
 
 // Typed bridge client over window.zero.
 
@@ -81,6 +92,23 @@ export async function pickFile(title: string, allowDirectories = false): Promise
   return result && result.length > 0 ? result[0] : null;
 }
 
+// Native save dialog (native-sdk.dialog.saveFile). Resolves to the chosen
+// path, or null when the user cancels. The caller owns the path: local
+// files are only ever written by the SFTP transfer machinery, never by
+// frontend code.
+export async function pickSaveFile(
+  title: string,
+  defaultName?: string,
+  defaultPath?: string,
+): Promise<string | null> {
+  const result = await invoke<string | null>("native-sdk.dialog.saveFile", {
+    title,
+    defaultName,
+    defaultPath,
+  });
+  return result ?? null;
+}
+
 // --- Oars commands --------------------------------------------------------
 
 export const api = {
@@ -115,13 +143,22 @@ export const api = {
       invoke<{ ok: boolean; channel: number }>("oars.monitor.dropCaches", { server_id: serverId, level }),
   },
   logs: {
-    scan: (serverId: string) => invoke<{ sources: LogSource[]; partial: boolean; reason: string }>("oars.logs.scan", { server_id: serverId }),
+    scan: (serverId: string) => invoke<LogScanResult>("oars.logs.scan", { server_id: serverId }),
     read: (serverId: string, path: string, lines: number) => invoke<LogReadResult>("oars.logs.read", { server_id: serverId, path, lines }),
-    follow: (serverId: string, path: string) => invoke<{ channel: number }>("oars.logs.follow", { server_id: serverId, path }),
-    clear: (serverId: string, path: string) => invoke<{ ok: boolean }>("oars.logs.clear", { server_id: serverId, path }),
+    follow: (serverId: string, path: string) => invoke<{ ok: boolean; channel: number }>("oars.logs.follow", { server_id: serverId, path }),
+    // `expected` is the exact identity preview from the selected LogSource
+    // (spec 04 §5): size/mtime/mode. The backend refuses a mismatch.
+    clear: (serverId: string, path: string, expected: { size: number; mtime: number; mode: number }) =>
+      invoke<LogClearResult>("oars.logs.clear", { server_id: serverId, path, expected }),
     addSource: (serverId: string, path: string) => invoke<{ ok: boolean }>("oars.logs.addSource", { server_id: serverId, path }),
   },
   sftp: {
+    // Whole-file download through the binary SFTP transfer machinery
+    // (spec 04 §5 / spec 05 §5); `localPath` must come from pickSaveFile.
+    download: (serverId: string, remotePath: string, localPath: string) =>
+      invoke<SftpOpStart>("oars.sftp.download", { server_id: serverId, remote_path: { utf8: remotePath }, local_path: localPath }),
+    poll: (serverId: string) => invoke<SftpTransferSnapshot>("oars.sftp.poll", { server_id: serverId }),
+    cancel: (serverId: string, transferId: number) => invoke<{ ok: boolean }>("oars.sftp.cancel", { server_id: serverId, transfer_id: transferId }),
     ls: (serverId: string, path: string) => invoke<{ entries: Array<{ name: { utf8?: string; base64?: string }; display: string; kind: string; size: number; mtime: number; mode: string; uid: number; gid: number; link_target: string | null }> }>("oars.sftp.ls", { server_id: serverId, path: { utf8: path } }),
     mkdir: (serverId: string, path: string) => invoke<{ ok: boolean }>("oars.sftp.mkdir", { server_id: serverId, path: { utf8: path } }),
     rm: (serverId: string, path: string) => invoke<{ ok: boolean }>("oars.sftp.rm", { server_id: serverId, path: { utf8: path } }),

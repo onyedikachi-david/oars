@@ -7,6 +7,7 @@ import type { Server, SessionStatus } from "./types";
 import { STATUS_LABEL } from "./types";
 import { AlertTriangle, Copy, ShieldCheck, X } from "lucide-react";
 import { Button } from "./components/ui/button";
+import { OarsLoadingState } from "./components/OarsLoadingState";
 
 const POLL_MS = 80;
 const INPUT_BUFFER_MAX = 256 * 1024;
@@ -341,6 +342,7 @@ export function TerminalTab({ server, onStatus, onServerUpdated }: Props) {
   };
 
   const isConnected = status === "ready" || status === "connecting" || status === "authenticating" || status === "needs_trust";
+  const connectionBusy = status === "connecting" || status === "authenticating";
   const displayFp = trust ? fingerprintForDisplay(trust.fingerprint) : "";
   const changedKey = changedKeyDetails(error);
 
@@ -387,6 +389,14 @@ export function TerminalTab({ server, onStatus, onServerUpdated }: Props) {
         role="application"
         aria-label={`Terminal for ${server.name}`}
       />
+      {connectionBusy && (
+        <OarsLoadingState
+          compact
+          className="terminal-loading"
+          title={status === "authenticating" ? "Checking credentials" : `Connecting to ${server.name}`}
+          detail="The terminal will be ready as soon as the secure session opens."
+        />
+      )}
       {dropped && <div className="terminal-toast" role="status">Output buffer overflowed — some lines were dropped</div>}
       {inputError && <div className="terminal-banner terminal-banner-error" role="alert">{inputError}</div>}
       {error && status === "error" && /host key changed/i.test(error) && (

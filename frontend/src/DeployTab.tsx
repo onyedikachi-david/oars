@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, BridgeError } from "./bridge";
+import { OarsLoadingState, OarsRefreshStatus } from "./components/OarsLoadingState";
 
 interface DeployApp {
   id: string;
@@ -34,13 +35,19 @@ export function DeployTab({ serverId }: { serverId: string }) {
   const [runStatus, setRunStatus] = useState<string>("");
   const [steps, setSteps] = useState<RunStep[]>([]);
   const [history, setHistory] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [hasLoaded, setHasLoaded] = useState(false);
 
   const load = useCallback(async () => {
+    setLoading(true);
     try {
       const r: any = await api.deploy.list(serverId);
       setApps(r.apps ?? []);
     } catch (e) {
       setError(e instanceof BridgeError ? e.message : String(e));
+    } finally {
+      setHasLoaded(true);
+      setLoading(false);
     }
   }, [serverId]);
 
@@ -141,9 +148,14 @@ export function DeployTab({ serverId }: { serverId: string }) {
     }
   };
 
+  if (loading && !hasLoaded) {
+    return <OarsLoadingState title="Loading deployments" detail="Oars is reading the applications configured for this server." />;
+  }
+
   return (
     <div className="deploy">
       <div className="deploy-toolbar" style={{ display: "flex", gap: 8, padding: "10px 12px", borderBottom: "1px solid var(--border)" }}>
+        {loading && <OarsRefreshStatus label="Updating apps" />}
         <button className="btn" onClick={() => setEditing({ name: "", folder: `/home/ubuntu/app`, repo: { url: "", transport: "https", branch: "main" }, runtime: { node_version: "22", type: "next", install: "npm ci", build: "npm run build", start: "npm start", build_folder: "" }, domains: [], ssl: false, app_port: 3000 })}>
           + New app
         </button>

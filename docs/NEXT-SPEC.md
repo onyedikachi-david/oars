@@ -2,140 +2,86 @@
 
 ## Target
 
-Implement the frontend for [spec 04, Log Management](specs/04-logs.md).
-The backend is present and tested. The current `LogsTab` is an early draft,
-not a complete product surface. Keep the target contract in the spec. Do not
-reduce it to match the draft.
+Complete the frontend for [spec 12, Remote Desktop](specs/12-vnc.md). The
+WebSocket codec, SSH tunnel, VNC bridge handlers, setup plans, and backend tests
+already exist. The current `VncTab` is a diagnostic draft, not the product UI.
 
 Read these files before editing:
 
 - `docs/DESIGN.md`
-- `docs/specs/04-logs.md`
-- `docs/specs/02-terminal.md`, for cursor streams and channel cleanup
-- `docs/specs/05-file-manager.md`, for downloads and transfer progress
-- `frontend/src/LogsTab.tsx`
-- `frontend/src/MonitorTab.tsx`, for current Oars dialogs, async channel reads,
-  notices, responsive lists, and loading states
+- `docs/specs/12-vnc.md`
+- `frontend/src/VncTab.tsx`
 - `frontend/src/bridge.ts` and `frontend/src/types.ts`
-- `src/bridge.zig`, starting at the spec 04 log handlers
-- `src/logs.zig`
+- `src/bridge.zig`, starting at the spec 12 handlers
+- `src/sessions.zig`, starting at the VNC tunnel state
+- installed `@novnc/novnc` 1.7.0 source and types
+- `frontend/preview.html`; extend it, never delete or replace it
 
 ## Current Checkout Truth
 
 The backend provides these commands:
 
-- `oars.logs.scan`
-- `oars.logs.read`
-- `oars.logs.follow`
-- `oars.logs.clear`
-- `oars.logs.addSource`
-- `oars.ssh.poll` and `oars.ssh.closeChannel`
-- `oars.sftp.download`, `oars.sftp.poll`, and `oars.sftp.cancel`
+- `oars.vnc.start {server_id, host?, port?}` returns
+  `{ok,tunnel_id,ws_port,token}`.
+- `oars.vnc.poll {server_id,tunnel_id}` returns tunnel state, byte counts, and
+  an error string.
+- `oars.vnc.stop {server_id,tunnel_id}` is idempotent.
+- `oars.vnc.probe {server_id}` reports installed servers and listening ports.
+- `oars.vnc.setup {server_id,display?,dry_run}` returns the plan before it
+  executes. Execution is approval-gated and audited.
 
-`native-sdk.dialog.saveFile` is also allowlisted in `src/main.zig`. Use it to
-choose the local download target. Do not send a whole log through a JSON bridge
-response. Use the existing SFTP transfer operation and show its real progress.
+The current frontend wrappers use `any` and omit required tunnel IDs. The tab
+embeds an iframe, but the backend returns a raw WebSocket tunnel, not a noVNC
+web page. Replace this draft with typed contracts and a real `RFB` instance.
 
-The current frontend has important gaps:
-
-- `LogsTab` uses one `search` value for source filtering and line search.
-  These are separate tasks and need separate state and controls.
-- `scan` depends on `selected`, while the scan effect depends on `scan`. A
-  selection change can cause another scan. Remove that dependency cycle.
-- Follow does not exist. The finished view must own one channel, one absolute
-  cursor, and a visible dropped-byte warning.
-- Source changes, Follow off, tab unmount, and server changes must call
-  `oars.ssh.closeChannel` for the owned follow channel.
-- The clear client omits the required identity preview. The backend requires
-  `expected: {size, mtime, mode}` from the selected `LogSource` and returns
-  `before_size` and `after_size`.
-- Partial scans, limited reads, unreadable sources, stale-clear conflicts,
-  missing files, channel EOF, and transfer failures do not have complete UI.
-- Download is absent from `api.logs`. Add typed native-dialog and SFTP helpers;
-  do not invent an `oars.logs.download` implementation that bypasses SFTP.
-- The current markup uses generic inputs and buttons and has no matching Oars
-  layout in `index.css`.
+Use only installed noVNC 1.7.0 APIs verified in the spec: the constructor starts
+the connection, later credentials use `sendCredentials`, scaling uses the
+`scaleViewport` property, and controls use `disconnect`, `sendCtrlAltDel`, and
+`clipboardPasteFrom`. There is no public `connect`, `setScale`, or writable
+`credentials` field.
 
 ## Implementation Order
 
-1. **Correct the bridge contract.** Add strict result types for scan, clear,
-   SFTP transfer snapshots, and the native save dialog. Change `logs.clear`
-   so it accepts the exact selected source preview. Add typed SFTP download,
-   poll, and cancel methods.
-
-2. **Build explicit state machines.** Keep scan, read, follow, clear, add, and
-   download status separate. Use request generations or cancellation flags so
-   an old read cannot replace a newer selection. Do not overlap follow polls.
-
-3. **Implement follow ownership.** Start `oars.logs.follow`, poll only its
-   channel with an absolute cursor, append bounded output, and surface
-   `dropped`. Treat EOF as a stopped or disappeared source. Close the channel
-   on every exit path. Do not claim that channel close proves remote-process
-   termination beyond the backend contract.
-
-4. **Build the Oars layout.** Use one focused split workspace: a restrained
-   source rail and a large log viewer. Do not nest cards. Use Geist Sans for
-   controls and source metadata. The log body is the one approved full-body
-   Geist Mono surface. On mobile, use a compact source selector or sheet above
-   the viewer instead of squeezing two panes.
-
-5. **Separate search tasks.** Source search filters names and paths. Viewer
-   search highlights safe text segments in the loaded lines and reports the
-   match count. Do not use `dangerouslySetInnerHTML`. Keep 5,000-line rendering
-   responsive; use a proven virtualizer if measured browser behavior needs it.
-
-6. **Make destructive work deliberate.** Clear uses an Oars modal with a
-   title, one-sentence effect, affected server and path, current size and
-   modification time, permanent-warning copy, Cancel, and Clear. Pass the
-   selected source preview unchanged. On a stale-preview conflict, rescan and
-   require a new confirmation. Never retry clear automatically.
-
-7. **Finish download through SFTP.** Ask for a destination with the native
-   save dialog. Start `oars.sftp.download`, poll the returned operation, show
-   bytes and status, allow cancel while active, and report the final local
-   destination. Do not create local paths in frontend code.
-
-8. **Handle every honest state.** Cover first scan, scanning skeleton, empty
-   scan, partial scan reason, unreadable source, read limit, no matches,
-   waiting-for-follow data, live, paused, dropped bytes, missing source,
-   clear conflict, and download failure. Keep old readable content visible
-   during refresh when it is still valid.
-
-## Preview Harness
-
-Extend `frontend/preview.html`; do not replace or delete it. Add deterministic
-log fixtures for:
-
-- grouped web, runtime, system, and custom sources
-- a recent large source, an unreadable source, and a partial scan
-- 200 to 5,000 lines with repeatable search matches and one very long line
-- a limited read response
-- follow chunks, a rotation-style continuation, dropped bytes, and EOF
-- stale clear rejection followed by a successful fresh clear
-- SFTP download progress, completion, failure, and cancel
-
-Keep existing fleet, terminal, and monitor fixtures working. Record mock calls
-so browser checks can prove exact payloads, cursors, channel close, and clear
-identity data.
+1. Add strict VNC start, probe, setup, and poll types. Pass `host`, `port`,
+   `display`, `dry_run`, and `tunnel_id` exactly as the Zig handlers require.
+2. Build one explicit lifecycle state machine: idle, probing, starting tunnel,
+   connecting, credentials required, connected, failed, and stopped.
+3. Own one tunnel and one `RFB` instance. Stop the tunnel and disconnect RFB on
+   Disconnect, server change, tab unmount, failed start, and stale async return.
+4. Render noVNC into a full workspace target. Keep the remote canvas unframed
+   inside the primary content area, with a compact operations toolbar above it.
+5. Add display presets `:0` and `:1`, a validated custom port, fit and 100%
+   scale modes, Ctrl+Alt+Del, clipboard paste, connection status, and byte
+   counters.
+6. Handle `credentialsrequired` with a focused password dialog. Read and write
+   `vnc:<server_id>` through the existing Keychain-backed `vault` helper. Never
+   persist the password in config, preview calls, logs, or status text.
+7. Probe before setup. Show the dry-run plan in the established Oars approval
+   modal, then execute only after explicit approval. Unknown OS plans stay
+   manual and must never run a guessed command.
+8. Extend the preview with deterministic probe, start, poll, stop, setup-plan,
+   setup-failure, credentials, and disconnected states. Keep all existing
+   terminal, monitor, and log fixtures working.
 
 ## Validation Gate
 
-Do not mark spec 04 implemented until all of these checks pass:
+Do not mark spec 12 implemented until all of these pass:
 
+- `zig build`
+- `zig build test`
+- `npm --prefix frontend test`
 - `npm --prefix frontend run build`
 - `git diff --check`
-- `zig build test` with the repository cache arguments when needed
-- Desktop browser checks at 1440 x 1000 in light and dark themes
-- Mobile browser checks at 390 x 844
-- Scan grouping, source search, source selection, line-count changes, viewer
-  search and highlights, and partial/unreadable/limited states
-- Follow start, chunk append, auto-scroll, user scroll hold, dropped warning,
-  stop, source switch, and unmount channel cleanup
-- Clear approval payload, stale conflict, rescan, successful clear, and result
-- Download save dialog, progress, cancel, completion, and failure
-- No layout overflow, text overlap, console errors, or stale async updates
+- Desktop checks at 1440 x 1000 in light and dark themes
+- Mobile checks at 390 x 844 with no overlapping toolbar controls
+- Real noVNC canvas is nonblank and accepts pointer and keyboard input through
+  the container tunnel; verify canvas pixels, not only DOM presence
+- Display presets and custom port reach the exact backend payload
+- Remembered and one-time password flows, with no password in recorded calls
+- Fit/100%, Ctrl+Alt+Del, clipboard, poll stats, Disconnect, failed tunnel,
+  stale start, server switch, and unmount cleanup
+- Setup dry run, approval, execution, manual guidance, and failure states
+- No console errors, stale state, leaked tunnel, text overlap, or blank canvas
 
-After validation, update `docs/specs/04-logs.md`, `docs/specs/README.md`, and
-`docs/HANDOVER.md` with only the behaviors that the current checkout proves.
-Leave PM2-specific enhancements and spec 05 file-manager work scoped to their
-own contracts unless they are required for the log download path.
+After validation, update `docs/specs/12-vnc.md`, `docs/specs/README.md`,
+`docs/ROADMAP.md`, and `docs/HANDOVER.md` with only current checkout evidence.

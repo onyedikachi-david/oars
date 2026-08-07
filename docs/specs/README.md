@@ -14,7 +14,7 @@ already exists.
 | 01 | [Multi-Server Management](01-multi-server.md) | Partial: CRUD, UI, and store hardening (perms, quarantine, save semantics) land; fingerprint migration (02) and grouping pending |
 | 02 | [Terminal (SSH)](02-terminal.md) | Partial: shell, exec, trust, per-tab cursors, resize, canonical fingerprints land; exec/trust UI and mirrored-tab wiring pending |
 | 03 | [Infra Monitoring](03-monitoring.md) | ✅ v1 frontend + backend implemented; Oars+ PM2 and alerts planned |
-| 04 | [Log Management](04-logs.md) | ✅ backend in (UI pending): NUL-delimited scan with busybox fallback, read, follow channels, identity-bound SFTP clear + audit, per-server source store |
+| 04 | [Log Management](04-logs.md) | ✅ v1 frontend + backend implemented: grouped scan, virtualized viewer/search, byte-cursor Follow, SFTP download, identity-bound Clear, binary/unreadable states |
 | 05 | [File Manager (SFTP)](05-file-manager.md) | 📋 |
 | 06 | [Scripts + Safe Broadcast](06-scripts.md) | 📋 |
 | 07 | [One-Click Deployment](07-deployment.md) | 📋 |

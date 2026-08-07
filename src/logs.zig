@@ -106,6 +106,24 @@ pub fn validatePath(path: []const u8) error{ RelativePath, InvalidChar, Trailing
     }
 }
 
+/// Classifies remote output before it enters a JSON text response. NUL bytes,
+/// invalid UTF-8, or a dense run of non-text controls mean the source must be
+/// downloaded instead of rendered (spec 04 §10).
+pub fn isBinaryContent(data: []const u8) bool {
+    if (data.len == 0) return false;
+    if (!std.unicode.utf8ValidateSlice(data)) return true;
+
+    const sample = data[0..@min(data.len, 256)];
+    var control_count: usize = 0;
+    for (sample) |byte| {
+        if (byte == 0) return true;
+        if ((byte < 0x20 and byte != '\n' and byte != '\r' and byte != '\t') or byte == 0x7f) {
+            control_count += 1;
+        }
+    }
+    return control_count >= 4 and control_count * 10 >= sample.len;
+}
+
 /// Parses the marker-delimited scan output. `remote_now` is the remote
 /// clock (from `%BEGIN_DATE%`); ages are clamped so future mtimes read 0
 /// rather than mixing local and remote clocks.
@@ -448,6 +466,14 @@ test "path validation rejects relative, control, and directory paths" {
     try std.testing.expectError(error.TrailingSlash, validatePath("/var/log/"));
     try std.testing.expectError(error.InvalidChar, validatePath("/var/log/a\nb.log"));
     try std.testing.expectError(error.InvalidChar, validatePath("/var/log/\x00"));
+}
+
+test "binary content sniff keeps text and rejects unsafe output" {
+    try std.testing.expect(!isBinaryContent("plain text\nwith tabs\tand utf8 \xc3\xa9\n"));
+    try std.testing.expect(!isBinaryContent(""));
+    try std.testing.expect(isBinaryContent("text\x00payload"));
+    try std.testing.expect(isBinaryContent("\xff\xfeinvalid utf8"));
+    try std.testing.expect(isBinaryContent("\x01\x02\x03\x04abcdefghijklmnop"));
 }
 
 test "nul-delimited scan records parse with grouping, age, and mode" {

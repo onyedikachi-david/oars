@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, BridgeError } from "./bridge";
+import { OarsLoadingState, OarsRefreshStatus } from "./components/OarsLoadingState";
 
 interface Script {
   id: string;
@@ -20,13 +21,19 @@ export function ScriptsTab({ serverId }: { serverId: string }) {
   const [editing, setEditing] = useState<Partial<Script> | null>(null);
   const [running, setRunning] = useState<string | null>(null);
   const [output, setOutput] = useState<string>("");
+  const [loading, setLoading] = useState(true);
+  const [hasLoaded, setHasLoaded] = useState(false);
 
   const load = useCallback(async () => {
+    setLoading(true);
     try {
       const r = await api.scripts.list();
       setScripts(r.scripts);
     } catch (e) {
       setError(e instanceof BridgeError ? e.message : String(e));
+    } finally {
+      setHasLoaded(true);
+      setLoading(false);
     }
   }, []);
 
@@ -37,6 +44,10 @@ export function ScriptsTab({ serverId }: { serverId: string }) {
     const hay = `${s.name} ${s.description} ${s.tags.join(" ")}`.toLowerCase();
     return hay.includes(q.toLowerCase());
   });
+
+  if (loading && !hasLoaded) {
+    return <OarsLoadingState title="Loading scripts" detail="Oars is reading the local automation library." />;
+  }
 
   const handleSave = async () => {
     if (!editing?.name?.trim() || !editing?.body?.trim()) {
@@ -98,6 +109,7 @@ export function ScriptsTab({ serverId }: { serverId: string }) {
     <div className="scripts">
       <div className="scripts-toolbar">
         <input type="text" placeholder="Search scripts…" value={q} onChange={(e) => setQ(e.target.value)} className="input" style={{ flex: 1 }} />
+        {loading && <OarsRefreshStatus label="Updating scripts" />}
         <button className="btn" onClick={() => setEditing({ name: "", body: "", tags: [], color: "blue" })}>+ New script</button>
       </div>
       {error && <div className="form-error" style={{ margin: "8px 12px" }}>{error}</div>}

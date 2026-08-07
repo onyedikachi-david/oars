@@ -1441,10 +1441,13 @@ fn handleLogsRead(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":true,\"path\":") catch return output[0..0];
     json.writeJsonString(&writer, payload.path) catch return output[0..0];
+    const binary = logs.isBinaryContent(outcome.output.items);
+    writer.writeAll(",\"binary\":") catch return output[0..0];
+    writer.writeAll(if (binary) "true" else "false") catch return output[0..0];
     writer.writeAll(",\"lines\":[") catch return output[0..0];
     // Split on newlines; a trailing newline's empty remainder is not a line,
     // but empty lines in the middle of the file are preserved.
-    const text = outcome.output.items;
+    const text = if (binary) "" else outcome.output.items;
     var start: usize = 0;
     var first = true;
     while (std.mem.indexOfScalarPos(u8, text, start, '\n')) |nl| {
@@ -1533,6 +1536,12 @@ fn handleLogsClear(context: *anyopaque, invocation: native_sdk.bridge.Invocation
     };
     const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + logs_clear_wait_ns;
     outcome.wait(self.io, deadline);
+    // A clear attempt means the file's identity may have changed, so the
+    // 60 s scan cache must not serve the old preview on a re-scan — the
+    // spec's rescan-after-conflict flow requires a fresh result.
+    if (self.manager.get(payload.server_id)) |session| {
+        session.logs_cache.invalidate(self.allocator);
+    }
     if (!outcome.isDone()) return respondError(output, "timed out waiting for the server");
     if (!outcome.ok) return respondError(output, outcome.message());
 

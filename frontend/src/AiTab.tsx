@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, BridgeError } from "./bridge";
+import { OarsLoadingState, OarsRefreshStatus } from "./components/OarsLoadingState";
 
 export function AiTab({ serverId }: { serverId: string }) {
   const [ctx, setCtx] = useState<any>(null);
@@ -7,16 +8,26 @@ export function AiTab({ serverId }: { serverId: string }) {
   const [history, setHistory] = useState<any[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [newProvider, setNewProvider] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [hasLoaded, setHasLoaded] = useState(false);
 
   const load = async () => {
+    setLoading(true);
     try { const r:any = await api.ai.context(serverId); setCtx(r); } catch(e){ setError(e instanceof BridgeError? e.message:String(e)); }
     try { const r:any = await api.ai.providerGet(); setProvider(r.provider ?? r); const hist:any = await api.ai.history(serverId); setHistory(hist.entries ?? hist.history ?? []); } catch {}
+    setHasLoaded(true);
+    setLoading(false);
   };
   useEffect(()=>{ load(); }, [serverId]);
+
+  if (loading && !hasLoaded) {
+    return <OarsLoadingState title="Preparing AI context" detail="Oars is collecting the local server context and provider settings." />;
+  }
 
   return (
     <div style={{ display:"flex", flexDirection:"column", flex:1, minHeight:0 }}>
       <div style={{ display:"flex", gap:8, padding:"10px 12px", borderBottom:"1px solid var(--border)" }}>
+        {loading && <OarsRefreshStatus label="Updating context" />}
         <button className="btn" onClick={load}>Refresh context</button>
         <span className="muted" style={{ fontSize:11 }}>{provider ? `provider: ${provider.name ?? provider.type ?? JSON.stringify(provider).slice(0,40)}` : "no provider"}</span>
       </div>

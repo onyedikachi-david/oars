@@ -1,18 +1,28 @@
 import { useEffect, useState } from "react";
 import { api, BridgeError } from "./bridge";
+import { OarsLoadingState, OarsRefreshStatus } from "./components/OarsLoadingState";
 
 export function AgentTab() {
   const [agents, setAgents] = useState<any[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [hasLoaded, setHasLoaded] = useState(false);
 
   const load = async () => {
+    setLoading(true);
     try { const r:any = await api.agent.list(); setAgents(r.agents ?? r.sockets ?? []); } catch(e){ setError(e instanceof BridgeError? e.message:String(e)); }
+    finally { setHasLoaded(true); setLoading(false); }
   };
   useEffect(()=>{ load(); }, []);
+
+  if (loading && !hasLoaded) {
+    return <OarsLoadingState title="Checking local agents" detail="Oars is looking for available SSH agent sockets." />;
+  }
 
   return (
     <div style={{ padding:12, display:"grid", gap:12 }}>
       <div style={{ display:"flex", gap:8 }}>
+        {loading && <OarsRefreshStatus label="Checking agents" />}
         <button className="btn" onClick={load}>Refresh</button>
       </div>
       {error && <div className="form-error">{error}</div>}

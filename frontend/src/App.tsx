@@ -34,6 +34,7 @@ import {
   Zap,
 } from "lucide-react";
 import { Button } from "./components/ui/button";
+import { OarsLoadingState, OarsRefreshStatus } from "./components/OarsLoadingState";
 import { api, BridgeError } from "./bridge";
 import type { Server as OarsServer, SessionStatus } from "./types";
 import { TerminalTab } from "./TerminalTab";
@@ -80,6 +81,8 @@ const VIEWS: { id: View; label: string }[] = [
   { id: "vault", label: "Vault" },
   { id: "agent", label: "Agent" },
 ];
+
+const CONNECTION_VIEWS = new Set<View>(["monitor", "logs", "files", "deploy", "keys", "backups", "ai", "vnc"]);
 
 const navGroups = [
   { label: "Workspace", items: [{ label: "Overview", icon: LayoutDashboard }, { label: "Servers", icon: Server }, { label: "Activity", icon: Activity }] },
@@ -473,16 +476,26 @@ export default function App() {
   const [activeSection, setActiveSection] = useState<Section>("Overview");
   const [mobileNav, setMobileNav] = useState(false);
   const [toast, setToast] = useState("");
+  const [serversLoading, setServersLoading] = useState(true);
+  const [serversRefreshing, setServersRefreshing] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
   const fleetSearchRef = useRef<HTMLInputElement>(null);
+  const serversLoadedRef = useRef(false);
 
   const refreshServers = useCallback(async () => {
+    const firstLoad = !serversLoadedRef.current;
+    if (firstLoad) setServersLoading(true);
+    else setServersRefreshing(true);
     try {
       const r = await api.servers.list();
       setServers(r.servers);
       setLoadError(r.recovery_error ?? null);
     } catch (e) {
       setLoadError(e instanceof BridgeError ? e.message : String(e));
+    } finally {
+      serversLoadedRef.current = true;
+      setServersLoading(false);
+      setServersRefreshing(false);
     }
   }, []);
 
@@ -753,11 +766,18 @@ export default function App() {
   })();
 
   const activeStatus = activeTab ? statuses.get(activeTab.server.id) : undefined;
+  const activeViewConnecting = Boolean(
+    activeTab
+      && CONNECTION_VIEWS.has(activeTab.view)
+      && (!activeStatus || activeStatus === "connecting" || activeStatus === "authenticating"),
+  );
   const connectedCount = Array.from(statuses.values()).filter((status) => status === "ready").length;
   const failedCount = Array.from(statuses.values()).filter((status) => status === "error").length;
-  const fleetStatus: SessionStatus | undefined = failedCount > 0 ? "error" : connectedCount > 0 ? "ready" : undefined;
+  const fleetStatus: SessionStatus | undefined = serversLoading ? "connecting" : failedCount > 0 ? "error" : connectedCount > 0 ? "ready" : undefined;
   const topStatusText = activeTab
     ? fleetLabel(activeStatus)
+    : serversLoading
+      ? "Loading profiles"
     : failedCount > 0
       ? `${failedCount} need${failedCount === 1 ? "s" : ""} attention`
       : connectedCount > 0
@@ -806,7 +826,7 @@ export default function App() {
           </label>
           <div className="sidebar-fleet-list" role="list">
             {fleetGroups.length === 0 ? (
-              <div className="sidebar-fleet-empty">{servers.length === 0 ? "No connection profiles yet." : "No matches."}</div>
+              <div className="sidebar-fleet-empty">{serversLoading ? "Loading profiles…" : servers.length === 0 ? "No connection profiles yet." : "No matches."}</div>
             ) : fleetGroups.map((group) => {
               const collapsed = collapsedFleetGroups.has(group.key);
               return (
@@ -826,7 +846,7 @@ export default function App() {
                     const isActive = tabs.some((t) => t.server.id === s.id && t.key === activeKey);
                     return (
                       <div key={s.id} className={`sidebar-fleet-row ${isActive ? "is-active" : ""}`} role="listitem" data-server-menu>
-                        <button type="button" className="sidebar-fleet-open" onClick={() => { openServer(s); setServerMenuId(null); }} title={`${s.name} — ${s.host}:${s.port}`}>
+                        <button type="button" className="sidebar-fleet-open" onClick={() => { openServer(s); setServerMenuId(null); setMobileNav(false); }} title={`${s.name} — ${s.host}:${s.port}`}>
                           <span className={fleetDotClass(st)} aria-hidden />
                           <span className="sidebar-fleet-meta">
                             <span className="sidebar-fleet-name">{s.name}</span>
@@ -848,8 +868,8 @@ export default function App() {
                           </Button>
                           {serverMenuId === s.id && (
                             <div className="sidebar-server-menu" role="menu" aria-label={`Actions for ${s.name}`}>
-                              <button type="button" role="menuitem" onClick={() => { openServerView(s, "terminal"); setServerMenuId(null); }}><Terminal /> Open terminal</button>
-                              <button type="button" role="menuitem" onClick={() => { openMirrored(s); setServerMenuId(null); }}><Plus /> New mirrored tab</button>
+                              <button type="button" role="menuitem" onClick={() => { openServerView(s, "terminal"); setServerMenuId(null); setMobileNav(false); }}><Terminal /> Open terminal</button>
+                              <button type="button" role="menuitem" onClick={() => { openMirrored(s); setServerMenuId(null); setMobileNav(false); }}><Plus /> New mirrored tab</button>
                               <button type="button" role="menuitem" onClick={() => { setModal({ server: s }); setServerMenuId(null); }}><Pencil /> Edit profile</button>
                             </div>
                           )}
@@ -902,7 +922,16 @@ export default function App() {
             >
               <span className="theme-toggle-thumb">{theme === "dark" ? <Moon /> : <Sun />}</span>
             </button>
-            <Button variant="ghost" size="icon-sm" aria-label="Refresh fleet" onClick={() => { refreshServers(); setToast("Fleet refreshed."); setTimeout(() => setToast(""), 2000); }}><RefreshCw /></Button>
+            {serversRefreshing && <OarsRefreshStatus label="Updating fleet" />}
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              aria-label={serversRefreshing ? "Refreshing fleet" : "Refresh fleet"}
+              disabled={serversLoading || serversRefreshing}
+              onClick={() => { refreshServers(); setToast("Fleet refreshed."); setTimeout(() => setToast(""), 2000); }}
+            >
+              <RefreshCw className={serversRefreshing ? "spin" : ""} />
+            </Button>
             <div className="top-status"><span className={fleetDotClass(activeTab ? activeStatus : fleetStatus)} aria-hidden /> {topStatusText}</div>
           </div>
         </header>
@@ -951,8 +980,13 @@ export default function App() {
                 ))}
               </nav>
               {activeTab.view !== "terminal" && <div className="content">
-                {activeTab.view === "monitor" ? <MonitorTab key={activeTab.key} server={activeTab.server} />
-                  : activeTab.view === "logs" ? <LogsTab key={activeTab.key} serverId={activeTab.server.id} />
+                {activeViewConnecting ? (
+                  <OarsLoadingState
+                    title={`Connecting to ${activeTab.server.name}`}
+                    detail="Oars is opening a secure session before it loads this view."
+                  />
+                ) : activeTab.view === "monitor" ? <MonitorTab key={activeTab.key} server={activeTab.server} />
+                  : activeTab.view === "logs" ? <LogsTab key={activeTab.key} server={activeTab.server} />
                   : activeTab.view === "files" ? <FilesTab key={activeTab.key} serverId={activeTab.server.id} />
                   : activeTab.view === "scripts" ? <ScriptsTab key={activeTab.key} serverId={activeTab.server.id} />
                   : activeTab.view === "deploy" ? <DeployTab key={activeTab.key} serverId={activeTab.server.id} />
@@ -967,6 +1001,8 @@ export default function App() {
                   : <div className="empty"><h3>{VIEWS.find((x) => x.id === activeTab.view)?.label}</h3><p className="muted">Coming in the next spec — backend is ready.</p></div>}
               </div>}
             </div>
+          ) : serversLoading ? (
+            <OarsLoadingState title="Loading your workspace" detail="Oars is reading local connection profiles and recent activity." />
           ) : activeSection === "Overview" ? (
             <Overview servers={servers} statuses={statuses} search={search} onAdd={() => setModal({})} onOpenServer={openServer} onAction={onAction} />
           ) : activeSection === "Servers" ? (

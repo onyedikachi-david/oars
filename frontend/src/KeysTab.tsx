@@ -1,24 +1,34 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, BridgeError } from "./bridge";
+import { OarsLoadingState, OarsRefreshStatus } from "./components/OarsLoadingState";
 
 export function KeysTab({ serverId }: { serverId: string }) {
   const [keys, setKeys] = useState<any[]>([]);
   const [roles, setRoles] = useState<any[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [newKey, setNewKey] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [hasLoaded, setHasLoaded] = useState(false);
 
   const load = useCallback(async () => {
+    setLoading(true);
     try {
       const r: any = await api.sshkeys.list(serverId);
       setKeys(r.keys ?? []);
       try { const rr: any = await api.sshkeys.rolesList(serverId); setRoles(rr.roles ?? rr.users ?? []); } catch {}
     } catch (e) { setError(e instanceof BridgeError ? e.message : String(e)); }
+    finally { setHasLoaded(true); setLoading(false); }
   }, [serverId]);
   useEffect(() => { load(); }, [load]);
+
+  if (loading && !hasLoaded) {
+    return <OarsLoadingState title="Loading access keys" detail="Oars is reading authorized keys and server roles." />;
+  }
 
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
       <div style={{ display: "flex", gap: 8, padding: "10px 12px", borderBottom: "1px solid var(--border)" }}>
+        {loading && <OarsRefreshStatus label="Updating keys" />}
         <input className="input" style={{ flex: 1, background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: 6, padding: "5px 8px", fontSize: 12 }} placeholder="ssh-ed25519 AAAAC3... comment" value={newKey} onChange={(e) => setNewKey(e.target.value)} />
         <button className="btn" onClick={async () => { if (!newKey.trim()) return; try { await api.sshkeys.add(serverId, newKey.trim()); setNewKey(""); load(); } catch (e) { setError(e instanceof BridgeError ? e.message : String(e)); } }}>Add key</button>
         <button className="btn" onClick={async () => { try { const r: any = await api.sshkeys.generate(`/tmp/oars-key-${Date.now()}`, "oars-generated"); if (r.public_key) { setNewKey(r.public_key); } } catch (e) { setError(e instanceof BridgeError ? e.message : String(e)); } }}>Generate</button>

@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { api, BridgeError } from "./bridge";
 import { Button } from "./components/ui/button";
+import { OarsLoadingState } from "./components/OarsLoadingState";
 import type { MonitorSnapshot, Server } from "./types";
 
 type GaugeTone = "healthy" | "watch" | "tight" | "critical" | "muted";
@@ -587,6 +588,13 @@ export function MonitorTab({ server }: { server: Server }) {
       : loadError
         ? loadError
         : "Oars is reading processor, memory, storage, and process data from the server.";
+    if (!loadError) {
+      return (
+        <section className="monitor" aria-label="System health">
+          <OarsLoadingState title={title} detail={detail} />
+        </section>
+      );
+    }
     return (
       <section className="monitor" aria-label="System health">
         <header className="monitor-overview monitor-overview-compact">
@@ -599,10 +607,8 @@ export function MonitorTab({ server }: { server: Server }) {
             <RefreshCw className={refreshing ? "spin" : ""} /> {refreshing ? "Refreshing…" : "Refresh"}
           </Button>
         </header>
-        <div className="monitor-skeleton" aria-hidden={!loadError}>
-          {[0, 1, 2].map((item) => <span key={item} />)}
-        </div>
-        {loadError && <Button variant="ghost" size="sm" onClick={() => void loadSnapshot()}>Try again</Button>}
+        <div className="monitor-error" role="alert">{loadError}</div>
+        <Button variant="ghost" size="sm" onClick={() => void loadSnapshot()}>Try again</Button>
       </section>
     );
   }

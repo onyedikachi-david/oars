@@ -6,9 +6,54 @@
     <title>Oars UI preview</title>
     <script>
 	      (() => {
-	        const now = Date.now();
-	        const monitorMode = new URLSearchParams(window.location.search).get("monitor") || "healthy";
-	        let nextDiagnosticChannel = 900;
+        const now = Date.now();
+        const monitorMode = new URLSearchParams(window.location.search).get("monitor") || "healthy";
+        const logsMode = new URLSearchParams(window.location.search).get("logs") || "default";
+        let nextDiagnosticChannel = 900;
+        // Logs fixtures (spec 04): deterministic sources, lines with
+        // repeatable search matches, one very long line, a follow channel
+        // state machine, stale-then-fresh clear, and SFTP transfer
+        // progress. Every call is recorded in `calls` for payload checks.
+        const LOG_BASE = Math.floor(Date.now() / 1000) - 3600;
+        const utf8Encoder = new TextEncoder();
+        const utf8Decoder = new TextDecoder();
+        const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const utf8Length = (value) => utf8Encoder.encode(value).length;
+        const utf8Slice = (value, from) => utf8Decoder.decode(utf8Encoder.encode(value).slice(from));
+        function buildLogLines(count) {
+          const lines = [];
+          for (let i = 0; i < count; i++) {
+            const t = new Date((LOG_BASE - count + i) * 1000).toISOString().replace("T", " ").slice(0, 19);
+            if (i === 42) {
+              lines.push(t + " WARN " + "x".repeat(100000) + " END");
+            } else if (i % 7 === 3) {
+              lines.push(t + " ERROR checkout-error on order " + i + " retrying in 1s");
+            } else {
+              lines.push(t + " INFO request " + i + " handled in " + (i % 40) + "ms");
+            }
+          }
+          return lines;
+        }
+        const LOG_SOURCES = [
+          { path: "/var/log/nginx/access.log", group: "web", name: "Nginx · access", size: 472000, mtime_epoch: LOG_BASE + 15, age_sec: 45, mode: 420, readable: true },
+          { path: "/var/log/nginx/error.log", group: "web", name: "Nginx · error", size: 128000, mtime_epoch: LOG_BASE - 840, age_sec: 900, mode: 420, readable: true },
+          { path: "/var/log/apache2/access.log", group: "web", name: "Apache · access", size: 3100000, mtime_epoch: LOG_BASE - 60, age_sec: 120, mode: 420, readable: true },
+          { path: "/var/log/pm2/app-out.log", group: "runtime", name: "PM2 · app out", size: 86000, mtime_epoch: LOG_BASE + 48, age_sec: 12, mode: 420, readable: true },
+          { path: "/var/log/pm2/app-error.log", group: "runtime", name: "PM2 · app error", size: 2048, mtime_epoch: LOG_BASE - 240, age_sec: 300, mode: 420, readable: true },
+          { path: "/var/log/node/api-stdout.log", group: "runtime", name: "Node · api stdout", size: 500, mtime_epoch: LOG_BASE - 17640, age_sec: 18000, mode: 420, readable: true },
+          { path: "/var/log/syslog", group: "system", name: "syslog", size: 91000000, mtime_epoch: LOG_BASE + 30, age_sec: 30, mode: 384, readable: false },
+          { path: "/var/log/auth.log", group: "system", name: "auth.log", size: 1200000, mtime_epoch: LOG_BASE + 2, age_sec: 58, mode: 384, readable: false },
+          { path: "/var/log/kern.log", group: "system", name: "kern.log", size: 780000, mtime_epoch: LOG_BASE - 540, age_sec: 600, mode: 420, readable: true },
+          { path: "/opt/app/logs/custom-app.log", group: "custom", name: "custom-app.log", size: 999, mtime_epoch: LOG_BASE - 18000, age_sec: 20000, mode: 420, readable: true },
+        ];
+        const logScanState = { sizes: new Map() };
+        function logSources() {
+          return LOG_SOURCES.map((s) => ({ ...s, size: logScanState.sizes.get(s.path) ?? s.size }));
+        }
+        const followState = { channel: 44, emitted: "", polls: 0, closed: false, droppedAt: 5, eofAt: 12 };
+        const clearAttempts = new Map();
+        const dlTransfers = new Map();
+        let dlNextId = 3001;
         const servers = [
           {
             id: "prod-api",
@@ -102,68 +147,187 @@
                 ],
               };
             }
-	            if (command === "oars.monitor.poll") {
-	              const c = (polls.get(payload.server_id + ":mon") || 0) + 1;
-	              polls.set(payload.server_id + ":mon", c);
-	              if (monitorMode === "not-ready") return { ok: true, status: "not_ready" };
-	              if (monitorMode === "sampling") {
-	                return { ok: true, ts: 0, cpu: null, mem: null, disk: null, processes: [], probe_error: "no sample yet" };
-	              }
-	              if (payload.server_id === "changed-host") {
-	                return { ok: true, ts: 0, cpu: null, mem: null, disk: null, processes: [], probe_error: "no /proc readable (loadavg empty)" };
-	              }
-	              const warming = c < 2;
-	              const degraded = monitorMode === "degraded";
-	              const cpuPct = warming ? null : degraded ? 92.4 : 24 + Math.sin(c / 5) * 8;
-	              return {
-	                ok: true,
-	                ts: Date.now() * 1000000,
-	                cpu: { utilization_pct: cpuPct, cpu_warming: warming, load_1: 0.42, load_5: 0.31, load_15: 0.22, uptime_sec: 86400*3 + 3600*5, cores: 4 },
-	                mem: degraded
-	                  ? { used_bytes: 7.1*1024**3, total_bytes: 7.8*1024**3, available_bytes: 0.7*1024**3, swap_used_bytes: 1.4*1024**3, swap_total_bytes: 2*1024**3 }
-	                  : { used_bytes: 4.2*1024**3, total_bytes: 7.8*1024**3, available_bytes: 3.1*1024**3, swap_used_bytes: 0.2*1024**3, swap_total_bytes: 2*1024**3 },
-	                disk: degraded
-	                  ? { used_bytes: 25.7*1024**3, total_bytes: 29*1024**3, available_bytes: 3.3*1024**3 }
-	                  : { used_bytes: 15*1024**3, total_bytes: 29*1024**3, available_bytes: 14*1024**3 },
+            if (command === "oars.monitor.poll") {
+              const c = (polls.get(payload.server_id + ":mon") || 0) + 1;
+              polls.set(payload.server_id + ":mon", c);
+              if (monitorMode === "not-ready") return { ok: true, status: "not_ready" };
+              if (monitorMode === "sampling") {
+                return { ok: true, ts: 0, cpu: null, mem: null, disk: null, processes: [], probe_error: "no sample yet" };
+              }
+              if (payload.server_id === "changed-host") {
+                return { ok: true, ts: 0, cpu: null, mem: null, disk: null, processes: [], probe_error: "no /proc readable (loadavg empty)" };
+              }
+              const warming = c < 2;
+              const degraded = monitorMode === "degraded";
+              const cpuPct = warming ? null : degraded ? 92.4 : 24 + Math.sin(c / 5) * 8;
+              return {
+                ok: true,
+                ts: Date.now() * 1000000,
+                cpu: { utilization_pct: cpuPct, cpu_warming: warming, load_1: 0.42, load_5: 0.31, load_15: 0.22, uptime_sec: 86400*3 + 3600*5, cores: 4 },
+                mem: degraded
+                  ? { used_bytes: 7.1*1024**3, total_bytes: 7.8*1024**3, available_bytes: 0.7*1024**3, swap_used_bytes: 1.4*1024**3, swap_total_bytes: 2*1024**3 }
+                  : { used_bytes: 4.2*1024**3, total_bytes: 7.8*1024**3, available_bytes: 3.1*1024**3, swap_used_bytes: 0.2*1024**3, swap_total_bytes: 2*1024**3 },
+                disk: degraded
+                  ? { used_bytes: 25.7*1024**3, total_bytes: 29*1024**3, available_bytes: 3.3*1024**3 }
+                  : { used_bytes: 15*1024**3, total_bytes: 29*1024**3, available_bytes: 14*1024**3 },
                 processes: [
                   { pid: 1842, name: "node", cpu: 4.2, mem: 3.1 },
                   { pid: 912, name: "postgres", cpu: 2.8, mem: 5.4 },
                   { pid: 441, name: "nginx", cpu: 0.6, mem: 0.8 },
                   { pid: 2011, name: "oars", cpu: cpuPct ?? 0.2, mem: 1.2 },
                 ],
-	                probe_error: degraded ? "Process details are incomplete because one /proc entry could not be read." : null,
-	              };
+                probe_error: degraded ? "Process details are incomplete because one /proc entry could not be read." : null,
+              };
             }
             if (command === "oars.monitor.probe") {
               polls.set(payload.server_id + ":mon", (polls.get(payload.server_id + ":mon")||0)+1);
               return { ok: true };
-	            }
-	            if (command === "oars.monitor.cleanDiskEstimate" || command === "oars.monitor.cleanDisk" || command === "oars.monitor.dropCaches") {
-	              const ch = nextDiagnosticChannel++;
-	              if (!window.__oarsMock.diagChannels) window.__oarsMock.diagChannels = new Map();
-	              const label = command.includes("cleanDiskEstimate")
-	                ? payload.plan === "journal"
-	                  ? "Archived and active journals take up 1.2G in the file system.\n"
-	                  : "356515840 /var/cache/apt\n"
-	                : command.includes("cleanDisk")
-	                  ? payload.plan === "journal"
-	                    ? "Vacuuming done, freed 1.1G of archived journals.\n"
-	                    : "APT package cache cleaned.\n"
-	                  : "sync complete; wrote drop_caches level "+payload.level+".\n";
-	              window.__oarsMock.diagChannels.set(ch, { label, done: false });
-	              return { ok: true, channel: ch };
-	            }
+            }
+            if (command === "oars.monitor.cleanDiskEstimate" || command === "oars.monitor.cleanDisk" || command === "oars.monitor.dropCaches") {
+              const ch = nextDiagnosticChannel++;
+              if (!window.__oarsMock.diagChannels) window.__oarsMock.diagChannels = new Map();
+              const label = command.includes("cleanDiskEstimate")
+                ? payload.plan === "journal"
+                  ? "Archived and active journals take up 1.2G in the file system.\n"
+                  : "356515840 /var/cache/apt\n"
+                : command.includes("cleanDisk")
+                  ? payload.plan === "journal"
+                    ? "Vacuuming done, freed 1.1G of archived journals.\n"
+                    : "APT package cache cleaned.\n"
+                  : "sync complete; wrote drop_caches level "+payload.level+".\n";
+              window.__oarsMock.diagChannels.set(ch, { label, done: false });
+              return { ok: true, channel: ch };
+            }
+            // ── Logs (spec 04) fixtures ──────────────────────────────
+            if (command === "oars.logs.scan") {
+              if (logsMode === "empty") return { ok: true, sources: [], partial: false, reason: "" };
+              const srcs = logSources();
+              if (logsMode === "partial") {
+                return { ok: true, sources: srcs, partial: true, reason: "entry limit reached at 500 files; some paths were not scanned" };
+              }
+              return { ok: true, sources: srcs, partial: false, reason: "" };
+            }
+            if (command === "oars.logs.read") {
+              if (logsMode === "stale-read" && payload.path === "/var/log/nginx/access.log") await delay(500);
+              const binary = logsMode === "binary" && payload.path === "/var/log/nginx/access.log";
+              const lines = binary ? [] : buildLogLines(payload.lines);
+              if (lines.length > 0) lines[0] = `${lines[0]} SOURCE=${payload.path}`;
+              return {
+                ok: true,
+                path: payload.path,
+                lines,
+                limited: logsMode === "limited" || payload.lines === 5000,
+                binary,
+              };
+            }
+            if (command === "oars.logs.follow") {
+              if (logsMode === "stale-follow") await delay(500);
+              followState.channel = 44;
+              followState.emitted = buildLogLines(100).join("\n") + "\n2026-08-07T10:00:59Z INFO café worker ready 🚀\n";
+              followState.polls = 0;
+              followState.closed = false;
+              return { ok: true, channel: 44 };
+            }
+            if (command === "oars.logs.clear") {
+              const n = clearAttempts.get(payload.path) || 0;
+              clearAttempts.set(payload.path, n + 1);
+              if (n === 0) {
+                logScanState.sizes.set(payload.path, 512000);
+                return { ok: false, error: "file changed since preview; re-scan before clearing" };
+              }
+              logScanState.sizes.set(payload.path, 0);
+              return { ok: true, before_size: payload.expected.size, after_size: 0 };
+            }
+            if (command === "oars.logs.addSource") {
+              LOG_SOURCES.push({
+                path: payload.path,
+                group: "custom",
+                name: payload.path.split("/").pop(),
+                size: 1024,
+                mtime_epoch: LOG_BASE - 60,
+                age_sec: 60,
+                mode: 420,
+                readable: true,
+              });
+              logScanState.sizes.clear();
+              return { ok: true };
+            }
+            if (command === "oars.sftp.download") {
+              const id = dlNextId++;
+              dlTransfers.set(id, { id, kind: "download", path: payload.remote_path.utf8, bytes: 0, total: 472000, status: "running", error: "" });
+              return { ok: true, op_id: id };
+            }
+            if (command === "oars.sftp.poll") {
+              for (const t of dlTransfers.values()) {
+                if (t.status !== "running") continue;
+                if (logsMode === "dlfail") { t.status = "failed"; t.error = "permission denied"; continue; }
+                t.bytes = Math.min(t.total, t.bytes + 110000);
+                if (t.bytes >= t.total) t.status = "done";
+              }
+              return { ok: true, transfers: [...dlTransfers.values()] };
+            }
+            if (command === "oars.sftp.cancel") {
+              const t = dlTransfers.get(payload.transfer_id);
+              if (t && t.status === "running") t.status = "canceled";
+              return { ok: true };
+            }
+            if (command === "native-sdk.dialog.saveFile") {
+              if (logsMode === "nodialog") return null;
+              return "/Users/preview/Downloads/" + (payload.defaultName || "download.log");
+            }
+            if (command === "oars.ssh.closeChannel") {
+              if (payload.channel === followState.channel) followState.closed = true;
+              return { ok: true };
+            }
             return { ok: true };
           },
         };
-        // Wrap ssh.poll to stream diag channel output
+        // Wrap ssh.poll to stream diag + follow channel output
         (() => {
           const origInvoke = window.zero.invoke.bind(window.zero);
           window.zero.invoke = async (command, payload={}) => {
-            if (command === "oars.ssh.poll" && window.__oarsMock.diagChannels) {
+            if (command === "oars.ssh.poll") {
               const cur = payload.cursors && payload.cursors[0];
               const chId = cur ? cur.channel : null;
-              if (chId !== null && window.__oarsMock.diagChannels.has(chId)) {
+              // Follow channel (spec 04): absolute cursor protocol — the
+              // response carries the delta from the requested cursor.
+              if (chId === followState.channel && !followState.closed) {
+                calls.push({ command, payload, at: performance.now() });
+                document.documentElement.dataset.oarsCalls = JSON.stringify(calls);
+                if (logsMode === "follow-error") {
+                  return { ok: false, error: "simulated follow poll failure" };
+                }
+                followState.polls += 1;
+                const p = followState.polls;
+                if (p === 3) {
+                  followState.emitted += "2026-08-07T10:01:00Z INFO follow chunk A\n2026-08-07T10:01:01Z INFO request 101 handled in 12ms\n2026-08-07T10:01:02Z INFO follow chunk A end\n";
+                }
+                if (p === 5) {
+                  followState.emitted += "tail: '/var/log/nginx/access.log' has been replaced; following new file\n2026-08-07T10:01:30Z INFO rotation chunk B line 1\n2026-08-07T10:01:31Z INFO rotation chunk B line 2\n";
+                }
+                if (p === 8) {
+                  followState.emitted += "2026-08-07T10:02:00Z ERROR checkout-error on order 777\n2026-08-07T10:02:01Z INFO retry in 1s\n";
+                }
+                const eof = p >= followState.eofAt;
+                const from = cur ? cur.cursor : 0;
+                const cursor = utf8Length(followState.emitted);
+                return {
+                  ok: true,
+                  status: "ready",
+                  channels: [{
+                    id: followState.channel,
+                    kind: "log",
+                    command: "tail -n 100 -F /var/log/nginx/access.log",
+                    cursor,
+                    dropped: p === followState.droppedAt ? 4096 : 0,
+                    pending: 0,
+                    eof,
+                    exit: null,
+                    data: utf8Slice(followState.emitted, from),
+                  }],
+                };
+              }
+              if (chId !== null && window.__oarsMock.diagChannels && window.__oarsMock.diagChannels.has(chId)) {
                 const entry = window.__oarsMock.diagChannels.get(chId);
                 if (!entry.done) {
                   entry.done = true;

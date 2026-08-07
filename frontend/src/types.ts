@@ -43,7 +43,7 @@ export type SessionStatus =
 
 export interface ChannelInfo {
   id: number;
-  kind: "shell" | "exec";
+  kind: "shell" | "exec" | "log";
   command: string;
   cursor: number;
   dropped: number;
@@ -115,4 +115,40 @@ export interface LogReadResult {
   path: string;
   lines: string[];
   limited: boolean;
+  binary: boolean;
+}
+
+export interface LogScanResult {
+  ok: boolean;
+  sources: LogSource[];
+  partial: boolean;
+  reason: string;
+}
+
+export interface LogClearResult {
+  ok: boolean;
+  before_size: number;
+  after_size: number;
+}
+
+export type SftpTransferStatus = "queued" | "running" | "done" | "failed" | "canceled";
+
+export interface SftpTransfer {
+  id: number;
+  kind: string;
+  path: string;
+  bytes: number;
+  total: number;
+  status: SftpTransferStatus;
+  error: string;
+}
+
+export interface SftpTransferSnapshot {
+  ok: boolean;
+  transfers: SftpTransfer[];
+}
+
+export interface SftpOpStart {
+  ok: boolean;
+  op_id: number;
 }

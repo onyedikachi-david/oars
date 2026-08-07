@@ -53,6 +53,11 @@ Linus Torvalds would judge a kernel patch.** Concretely:
 - **Stage 1 (Foundation) is implemented and green:** Zig core (`ssh`,
   `sessions`, `servers`, `bridge`, `main`, `runner`), React/xterm.js
   terminal UI, host-key trust flow, config store, tests pass.
+- **Stage 2 v1 is implemented and green (verified 2026-08-07):** monitoring
+  and logs have complete React surfaces over the existing Zig contracts. Logs
+  use absolute byte cursors, source-bound async requests, TanStack Virtual for
+  5,000-line views, binary-content rejection, SFTP download progress, and
+  identity-bound Clear. PM2 controls and threshold alerts remain Oars+ work.
 - **All 18 feature specs exist** in `docs/specs/` (`01`–`18`), each with
   acceptance criteria (§12) and a **Research & References section (§13)**
   citing primary sources with URLs and line refs. Claims were verified
@@ -91,7 +96,8 @@ Linus Torvalds would judge a kernel patch.** Concretely:
 - **Vendored C:** `third_party/libssh2` (1.11.1, BSD-3) +
   `third_party/mbedtls` (3.6.2, Apache-2.0), compiled via `zig cc`
   (`buildVendoredLibraries` + `linkSshStack` in `build.zig`).
-- **Frontend:** React + TypeScript + Vite (rolldown), xterm.js 5.3.0
+- **Frontend:** React + TypeScript + Vite (rolldown), TanStack Virtual 3.14.9,
+  Vitest 4.1.10, xterm.js 5.3.0
   (package name is `xterm`, CSS at `xterm/css/xterm.css`), noVNC 1.7.0
   (`@novnc/novnc`) already installed for spec 12.
 - Key files: `src/{main,runner,bridge,sessions,servers,ssh,openssh}.zig`,

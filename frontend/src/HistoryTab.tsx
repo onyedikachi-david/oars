@@ -1,20 +1,31 @@
 import { useEffect, useState } from "react";
 import { api, BridgeError } from "./bridge";
+import { OarsLoadingState, OarsRefreshStatus } from "./components/OarsLoadingState";
 
 export function HistoryTab() {
   const [entries, setEntries] = useState<any[]>([]);
   const [audit, setAudit] = useState<any[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [hasLoaded, setHasLoaded] = useState(false);
 
   const load = async () => {
+    setLoading(true);
     try { const r:any = await api.history.list({}); setEntries(r.entries ?? r.history ?? r.items ?? []); } catch(e){ setError(e instanceof BridgeError? e.message:String(e)); }
     try { const r:any = await api.history.auditList(); setAudit(r.entries ?? r.audit ?? []); } catch{}
+    setHasLoaded(true);
+    setLoading(false);
   };
   useEffect(()=>{ load(); }, []);
+
+  if (loading && !hasLoaded) {
+    return <OarsLoadingState compact title="Loading activity" detail="Oars is reading command history and the local audit journal." />;
+  }
 
   return (
     <div style={{ display:"flex", flexDirection:"column", flex:1, minHeight:0 }}>
       <div style={{ display:"flex", gap:8, padding:"10px 12px", borderBottom:"1px solid var(--border)" }}>
+        {loading && <OarsRefreshStatus label="Updating activity" />}
         <button className="btn" onClick={load}>Refresh</button>
         <button className="btn" onClick={async()=>{ if(!confirm("Clear audit log?")) return; try{ await api.history.auditClear(); load(); }catch(e){ setError(e instanceof BridgeError? e.message:String(e)); }}}>Clear audit</button>
       </div>

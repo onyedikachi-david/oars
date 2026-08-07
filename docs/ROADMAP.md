@@ -296,7 +296,7 @@ is a no-op, full connect cancellation is not bounded, and server-store
 permissions and corrupt-file recovery need hardening. LICENSE and CONTRIBUTING
 are still absent.
 
-### Stage 2 — Monitoring + Logs 🔨
+### Stage 2 — Monitoring + Logs ✅ v1
 - `oars.monitor.poll` — capability-selected reads of `/proc/stat`,
   `/proc/loadavg`, `/proc/meminfo`, `df`, and `ps`; parse in Zig and serve a
   cached snapshot on demand.

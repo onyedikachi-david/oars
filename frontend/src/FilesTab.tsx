@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, BridgeError } from "./bridge";
+import { OarsLoadingState, OarsRefreshStatus } from "./components/OarsLoadingState";
 
 interface Entry {
   name: { utf8?: string; base64?: string };
@@ -30,6 +31,7 @@ export function FilesTab({ serverId }: { serverId: string }) {
   const [entries, setEntries] = useState<Entry[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [hasLoaded, setHasLoaded] = useState(false);
   const [newFolder, setNewFolder] = useState("");
   const [showHidden, setShowHidden] = useState(false);
 
@@ -43,6 +45,7 @@ export function FilesTab({ serverId }: { serverId: string }) {
     } catch (e) {
       setError(e instanceof BridgeError ? e.message : String(e));
     } finally {
+      setHasLoaded(true);
       setLoading(false);
     }
   }, [serverId]);
@@ -51,6 +54,10 @@ export function FilesTab({ serverId }: { serverId: string }) {
 
   const crumbs = path.split("/").filter(Boolean);
   const filtered = entries.filter((e) => showHidden || !e.display.startsWith("."));
+
+  if (loading && !hasLoaded) {
+    return <OarsLoadingState title="Opening the file browser" detail="Oars is reading the first directory from this server." />;
+  }
 
   return (
     <div className="files">
@@ -71,6 +78,7 @@ export function FilesTab({ serverId }: { serverId: string }) {
           <input type="checkbox" checked={showHidden} onChange={(e) => setShowHidden(e.target.checked)} />
           hidden
         </label>
+        {loading && <OarsRefreshStatus label="Reading folder" />}
         <button className="btn" onClick={() => load(path)} disabled={loading}>
           Refresh
         </button>

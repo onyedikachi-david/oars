@@ -1,14 +1,19 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, BridgeError } from "./bridge";
+import { OarsLoadingState, OarsRefreshStatus } from "./components/OarsLoadingState";
 
 export function BackupsTab({ serverId }: { serverId: string }) {
   const [jobs, setJobs] = useState<any[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<any | null>(null);
   const [runStatus, setRunStatus] = useState<string>("");
+  const [loading, setLoading] = useState(true);
+  const [hasLoaded, setHasLoaded] = useState(false);
 
   const load = useCallback(async () => {
+    setLoading(true);
     try { const r: any = await api.backup.list(serverId); setJobs(r.jobs ?? r.backups ?? []); } catch (e) { setError(e instanceof BridgeError ? e.message : String(e)); }
+    finally { setHasLoaded(true); setLoading(false); }
   }, [serverId]);
   useEffect(()=>{ load(); }, [load]);
 
@@ -29,9 +34,14 @@ export function BackupsTab({ serverId }: { serverId: string }) {
     } catch (e) { setError(e instanceof BridgeError ? e.message : String(e)); }
   };
 
+  if (loading && !hasLoaded) {
+    return <OarsLoadingState title="Loading backups" detail="Oars is reading backup jobs and retention settings." />;
+  }
+
   return (
     <div style={{ display:"flex", flexDirection:"column", flex:1, minHeight:0 }}>
       <div style={{ display:"flex", gap:8, padding:"10px 12px", borderBottom:"1px solid var(--border)" }}>
+        {loading && <OarsRefreshStatus label="Updating jobs" />}
         <button className="btn" onClick={()=> setEditing({ name:"", paths:"/var/www", schedule:"daily", retention_days:7 })}>+ New backup</button>
         <button className="btn" onClick={load}>Refresh</button>
         <button className="btn" onClick={async()=>{ try{ const r:any = await api.backup.install(serverId); setError(r.ok? "Install issued":"install failed"); }catch(e){ setError(e instanceof BridgeError? e.message:String(e)); }}}>Install agent</button>
