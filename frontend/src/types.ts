@@ -152,3 +152,33 @@ export interface SftpOpStart {
   ok: boolean;
   op_id: number;
 }
+
+export interface VncStartResult {
+  ok: boolean;
+  tunnel_id: number;
+  ws_port: number;
+  token: string;
+}
+
+export interface VncProbeResult {
+  ok: boolean;
+  x11vnc: boolean;
+  tigervnc: boolean;
+  listening: Array<{ port: number; process: string }>;
+}
+
+export interface VncSetupResult {
+  ok: boolean;
+  action: "install" | "configure" | "manual";
+  plan: string;
+  hint: string;
+  executed: boolean;
+}
+
+export interface VncPollResult {
+  ok: boolean;
+  state: "listening" | "handshake" | "connected" | "closing" | "closed";
+  bytes_up: number;
+  bytes_down: number;
+  error: string;
+}

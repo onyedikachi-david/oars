@@ -115,11 +115,11 @@ fn listenerProcess(line: []const u8) []const u8 {
 }
 
 pub const SetupPlan = struct {
-    /// install | already_installed | manual
+    /// install | configure | manual
     action: []const u8,
-    /// The exact exec command (empty for manual/already_installed).
+    /// The exact package-install command (empty for manual/configure).
     plan: []const u8,
-    /// Suggested start command (the user replaces <vnc-password>).
+    /// Password-free command preview shown in the approval dialog.
     hint: []const u8,
 
     pub fn deinit(self: *SetupPlan, allocator: std.mem.Allocator) void {
@@ -129,28 +129,89 @@ pub const SetupPlan = struct {
     }
 };
 
-/// The tested OS adapter (spec 12 §5): Alpine and Debian/Ubuntu get an
-/// exact install command; anything else gets manual guidance. The hint
-/// binds VNC to the display's port and always configures a password
-/// (spec 12 §8: the setup helper never suggests `-nopw`).
+pub const max_setup_display: u16 = 99;
+
+fn startHint(allocator: std.mem.Allocator, display: u16) []const u8 {
+    const port: u32 = 5900 + @as(u32, display);
+    return std.fmt.allocPrint(
+        allocator,
+        "x11vnc -storepasswd $HOME/.local/share/oars/vnc/display-{d}.passwd; " ++
+            "x11vnc -display :{d} -rfbport {d} -localhost -forever -shared " ++
+            "-rfbauth $HOME/.local/share/oars/vnc/display-{d}.passwd",
+        .{ display, display, port, display },
+    ) catch "";
+}
+
+/// Builds the fixed server-side command. The password arrives through stdin
+/// and never appears in this command or in the remote process arguments.
+pub fn secureStartCommand(allocator: std.mem.Allocator, display: u16) ![]u8 {
+    if (display > max_setup_display) return error.InvalidDisplay;
+    const port: u32 = 5900 + @as(u32, display);
+    return std.fmt.allocPrint(
+        allocator,
+        "set -eu; umask 077; " ++
+            "auth_dir=\"$HOME/.local/share/oars/vnc\"; " ++
+            "auth_file=\"$auth_dir/display-{d}.passwd\"; pid_file=\"$auth_dir/display-{d}.pid\"; " ++
+            "ready_file=\"$auth_dir/display-{d}.ready\"; log_file=\"$auth_dir/display-{d}.log\"; " ++
+            "xvfb_pid_file=\"$auth_dir/display-{d}.xvfb.pid\"; xvfb_log=\"$auth_dir/display-{d}.xvfb.log\"; " ++
+            "mkdir -p \"$auth_dir\"; chmod 700 \"$auth_dir\"; " ++
+            "x11vnc -storepasswd \"$auth_file\" >/dev/null 2>&1; chmod 600 \"$auth_file\"; " ++
+            "if [ -f \"$pid_file\" ]; then pid=$(cat \"$pid_file\" 2>/dev/null || true); " ++
+            "case \"$pid\" in ''|*[!0-9]*) ;; *) " ++
+            "if kill -0 \"$pid\" 2>/dev/null && [ \"$(cat \"/proc/$pid/comm\" 2>/dev/null || true)\" = x11vnc ]; " ++
+            "then kill \"$pid\"; sleep 1; fi ;; esac; rm -f \"$pid_file\"; fi; " ++
+            "oars_xvfb=0; if [ -f \"$xvfb_pid_file\" ]; then xvfb_pid=$(cat \"$xvfb_pid_file\" 2>/dev/null || true); " ++
+            "case \"$xvfb_pid\" in ''|*[!0-9]*) ;; *) if kill -0 \"$xvfb_pid\" 2>/dev/null && " ++
+            "[ \"$(cat \"/proc/$xvfb_pid/comm\" 2>/dev/null || true)\" = Xvfb ]; then oars_xvfb=1; fi ;; esac; fi; " ++
+            "if [ ! -S /tmp/.X11-unix/X{d} ]; then : >\"$xvfb_log\"; chmod 600 \"$xvfb_log\"; " ++
+            "setsid Xvfb :{d} -screen 0 1280x800x24 -nolisten tcp </dev/null >\"$xvfb_log\" 2>&1 & " ++
+            "xvfb_pid=$!; printf '%s\\n' \"$xvfb_pid\" >\"$xvfb_pid_file\"; oars_xvfb=1; i=0; " ++
+            "while [ ! -S /tmp/.X11-unix/X{d} ] && [ \"$i\" -lt 5 ]; do " ++
+            "if ! kill -0 \"$xvfb_pid\" 2>/dev/null; then break; fi; sleep 1; i=$((i + 1)); done; " ++
+            "if [ ! -S /tmp/.X11-unix/X{d} ]; then printf 'Xvfb failed to open display :{d}\\n'; " ++
+            "tail -n 8 \"$xvfb_log\" 2>/dev/null || true; exit 1; fi; fi; " ++
+            "auth_args=''; if [ \"$oars_xvfb\" -eq 0 ]; then auth_args='-auth guess'; fi; " ++
+            ": >\"$log_file\"; chmod 600 \"$log_file\"; rm -f \"$ready_file\"; " ++
+            "setsid x11vnc -norc -display :{d} $auth_args -rfbport {d} -localhost -forever -shared " ++
+            "-rfbauth \"$auth_file\" -flag \"$ready_file\" -o \"$log_file\" </dev/null >/dev/null 2>&1 & " ++
+            "pid=$!; printf '%s\\n' \"$pid\" >\"$pid_file\"; i=0; " ++
+            "while [ ! -s \"$ready_file\" ] && [ \"$i\" -lt 10 ]; do " ++
+            "if ! kill -0 \"$pid\" 2>/dev/null; then break; fi; sleep 1; i=$((i + 1)); done; " ++
+            "if [ ! -s \"$ready_file\" ] || ! kill -0 \"$pid\" 2>/dev/null; then " ++
+            "printf 'x11vnc failed to open port {d} for display :{d}\\n'; " ++
+            "tail -n 12 \"$log_file\" 2>/dev/null || true; kill \"$pid\" 2>/dev/null || true; " ++
+            "rm -f \"$pid_file\" \"$ready_file\"; exit 1; fi",
+        .{ display, display, display, display, display, display, display, display, display, display, display, display, port, port, display },
+    );
+}
+
+/// The tested OS adapter (spec 12 §5): Alpine and Debian/Ubuntu get an exact
+/// install command; anything else gets manual guidance. Installed x11vnc can
+/// still be configured and restarted with a new password.
 pub fn setupPlan(
     allocator: std.mem.Allocator,
     os_release: []const u8,
     display: u16,
     x11vnc_installed: bool,
 ) SetupPlan {
+    if (display > max_setup_display) {
+        return .{
+            .action = allocator.dupe(u8, "manual") catch "",
+            .plan = "",
+            .hint = allocator.dupe(u8, "choose a display between :0 and :99") catch "",
+        };
+    }
     if (x11vnc_installed) {
         return .{
-            .action = allocator.dupe(u8, "already_installed") catch "",
+            .action = allocator.dupe(u8, "configure") catch "",
             .plan = "",
-            .hint = "",
+            .hint = startHint(allocator, display),
         };
     }
     const alpine = std.mem.indexOf(u8, os_release, "ID=alpine") != null;
     const debian = std.mem.indexOf(u8, os_release, "ID=debian") != null or std.mem.indexOf(u8, os_release, "ID=ubuntu") != null;
-    const port = 5900 + display;
-    var hint_buf: [512]u8 = undefined;
-    const hint = std.fmt.bufPrint(&hint_buf, "Xvfb :{d} -screen 0 1280x800x24 >/dev/null 2>&1 & sleep 1; x11vnc -display :{d} -rfbport {d} -forever -shared -passwd <vnc-password>", .{ display, display, port }) catch "";
+    const hint = startHint(allocator, display);
+    defer if (hint.len > 0) allocator.free(hint);
     if (alpine) {
         return .{
             .action = allocator.dupe(u8, "install") catch "",
@@ -221,7 +282,7 @@ test "probe output dedupes ports and reports nothing on empty output" {
     try std.testing.expectEqual(@as(usize, 1), result.listening.len);
 }
 
-test "setup plan: alpine gets apk, debian gets apt, unknown gets manual, installed short-circuits" {
+test "setup plan: supported systems install, unknown is manual, installed configures" {
     const allocator = std.testing.allocator;
     const alpine_os = "NAME=\"Alpine Linux\"\nID=alpine\n";
     var alpine_plan = setupPlan(allocator, alpine_os, 1, false);
@@ -229,7 +290,9 @@ test "setup plan: alpine gets apk, debian gets apt, unknown gets manual, install
     try std.testing.expectEqualStrings("install", alpine_plan.action);
     try std.testing.expectEqualStrings("apk add --no-cache x11vnc xvfb", alpine_plan.plan);
     try std.testing.expect(std.mem.indexOf(u8, alpine_plan.hint, "-rfbport 5901") != null);
-    try std.testing.expect(std.mem.indexOf(u8, alpine_plan.hint, "-passwd") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alpine_plan.hint, "-storepasswd") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alpine_plan.hint, "-localhost") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alpine_plan.hint, "-rfbauth") != null);
     try std.testing.expect(std.mem.indexOf(u8, alpine_plan.hint, "-nopw") == null);
 
     const debian_os = "PRETTY_NAME=\"Debian GNU/Linux 12\"\nID=debian\n";
@@ -245,5 +308,34 @@ test "setup plan: alpine gets apk, debian gets apt, unknown gets manual, install
 
     var installed_plan = setupPlan(allocator, "ID=alpine\n", 0, true);
     defer installed_plan.deinit(allocator);
-    try std.testing.expectEqualStrings("already_installed", installed_plan.action);
+    try std.testing.expectEqualStrings("configure", installed_plan.action);
+    try std.testing.expectEqualStrings("", installed_plan.plan);
+    try std.testing.expect(std.mem.indexOf(u8, installed_plan.hint, "-rfbauth") != null);
+}
+
+test "secure start command uses stdin auth and loopback only" {
+    const command = try secureStartCommand(std.testing.allocator, 1);
+    defer std.testing.allocator.free(command);
+    try std.testing.expect(std.mem.indexOf(u8, command, "x11vnc -storepasswd \"$auth_file\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, command, "-localhost") != null);
+    try std.testing.expect(std.mem.indexOf(u8, command, "-rfbauth \"$auth_file\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, command, "-pidfile") == null);
+    try std.testing.expect(std.mem.indexOf(u8, command, "-flag \"$ready_file\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, command, "pid=$!") != null);
+    try std.testing.expect(std.mem.indexOf(u8, command, "-norc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, command, "-passwd ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, command, "-rfbport 5901") != null);
+    try std.testing.expectError(error.InvalidDisplay, secureStartCommand(std.testing.allocator, 100));
+}
+
+test "secure start command is valid POSIX shell" {
+    const command = try secureStartCommand(std.testing.allocator, 1);
+    defer std.testing.allocator.free(command);
+    const result = try std.process.run(std.testing.allocator, std.testing.io, .{
+        .argv = &.{ "/bin/sh", "-n", "-c", command },
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) std.debug.print("VNC shell error: {s}\n", .{result.stderr});
+    try std.testing.expect(result.term == .exited and result.term.exited == 0);
 }

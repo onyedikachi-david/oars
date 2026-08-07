@@ -48,7 +48,7 @@ Linus Torvalds would judge a kernel patch.** Concretely:
    origin-gate everything.
 8. **Comments explain *why*.** Never restate what the code does.
 
-## 2. State of the world (verified 2026-08-03)
+## 2. State of the world (verified through 2026-08-07)
 
 - **Stage 1 (Foundation) is implemented and green:** Zig core (`ssh`,
   `sessions`, `servers`, `bridge`, `main`, `runner`), React/xterm.js
@@ -58,6 +58,12 @@ Linus Torvalds would judge a kernel patch.** Concretely:
   use absolute byte cursors, source-bound async requests, TanStack Virtual for
   5,000-line views, binary-content rejection, SFTP download progress, and
   identity-bound Clear. PM2 controls and threshold alerts remain Oars+ work.
+- **Stage 3 is implemented except for one live acceptance check (verified
+  2026-08-07):** the RFC 6455 bridge, direct-TCP tunnel, probe/setup backend,
+  typed noVNC surface, Keychain password replacement, responsive loading
+  states, and deterministic preview flows are in. A packaged test must still
+  prove nonblank framebuffer pixels plus pointer and keyboard input against a
+  live VNC desktop.
 - **All 18 feature specs exist** in `docs/specs/` (`01`–`18`), each with
   acceptance criteria (§12) and a **Research & References section (§13)**
   citing primary sources with URLs and line refs. Claims were verified
@@ -1247,11 +1253,9 @@ direct-tcpip tunnels (`src/ssh.zig` `openTunnel`), the worker-side tunnel
 state machine in `src/sessions.zig` (listening → handshake → connected →
 closing → closed, driven from the existing run loop), the probe/setup
 helpers (`src/vnc.zig`), the five `oars.vnc.*` bridge handlers
-(start/stop/probe/setup/poll), and the full container integration test
-(`src/integration_vnc.zig`). 157/157 tests green (two consecutive runs),
-`zig build` + frontend build clean. `docs/specs/12-vnc.md` §12 acceptance
-marked for the backend-verifiable items (the credential-bridge box stays
-open for the frontend).
+(start/stop/probe/setup/poll), and the container integration test
+(`src/integration_vnc.zig`). The later frontend and live RFB work completes
+this checkpoint; see section 27 for the current 186-test result.
 
 ### 21.1 What landed
 
@@ -1279,20 +1283,18 @@ open for the frontend).
   || netstat -tln`, `%BEGIN_VNC_PROBE%`-delimited, ports 5900-5999
   deduped, process name from both `users:((` (ss) and `pid/name`
   (netstat) formats), IPv6 `:::` lines handled) and the OS-adapter
-  setup plan (Alpine apk / Debian apt / manual; hint always carries
-  `-passwd`, never `-nopw`).
+  setup plan (Alpine apk / Debian apt / manual; the password enters through
+  bounded stdin and the server starts with `-rfbauth`, never `-nopw`).
 - **`src/bridge.zig`** — 5 handlers: `oars.vnc.start` (ephemeral loopback
   listener; 32-hex token from `std.Io.random`), `.stop`, `.probe`,
   `.setup` (dry-run plan first; execute requires root and audits with
   `display=<n>`), `.poll` (state + byte counters; `closed` for
   tombstones). Session gate: only a `ready` session tunnels.
 - **`src/integration_vnc.zig`** — full container test: setup dry-run →
-  execute + audit, `setsid`-detached Xvfb + x11vnc on :1/5901,
-  probe-with-readiness-loop (asserts the listener process name),
-  `oars.vnc.start` → Zig WebSocket client performs the real RFC 6455
-  handshake (Origin `zero://app`) → observes `RFB 003.008` through the
-  tunnel → poll `connected` with real byte counters → stop → poll
-  `closed`.
+  execute + audit, detached Xvfb + x11vnc on :1/5901, and a real xterm.
+  The Zig client completes RFC 6455 and RFB 3.8 authentication, verifies a
+  varied 1280x800 raw framebuffer, moves the remote pointer, types into xterm,
+  checks byte counters, stops the tunnel, and confirms the closed state.
 
 ### 21.2 Bugs / notes (the container saga)
 
@@ -1315,21 +1317,14 @@ open for the frontend).
   The probe now tries `netstat -tlnp` between `ss` and plain
   `netstat -tln`, and `listenerProcess` parses both formats. The
   integration test asserts the listener's process name is `x11vnc`.
-- **`--test-filter` does not exist in Zig 0.16** — neither as a runner
-  flag nor a build flag; the runner only accepts `--listen=-`,
-  `--seed=`, `--cache-dir`. You cannot run one container test in
-  isolation; run the full suite (`set -a; source
-  scripts/.dev-sshd.env; set +a; zig build test --summary all`).
-- **Keys/access/backup container flakes are state, not code.** Repeated
-  full-suite runs on the persistent container accumulate users
-  (`useradd` exits 9), keys, and rclone state (`no_changes` on a second
-  sync); the next full run passes again. Known, non-blocking.
+- The build step does not expose Zig's compile-time test filter. Use
+  `scripts/integration-test.sh` for the complete remote pass.
+- The integration cases share one disposable remote host. The one-shot script
+  uses `zig build -j1 test` so key, account, process, and object-store changes
+  do not overlap.
 
 ### 21.3 Known limits / next
 
-- Frontend (spec 12 §12): the noVNC view, the credential-bridge
-  handoff of a remembered VNC password, CSP for the loopback WS source,
-  rendering/input acceptance, and the tab footer stats wiring.
 - `poll` on a tombstone returns the final byte counters — good enough
   for the footer; a future cleanup could add a `closed_reason`.
 - Tunnels are bounded by usage; tombstones prune after 60 s.
@@ -1564,9 +1559,35 @@ separation, first trust, changed-key recovery, mirrored-tab close behavior,
 persistent terminal state, profile validation, and responsive layout. Keep
 `frontend/preview.html` as the reusable bridge-state harness for later specs.
 
-## 27. Next implementation target
+## 27. Session handover — 2026-08-07: spec 12 VNC frontend and secure setup
 
-Implement the spec 04 Log Management frontend. Follow
-`docs/NEXT-SPEC.md`; it records the verified backend commands, current client
-contract gaps, safe clear and download flows, preview fixtures, and the full
-validation gate for the next model.
+The VNC tab now owns one typed noVNC `RFB` instance and one SSH tunnel. It
+supports display presets and a validated custom port, fit/100% scaling,
+Ctrl+Alt+Del, clipboard paste, byte counters, Keychain password replacement,
+authentication retry, and deterministic cleanup on disconnect, closed polls,
+server change, stale starts, and unmount. noVNC owns a dedicated empty DOM
+target so its cleanup cannot remove React-owned loading or placeholder nodes.
+
+The setup backend now does the approved work instead of stopping after package
+installation. It writes the password through bounded exec input, clears owned
+password buffers, creates a mode-0600 auth file, starts Xvfb when needed, and
+starts x11vnc with `-localhost -rfbauth`. Slow installs and configuration
+commands cannot report success after a timeout. The production page includes
+the loopback WebSocket CSP required by the packaged transport contract.
+
+Frontend tests, frontend build, Zig build/tests, diff checks, and desktop/mobile
+preview flows passed. The preview proved redacted setup/Keychain payloads,
+responsive dialogs and loading, and one-stop tunnel cleanup.
+
+The final container check now completes VNC authentication against live
+x11vnc, reads a varied 1280x800 framebuffer from xterm, moves the X pointer,
+types into xterm, verifies tunnel byte counters, and tears the tunnel down. The
+setup path also handles x11vnc's password confirmation through non-blocking SSH
+stdin, uses supported readiness and log files, and returns bounded diagnostics.
+The fresh serialized run passes all 186 tests. Spec 12 is complete.
+
+## 28. Next implementation target
+
+Implement the spec 05 File Manager frontend. Follow `docs/NEXT-SPEC.md`; it
+records the exact SFTP backend contract, the raw-path identity rule, the editor
+concurrency gap, transfer requirements, preview fixtures, and validation gate.

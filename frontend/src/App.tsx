@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   Archive,
@@ -48,10 +48,11 @@ import { KeysTab } from "./KeysTab";
 import { AccessTab } from "./AccessTab";
 import { BackupsTab } from "./BackupsTab";
 import { AiTab } from "./AiTab";
-import { VncTab } from "./VncTab";
 import { HistoryTab } from "./HistoryTab";
 import { VaultTab } from "./VaultTab";
 import { AgentTab } from "./AgentTab";
+
+const VncTab = lazy(() => import("./VncTab").then((module) => ({ default: module.VncTab })));
 
 // ---------------------------------------------------------------------------
 // Shell nav
@@ -994,7 +995,11 @@ export default function App() {
                   : activeTab.view === "access" ? <AccessTab key={activeTab.key} />
                   : activeTab.view === "backups" ? <BackupsTab key={activeTab.key} serverId={activeTab.server.id} />
                   : activeTab.view === "ai" ? <AiTab key={activeTab.key} serverId={activeTab.server.id} />
-                  : activeTab.view === "vnc" ? <VncTab key={activeTab.key} serverId={activeTab.server.id} />
+                  : activeTab.view === "vnc" ? (
+                    <Suspense fallback={<OarsLoadingState title="Loading remote desktop" detail="Oars is preparing the secure VNC client." />}>
+                      <VncTab key={activeTab.key} serverId={activeTab.server.id} />
+                    </Suspense>
+                  )
                   : activeTab.view === "history" ? <HistoryTab key={activeTab.key} />
                   : activeTab.view === "vault" ? <VaultTab key={activeTab.key} />
                   : activeTab.view === "agent" ? <AgentTab key={activeTab.key} />

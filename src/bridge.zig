@@ -815,6 +815,7 @@ fn handleSshPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
 
 const vnc_exec_cap: usize = 256 * 1024;
 const vnc_exec_timeout_ns = 20 * std.time.ns_per_s;
+const vnc_install_timeout_ns = 5 * std.time.ns_per_min;
 const vnc_start_timeout_ns = 5 * std.time.ns_per_s;
 
 const VncStartPayload = struct {
@@ -831,6 +832,7 @@ const VncSetupPayload = struct {
     server_id: []const u8,
     display: ?u16 = null,
     dry_run: bool = false,
+    password: ?[]const u8 = null,
 };
 const VncPollPayload = struct {
     server_id: []const u8,
@@ -841,10 +843,31 @@ fn vncExec(self: *Context, server_id: []const u8, cmd: []const u8) ?sessions.Exe
     return self.manager.execWait(server_id, cmd, vnc_exec_cap, vnc_exec_timeout_ns) catch null;
 }
 
+fn vncExecWithInput(self: *Context, server_id: []const u8, cmd: []const u8, input: []const u8) ?sessions.ExecOutcome {
+    return self.manager.execWaitWithInput(server_id, cmd, input, 64 * 1024, 30 * std.time.ns_per_s) catch null;
+}
+
 fn vncCheck(self: *Context, server_id: []const u8, cmd: []const u8) bool {
     var out = vncExec(self, server_id, cmd) orelse return false;
     defer out.output.deinit(self.allocator);
-    return out.exit == 0;
+    return !out.limited and out.exit == 0;
+}
+
+fn vncInstall(self: *Context, server_id: []const u8, cmd: []const u8) bool {
+    var out = self.manager.execWait(server_id, cmd, vnc_exec_cap, vnc_install_timeout_ns) catch return false;
+    defer out.output.deinit(self.allocator);
+    return !out.limited and out.exit == 0;
+}
+
+fn vncSetupFailure(output: []u8, captured: []const u8, timed_out: bool) []const u8 {
+    if (timed_out) return respondError(output, "VNC configuration timed out before the server became ready");
+    const trimmed = std.mem.trim(u8, captured, " \t\r\n");
+    if (trimmed.len == 0) return respondError(output, "VNC configuration failed; the remote command returned no diagnostic output");
+    const detail = if (trimmed.len > 1200) trimmed[trimmed.len - 1200 ..] else trimmed;
+    var message_buf: [1400]u8 = undefined;
+    const message = std.fmt.bufPrint(&message_buf, "VNC configuration failed: {s}", .{detail}) catch
+        "VNC configuration failed; inspect the remote x11vnc log";
+    return respondError(output, message);
 }
 
 fn vncSessionReady(self: *Context, output: []u8, server_id: []const u8) ?[]const u8 {
@@ -941,9 +964,9 @@ fn handleVncProbe(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
 }
 
 /// The setup helper (spec 12 §5): detect the OS, return the tested
-/// install plan; `dry_run: false` executes it after the user's approval
-/// (the frontend shows the plan first) and audits. Always suggests a
-/// password-protected start command — never `-nopw` (spec 12 §8).
+/// install plan; `dry_run: false` installs when needed, stores the supplied
+/// password through x11vnc stdin, and starts a loopback-only server. The
+/// password is never part of a command, process argument, output, or audit.
 fn handleVncSetup(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
     var parsed = parsePayload(VncSetupPayload, self.allocator, invocation.request.payload) catch {
@@ -952,24 +975,51 @@ fn handleVncSetup(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
     defer parsed.deinit();
     const payload = parsed.value;
     if (vncSessionReady(self, output, payload.server_id)) |err| return err;
+    const display = payload.display orelse 0;
+    if (display > vncmod.max_setup_display) return respondError(output, "display must be between 0 and 99");
 
     var os_out = vncExec(self, payload.server_id, "cat /etc/os-release 2>/dev/null") orelse return respondError(output, "cannot detect the server OS");
     defer os_out.output.deinit(self.allocator);
     const installed = vncCheck(self, payload.server_id, "command -v x11vnc >/dev/null 2>&1");
-    var plan = vncmod.setupPlan(self.allocator, os_out.output.items, payload.display orelse 0, installed);
+    var plan = vncmod.setupPlan(self.allocator, os_out.output.items, display, installed);
     defer plan.deinit(self.allocator);
 
-    if (payload.dry_run or std.mem.eql(u8, plan.action, "already_installed") or std.mem.eql(u8, plan.action, "manual")) {
+    if (payload.dry_run or std.mem.eql(u8, plan.action, "manual")) {
         return vncSetupResponse(output, &plan, false);
     }
-    var idc = vncExec(self, payload.server_id, "id -u") orelse return respondError(output, "not connected");
-    defer idc.output.deinit(self.allocator);
-    if (idc.exit != 0 or std.mem.indexOf(u8, std.mem.trim(u8, idc.output.items, " \t\r\n"), "0") == null) {
-        return respondError(output, "installing a VNC server requires root access on the server");
+    const password = payload.password orelse return respondError(output, "enter a VNC password");
+    if (password.len == 0 or password.len > 1024) return respondError(output, "VNC password must be between 1 and 1024 bytes");
+    if (std.mem.indexOfAny(u8, password, "\r\n") != null) return respondError(output, "VNC password cannot contain a line break");
+
+    if (std.mem.eql(u8, plan.action, "install")) {
+        var idc = vncExec(self, payload.server_id, "id -u") orelse return respondError(output, "not connected");
+        defer idc.output.deinit(self.allocator);
+        if (idc.exit != 0 or !std.mem.eql(u8, std.mem.trim(u8, idc.output.items, " \t\r\n"), "0")) {
+            return respondError(output, "installing a VNC server requires root access on the server");
+        }
+        if (!vncInstall(self, payload.server_id, plan.plan)) return respondError(output, "installation failed or timed out");
     }
-    if (!vncCheck(self, payload.server_id, plan.plan)) return respondError(output, "installation failed");
+
+    const start_command = vncmod.secureStartCommand(self.allocator, display) catch return respondError(output, "cannot build the VNC start command");
+    defer self.allocator.free(start_command);
+    const input_len = password.len * 2 + 4;
+    const password_input = self.allocator.alloc(u8, input_len) catch return respondError(output, "out of memory");
+    defer {
+        std.crypto.secureZero(u8, password_input);
+        self.allocator.free(password_input);
+    }
+    @memcpy(password_input[0..password.len], password);
+    password_input[password.len] = '\n';
+    @memcpy(password_input[password.len + 1 .. password.len * 2 + 1], password);
+    password_input[input_len - 3] = '\n';
+    password_input[input_len - 2] = 'y';
+    password_input[input_len - 1] = '\n';
+    var started = vncExecWithInput(self, payload.server_id, start_command, password_input) orelse return respondError(output, "VNC configuration failed");
+    defer started.output.deinit(self.allocator);
+    if (started.limited or started.exit != 0) return vncSetupFailure(output, started.output.items, started.limited);
+
     var detail_buf: [64]u8 = undefined;
-    const detail = std.fmt.bufPrint(&detail_buf, "display={d}", .{payload.display orelse 0}) catch "vnc.setup";
+    const detail = std.fmt.bufPrint(&detail_buf, "display={d} action={s}", .{ display, plan.action }) catch "vnc.setup";
     sshkeysAudit(self, "vnc.setup", payload.server_id, detail);
     return vncSetupResponse(output, &plan, true);
 }
@@ -6384,17 +6434,28 @@ const VaultImportConfirmPayload = struct {
 
 fn vaultAllSections(self: *Context, buf: []vault.Section) usize {
     var n: usize = 0;
-    buf[n] = .{ .name = "servers", .path = self.store.path, .jsonl = false }; n += 1;
-    buf[n] = .{ .name = "logs", .path = self.logs.path, .jsonl = false }; n += 1;
-    buf[n] = .{ .name = "scripts", .path = self.scripts.path, .jsonl = false }; n += 1;
-    buf[n] = .{ .name = "apps", .path = self.apps.path, .jsonl = false }; n += 1;
-    buf[n] = .{ .name = "deploy_runs", .path = self.deploy_history.path, .jsonl = false }; n += 1;
-    buf[n] = .{ .name = "access_identities", .path = self.access.identities.path, .jsonl = false }; n += 1;
-    buf[n] = .{ .name = "backup_jobs", .path = self.backup.jobs.path, .jsonl = false }; n += 1;
-    buf[n] = .{ .name = "backup_runs", .path = self.backup.history.path, .jsonl = false }; n += 1;
-    buf[n] = .{ .name = "ai_provider", .path = self.ai.provider.path, .jsonl = false }; n += 1;
-    buf[n] = .{ .name = "history", .path = self.history.path, .jsonl = true }; n += 1;
-    buf[n] = .{ .name = "audit", .path = self.audit.path, .jsonl = true }; n += 1;
+    buf[n] = .{ .name = "servers", .path = self.store.path, .jsonl = false };
+    n += 1;
+    buf[n] = .{ .name = "logs", .path = self.logs.path, .jsonl = false };
+    n += 1;
+    buf[n] = .{ .name = "scripts", .path = self.scripts.path, .jsonl = false };
+    n += 1;
+    buf[n] = .{ .name = "apps", .path = self.apps.path, .jsonl = false };
+    n += 1;
+    buf[n] = .{ .name = "deploy_runs", .path = self.deploy_history.path, .jsonl = false };
+    n += 1;
+    buf[n] = .{ .name = "access_identities", .path = self.access.identities.path, .jsonl = false };
+    n += 1;
+    buf[n] = .{ .name = "backup_jobs", .path = self.backup.jobs.path, .jsonl = false };
+    n += 1;
+    buf[n] = .{ .name = "backup_runs", .path = self.backup.history.path, .jsonl = false };
+    n += 1;
+    buf[n] = .{ .name = "ai_provider", .path = self.ai.provider.path, .jsonl = false };
+    n += 1;
+    buf[n] = .{ .name = "history", .path = self.history.path, .jsonl = true };
+    n += 1;
+    buf[n] = .{ .name = "audit", .path = self.audit.path, .jsonl = true };
+    n += 1;
     return n;
 }
 
@@ -6410,7 +6471,8 @@ fn vaultFilteredSections(self: *Context, requested: ?[]const []const u8, buf: []
                 if (s.jsonl) continue;
                 if (std.mem.eql(u8, s.name, "deploy_runs")) continue;
                 if (std.mem.eql(u8, s.name, "backup_runs")) continue;
-                buf[n] = s; n += 1;
+                buf[n] = s;
+                n += 1;
             }
             return n;
         }
@@ -6421,7 +6483,9 @@ fn vaultFilteredSections(self: *Context, requested: ?[]const []const u8, buf: []
     for (requested.?) |name| {
         for (all[0..all_n]) |s| {
             if (std.mem.eql(u8, s.name, name)) {
-                buf[n] = s; n += 1; break;
+                buf[n] = s;
+                n += 1;
+                break;
             }
         }
     }

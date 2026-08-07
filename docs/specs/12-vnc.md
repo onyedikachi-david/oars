@@ -1,8 +1,7 @@
 # Spec 12 — Remote Desktop (VNC over SSH)
 
-**Status:** 📋 (protocol and packaged macOS WebView transport research verified
-2026-08-03; implementation planned) · **Depends on:** 02 (session worker), new
-`src/ws.zig` · **Spec owner:** core
+**Status:** ✅ v1 frontend + backend implemented · **Depends on:** 02 (session
+worker), `src/ws.zig` · **Spec owner:** core + frontend
 
 ## 1. Overview
 
@@ -61,10 +60,17 @@ approval-gated.
 ### `oars.vnc.stop` `{server_id, tunnel_id}` → `{ok}`
 ### `oars.vnc.probe` `{server_id}` → `{ok, x11vnc: bool, tigervnc: bool, listening:[{port, process?}]}`
 - Exec: `command -v x11vnc tigervncserver Xvnc; ss -tlnp 2>/dev/null | grep -E ':59[0-9][0-9]'`.
-### `oars.vnc.setup` `{server_id, display?}` → approval-gated exec of a tested OS-adapter plan; audit entry.
-- Detect the distribution, package manager, display ownership, init system, and
-  VNC implementation. Unknown targets get manual guidance rather than a guessed
-  install or service command.
+### `oars.vnc.setup` `{server_id, display?, dry_run, password?}` → `{ok, action, executed, plan, hint}`
+- A dry run returns an exact `install`, `configure`, or `manual` plan and never
+  accepts or returns a password. Unknown targets get manual guidance rather
+  than a guessed command.
+- Execution requires a password for install/configure plans. Supported
+  Debian/Ubuntu and Alpine targets install `x11vnc` and `Xvfb` when needed,
+  then write the password through command input to an owner-only auth file and
+  start `x11vnc` with `-localhost -rfbauth`. The password never enters the
+  command string, process arguments, output, or audit record.
+- Package installation requires remote root access. Every successful execution
+  records only the display and action in the audit journal.
 ### `oars.vnc.poll` `{server_id, tunnel_id}` → `{ok, state: listening|connected|closed, bytes_up, bytes_down, error?}` (stats for the tab footer)
 
 ## 6. Zig core design
@@ -157,16 +163,19 @@ approval-gated.
 ## 11. Testing
 
 - Unit: WS handshake (valid/invalid key, bad Origin, bad token path), frame codec round-trip (masked client frames, fragmentation, ping/pong), channel-bridge byte fidelity.
-- Integration (container): run `x11vnc` inside the container; `oars.vnc.start` → connect with noVNC in a headless WebKit test (or `websocket` client in Zig tests) → assert framebuffer updates arrive (RFB handshake bytes observed).
+- Integration (container): start Xvfb, xterm, and `x11vnc`; run
+  `oars.vnc.start`; complete RFB 3.8 and VNC authentication through the
+  WebSocket tunnel; read a 1280x800 raw framebuffer with varied pixels; move
+  the remote pointer; type into xterm; verify byte counters and teardown.
 - Manual: real desktop session, resize, clipboard, Ctrl+Alt+Del, disconnect mid-session.
 
 ## 12. Acceptance criteria
 
-- [x] VNC session renders and accepts input against a real x11vnc in the test container.
-      *(Backend: the RFB greeting (`RFB 003.008`) was observed flowing
-      through the tunnel end-to-end by the Zig WebSocket client against a
-      live x11vnc — `integration_vnc`. Rendering/input itself is the
-      frontend half.)*
+- [x] A VNC session renders and accepts pointer and keyboard input against a
+      real x11vnc in the test container. `integration_vnc` completes RFB 3.8
+      authentication, verifies varied pixels in the full 1280x800 raw
+      framebuffer, checks the remote pointer with `xdotool`, and checks text
+      entered into a real xterm.
 - [x] The implementation preserves the measured packaged contract:
       `Origin: zero://app`, the `binary` subprotocol, no negotiated extensions,
       and a CSP that permits only the required loopback WebSocket source. The
@@ -174,12 +183,14 @@ approval-gated.
       *(Bad Origin/token rejection and the 15 s idle self-destruct are
       covered: `ws.zig` handshake unit tests + `sessions.zig` tombstone
       tests; the CSP half lands with the frontend.)*
-- [ ] A remembered VNC password crosses the credential bridge once into
+- [x] A remembered VNC password crosses the credential bridge once into
       frontend memory and then reaches noVNC. It never enters config, logs,
       audit, telemetry, or the VNC tunnel outside protocol authentication.
-      *(Frontend: the backend already keeps VNC auth strictly inside the
-      VNC protocol.)*
-- [x] Setup helper installs x11vnc only after approval + audit.
+      Preview calls redact the value, and rejected credentials are removed
+      before the retry flow.
+- [x] Setup helper installs, configures, and starts loopback-only x11vnc only
+      after approval and audit. Password bytes travel through bounded command
+      input and are cleared after use.
 - [x] Codec/handshake unit tests green.
 
 ## 13. Research & References

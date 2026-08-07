@@ -22,7 +22,7 @@ already exists.
 | 09 | [Access Management](09-access.md) | 📋 |
 | 10 | [Backups](10-backups.md) | 📋 |
 | 11 | [AI Terminal](11-ai-terminal.md) | 📋 |
-| 12 | [Remote Desktop (VNC)](12-vnc.md) | 📋 (packaged macOS WebView transport verified; implementation planned) |
+| 12 | [Remote Desktop (VNC)](12-vnc.md) | ✅ v1 frontend + backend implemented |
 | 13 | [Command Palette & Keyboard UX](13-command-palette.md) | 📋 (Oars+) |
 | 14 | [Server Groups & Fleet Views](14-groups.md) | ✅ backend in (UI pending): group/tags validation + normalization on `servers.save` (one-level path rule, case-insensitive dedupe) |
 | 15 | [Command History & Audit](15-history.md) | ✅ backend in (UI pending): history/audit journals with write-time redaction, tracked-exec capture, replay, type-to-confirm clear |

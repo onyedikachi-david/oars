@@ -9,6 +9,11 @@
         const now = Date.now();
         const monitorMode = new URLSearchParams(window.location.search).get("monitor") || "healthy";
         const logsMode = new URLSearchParams(window.location.search).get("logs") || "default";
+        const vncProbeMode = new URLSearchParams(window.location.search).get("vncProbe") || "ready";
+        const vncSetupMode = new URLSearchParams(window.location.search).get("vncSetup") || "install";
+        const vncPollMode = new URLSearchParams(window.location.search).get("vncPoll") || "listening";
+        const vncCredsMode = new URLSearchParams(window.location.search).get("vncCreds") || "none";
+        const vncTunnelMode = new URLSearchParams(window.location.search).get("vncTunnel") || "ok";
         let nextDiagnosticChannel = 900;
         // Logs fixtures (spec 04): deterministic sources, lines with
         // repeatable search matches, one very long line, a follow channel
@@ -54,6 +59,38 @@
         const clearAttempts = new Map();
         const dlTransfers = new Map();
         let dlNextId = 3001;
+        // ── VNC fixtures (spec 12): deterministic probe, start, poll, stop, setup, credentials, disconnected states
+        let vncNextTunnelId = 2001;
+        let vncNextPort = 48181;
+        let vncConfigured = false;
+        const vncTunnels = new Map(); // tunnel_id -> { port, token, state, bytes_up, bytes_down, error }
+        function vncProbePayload() {
+          if (vncConfigured) return { ok: true, x11vnc: true, tigervnc: false, listening: [{ port: 5900, process: "x11vnc" }] };
+          if (vncProbeMode === "missing") return { ok: true, x11vnc: false, tigervnc: false, listening: [] };
+          if (vncProbeMode === "partial") return { ok: true, x11vnc: true, tigervnc: false, listening: [{ port: 5901, process: "Xvnc" }] };
+          // ready: x11vnc installed + one listener
+          return { ok: true, x11vnc: true, tigervnc: true, listening: [{ port: 5901, process: "x11vnc" }] };
+        }
+        function vncSetupHint(display) {
+          const port = 5900 + display;
+          return "x11vnc -storepasswd $HOME/.local/share/oars/vnc/display-" + display + ".passwd; x11vnc -display :" + display + " -rfbport " + port + " -localhost -forever -shared -rfbauth $HOME/.local/share/oars/vnc/display-" + display + ".passwd";
+        }
+        function vncSetupPayload(display, dryRun, password) {
+          const d = display ?? 0;
+          const action = vncSetupMode === "already" || vncConfigured ? "configure" : "install";
+          if (vncSetupMode === "already" && dryRun) return { ok: true, action, plan: "", hint: vncSetupHint(d), executed: false };
+          if (vncSetupMode === "manual") return { ok: true, action: "manual", plan: "", hint: "install x11vnc for your distribution, then start it bound to 127.0.0.1 with a password", executed: false };
+          if (vncSetupMode === "fail") {
+            // dry_run preview still returns a plan; installed path would error — emulate as ok:false rejected by handler
+            if (dryRun) return { ok: true, action: "install", plan: "apt-get update && apt-get install -y x11vnc xvfb", hint: vncSetupHint(d), executed: false };
+            return { ok: false, error: "VNC configuration failed" };
+          }
+          if (dryRun) return { ok: true, action, plan: action === "install" ? "apt-get update && apt-get install -y x11vnc xvfb" : "", hint: vncSetupHint(d), executed: false };
+          if (!password) return { ok: false, error: "enter a VNC password" };
+          vncConfigured = true;
+          return { ok: true, action, plan: action === "install" ? "apt-get update && apt-get install -y x11vnc xvfb" : "", hint: vncSetupHint(d), executed: true };
+        }
+
         const servers = [
           {
             id: "prod-api",
@@ -106,11 +143,18 @@
         ];
         const calls = [];
         const polls = new Map();
+        const previewSecrets = new Map();
+        function recordCall(command, payload) {
+          let recorded = payload;
+          if (command === "native-sdk.credentials.set" && payload && "secret" in payload) recorded = { ...payload, secret: "<redacted>" };
+          if (command === "oars.vnc.setup" && payload && "password" in payload) recorded = { ...payload, password: "<redacted>" };
+          calls.push({ command, payload: recorded, at: performance.now() });
+          document.documentElement.dataset.oarsCalls = JSON.stringify(calls);
+        }
         window.__oarsMock = { calls, servers };
         window.zero = {
           async invoke(command, payload = {}) {
-            calls.push({ command, payload, at: performance.now() });
-            document.documentElement.dataset.oarsCalls = JSON.stringify(calls);
+            recordCall(command, payload);
             if (command === "oars.servers.list") return { servers };
             if (command === "oars.servers.save") {
               const current = servers.find((server) => server.id === payload.id);
@@ -120,7 +164,14 @@
             }
             if (command === "oars.servers.delete") return { ok: true };
             if (command.startsWith("native-sdk.credentials.")) {
-              return command.endsWith(".get") ? "preview-secret" : { ok: true };
+              if (command.endsWith(".set")) { previewSecrets.set(payload.account, payload.secret); return { ok: true }; }
+              if (command.endsWith(".delete")) { previewSecrets.delete(payload.account); return { ok: true }; }
+              if (command.endsWith(".get")) {
+                if (previewSecrets.has(payload.account)) return previewSecrets.get(payload.account);
+                if (vncCredsMode === "none" && payload.account && String(payload.account).startsWith("vnc:")) return null;
+                return "preview-secret";
+              }
+              return { ok: true };
             }
             if (command === "oars.ssh.connect" || command === "oars.ssh.disconnect" || command === "oars.ssh.resize" || command === "oars.ssh.input" || command === "oars.ssh.trust") return { ok: true };
             if (command === "oars.ssh.retrust") {
@@ -271,6 +322,43 @@
               if (t && t.status === "running") t.status = "canceled";
               return { ok: true };
             }
+            // ── VNC fixtures (spec 12) ────────────────────────────────
+            if (command === "oars.vnc.probe") {
+              if (vncProbeMode === "error") return { ok: false, error: "probe failed" };
+              return vncProbePayload();
+            }
+            if (command === "oars.vnc.setup") {
+              const result = vncSetupPayload(payload.display ?? 0, !!payload.dry_run, payload.password);
+              if (result.ok === false) return result;
+              return result;
+            }
+            if (command === "oars.vnc.start") {
+              if (vncTunnelMode === "fail") return { ok: false, error: "tunnel start failed" };
+              if (vncTunnelMode === "timeout") { await delay(2500); return { ok: false, error: "tunnel start timed out" }; }
+              if (vncTunnelMode === "slow") { await delay(30000); return { ok: false, error: "tunnel start timed out" }; }
+              const tid = vncNextTunnelId++;
+              const port = vncNextPort++;
+              const token = Array.from({length:32}, () => Math.floor(Math.random()*16).toString(16)).join("");
+              vncTunnels.set(tid, { port, token, state: vncPollMode, bytes_up: 0, bytes_down: 0, error: vncTunnelMode === "closed" ? "no VNC server on 127.0.0.1:" + (payload.port ?? 5900) + " — try the setup helper" : "" });
+              // simulate byte growth on subsequent polls
+              return { ok: true, tunnel_id: tid, ws_port: port, token };
+            }
+            if (command === "oars.vnc.poll") {
+              const entry = vncTunnels.get(payload.tunnel_id);
+              if (!entry) return { ok: false, error: "unknown tunnel" };
+              // advance bytes on each poll call to exercise the footer counter
+              entry.bytes_up += 2048;
+              entry.bytes_down += entry.state === "connected" ? 8192 : 0;
+              // honor ?vncPoll=connected / listening / closed / error
+              if (vncPollMode === "closed") entry.state = "closed";
+              if (vncPollMode === "error") { entry.state = "closed"; entry.error = "channel open failed"; }
+              return { ok: true, state: entry.state, bytes_up: entry.bytes_up, bytes_down: entry.bytes_down, error: entry.error };
+            }
+            if (command === "oars.vnc.stop") {
+              const entry = vncTunnels.get(payload.tunnel_id);
+              if (entry) entry.state = "closed";
+              return { ok: true };
+            }
             if (command === "native-sdk.dialog.saveFile") {
               if (logsMode === "nodialog") return null;
               return "/Users/preview/Downloads/" + (payload.defaultName || "download.log");
@@ -292,8 +380,7 @@
               // Follow channel (spec 04): absolute cursor protocol — the
               // response carries the delta from the requested cursor.
               if (chId === followState.channel && !followState.closed) {
-                calls.push({ command, payload, at: performance.now() });
-                document.documentElement.dataset.oarsCalls = JSON.stringify(calls);
+                recordCall(command, payload);
                 if (logsMode === "follow-error") {
                   return { ok: false, error: "simulated follow poll failure" };
                 }

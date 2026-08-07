@@ -18,4 +18,6 @@ set -a
 source "$SCRIPT_DIR/.dev-sshd.env"
 set +a
 
-zig build test
+# The integration cases share one disposable remote host. Run one test at a
+# time so account, key, process, and object-store mutations cannot overlap.
+zig build -j1 test

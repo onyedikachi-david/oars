@@ -16,10 +16,14 @@
 # Spec 10 adds rclone (community repo) for the backups integration leg;
 # the bucket side lives in a separate minio/minio container on the shared
 # oars-dev-net network (see scripts/dev-sshd.sh).
+#
+# Spec 12 adds x11vnc/Xvfb plus xterm/xdotool. The VNC integration test uses
+# the latter pair to prove framebuffer, pointer, and keyboard behavior.
 
 FROM alpine:3.20
 
 RUN apk add --no-cache openssh bash zip unzip git nodejs npm nginx curl shadow sudo rclone \
+        x11vnc xvfb xterm xdotool \
     && ssh-keygen -A \
     && echo 'root:oars-test-password' | chpasswd \
     && mkdir -p /root/.ssh \

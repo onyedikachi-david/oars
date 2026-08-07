@@ -635,11 +635,16 @@ html.light {
 .oars-disclosure-body { display: flex; flex-direction: column; gap: 12px; padding-top: 2px; }
 .oars-form-error { padding: 10px 11px; border: 1px solid oklch(0.66 0.14 32 / 0.18); border-radius: 7px; background: oklch(0.66 0.14 32 / 0.08); color: oklch(0.58 0.16 28); font-size: 11px; line-height: 1.5; }
 .oars-modal-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 -20px -18px; padding: 14px 20px; border-top: 1px solid var(--border); background: var(--muted); }
+.oars-modal-footer { width: 100%; margin: 0; box-sizing: border-box; }
 .oars-modal-actions-right { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 .oars-modal-actions-left { display: flex; align-items: center; gap: 8px; }
 .oars-danger-ghost { color: var(--destructive); }
 .oars-danger-ghost:hover { color: var(--destructive); background: oklch(0.66 0.14 32 / 0.08); }
 .oars-confirm { display: inline-flex; align-items: center; gap: 6px; color: var(--foreground); font-size: 11px; }
+.vnc-loading { position: absolute; z-index: 2; inset: 0; display: grid; place-items: center; padding: 16px; overflow: hidden; background: var(--muted); pointer-events: none; }
+.vnc-rfb-target { position: absolute; z-index: 0; inset: 0; overflow: hidden; background: #0f1318; }
+.vnc-rfb-target canvas { max-width: 100%; max-height: 100%; }
+.vnc-password-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 /* Overlay/dialog used by palette (keep existing) */
 .overlay { position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; padding: 24px; background: oklch(0.18 0.012 72 / 0.45); backdrop-filter: blur(6px); }
 .dialog { border: 1px solid var(--border); border-radius: 12px; background: var(--card); box-shadow: 0 20px 60px oklch(0 0 0 / 0.3); overflow: hidden; }
@@ -658,6 +663,7 @@ html.light {
  .oars-modal-overlay { align-items: end; padding: 10px; }
  .oars-modal { max-height: calc(100dvh - 20px); border-radius: 10px; }
  .oars-row-2 { grid-template-columns: 1fr; }
+ .vnc-password-grid { grid-template-columns: 1fr; }
  .oars-modal-actions { align-items: stretch; flex-direction: column-reverse; }
  .oars-modal-actions-left, .oars-modal-actions-right { width: 100%; margin-left: 0; }
  .oars-modal-actions-right [data-slot="button"] { flex: 1; }

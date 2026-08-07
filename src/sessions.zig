@@ -188,6 +188,8 @@ pub const ChannelEntry = struct {
     raw: *ssh.Channel,
     stdin_mutex: std.atomic.Mutex = .unlocked,
     stdin_queue: std.ArrayList(u8) = .empty,
+    /// Set for execWithInput until all queued bytes and EOF reach libssh2.
+    stdin_eof_pending: bool = false,
     eof_seen: bool = false,
     /// Set once the raw libssh2 channel is closed and freed; session
     /// teardown must not close it again.
@@ -208,12 +210,22 @@ pub const ChannelEntry = struct {
             allocator.free(hs);
         }
     }
+
+    fn clearStdin(self: *ChannelEntry, allocator: std.mem.Allocator) void {
+        if (self.stdin_queue.items.len > 0) std.crypto.secureZero(u8, self.stdin_queue.items);
+        self.stdin_queue.deinit(allocator);
+        self.stdin_queue = .empty;
+        self.stdin_eof_pending = false;
+    }
 };
 
 const Op = union(enum) {
     exec: struct {
         id: u32,
         command: []const u8,
+        /// Optional stdin for a bounded non-interactive exec. Owned by the
+        /// op and cleared as soon as the worker has written it.
+        stdin_data: ?[]u8 = null,
         /// Spec 15: when non-null the completed run is recorded in
         /// command history under this kind. Owned by the op; the channel
         /// entry takes them over (or frees them) when the op runs.
@@ -949,6 +961,29 @@ pub const Manager = struct {
         return id;
     }
 
+    /// Queues an untracked exec and writes bounded stdin before sending EOF.
+    /// The worker clears the owned stdin buffer immediately after use.
+    pub fn execWithInput(self: *Manager, server_id: []const u8, command: []const u8, stdin_data: []const u8) !u32 {
+        const session = self.get(server_id) orelse return error.NoSession;
+        if (session.status.load(.acquire) != .ready) return error.NotReady;
+        const id = session.next_channel_id.fetchAdd(1, .monotonic);
+        const owned = try self.allocator.dupe(u8, command);
+        errdefer self.allocator.free(owned);
+        const owned_stdin = try self.allocator.dupe(u8, stdin_data);
+        errdefer {
+            std.crypto.secureZero(u8, owned_stdin);
+            self.allocator.free(owned_stdin);
+        }
+        lockSpin(&session.ops_mutex);
+        defer session.ops_mutex.unlock();
+        try session.ops.append(self.allocator, .{ .exec = .{
+            .id = id,
+            .command = owned,
+            .stdin_data = owned_stdin,
+        } });
+        return id;
+    }
+
     /// Queues a tracked exec (spec 15): the completed run is recorded in
     /// command history under `history_kind`. `history_command` (optional)
     /// is pre-redacted command text to store — used when the operation
@@ -1260,6 +1295,17 @@ pub const Manager = struct {
     /// scan/read). The output is owned by the caller.
     pub fn execWait(self: *Manager, server_id: []const u8, command: []const u8, max_bytes: usize, timeout_ns: i128) !ExecOutcome {
         const channel = try self.exec(server_id, command);
+        return self.waitExec(server_id, channel, max_bytes, timeout_ns);
+    }
+
+    /// Runs a bounded exec with stdin to completion. Secret input is never
+    /// part of the command text or command history.
+    pub fn execWaitWithInput(self: *Manager, server_id: []const u8, command: []const u8, stdin_data: []const u8, max_bytes: usize, timeout_ns: i128) !ExecOutcome {
+        const channel = try self.execWithInput(server_id, command, stdin_data);
+        return self.waitExec(server_id, channel, max_bytes, timeout_ns);
+    }
+
+    fn waitExec(self: *Manager, server_id: []const u8, channel: u32, max_bytes: usize, timeout_ns: i128) !ExecOutcome {
         const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + timeout_ns;
         var out = ExecOutcome{ .output = .empty };
         errdefer out.deinit(self.allocator);
@@ -1934,6 +1980,7 @@ fn workerMain(session: *Session) void {
         // queued ops
         processOps(session);
         if (session.stop_flag.load(.acquire)) break;
+        driveExecStdin(session);
 
         // reads on all channels
         var i: usize = 0;
@@ -1978,7 +2025,7 @@ fn workerMain(session: *Session) void {
                         if (still) _ = session.channels.orderedRemove(i);
                         session.channels_mutex.unlock();
                         if (still) {
-                            entry.stdin_queue.deinit(allocator);
+                            entry.clearStdin(allocator);
                             entry.freeCommandText(allocator);
                             entry.stream.deinit(allocator);
                             allocator.destroy(entry.stream);
@@ -2067,7 +2114,7 @@ fn evictCompletedExecs(session: *Session) void {
         const i = found orelse break;
         const entry = session.channels.items[i];
         _ = session.channels.orderedRemove(i);
-        entry.stdin_queue.deinit(session.allocator);
+        entry.clearStdin(session.allocator);
         entry.freeCommandText(session.allocator);
         entry.stream.deinit(session.allocator);
         session.allocator.destroy(entry.stream);
@@ -2274,14 +2321,14 @@ fn processOps(session: *Session) void {
                     entry.raw.sendEof();
                     entry.raw.close(session.io);
                 }
-                entry.stdin_queue.deinit(allocator);
+                entry.clearStdin(allocator);
                 entry.freeCommandText(allocator);
                 entry.stream.deinit(allocator);
                 allocator.destroy(entry.stream);
                 allocator.destroy(entry);
             },
-            .exec => |e| tryOpenChannel(session, e.id, .exec, e.command, e.history_kind, e.history_command, e.history_secrets),
-            .follow => |f| tryOpenChannel(session, f.id, .log, f.command, null, null, null),
+            .exec => |e| tryOpenChannel(session, e.id, .exec, e.command, e.stdin_data, e.history_kind, e.history_command, e.history_secrets),
+            .follow => |f| tryOpenChannel(session, f.id, .log, f.command, null, null, null, null),
             .clear => |cl| clearLogFile(session, cl.path, cl.expected, cl.outcome),
             .sftp_ls => |so| sftpOpLs(session, so.path, so.outcome),
             .sftp_stat => |so| sftpOpStat(session, so.path, so.outcome),
@@ -2301,6 +2348,28 @@ fn processOps(session: *Session) void {
             .jump_start => |j| jumpStartOp(session, j),
             .forward_set => |f| forwardSetOp(session, f),
         }
+    }
+}
+
+/// Advances stdin for non-interactive exec channels without blocking the
+/// worker. This lets libssh2 service EAGAIN between writes and preserves the
+/// channel long enough to collect remote diagnostics on an early exit.
+fn driveExecStdin(session: *Session) void {
+    lockSpin(&session.channels_mutex);
+    defer session.channels_mutex.unlock();
+    for (session.channels.items) |entry| {
+        if (!entry.stdin_eof_pending or entry.raw_closed) continue;
+        if (entry.stdin_queue.items.len > 0) {
+            const old_len = entry.stdin_queue.items.len;
+            const written = entry.raw.write(entry.stdin_queue.items);
+            if (written > 0) {
+                std.crypto.secureZero(u8, entry.stdin_queue.items[0..written]);
+                std.mem.copyForwards(u8, entry.stdin_queue.items[0 .. old_len - written], entry.stdin_queue.items[written..old_len]);
+                std.crypto.secureZero(u8, entry.stdin_queue.items[old_len - written .. old_len]);
+                entry.stdin_queue.items.len -= written;
+            }
+        }
+        if (entry.stdin_queue.items.len == 0 and entry.raw.trySendEof()) entry.clearStdin(session.allocator);
     }
 }
 
@@ -2553,19 +2622,22 @@ fn tunnelReadWs(t: *Tunnel, buf: []u8) WsRead {
 
 /// Flushes the outbound buffer (handshake response + frames) to the WS
 /// socket, POLLOUT-gated, ≤ 16 KB per write.
-fn tunnelFlushWs(t: *Tunnel) void {
+fn tunnelFlushWs(t: *Tunnel) usize {
     const fd = t.ws.?.socket.handle;
+    var total: usize = 0;
     while (t.send_buf.items.len > 0) {
         var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
-        const ready = std.posix.poll(&fds, 0) catch return;
-        if (ready == 0 or fds[0].revents & std.posix.POLL.OUT == 0) return;
+        const ready = std.posix.poll(&fds, 0) catch return total;
+        if (ready == 0 or fds[0].revents & std.posix.POLL.OUT == 0) return total;
         const chunk = t.send_buf.items[0..@min(t.send_buf.items.len, 16 * 1024)];
         const rc = std.c.write(fd, chunk.ptr, chunk.len);
-        if (rc <= 0) return; // EAGAIN or error — the buffer stays for the next pass
+        if (rc <= 0) return total; // EAGAIN or error — retain the buffer
         const n: usize = @intCast(rc);
         std.mem.copyForwards(u8, t.send_buf.items[0 .. t.send_buf.items.len - n], t.send_buf.items[n..]);
         t.send_buf.items.len -= n;
+        total += n;
     }
+    return total;
 }
 
 fn tunnelQueueFrame(t: *Tunnel, allocator: std.mem.Allocator, opcode: wsmod.Opcode, payload: []const u8) void {
@@ -2727,7 +2799,7 @@ fn closeShellChannel(session: *Session) void {
         const entry = session.channels.items[i];
         if (entry.kind == .shell) {
             if (!entry.raw_closed) entry.raw.close(session.io);
-            entry.stdin_queue.deinit(session.allocator);
+            entry.clearStdin(session.allocator);
             entry.freeCommandText(session.allocator);
             entry.stream.deinit(session.allocator);
             session.allocator.destroy(entry.stream);
@@ -2981,25 +3053,29 @@ fn processTunnels(session: *Session, io: std.Io, now_ns: i128) void {
                     tunnelAddUp(session, tunnel, w);
                     tunnelTouch(session, tunnel, now_ns);
                 }
-                // 3. SSH channel → binary frames on the WS socket.
-                switch (tunnel.raw.?.read(&chunk)) {
-                    .eof => {
-                        tunnelFail(session, tunnel, "the remote VNC server closed the connection");
-                        continue;
-                    },
-                    .again => {},
-                    .data => |n| {
-                        tunnelAddDown(session, tunnel, n);
-                        tunnelTouch(session, tunnel, now_ns);
-                        if (tunnel.send_buf.items.len + n + 14 > wsmod.max_connection_buffer) {
-                            tunnelFail(session, tunnel, "connection buffer exceeded");
-                            continue;
-                        }
-                        tunnelQueueFrame(tunnel, allocator, .binary, chunk[0..n]);
-                    },
+                // 3. SSH channel → binary frames on the WS socket. Drain all
+                // queued libssh2 packets before returning to other channels.
+                var remote_closed = false;
+                read_remote: while (tunnel.send_buf.items.len + tunnel_ws_chunk + 14 <= wsmod.max_connection_buffer) {
+                    switch (tunnel.raw.?.read(&chunk)) {
+                        .eof => {
+                            remote_closed = true;
+                            break :read_remote;
+                        },
+                        .again => break :read_remote,
+                        .data => |n| {
+                            tunnelAddDown(session, tunnel, n);
+                            tunnelTouch(session, tunnel, now_ns);
+                            tunnelQueueFrame(tunnel, allocator, .binary, chunk[0..n]);
+                        },
+                    }
+                }
+                if (remote_closed) {
+                    tunnelFail(session, tunnel, "the remote VNC server closed the connection");
+                    continue;
                 }
                 // 4. Flush the outbound buffer.
-                if (tunnel.ws != null) tunnelFlushWs(tunnel);
+                if (tunnel.ws != null and tunnelFlushWs(tunnel) > 0) tunnelTouch(session, tunnel, now_ns);
                 // 5. Idle timeout.
                 lockSpin(&session.tunnels_mutex);
                 const idle = now_ns - tunnel.last_activity_ns >= tunnel_idle_timeout_ns;
@@ -3010,7 +3086,7 @@ fn processTunnels(session: *Session, io: std.Io, now_ns: i128) void {
                 }
             },
             .closing => {
-                if (tunnel.ws != null) tunnelFlushWs(tunnel);
+                if (tunnel.ws != null) _ = tunnelFlushWs(tunnel);
                 if (tunnel.send_buf.items.len == 0) {
                     // Terminal: release the fds but keep the record as a
                     // tombstone so polls report `closed` (spec 12 §5).
@@ -3064,27 +3140,27 @@ fn handshakeErrorText(err: wsmod.HandshakeError) []const u8 {
 /// the optional history strings, and the optional secret values on every
 /// path: the entry frees them at eviction/close/teardown, the failure
 /// paths free them here.
-fn tryOpenChannel(session: *Session, id: u32, kind: ChannelKind, command: []const u8, history_kind: ?[]const u8, history_command: ?[]const u8, history_secrets: ?[][]const u8) void {
+fn tryOpenChannel(session: *Session, id: u32, kind: ChannelKind, command: []const u8, stdin_data: ?[]u8, history_kind: ?[]const u8, history_command: ?[]const u8, history_secrets: ?[][]const u8) void {
     const allocator = session.allocator;
     const raw = session.transport.openChannel(session.io) catch {
-        freeChannelPayload(allocator, command, history_kind, history_command, history_secrets);
+        freeChannelPayload(allocator, command, stdin_data, history_kind, history_command, history_secrets);
         return;
     };
     raw.exec(session.io, command) catch {
         raw.close(session.io);
-        freeChannelPayload(allocator, command, history_kind, history_command, history_secrets);
+        freeChannelPayload(allocator, command, stdin_data, history_kind, history_command, history_secrets);
         return;
     };
     const stream = allocator.create(Stream) catch {
         raw.close(session.io);
-        freeChannelPayload(allocator, command, history_kind, history_command, history_secrets);
+        freeChannelPayload(allocator, command, stdin_data, history_kind, history_command, history_secrets);
         return;
     };
     stream.* = Stream.init(allocator);
     const entry = allocator.create(ChannelEntry) catch {
         allocator.destroy(stream);
         raw.close(session.io);
-        freeChannelPayload(allocator, command, history_kind, history_command, history_secrets);
+        freeChannelPayload(allocator, command, stdin_data, history_kind, history_command, history_secrets);
         return;
     };
     entry.* = .{
@@ -3097,10 +3173,13 @@ fn tryOpenChannel(session: *Session, id: u32, kind: ChannelKind, command: []cons
         .started_ns = std.Io.Timestamp.now(session.io, .real).nanoseconds,
         .stream = stream,
         .raw = raw,
+        .stdin_queue = if (stdin_data) |input| .{ .items = input, .capacity = input.len } else .empty,
+        .stdin_eof_pending = stdin_data != null,
     };
     lockSpin(&session.channels_mutex);
     session.channels.append(allocator, entry) catch {
         session.channels_mutex.unlock();
+        entry.clearStdin(allocator);
         entry.freeCommandText(allocator);
         allocator.destroy(entry);
         allocator.destroy(stream);
@@ -3111,8 +3190,12 @@ fn tryOpenChannel(session: *Session, id: u32, kind: ChannelKind, command: []cons
 }
 
 /// Frees the channel-op payload strings on a failed open.
-fn freeChannelPayload(allocator: std.mem.Allocator, command: []const u8, history_kind: ?[]const u8, history_command: ?[]const u8, history_secrets: ?[][]const u8) void {
+fn freeChannelPayload(allocator: std.mem.Allocator, command: []const u8, stdin_data: ?[]u8, history_kind: ?[]const u8, history_command: ?[]const u8, history_secrets: ?[][]const u8) void {
     allocator.free(command);
+    if (stdin_data) |input| {
+        std.crypto.secureZero(u8, input);
+        allocator.free(input);
+    }
     if (history_kind) |hk| allocator.free(hk);
     if (history_command) |hc| allocator.free(hc);
     if (history_secrets) |hs| {
@@ -4510,6 +4593,10 @@ fn sessionDone(session: *Session) void {
         switch (op) {
             .exec => |e| {
                 session.allocator.free(e.command);
+                if (e.stdin_data) |input| {
+                    std.crypto.secureZero(u8, input);
+                    session.allocator.free(input);
+                }
                 if (e.history_kind) |hk| session.allocator.free(hk);
                 if (e.history_command) |hc| session.allocator.free(hc);
                 if (e.history_secrets) |hs| {
@@ -4570,7 +4657,7 @@ fn sessionDone(session: *Session) void {
     lockSpin(&session.channels_mutex);
     for (session.channels.items) |entry| {
         if (!entry.raw_closed) entry.raw.close(session.io);
-        entry.stdin_queue.deinit(session.allocator);
+        entry.clearStdin(session.allocator);
         entry.freeCommandText(session.allocator);
         entry.stream.deinit(session.allocator);
         session.allocator.destroy(entry.stream);

@@ -719,7 +719,13 @@ pub const Channel = struct {
     }
 
     pub fn sendEof(self: *Channel) void {
-        _ = c.libssh2_channel_send_eof(self.raw);
+        _ = self.trySendEof();
+    }
+
+    /// Non-blocking EOF request. The worker retries when libssh2 needs more
+    /// transport progress before it can accept the request.
+    pub fn trySendEof(self: *Channel) bool {
+        return c.libssh2_channel_send_eof(self.raw) == 0;
     }
 
     pub fn waitEof(self: *Channel, io: std.Io) Error!void {

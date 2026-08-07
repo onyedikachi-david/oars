@@ -241,7 +241,7 @@ graph TD
     C --> D[libssh2 + mbedTLS<br/>vendored, built by zig cc]
     D --> E1[SSH transport]
     D --> E2[Channels: shell / exec]
-    D -. planned wrappers .-> E3[SFTP · SCP · agent]
+    D --> E3[SFTP · direct TCP tunnels · agent]
     B --> F[Keychain<br/>native-sdk.credentials]
     B --> G[Config store<br/>servers.json in app data dir]
     C --> H[Streams: cursor-based<br/>output buffers, 4MB cap]
@@ -251,9 +251,9 @@ graph TD
 **Key design decisions and target constraints:**
 
 1. **No native→JS push channel in the SDK** → frontend polls `oars.ssh.poll`
-   (~80ms). The current stream advances one shared read cursor. The target API
-   takes an absolute cursor per channel and per consumer, so mirrored views do
-   not drain each other. Bounded-buffer overflow reports each reader's gap.
+   (~80ms). Each consumer supplies an absolute cursor per channel, so mirrored
+   views do not drain each other. Bounded-buffer overflow reports each reader's
+   gap.
 2. **The runtime main thread never blocks on the network.** One worker thread
    per connection owns its libssh2 session; cross-thread state is spin-locked,
    short critical sections.
@@ -272,10 +272,10 @@ graph TD
 |---|---|
 | `oars.servers.list` / `save` / `delete` | Fleet config CRUD (JSON store) |
 | `oars.ssh.connect` / `disconnect` | Start/stop a session (secrets passed per-connect from Keychain) |
-| `oars.ssh.poll` | Registered with a shared mutable cursor today; target is non-destructive per-channel deltas from caller-supplied cursors |
+| `oars.ssh.poll` | Non-destructive per-channel deltas from caller-supplied cursors |
 | `oars.ssh.input` | Terminal stdin |
 | `oars.ssh.exec` | Fire-and-stream a command on a fresh channel (id returned) |
-| `oars.ssh.resize` | Registered, but `resizePty` is currently a no-op; target sends PTY columns/rows |
+| `oars.ssh.resize` | Sends terminal columns/rows to the live PTY |
 | `oars.ssh.trust` | Accept/reject host-key fingerprint |
 | `native-sdk.credentials.*` | Keychain (builtin, permission-gated) |
 | `native-sdk.dialog.openFile` | Key picker (builtin, permission-gated) |
@@ -288,13 +288,12 @@ graph TD
 > one spec per feature (bridge payloads, UI states, Zig design, security,
 > edge cases, acceptance criteria). This section is the sequencing view.
 
-### Stage 1 — Foundation partial
-SSH transport, session manager, bridge protocol, terminal UI, trust flow, and
-config store exist. Live key authentication, trust, and shell use were recorded
-on 2026-08-03. Password auth and exec still need the container pass. PTY resize
-is a no-op, full connect cancellation is not bounded, and server-store
-permissions and corrupt-file recovery need hardening. LICENSE and CONTRIBUTING
-are still absent.
+### Stage 1 — Foundation ✅ v1
+SSH transport, session manager, bridge protocol, terminal UI, trust flow,
+password/key authentication, cursor polling, PTY resize, hardened config
+storage, and the dockerized SSH integration pass are implemented. A dead-IP
+TCP connect remains kernel-bounded because Zig 0.16 has no non-blocking connect
+primitive in the used `std.Io` path.
 
 ### Stage 2 — Monitoring + Logs ✅ v1
 - `oars.monitor.poll` — capability-selected reads of `/proc/stat`,
@@ -308,21 +307,28 @@ are still absent.
   monitor pipeline. Their priority is an Oars product decision, not a claim
   about the vendor's current roadmap.
 
-### Stage 3 — Remote Desktop (VNC) + port tunnels 🔨 next after Stage 2
+### Stage 3 — Remote Desktop (VNC) + port tunnels ✅ v1
 - `src/ws.zig` — bounded RFC 6455 server: handshake with Origin validation,
   token path, explicit `binary` subprotocol selection, no extensions, frame
   and buffer limits, masked client frames, fragmentation, ping/pong, close,
   and unit tests.
 - Worker-loop tunnel support: `oars.vnc.start/stop` (direct-tcpip channel + 127.0.0.1
   listener + bridge), idle-timeout, cleanup on disconnect.
-- Frontend `VncTab`: noVNC RFB, display picker (`:0`, `:1`, custom port), credentials from
-  Keychain (`vnc:<server_id>`), fit-window scaling, Ctrl+Alt+Del menu, clipboard, clear
-  disconnect/security-failure states. One-click setup helper with approval card.
+- Frontend `VncTab`: noVNC RFB, display picker (`:0`, `:1`, custom port),
+  Keychain credentials (`vnc:<server_id>`), fit/100% scaling, Ctrl+Alt+Del,
+  clipboard paste, loading and failure states, and tunnel cleanup.
+- The setup helper now installs when required, creates an owner-only password
+  file through bounded stdin, and starts loopback-only x11vnc after approval.
+- Container acceptance completes RFB 3.8 authentication against live x11vnc,
+  verifies varied 1280x800 framebuffer pixels, moves the remote pointer, and
+  types into xterm through the tunnel.
 - **Reusable for:** DB tunnels (their planned Database Manager), SSH-agent forwarding,
   any local-port ↔ remote-service bridge.
 
-### Stage 4 — File manager (SFTP)
-- `oars.sftp.*` — session-scoped SFTP subsystem (worker-owned): ls/stat/read/write/mkdir/rm/rename/chmod/readdir.
+### Stage 4 — File manager (SFTP) 🔨 next
+- The worker-owned `oars.sftp.*` backend and container integration path are
+  implemented: listing/stat/read/write/save/download, mkdir/rm/rename/chmod,
+  unzip, zip-download, folder size, transfer polling, and cancellation.
 - Frontend v1: one remote pane plus native file dialogs, hidden-items toggle,
   per-file progress and cancel, Finder/Explorer upload drops, inline editor,
   validated ZIP expansion, Download-as-zip, folder sizes on demand, and
@@ -374,8 +380,7 @@ are still absent.
 
 ## 7. Immediate next steps
 
-1. Finish Stage 1 truth gaps: real PTY resize, cancellable DNS/TCP connect,
-   owner-only server storage, and corrupt-file quarantine.
-2. Run the dockerized sshd checks for password auth, key auth, trust, shell,
-   exec exit codes, resize, disconnect during connect, and changed host keys.
-3. Add LICENSE and CONTRIBUTING, then begin Stage 2 from the corrected specs.
+1. Complete the spec 05 file-manager frontend over the existing SFTP backend.
+2. Run the remaining spec 12 packaged live-framebuffer input acceptance check.
+3. Continue with the spec 06 scripts frontend after spec 05 passes its full
+   transfer, editor, archive, and responsive validation gate.

@@ -9,6 +9,10 @@ import type {
   LogClearResult,
   SftpTransferSnapshot,
   SftpOpStart,
+  VncStartResult,
+  VncProbeResult,
+  VncSetupResult,
+  VncPollResult,
 } from "./types";
 
 // Typed bridge client over window.zero.
@@ -221,11 +225,20 @@ export const api = {
     history: (serverId?: string) => invoke<any>("oars.ai.history", serverId ? { server_id: serverId } : {}),
   },
   vnc: {
-    start: (serverId: string) => invoke<any>("oars.vnc.start", { server_id: serverId }),
-    stop: (serverId: string) => invoke<any>("oars.vnc.stop", { server_id: serverId }),
-    probe: (serverId: string) => invoke<any>("oars.vnc.probe", { server_id: serverId }),
-    setup: (serverId: string) => invoke<any>("oars.vnc.setup", { server_id: serverId }),
-    poll: (serverId: string) => invoke<any>("oars.vnc.poll", { server_id: serverId }),
+    start: (serverId: string, opts?: { host?: string; port?: number }) =>
+      invoke<VncStartResult>("oars.vnc.start", { server_id: serverId, host: opts?.host, port: opts?.port }),
+    stop: (serverId: string, tunnelId: number) =>
+      invoke<{ ok: boolean }>("oars.vnc.stop", { server_id: serverId, tunnel_id: tunnelId }),
+    probe: (serverId: string) => invoke<VncProbeResult>("oars.vnc.probe", { server_id: serverId }),
+    setup: (serverId: string, opts?: { display?: number; dry_run?: boolean; password?: string }) =>
+      invoke<VncSetupResult>("oars.vnc.setup", {
+        server_id: serverId,
+        display: opts?.display,
+        dry_run: opts?.dry_run,
+        ...(opts?.password === undefined ? {} : { password: opts.password }),
+      }),
+    poll: (serverId: string, tunnelId: number) =>
+      invoke<VncPollResult>("oars.vnc.poll", { server_id: serverId, tunnel_id: tunnelId }),
   },
   history: {
     record: (entry: any) => invoke<any>("oars.history.record", entry),
