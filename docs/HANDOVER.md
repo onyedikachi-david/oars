@@ -1758,7 +1758,48 @@ heap + handshake. 193/193 with the dev containers.
     lifetimes (deploy.Step, access items) must dupe or use static text;
     respondError paths need a caller-owned buffer threaded down.
 
-## 31. Next implementation target
+## 31. Session handover — 2026-08-07: §29 audit findings fixed + two jump-path bugs the new test caught
+
+The three §29 findings are now fixed in `sessions.zig`:
+
+1. **Jump-host disconnect deadlock** — `disconnect` now removes the map
+   entry under the manager mutex, then joins + destroys OUTSIDE it (new
+   `teardown` helper). The dying worker's cascade resolves dependants
+   via `cascadeCloseDependant`, which does get+update atomically under
+   the manager mutex — so a found entry is always live (removal happens
+   under the same mutex before teardown) and no join ever waits on a
+   thread that needs the mutex.
+2. **Reconnect-after-clean-close leak** — `connect` removes the stale
+   `.closed` entry under the mutex and tears it down after the unlock
+   (defer order documented in the code) instead of `put`-overwriting it.
+3. **Dead `Session.via` field** — removed (write-only; the cascade
+   resolves dependants by id through the manager map).
+
+Writing the container regression test (`integration_jump.zig`, wired
+into the comptime block — pitfall 24) caught two more real bugs:
+
+4. **The jump-tunnel pump blocked the via worker's run loop.**
+   `processJumpTunnels` did a bare `std.posix.read` on the blocking
+   socketpair fd every pass; the first time the target went quiet
+   mid-exchange (right after the password-auth request) the read never
+   returned, freezing the via worker and stalling the auth
+   ("authentication failed: Timeout (Waiting for password response)").
+   The fd read is now `poll(fd, POLL.IN, 0)`-gated (pitfall 7). Note the
+   channel→fd write side is still a blocking `write(2)`; a target that
+   stops draining entirely can stall the pump — bytes already dequeued
+   from libssh2 can't be un-read, so a proper fix wants a bounded
+   per-tunnel pending buffer. Accepted for now (the existing "partial
+   writes: v1 closes" note is the same compromise).
+5. **The cascade resolved the wrong id.** workerMain filled the jump
+   tunnel's `target_server_id` with `via_id`, so the cascade looked up
+   the via (already removed) and silently no-op'd — dependants were
+   never marked. It now dupes `session.server.id` (the dependant). The
+   integration test (connect through the jump, disconnect the via,
+   assert the target leaves `.ready`) fails without fixes 1+4+5.
+
+196/196 with the dev containers (1m17s — the env gates really ran).
+
+## 32. Next implementation target
 
 Implement the spec 05 File Manager frontend. Follow `docs/NEXT-SPEC.md`; it
 records the exact SFTP backend contract, the raw-path identity rule, the editor

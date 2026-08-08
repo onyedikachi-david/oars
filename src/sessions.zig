@@ -20,6 +20,16 @@ const deploy = @import("deploy.zig");
 const wsmod = @import("ws.zig");
 const agent = @import("agent.zig");
 
+// fcntl is variadic, so the cImport cannot translate it; declare the
+// exact signature we use, with the darwin/Linux constants pinned
+// (sys/fcntl.h: F_SETFL=4, O_NONBLOCK=0x0004 — identical on both).
+extern fn fcntl(fd: c_int, cmd: c_int, flags: c_int) c_int;
+const F_SETFL: c_int = 4;
+const O_NONBLOCK: c_int = 0x0004;
+// macOS errno accessor (unistd-level EAGAIN is 35 on darwin/Linux).
+extern fn __error() *c_int;
+const EAGAIN: c_int = 35;
+
 /// Blocking acquire on std.atomic.Mutex (spinlock) — 0.16's atomic.Mutex
 /// only exposes tryLock. Sections are short (buffer/cursor updates), so
 /// spinning is appropriate.
@@ -655,18 +665,29 @@ pub const JumpStartOutcome = struct {
 /// channel to the target, pumped against the local socketpair fd. The
 /// via worker owns its lifecycle; the target session's transport runs
 /// over the other socketpair end.
+/// Per-direction pump buffer cap for jump tunnels (spec 18). A full
+/// buffer backpressures: the source is not read until the buffer
+/// drains, so the worker loop never blocks and no bytes are dropped.
+const jump_frame_cap = 256 * 1024;
+
 pub const JumpTunnel = struct {
     channel: *ssh.Channel,
     fd: std.posix.socket_t,
     /// Owned; the via worker cascades a clear close to this session
     /// when the tunnel dies.
     target_server_id: []const u8,
+    /// Bytes read from the channel, not yet fully written to the fd.
+    to_fd_buf: std.ArrayList(u8) = .empty,
+    /// Bytes read from the fd, not yet fully written to the channel.
+    to_channel_buf: std.ArrayList(u8) = .empty,
     bytes_up: u64 = 0,
     bytes_down: u64 = 0,
 
     pub fn deinit(self: *JumpTunnel, allocator: std.mem.Allocator, io: std.Io) void {
         _ = ssh.c.close(self.fd);
         self.channel.close(io);
+        self.to_fd_buf.deinit(allocator);
+        self.to_channel_buf.deinit(allocator);
         allocator.free(self.target_server_id);
     }
 };
@@ -727,10 +748,15 @@ pub const ForwardSetOutcome = struct {
 };
 
 /// Spec 18: one accepted auth-agent channel being proxied to the local
-/// agent socket.
+/// agent socket. Same buffered/non-blocking pump contract as
+/// JumpTunnel (a blocking fd here would freeze the via worker's loop).
 pub const ForwardTunnel = struct {
     channel: *ssh.Channel,
     agent_fd: std.posix.socket_t,
+    /// Bytes read from the channel, not yet fully written to the socket.
+    to_socket_buf: std.ArrayList(u8) = .empty,
+    /// Bytes read from the socket, not yet fully written to the channel.
+    to_channel_buf: std.ArrayList(u8) = .empty,
 };
 
 /// Closed tunnels survive this long as tombstones so polls keep
@@ -806,10 +832,6 @@ pub const Session = struct {
     /// target, pumped against the local socketpair fd. Guarded by the
     /// same tunnels_mutex; the worker owns each tunnel's lifecycle.
     jump_tunnels: std.ArrayList(*JumpTunnel) = .empty,
-    /// Spec 18: the jump host this session tunnels through (owned ref).
-    /// The via session's worker pumps the tunnel; when the via dies the
-    /// cascade marks this session with a clear close state.
-    via: ?*Session = null,
     /// Owned name of the via hop, for error messages ("<name> unreachable").
     via_name: ?[]const u8 = null,
     /// The manager that owns this session (for the jump cascade).
@@ -925,10 +947,21 @@ pub const Manager = struct {
         passphrase: ?[]const u8,
     ) !*Session {
         lockSpin(&self.mutex);
+        // A stale cleanly-closed session is replaced rather than leaked:
+        // removed from the map here and torn down after the unlock
+        // (joining under the manager mutex deadlocks against the dying
+        // worker's dependant cascade — see disconnect). Defer order:
+        // the unlock runs first (declared last), the teardown second.
+        var stale_key: ?[]const u8 = null;
+        var stale_session: ?*Session = null;
+        defer if (stale_session) |ss| self.teardown(stale_key.?, ss);
         defer self.mutex.unlock();
 
-        if (self.sessions.get(server.id)) |existing| {
-            if (existing.status.load(.acquire) != .closed) return error.AlreadyConnected;
+        if (self.sessions.getEntry(server.id)) |existing| {
+            if (existing.value_ptr.*.status.load(.acquire) != .closed) return error.AlreadyConnected;
+            stale_key = existing.key_ptr.*;
+            stale_session = existing.value_ptr.*;
+            _ = self.sessions.remove(server.id);
         }
 
         const session = try self.allocator.create(Session);
@@ -969,12 +1002,16 @@ pub const Manager = struct {
         return session;
     }
 
-    /// Signals a session to stop, cancels any in-flight DNS lookup, joins
-    /// its worker thread, then frees all session memory. Safe to call when
-    /// no session exists. The join stays bounded because the worker checks
-    /// the stop signal between every connect phase and inside every deadline
-    /// loop; only the kernel-bounded TCP connect itself can extend it (the
-    /// std Io has no non-blocking connect — spec 02 §5).
+    /// Signals a session to stop, cancels any in-flight DNS lookup, then
+    /// tears it down. Safe to call when no session exists. The map entry
+    /// is removed under the manager mutex, but the join and destruction
+    /// run OUTSIDE it: a dying worker's sessionDone jump-tunnel cascade
+    /// resolves dependants through the manager mutex, so joining while
+    /// holding it deadlocks both threads. The join stays bounded because
+    /// the worker checks the stop signal between every connect phase and
+    /// inside every deadline loop; only the kernel-bounded TCP connect
+    /// itself can extend it (the std Io has no non-blocking connect —
+    /// spec 02 §5).
     pub fn disconnect(self: *Manager, server_id: []const u8) void {
         lockSpin(&self.mutex);
         const entry = self.sessions.getEntry(server_id) orelse {
@@ -985,10 +1022,17 @@ pub const Manager = struct {
         const session = entry.value_ptr.*;
         session.stop_flag.store(true, .release);
         session.transport.cancelConnect(session.io);
-        if (session.worker) |thread| thread.join();
         _ = self.sessions.remove(server_id);
         self.mutex.unlock();
 
+        self.teardown(key, session);
+    }
+
+    /// Joins the worker and frees all session memory. The map entry must
+    /// already be removed and the caller must not hold the manager mutex
+    /// (see disconnect).
+    fn teardown(self: *Manager, key: []const u8, session: *Session) void {
+        if (session.worker) |thread| thread.join();
         self.allocator.free(key);
         var s = session.server;
         s.deinit(session.allocator);
@@ -996,6 +1040,21 @@ pub const Manager = struct {
         if (session.passphrase) |p| session.allocator.free(p);
         session.threaded.deinit();
         session.allocator.destroy(session);
+    }
+
+    /// Marks a jump-tunnel dependant cascade-closed, resolving it under
+    /// the manager mutex so a concurrent disconnect cannot destroy the
+    /// target mid-update (disconnect removes the entry under the same
+    /// mutex before tearing down, so a found entry is always live).
+    fn cascadeCloseDependant(self: *Manager, target_server_id: []const u8, via_name: []const u8) void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const target = self.sessions.get(target_server_id) orelse return;
+        if (target.status.load(.acquire) == .ready) {
+            target.status.store(.@"error", .release);
+            var msg_buf: [256]u8 = undefined;
+            target.setError(std.fmt.bufPrint(&msg_buf, "jump host {s} disconnected", .{via_name}) catch "jump host disconnected");
+        }
     }
 
     pub fn shutdownAll(self: *Manager) void {
@@ -1763,13 +1822,27 @@ fn workerMain(session: *Session) void {
             session.setError("jump host tunnel socket failed");
             return;
         }
+        // Both ends must be non-blocking: the via worker pumps fds[0] in
+        // its run loop (a blocking read would freeze every other channel
+        // of the via session), and the target's libssh2 runs EAGAIN loops
+        // on fds[1] (libssh2_session_set_blocking does NOT alter the
+        // socket itself). SO_NOSIGPIPE keeps a closed peer from
+        // signalling the process on write.
+        for (&fds) |fd| {
+            _ = fcntl(fd, F_SETFL, O_NONBLOCK);
+            var one: c_int = 1;
+            _ = ssh.c.setsockopt(fd, ssh.c.SOL_SOCKET, ssh.c.SO_NOSIGPIPE, &one, @sizeOf(c_int));
+        }
         var outcome: JumpStartOutcome = .{};
         const host_owned = allocator.dupe(u8, session.server.host) catch {
             _ = ssh.c.close(fds[0]);
             _ = ssh.c.close(fds[1]);
             return;
         };
-        const target_id_owned = allocator.dupe(u8, via_id) catch {
+        // The tunnel's dependant is THIS session — the cascade resolves
+        // it by id when the via dies (duping via_id here made the
+        // cascade resolve the via itself, a silent no-op).
+        const target_id_owned = allocator.dupe(u8, session.server.id) catch {
             allocator.free(host_owned);
             _ = ssh.c.close(fds[0]);
             _ = ssh.c.close(fds[1]);
@@ -1800,7 +1873,6 @@ fn workerMain(session: *Session) void {
             session.setError(std.fmt.bufPrint(&error_buf, "jump host {s} unreachable: {s}", .{ via_record.name, outcome.message() }) catch "jump host unreachable");
             return;
         }
-        session.via = via_session;
         session.via_name = allocator.dupe(u8, via_record.name) catch null;
         connect_fd = fds[1];
     }
@@ -2586,32 +2658,51 @@ fn processJumpTunnels(session: *Session, io: std.Io) void {
 
         var remove = false;
         var buf: [16 * 1024]u8 = undefined;
-        // channel → fd
-        switch (jt.channel.read(&buf)) {
-            .eof => remove = true,
-            .again => {},
-            .data => |n| {
+        // Drain pending sends first — the fd and channel are both
+        // non-blocking, so these never stall the worker loop; whatever
+        // does not fit stays buffered for the next pass.
+        if (jt.to_fd_buf.items.len > 0) {
+            const w = ssh.c.write(jt.fd, jt.to_fd_buf.items.ptr, jt.to_fd_buf.items.len);
+            if (w < 0) {
+                if (__error().* != EAGAIN) remove = true;
+            } else if (w > 0) {
+                const n: usize = @intCast(w);
                 jt.bytes_down += n;
-                const written = ssh.c.write(jt.fd, buf[0..n].ptr, buf[0..n].len);
-                if (written < 0) {
+                std.mem.copyForwards(u8, jt.to_fd_buf.items[0 .. jt.to_fd_buf.items.len - n], jt.to_fd_buf.items[n..]);
+                jt.to_fd_buf.items.len -= n;
+            }
+        }
+        if (!remove and jt.to_channel_buf.items.len > 0) {
+            const w = jt.channel.write(jt.to_channel_buf.items);
+            if (w > 0) {
+                jt.bytes_up += w;
+                std.mem.copyForwards(u8, jt.to_channel_buf.items[0 .. jt.to_channel_buf.items.len - w], jt.to_channel_buf.items[w..]);
+                jt.to_channel_buf.items.len -= w;
+            }
+        }
+        // channel → to_fd_buf (only while the buffer has room — a full
+        // buffer backpressures instead of blocking or dropping bytes).
+        if (!remove and jt.to_fd_buf.items.len < jump_frame_cap) {
+            switch (jt.channel.read(&buf)) {
+                .eof => remove = true,
+                .again => {},
+                .data => |n| {
+                    jt.to_fd_buf.appendSlice(allocator, buf[0..n]) catch {};
+                },
+            }
+        }
+        // fd → to_channel_buf (non-blocking: EAGAIN means quiet, EOF and
+        // real errors retire the tunnel).
+        if (!remove and jt.to_channel_buf.items.len < jump_frame_cap) {
+            const n = std.posix.read(jt.fd, &buf) catch |err| switch (err) {
+                error.WouldBlock => 0,
+                else => {
                     remove = true;
                     continue;
-                }
-                if (@as(usize, @intCast(written)) < n) remove = true; // partial writes: v1 closes
-            },
-        }
-        // fd → channel
-        if (!remove) {
-            const n = std.posix.read(jt.fd, &buf) catch {
-                remove = true;
-                continue;
+                },
             };
-            if (n == 0) {
-                remove = true; // peer closed
-            } else {
-                const w = jt.channel.write(buf[0..n]);
-                if (w == 0) remove = true;
-                jt.bytes_up += w;
+            if (n > 0) {
+                jt.to_channel_buf.appendSlice(allocator, buf[0..n]) catch {};
             }
         }
         if (remove) {
@@ -2959,6 +3050,12 @@ fn connectAgentSocket(session: *Session) !std.posix.socket_t {
     const fd = ssh.c.socket(ssh.c.AF_UNIX, ssh.c.SOCK_STREAM, 0);
     if (fd < 0) return error.ConnectionFailed;
     errdefer _ = ssh.c.close(fd);
+    // Non-blocking from the start (a blocking connect or write would
+    // freeze the via worker's run loop) and SO_NOSIGPIPE so a closed
+    // agent never signals the process.
+    _ = fcntl(fd, F_SETFL, O_NONBLOCK);
+    var one: c_int = 1;
+    _ = ssh.c.setsockopt(fd, ssh.c.SOL_SOCKET, ssh.c.SO_NOSIGPIPE, &one, @sizeOf(c_int));
     var addr: ssh.c.sockaddr_un = .{};
     addr.sun_family = ssh.c.AF_UNIX;
     if (@hasField(@TypeOf(addr), "sun_len")) {
@@ -2966,7 +3063,19 @@ fn connectAgentSocket(session: *Session) !std.posix.socket_t {
     }
     @memcpy(@as([*]u8, @ptrCast(&addr.sun_path))[0..path.len], path[0..path.len]);
     const addr_len: c_uint = @intCast(@offsetOf(ssh.c.sockaddr_un, "sun_path") + path.len + 1);
-    if (ssh.c.connect(fd, @ptrCast(&addr), addr_len) != 0) return error.ConnectionFailed;
+    if (ssh.c.connect(fd, @ptrCast(&addr), addr_len) != 0) {
+        if (__error().* == EAGAIN or __error().* == 36) { // EAGAIN/EINPROGRESS
+            // Non-blocking connect: wait for writability, then verify.
+            var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
+            const ready = std.posix.poll(&pfd, 2000) catch return error.ConnectionFailed;
+            if (ready == 0) return error.ConnectionFailed;
+            var so_error: c_int = 0;
+            var so_len: std.posix.socklen_t = @sizeOf(c_int);
+            if (ssh.c.getsockopt(fd, ssh.c.SOL_SOCKET, ssh.c.SO_ERROR, &so_error, &so_len) != 0 or so_error != 0) return error.ConnectionFailed;
+        } else {
+            return error.ConnectionFailed;
+        }
+    }
     return fd;
 }
 
@@ -2985,11 +3094,13 @@ fn processForwardChannels(session: *Session, io: std.Io) void {
         session.forward_mutex.unlock();
         const agent_fd = connectAgentSocket(session) catch {
             ch.close(io);
+            allocator.destroy(ch);
             continue;
         };
         const ft = allocator.create(ForwardTunnel) catch {
             _ = ssh.c.close(agent_fd);
             ch.close(io);
+            allocator.destroy(ch);
             continue;
         };
         ft.* = .{ .channel = ch, .agent_fd = agent_fd };
@@ -3014,22 +3125,47 @@ fn processForwardChannels(session: *Session, io: std.Io) void {
         session.forward_mutex.unlock();
         var remove = false;
         var buf: [16 * 1024]u8 = undefined;
-        switch (ft.channel.read(&buf)) {
-            .eof => remove = true,
-            .again => {},
-            .data => |n| {
-                if (ssh.c.write(ft.agent_fd, buf[0..n].ptr, buf[0..n].len) < 0) remove = true;
-            },
+        // Drain pending sends first (non-blocking; leftovers stay
+        // buffered for the next pass, so no bytes are dropped and the
+        // worker loop never stalls).
+        if (ft.to_socket_buf.items.len > 0) {
+            const w = ssh.c.write(ft.agent_fd, ft.to_socket_buf.items.ptr, ft.to_socket_buf.items.len);
+            if (w < 0) {
+                if (__error().* != EAGAIN) remove = true;
+            } else if (w > 0) {
+                const n: usize = @intCast(w);
+                std.mem.copyForwards(u8, ft.to_socket_buf.items[0 .. ft.to_socket_buf.items.len - n], ft.to_socket_buf.items[n..]);
+                ft.to_socket_buf.items.len -= n;
+            }
         }
-        if (!remove) {
-            const n = std.posix.read(ft.agent_fd, &buf) catch {
-                remove = true;
-                continue;
+        if (!remove and ft.to_channel_buf.items.len > 0) {
+            const w = ft.channel.write(ft.to_channel_buf.items);
+            if (w > 0) {
+                std.mem.copyForwards(u8, ft.to_channel_buf.items[0 .. ft.to_channel_buf.items.len - w], ft.to_channel_buf.items[w..]);
+                ft.to_channel_buf.items.len -= w;
+            }
+        }
+        // channel → to_socket_buf (backpressures when the buffer is full).
+        if (!remove and ft.to_socket_buf.items.len < jump_frame_cap) {
+            switch (ft.channel.read(&buf)) {
+                .eof => remove = true,
+                .again => {},
+                .data => |n| {
+                    ft.to_socket_buf.appendSlice(allocator, buf[0..n]) catch {};
+                },
+            }
+        }
+        // socket → to_channel_buf (non-blocking; EAGAIN is quiet).
+        if (!remove and ft.to_channel_buf.items.len < jump_frame_cap) {
+            const n = std.posix.read(ft.agent_fd, &buf) catch |err| switch (err) {
+                error.WouldBlock => 0,
+                else => {
+                    remove = true;
+                    continue;
+                },
             };
-            if (n == 0) {
-                remove = true;
-            } else {
-                if (ft.channel.write(buf[0..n]) == 0) remove = true;
+            if (n > 0) {
+                ft.to_channel_buf.appendSlice(allocator, buf[0..n]) catch {};
             }
         }
         if (remove) {
@@ -3037,8 +3173,12 @@ fn processForwardChannels(session: *Session, io: std.Io) void {
             _ = session.forward_active.orderedRemove(i);
             session.forward_mutex.unlock();
             _ = ssh.c.close(ft.agent_fd);
-            ft.channel.close(io);
+            const ch = ft.channel;
+            ch.close(io);
+            ft.to_socket_buf.deinit(allocator);
+            ft.to_channel_buf.deinit(allocator);
             allocator.destroy(ft);
+            allocator.destroy(ch);
             continue;
         }
         i += 1;
@@ -4774,16 +4914,12 @@ fn sessionDone(session: *Session) void {
     session.tunnels_mutex.unlock();
 
     // Jump-host tunnels (spec 18): everything dies with the via session,
-    // and dependants get a clear cascade close state.
+    // and dependants get a clear cascade close state. The dependant is
+    // resolved under the manager mutex (cascadeCloseDependant) so a
+    // concurrent disconnect cannot tear it down mid-update.
     lockSpin(&session.tunnels_mutex);
     for (session.jump_tunnels.items) |jt| {
-        if (session.owner.get(jt.target_server_id)) |target| {
-            if (target.status.load(.acquire) == .ready) {
-                target.status.store(.@"error", .release);
-                var msg_buf: [256]u8 = undefined;
-                target.setError(std.fmt.bufPrint(&msg_buf, "jump host {s} disconnected", .{session.server.name}) catch "jump host disconnected");
-            }
-        }
+        session.owner.cascadeCloseDependant(jt.target_server_id, session.server.name);
         jt.deinit(session.allocator, session.io);
         session.allocator.destroy(jt);
     }
@@ -4793,11 +4929,17 @@ fn sessionDone(session: *Session) void {
 
     // Agent forwarding (spec 18): close every accepted agent channel.
     lockSpin(&session.forward_mutex);
-    for (session.forward_queue.items) |ch| ch.close(session.io);
+    for (session.forward_queue.items) |ch| {
+        ch.close(session.io);
+        session.allocator.destroy(ch);
+    }
     session.forward_queue.clearAndFree(session.allocator);
     for (session.forward_active.items) |ft| {
         _ = ssh.c.close(ft.agent_fd);
         ft.channel.close(session.io);
+        ft.to_socket_buf.deinit(session.allocator);
+        ft.to_channel_buf.deinit(session.allocator);
+        session.allocator.destroy(ft.channel);
         session.allocator.destroy(ft);
     }
     session.forward_active.clearAndFree(session.allocator);
@@ -5167,4 +5309,107 @@ test "sessionDone completes queued op outcomes honestly" {
     allocator.destroy(waited);
     try std.testing.expect(session.worker_done.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), session.ops.items.len);
+}
+
+test "reconnect after clean close tears down the replaced session" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const now = std.Io.Timestamp.now(io, .real).nanoseconds;
+    var dir_buf: [128]u8 = undefined;
+    var store_path_buf: [512]u8 = undefined;
+    var audit_path_buf: [512]u8 = undefined;
+    var history_path_buf: [512]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "oars-sessions-test-{d}", .{now});
+    const store_path = try std.fmt.bufPrint(&store_path_buf, "/tmp/{s}/servers.json", .{dir});
+    const audit_path = try std.fmt.bufPrint(&audit_path_buf, "/tmp/{s}/audit.jsonl", .{dir});
+    const history_path = try std.fmt.bufPrint(&history_path_buf, "/tmp/{s}/history.jsonl", .{dir});
+    var store: servers.Store = .{ .allocator = allocator, .path = store_path };
+    var audit: history.AuditStore = .{ .allocator = allocator, .path = audit_path };
+    var history_store: history.HistoryStore = .{ .allocator = allocator, .path = history_path };
+    var manager = Manager.init(allocator, io, &store, &audit, &history_store, null);
+    defer manager.deinit();
+
+    const server = servers.Server{
+        .id = "re-1",
+        .name = "re",
+        .host = "127.0.0.1",
+        .port = 1,
+        .user = "u",
+    };
+    _ = try manager.connect(server, null, null);
+    const first = manager.get("re-1").?;
+    const deadline = std.Io.Timestamp.now(io, .real).nanoseconds + 10 * std.time.ns_per_s;
+    while (!first.worker_done.load(.acquire)) {
+        if (std.Io.Timestamp.now(io, .real).nanoseconds >= deadline) return error.WorkerStuck;
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(5), .awake) catch {};
+    }
+    // A refused connect ends .error; the stale-replacement path is
+    // specific to a cleanly-closed record, so close it out synthetically.
+    first.status.store(.closed, .release);
+
+    // The replacement must tear the stale session down (join + free),
+    // not overwrite the map entry and leak it.
+    _ = try manager.connect(server, null, null);
+    const second = manager.get("re-1").?;
+    try std.testing.expect(first != second);
+    manager.disconnect("re-1");
+    // std.testing.allocator fails the run unless the first session, its
+    // server copy, and the replaced map key were all freed.
+}
+
+test "cascadeCloseDependant marks the dependant and tolerates a removed one" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const now = std.Io.Timestamp.now(io, .real).nanoseconds;
+    var dir_buf: [128]u8 = undefined;
+    var store_path_buf: [512]u8 = undefined;
+    var audit_path_buf: [512]u8 = undefined;
+    var history_path_buf: [512]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "oars-sessions-test-{d}", .{now});
+    const store_path = try std.fmt.bufPrint(&store_path_buf, "/tmp/{s}/servers.json", .{dir});
+    const audit_path = try std.fmt.bufPrint(&audit_path_buf, "/tmp/{s}/audit.jsonl", .{dir});
+    const history_path = try std.fmt.bufPrint(&history_path_buf, "/tmp/{s}/history.jsonl", .{dir});
+    var store: servers.Store = .{ .allocator = allocator, .path = store_path };
+    var audit: history.AuditStore = .{ .allocator = allocator, .path = audit_path };
+    var history_store: history.HistoryStore = .{ .allocator = allocator, .path = history_path };
+    var manager = Manager.init(allocator, io, &store, &audit, &history_store, null);
+    defer manager.deinit();
+
+    // A hand-built dependant session in the map (worker never ran).
+    const target = try allocator.create(Session);
+    target.* = .{
+        .id = 7,
+        .server = try (servers.Server{ .id = "t-1", .name = "t", .host = "h", .user = "u" }).copy(allocator),
+        .allocator = allocator,
+        .threaded = std.Io.Threaded.init(allocator, .{}),
+        .io = undefined,
+        .transport = try ssh.Session.init(allocator),
+        .store = &store,
+        .audit = &audit,
+        .history = &history_store,
+        .owner = &manager,
+        .started_at_ns = now,
+    };
+    target.io = target.threaded.io();
+    target.status.store(.ready, .release);
+    const key = try allocator.dupe(u8, "t-1");
+    {
+        lockSpin(&manager.mutex);
+        defer manager.mutex.unlock();
+        try manager.sessions.put(key, target);
+    }
+
+    manager.cascadeCloseDependant("t-1", "jump-box");
+    try std.testing.expectEqual(Status.@"error", target.status.load(.acquire));
+    try std.testing.expect(std.mem.indexOf(u8, target.errorText(), "jump-box") != null);
+
+    // Removed from the map first: the cascade is a no-op and touches
+    // nothing (disconnect tears down under the same mutex discipline).
+    {
+        lockSpin(&manager.mutex);
+        defer manager.mutex.unlock();
+        _ = manager.sessions.remove("t-1");
+    }
+    manager.teardown(key, target);
+    manager.cascadeCloseDependant("t-1", "jump-box");
 }
