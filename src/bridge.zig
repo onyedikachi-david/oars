@@ -923,8 +923,10 @@ fn handleVncStart(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
     }
     const token = token_buf[0..32];
     const id = self.manager.nextTunnelId();
-    var outcome: sessions.TunnelStartOutcome = .{};
-    self.manager.tunnelStart(payload.server_id, id, token, host, port, &outcome) catch |err| {
+    const outcome = self.allocator.create(sessions.TunnelStartOutcome) catch return respondError(output, "out of memory");
+    outcome.* = .{ .allocator = self.allocator };
+    self.manager.tunnelStart(payload.server_id, id, token, host, port, outcome) catch |err| {
+        self.allocator.destroy(outcome);
         return respondError(output, switch (err) {
             error.NoSession => "not connected",
             error.NotReady => "session not ready",
@@ -932,7 +934,10 @@ fn handleVncStart(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
         });
     };
     outcome.wait(self.io, std.Io.Timestamp.now(self.io, .real).nanoseconds + vnc_start_timeout_ns);
-    if (!outcome.isDone()) return respondError(output, "tunnel start timed out");
+    // On a deadline the op keeps the outcome (its eventual set frees it);
+    // otherwise it is destroyed after the result is read.
+    if (!outcome.isDone() and !outcome.abandon()) return respondError(output, "tunnel start timed out");
+    defer self.allocator.destroy(outcome);
     if (!outcome.ok) return respondError(output, outcome.message());
 
     var writer = std.Io.Writer.fixed(output);
@@ -1635,12 +1640,14 @@ fn handleLogsClear(context: *anyopaque, invocation: native_sdk.bridge.Invocation
 
     if (validateLogPath(payload.path, output)) |err_response| return err_response;
 
-    var outcome: sessions.ClearOutcome = .{};
+    const outcome = self.allocator.create(sessions.ClearOutcome) catch return respondError(output, "out of memory");
+    outcome.* = .{ .allocator = self.allocator };
     self.manager.clearLog(payload.server_id, payload.path, .{
         .size = payload.expected.size,
         .mtime = payload.expected.mtime,
         .mode = payload.expected.mode,
-    }, &outcome) catch |err| {
+    }, outcome) catch |err| {
+        self.allocator.destroy(outcome);
         return respondError(output, switch (err) {
             error.NoSession => "not connected",
             error.NotReady => "session not ready",
@@ -1655,7 +1662,10 @@ fn handleLogsClear(context: *anyopaque, invocation: native_sdk.bridge.Invocation
     if (self.manager.get(payload.server_id)) |session| {
         session.logs_cache.invalidate(self.allocator);
     }
-    if (!outcome.isDone()) return respondError(output, "timed out waiting for the server");
+    // On a deadline the op keeps the outcome (its eventual set frees it);
+    // otherwise it is destroyed after the result is read.
+    if (!outcome.isDone() and !outcome.abandon()) return respondError(output, "timed out waiting for the server");
+    defer self.allocator.destroy(outcome);
     if (!outcome.ok) return respondError(output, outcome.message());
 
     var writer = std.Io.Writer.fixed(output);
@@ -1818,11 +1828,15 @@ fn decodeSftpBase64Arg(self: *Context, output: []u8, b64: []const u8, max: usize
 }
 
 /// Waits for a synchronous SFTP outcome (bounded), then copies the
-/// worker-built JSON into the output buffer and frees it.
+/// worker-built JSON into the output buffer and frees it. Takes ownership
+/// of the heap outcome: on a deadline the op keeps it (its eventual set
+/// frees it — see SftpOutcome's lifetime doc), otherwise it is destroyed
+/// here after the result is read.
 fn sftpSyncOutcome(self: *Context, output: []u8, outcome: *sessions.SftpOutcome) []const u8 {
     const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + sftp_wait_ns;
     outcome.wait(self.io, deadline);
-    if (!outcome.isDone()) return respondError(output, "timed out waiting for the server");
+    if (!outcome.isDone() and !outcome.abandon()) return respondError(output, "timed out waiting for the server");
+    defer self.allocator.destroy(outcome);
     if (!outcome.ok) return respondError(output, outcome.message());
     const payload_json = outcome.json orelse return respondError(output, "no response payload");
     defer self.allocator.free(payload_json);
@@ -1883,9 +1897,13 @@ fn handleSftpLs(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
     var path: ?[]u8 = null;
     if (decodeSftpPathArg(self, output, parsed.value.path, &path)) |err_response| return err_response;
     defer self.allocator.free(path.?);
-    var outcome: sessions.SftpOutcome = .{};
-    self.manager.sftpLs(parsed.value.server_id, path.?, &outcome) catch |err| return sftpQueueError(output, err);
-    return sftpSyncOutcome(self, output, &outcome);
+    const outcome = self.allocator.create(sessions.SftpOutcome) catch return respondError(output, "out of memory");
+    outcome.* = .{ .allocator = self.allocator };
+    self.manager.sftpLs(parsed.value.server_id, path.?, outcome) catch |err| {
+        self.allocator.destroy(outcome);
+        return sftpQueueError(output, err);
+    };
+    return sftpSyncOutcome(self, output, outcome);
 }
 
 fn handleSftpStat(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
@@ -1897,9 +1915,13 @@ fn handleSftpStat(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
     var path: ?[]u8 = null;
     if (decodeSftpPathArg(self, output, parsed.value.path, &path)) |err_response| return err_response;
     defer self.allocator.free(path.?);
-    var outcome: sessions.SftpOutcome = .{};
-    self.manager.sftpStat(parsed.value.server_id, path.?, &outcome) catch |err| return sftpQueueError(output, err);
-    return sftpSyncOutcome(self, output, &outcome);
+    const outcome = self.allocator.create(sessions.SftpOutcome) catch return respondError(output, "out of memory");
+    outcome.* = .{ .allocator = self.allocator };
+    self.manager.sftpStat(parsed.value.server_id, path.?, outcome) catch |err| {
+        self.allocator.destroy(outcome);
+        return sftpQueueError(output, err);
+    };
+    return sftpSyncOutcome(self, output, outcome);
 }
 
 /// Explicit-offset 64 KB read (spec 05 §5); the worker answers with
@@ -1916,9 +1938,13 @@ fn handleSftpRead(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
     var path: ?[]u8 = null;
     if (decodeSftpPathArg(self, output, parsed.value.path, &path)) |err_response| return err_response;
     defer self.allocator.free(path.?);
-    var outcome: sessions.SftpOutcome = .{};
-    self.manager.sftpRead(parsed.value.server_id, path.?, parsed.value.offset, parsed.value.max, &outcome) catch |err| return sftpQueueError(output, err);
-    return sftpSyncOutcome(self, output, &outcome);
+    const outcome = self.allocator.create(sessions.SftpOutcome) catch return respondError(output, "out of memory");
+    outcome.* = .{ .allocator = self.allocator };
+    self.manager.sftpRead(parsed.value.server_id, path.?, parsed.value.offset, parsed.value.max, outcome) catch |err| {
+        self.allocator.destroy(outcome);
+        return sftpQueueError(output, err);
+    };
+    return sftpSyncOutcome(self, output, outcome);
 }
 
 /// Upload chunk under the frontend's unguessable transfer_id (spec 05 §5):
@@ -1943,9 +1969,13 @@ fn handleSftpWrite(context: *anyopaque, invocation: native_sdk.bridge.Invocation
     if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
     self.manager.sftpStartUpload(session, payload.transfer_id, path.?) catch return respondError(output, "out of memory");
     const total = payload.total orelse (payload.offset +| data.?.len);
-    var outcome: sessions.SftpOutcome = .{};
-    self.manager.sftpWriteChunk(payload.server_id, path.?, payload.offset, data.?, total, payload.transfer_id, &outcome) catch |err| return sftpQueueError(output, err);
-    return sftpSyncOutcome(self, output, &outcome);
+    const outcome = self.allocator.create(sessions.SftpOutcome) catch return respondError(output, "out of memory");
+    outcome.* = .{ .allocator = self.allocator };
+    self.manager.sftpWriteChunk(payload.server_id, path.?, payload.offset, data.?, total, payload.transfer_id, outcome) catch |err| {
+        self.allocator.destroy(outcome);
+        return sftpQueueError(output, err);
+    };
+    return sftpSyncOutcome(self, output, outcome);
 }
 
 /// Editor save (spec 05 §4.2): temp file + atomic posix-rename on the
@@ -1962,9 +1992,13 @@ fn handleSftpSave(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
     var data: ?[]u8 = null;
     if (decodeSftpBase64Arg(self, output, parsed.value.base64, sftpmod.max_inline_bytes, &data)) |err_response| return err_response;
     defer self.allocator.free(data.?);
-    var outcome: sessions.SftpOutcome = .{};
-    self.manager.sftpSave(parsed.value.server_id, path.?, data.?, &outcome) catch |err| return sftpQueueError(output, err);
-    return sftpSyncOutcome(self, output, &outcome);
+    const outcome = self.allocator.create(sessions.SftpOutcome) catch return respondError(output, "out of memory");
+    outcome.* = .{ .allocator = self.allocator };
+    self.manager.sftpSave(parsed.value.server_id, path.?, data.?, outcome) catch |err| {
+        self.allocator.destroy(outcome);
+        return sftpQueueError(output, err);
+    };
+    return sftpSyncOutcome(self, output, outcome);
 }
 
 /// Remote→local download through the native writer: the core owns the
@@ -2003,9 +2037,13 @@ fn handleSftpMkdir(context: *anyopaque, invocation: native_sdk.bridge.Invocation
     var path: ?[]u8 = null;
     if (decodeSftpPathArg(self, output, parsed.value.path, &path)) |err_response| return err_response;
     defer self.allocator.free(path.?);
-    var outcome: sessions.SftpOutcome = .{};
-    self.manager.sftpMkdir(parsed.value.server_id, path.?, &outcome) catch |err| return sftpQueueError(output, err);
-    return sftpSyncOutcome(self, output, &outcome);
+    const outcome = self.allocator.create(sessions.SftpOutcome) catch return respondError(output, "out of memory");
+    outcome.* = .{ .allocator = self.allocator };
+    self.manager.sftpMkdir(parsed.value.server_id, path.?, outcome) catch |err| {
+        self.allocator.destroy(outcome);
+        return sftpQueueError(output, err);
+    };
+    return sftpSyncOutcome(self, output, outcome);
 }
 
 /// Plain delete is synchronous; recursive deletes run as an async transfer
@@ -2022,17 +2060,20 @@ fn handleSftpRm(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
     defer self.allocator.free(path.?);
 
     if (!payload.recursive) {
-        var outcome: sessions.SftpOutcome = .{};
-        self.manager.sftpRm(payload.server_id, path.?, false, 0, &outcome) catch |err| return sftpQueueError(output, err);
-        return sftpSyncOutcome(self, output, &outcome);
+        const outcome = self.allocator.create(sessions.SftpOutcome) catch return respondError(output, "out of memory");
+        outcome.* = .{ .allocator = self.allocator };
+        self.manager.sftpRm(payload.server_id, path.?, false, 0, outcome) catch |err| {
+            self.allocator.destroy(outcome);
+            return sftpQueueError(output, err);
+        };
+        return sftpSyncOutcome(self, output, outcome);
     }
     const session = self.manager.get(payload.server_id) orelse return respondError(output, "not connected");
     if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
     const op_id = self.manager.sftpStartTransfer(session, "rm", path.?) catch return respondError(output, "out of memory");
-    // The worker's recursive path never writes the outcome; it signals
+    // The worker's recursive path never writes an outcome; it signals
     // through the transfer record instead.
-    var dummy: sessions.SftpOutcome = .{};
-    self.manager.sftpRm(payload.server_id, path.?, true, op_id, &dummy) catch |err| {
+    self.manager.sftpRm(payload.server_id, path.?, true, op_id, null) catch |err| {
         sftpFailTransfer(session, op_id, "failed to queue");
         return sftpQueueError(output, err);
     };
@@ -2051,9 +2092,13 @@ fn handleSftpRename(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
     var to: ?[]u8 = null;
     if (decodeSftpPathArg(self, output, parsed.value.to, &to)) |err_response| return err_response;
     defer self.allocator.free(to.?);
-    var outcome: sessions.SftpOutcome = .{};
-    self.manager.sftpRename(parsed.value.server_id, from.?, to.?, &outcome) catch |err| return sftpQueueError(output, err);
-    return sftpSyncOutcome(self, output, &outcome);
+    const outcome = self.allocator.create(sessions.SftpOutcome) catch return respondError(output, "out of memory");
+    outcome.* = .{ .allocator = self.allocator };
+    self.manager.sftpRename(parsed.value.server_id, from.?, to.?, outcome) catch |err| {
+        self.allocator.destroy(outcome);
+        return sftpQueueError(output, err);
+    };
+    return sftpSyncOutcome(self, output, outcome);
 }
 
 fn handleSftpChmod(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
@@ -2067,9 +2112,13 @@ fn handleSftpChmod(context: *anyopaque, invocation: native_sdk.bridge.Invocation
     var path: ?[]u8 = null;
     if (decodeSftpPathArg(self, output, payload.path, &path)) |err_response| return err_response;
     defer self.allocator.free(path.?);
-    var outcome: sessions.SftpOutcome = .{};
-    self.manager.sftpChmod(payload.server_id, path.?, payload.mode, &outcome) catch |err| return sftpQueueError(output, err);
-    return sftpSyncOutcome(self, output, &outcome);
+    const outcome = self.allocator.create(sessions.SftpOutcome) catch return respondError(output, "out of memory");
+    outcome.* = .{ .allocator = self.allocator };
+    self.manager.sftpChmod(payload.server_id, path.?, payload.mode, outcome) catch |err| {
+        self.allocator.destroy(outcome);
+        return sftpQueueError(output, err);
+    };
+    return sftpSyncOutcome(self, output, outcome);
 }
 
 /// Expand in place (spec 05 §5): central-directory preflight on the worker,
@@ -2917,10 +2966,13 @@ fn deployCursor(cursors: std.json.Value, channel: u32) u64 {
 }
 
 /// Synchronous SFTP write for deploy config files (`.env`, PM2
-/// ecosystem, nginx site). Returns a static error message or null.
+/// ecosystem, nginx site). Returns a static error message or null
+/// (deploy.Step errors are static text by contract).
 fn deployWriteFile(self: *Context, server_id: []const u8, path: []const u8, data: []const u8) ?[]const u8 {
-    var outcome: sessions.SftpOutcome = .{};
-    self.manager.sftpSave(server_id, path, data, &outcome) catch |err| {
+    const outcome = self.allocator.create(sessions.SftpOutcome) catch return "out of memory";
+    outcome.* = .{ .allocator = self.allocator };
+    self.manager.sftpSave(server_id, path, data, outcome) catch |err| {
+        self.allocator.destroy(outcome);
         return switch (err) {
             error.NoSession => "not connected",
             error.NotReady => "session not ready",
@@ -2929,11 +2981,14 @@ fn deployWriteFile(self: *Context, server_id: []const u8, path: []const u8, data
     };
     const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + deploy_file_wait_ns;
     outcome.wait(self.io, deadline);
-    if (!outcome.isDone()) return "timed out writing the file";
-    if (!outcome.ok) return outcome.message();
-    // The worker's success payload is owned; free it (mirrors
-    // sftpSyncOutcome).
-    if (outcome.json) |j| self.allocator.free(j);
+    var owned = true;
+    defer if (owned) self.allocator.destroy(outcome);
+    if (!outcome.isDone() and !outcome.abandon()) {
+        owned = false; // the op owns the outcome now; its set frees it
+        return "timed out writing the file";
+    }
+    defer if (outcome.json) |j| self.allocator.free(j);
+    if (!outcome.ok) return "failed to write the file";
     return null;
 }
 
@@ -3360,23 +3415,43 @@ fn sshkeysPath(self: *Context, output: []u8, server_id: []const u8, user: ?[]con
 /// Synchronous SFTP read of a small file; null when the file is missing
 /// (spec 08 §10: missing → empty list/create path). Bounded.
 fn sshkeysRead(self: *Context, server_id: []const u8, path: []const u8) ?[]u8 {
-    var stat_out: sessions.SftpOutcome = .{};
-    self.manager.sftpStat(server_id, path, &stat_out) catch return null;
+    const stat_out = self.allocator.create(sessions.SftpOutcome) catch return null;
+    stat_out.* = .{ .allocator = self.allocator };
+    self.manager.sftpStat(server_id, path, stat_out) catch {
+        self.allocator.destroy(stat_out);
+        return null;
+    };
     const stat_deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + sshkeys_wait_ns;
     stat_out.wait(self.io, stat_deadline);
+    var stat_owned = true;
+    defer if (stat_owned) self.allocator.destroy(stat_out);
+    if (!stat_out.isDone() and !stat_out.abandon()) {
+        stat_owned = false; // the op owns the outcome now; its set frees it
+        return null; // missing
+    }
     defer if (stat_out.json) |j| self.allocator.free(j);
-    if (!stat_out.isDone() or !stat_out.ok) return null; // missing
+    if (!stat_out.ok) return null; // missing
 
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(self.allocator);
     var offset: u64 = 0;
     while (true) {
-        var read_out: sessions.SftpOutcome = .{};
-        self.manager.sftpRead(server_id, path, offset, sshkeys_read_chunk, &read_out) catch return null;
+        const read_out = self.allocator.create(sessions.SftpOutcome) catch return null;
+        read_out.* = .{ .allocator = self.allocator };
+        self.manager.sftpRead(server_id, path, offset, sshkeys_read_chunk, read_out) catch {
+            self.allocator.destroy(read_out);
+            return null;
+        };
         read_out.wait(self.io, stat_deadline);
-        if (!read_out.isDone() or !read_out.ok) return null;
+        var read_owned = true;
+        defer if (read_owned) self.allocator.destroy(read_out);
+        if (!read_out.isDone() and !read_out.abandon()) {
+            read_owned = false;
+            return null;
+        }
+        defer if (read_out.json) |j| self.allocator.free(j);
+        if (!read_out.ok) return null;
         const payload = read_out.json orelse return null;
-        defer self.allocator.free(payload);
         const parsed = std.json.parseFromSlice(struct {
             ok: bool,
             base64: []const u8 = "",
@@ -3401,9 +3476,11 @@ fn sshkeysRead(self: *Context, server_id: []const u8, path: []const u8) ?[]u8 {
 /// optional chown (role-user files are written by the root session and
 /// must be readable by the account sshd reads them as). Returns a static
 /// error message or null on success.
-fn sshkeysWrite(self: *Context, server_id: []const u8, path: []const u8, content: []const u8, mode: ?u32, owner: ?[]const u8) ?[]const u8 {
-    var out: sessions.SftpOutcome = .{};
-    self.manager.sftpSave(server_id, path, content, &out) catch |err| {
+fn sshkeysWrite(self: *Context, server_id: []const u8, path: []const u8, content: []const u8, mode: ?u32, owner: ?[]const u8, err_buf: []u8) ?[]const u8 {
+    const out = self.allocator.create(sessions.SftpOutcome) catch return "out of memory";
+    out.* = .{ .allocator = self.allocator };
+    self.manager.sftpSave(server_id, path, content, out) catch |err| {
+        self.allocator.destroy(out);
         return switch (err) {
             error.NoSession => "not connected",
             error.NotReady => "session not ready",
@@ -3412,15 +3489,30 @@ fn sshkeysWrite(self: *Context, server_id: []const u8, path: []const u8, content
     };
     const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + sshkeys_wait_ns;
     out.wait(self.io, deadline);
-    if (!out.isDone()) return "timed out writing the file";
-    if (!out.ok) return out.message();
-    if (out.json) |j| self.allocator.free(j);
+    var out_owned = true;
+    defer if (out_owned) self.allocator.destroy(out);
+    if (!out.isDone() and !out.abandon()) {
+        out_owned = false; // the op owns the outcome now; its set frees it
+        return "timed out writing the file";
+    }
+    defer if (out.json) |j| self.allocator.free(j);
+    if (!out.ok) return std.fmt.bufPrint(err_buf, "{s}", .{out.message()}) catch "failed to write the file";
     if (mode) |m| {
-        var chmod_out: sessions.SftpOutcome = .{};
-        self.manager.sftpChmod(server_id, path, m, &chmod_out) catch return "failed to set file permissions";
+        const chmod_out = self.allocator.create(sessions.SftpOutcome) catch return "out of memory";
+        chmod_out.* = .{ .allocator = self.allocator };
+        self.manager.sftpChmod(server_id, path, m, chmod_out) catch {
+            self.allocator.destroy(chmod_out);
+            return "failed to set file permissions";
+        };
         chmod_out.wait(self.io, deadline);
-        if (!chmod_out.isDone() or !chmod_out.ok) return "failed to set file permissions";
-        if (chmod_out.json) |j| self.allocator.free(j);
+        var chmod_owned = true;
+        defer if (chmod_owned) self.allocator.destroy(chmod_out);
+        if (!chmod_out.isDone() and !chmod_out.abandon()) {
+            chmod_owned = false;
+            return "failed to set file permissions";
+        }
+        defer if (chmod_out.json) |j| self.allocator.free(j);
+        if (!chmod_out.ok) return "failed to set file permissions";
     }
     if (owner) |o| {
         var cmd_buf: [512]u8 = undefined;
@@ -3436,38 +3528,81 @@ fn sshkeysWrite(self: *Context, server_id: []const u8, path: []const u8, content
 /// spec 08 §8). Returns a static error message or null.
 fn sshkeysEnsureSshDir(self: *Context, server_id: []const u8, path: []const u8) ?[]const u8 {
     const dir = std.fs.path.dirname(path) orelse return "invalid path";
-    var stat_out: sessions.SftpOutcome = .{};
-    self.manager.sftpStat(server_id, dir, &stat_out) catch return "cannot stat the ssh directory";
+    const stat_out = self.allocator.create(sessions.SftpOutcome) catch return "out of memory";
+    stat_out.* = .{ .allocator = self.allocator };
+    self.manager.sftpStat(server_id, dir, stat_out) catch {
+        self.allocator.destroy(stat_out);
+        return "cannot stat the ssh directory";
+    };
     const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + sshkeys_wait_ns;
     stat_out.wait(self.io, deadline);
-    if (stat_out.isDone() and stat_out.ok) {
-        if (stat_out.json) |j| self.allocator.free(j);
-        return null;
+    var stat_owned = true;
+    defer if (stat_owned) self.allocator.destroy(stat_out);
+    var exists = false;
+    if (stat_out.isDone()) {
+        exists = stat_out.ok;
+    } else if (stat_out.abandon()) {
+        exists = stat_out.ok; // completed between isDone and abandon
+    } else {
+        stat_owned = false; // the op owns the outcome now; its set frees it
     }
-    if (stat_out.json) |j| self.allocator.free(j);
+    if (stat_owned) {
+        if (stat_out.json) |j| self.allocator.free(j);
+    }
+    if (exists) return null;
     // Missing: create it, then tighten to 0700.
-    var mk_out: sessions.SftpOutcome = .{};
-    self.manager.sftpMkdir(server_id, dir, &mk_out) catch return "failed to create the ssh directory";
+    const mk_out = self.allocator.create(sessions.SftpOutcome) catch return "out of memory";
+    mk_out.* = .{ .allocator = self.allocator };
+    self.manager.sftpMkdir(server_id, dir, mk_out) catch {
+        self.allocator.destroy(mk_out);
+        return "failed to create the ssh directory";
+    };
     mk_out.wait(self.io, deadline);
-    if (!mk_out.isDone() or !mk_out.ok) return "failed to create the ssh directory";
-    if (mk_out.json) |j| self.allocator.free(j);
-    var chmod_out: sessions.SftpOutcome = .{};
-    self.manager.sftpChmod(server_id, dir, 0o700, &chmod_out) catch return "failed to set the ssh directory permissions";
+    var mk_owned = true;
+    defer if (mk_owned) self.allocator.destroy(mk_out);
+    if (!mk_out.isDone() and !mk_out.abandon()) {
+        mk_owned = false;
+        return "failed to create the ssh directory";
+    }
+    defer if (mk_out.json) |j| self.allocator.free(j);
+    if (!mk_out.ok) return "failed to create the ssh directory";
+    const chmod_out = self.allocator.create(sessions.SftpOutcome) catch return "out of memory";
+    chmod_out.* = .{ .allocator = self.allocator };
+    self.manager.sftpChmod(server_id, dir, 0o700, chmod_out) catch {
+        self.allocator.destroy(chmod_out);
+        return "failed to set the ssh directory permissions";
+    };
     chmod_out.wait(self.io, deadline);
-    if (!chmod_out.isDone() or !chmod_out.ok) return "failed to set the ssh directory permissions";
-    if (chmod_out.json) |j| self.allocator.free(j);
+    var chmod_owned = true;
+    defer if (chmod_owned) self.allocator.destroy(chmod_out);
+    if (!chmod_out.isDone() and !chmod_out.abandon()) {
+        chmod_owned = false;
+        return "failed to set the ssh directory permissions";
+    }
+    defer if (chmod_out.json) |j| self.allocator.free(j);
+    if (!chmod_out.ok) return "failed to set the ssh directory permissions";
     return null;
 }
 
 /// The current mode of `path` (from a fresh stat) or 0600 for a missing
 /// file — authorized_keys discipline (spec 08 §10).
 fn sshkeysMode(self: *Context, server_id: []const u8, path: []const u8) u32 {
-    var stat_out: sessions.SftpOutcome = .{};
-    self.manager.sftpStat(server_id, path, &stat_out) catch return 0o600;
+    const stat_out = self.allocator.create(sessions.SftpOutcome) catch return 0o600;
+    stat_out.* = .{ .allocator = self.allocator };
+    self.manager.sftpStat(server_id, path, stat_out) catch {
+        self.allocator.destroy(stat_out);
+        return 0o600;
+    };
     const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + sshkeys_wait_ns;
     stat_out.wait(self.io, deadline);
+    var stat_owned = true;
+    defer if (stat_owned) self.allocator.destroy(stat_out);
+    if (!stat_out.isDone() and !stat_out.abandon()) {
+        stat_owned = false; // the op owns the outcome now; its set frees it
+        return 0o600;
+    }
     defer if (stat_out.json) |j| self.allocator.free(j);
-    if (!stat_out.isDone() or !stat_out.ok) return 0o600;
+    if (!stat_out.ok) return 0o600;
     const parsed = std.json.parseFromSlice(struct {
         ok: bool,
         entry: struct { mode: []const u8 = "" },
@@ -3638,7 +3773,8 @@ fn handleSshKeysAdd(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
     try out.append(self.allocator, '\n');
 
     const mode = sshkeysMode(self, payload.server_id, path);
-    if (sshkeysWrite(self, payload.server_id, path, out.items, mode, payload.user)) |msg| return respondError(output, msg);
+    var write_err_buf: [256]u8 = undefined;
+    if (sshkeysWrite(self, payload.server_id, path, out.items, mode, payload.user, &write_err_buf)) |msg| return respondError(output, msg);
 
     // Report the new line's index/hash from the written state.
     var written = sshkeys.parse(self.allocator, out.items) catch {
@@ -3672,6 +3808,7 @@ fn sshkeysRewriteCore(
     replacement: ?[]const u8,
     owner: ?[]const u8,
     msg: *[]const u8,
+    write_err_buf: []u8,
 ) ?[]u8 {
     msg.* = "";
     const content = sshkeysRead(self, server_id, path) orelse {
@@ -3715,7 +3852,7 @@ fn sshkeysRewriteCore(
     };
     errdefer self.allocator.free(rewritten);
     const mode = sshkeysMode(self, server_id, path);
-    if (sshkeysWrite(self, server_id, path, rewritten, mode, owner)) |write_msg| {
+    if (sshkeysWrite(self, server_id, path, rewritten, mode, owner, write_err_buf)) |write_msg| {
         msg.* = write_msg;
         return null;
     }
@@ -3735,7 +3872,11 @@ fn sshkeysRewrite(
     owner: ?[]const u8,
 ) ?[]u8 {
     var msg: []const u8 = "";
-    const rewritten = sshkeysRewriteCore(self, server_id, path, fingerprint, expected_hash, replacement, owner, &msg) orelse {
+    // The write error text is formatted into this frame's buffer so it
+    // stays valid until respondError copies it (the heap outcome that
+    // produced it is destroyed before sshkeysWrite returns).
+    var write_err_buf: [256]u8 = undefined;
+    const rewritten = sshkeysRewriteCore(self, server_id, path, fingerprint, expected_hash, replacement, owner, &msg, &write_err_buf) orelse {
         err_response.* = respondError(output, msg);
         return null;
     };
@@ -3874,7 +4015,8 @@ fn sshkeysRolesSave(self: *Context, server_id: []const u8, roles: *const std.Arr
     var out: std.Io.Writer.Allocating = .init(self.allocator);
     defer out.deinit();
     std.json.Stringify.value(roles.items, .{}, &out.writer) catch return false;
-    return sshkeysWrite(self, server_id, roles_marker_path, out.writer.buffered(), 0o600, null) == null;
+    var err_buf: [256]u8 = undefined;
+    return sshkeysWrite(self, server_id, roles_marker_path, out.writer.buffered(), 0o600, null, &err_buf) == null;
 }
 
 fn handleSshKeysRolesList(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
@@ -5069,7 +5211,8 @@ fn accessRunItem(self: *Context, job: *access.Job, item: *access.JobItem) void {
             const path = sshkeysPathMsg(self, item.server_id, item.user, &msg) orelse return accessItemError(self, item, msg);
             defer self.allocator.free(path);
             const replacement: ?[]const u8 = if (job.kind == .rotate) item.public_key_line else null;
-            const rewritten = sshkeysRewriteCore(self, item.server_id, path, item.fingerprint, item.expected_line_hash, replacement, item.user, &msg) orelse return accessItemError(self, item, msg);
+            var write_err_buf: [256]u8 = undefined;
+            const rewritten = sshkeysRewriteCore(self, item.server_id, path, item.fingerprint, item.expected_line_hash, replacement, item.user, &msg, &write_err_buf) orelse return accessItemError(self, item, msg);
             defer self.allocator.free(rewritten);
             accessAuditItem(self, if (job.kind == .offboard) "access.offboard" else "access.rotate", item);
             item.state = .done;
@@ -5112,7 +5255,8 @@ fn accessRunItem(self: *Context, job: *access.Job, item: *access.JobItem) void {
             out.appendSlice(self.allocator, item.public_key_line) catch return accessItemError(self, item, "out of memory");
             out.append(self.allocator, '\n') catch return accessItemError(self, item, "out of memory");
             const mode = sshkeysMode(self, item.server_id, path);
-            if (sshkeysWrite(self, item.server_id, path, out.items, mode, item.user)) |emsg| return accessItemError(self, item, emsg);
+            var write_err_buf: [256]u8 = undefined;
+            if (sshkeysWrite(self, item.server_id, path, out.items, mode, item.user, &write_err_buf)) |emsg| return accessItemError(self, item, emsg);
             accessAuditItem(self, "access.onboard", item);
             item.state = .done;
         },
@@ -5359,8 +5503,9 @@ fn backupRcloneInvocation(self: *Context, job: *const backup.Job, remote: []cons
 }
 
 /// Writes the job's remote config section to `path` (0600, secrets in the
-/// file only — never argv or audit).
-fn backupWriteConfig(self: *Context, server_id: []const u8, job: *const backup.Job, remote: []const u8, path: []const u8, credentials: ?BackupCredentials) ?[]const u8 {
+/// file only — never argv or audit). Write-failure text is formatted into
+/// `write_err_buf` (owned by the outermost caller; see sshkeysWrite).
+fn backupWriteConfig(self: *Context, server_id: []const u8, job: *const backup.Job, remote: []const u8, path: []const u8, credentials: ?BackupCredentials, write_err_buf: []u8) ?[]const u8 {
     const section = backup.remoteConfigSection(self.allocator, job, remote, if (credentials) |c| c.access_key else null, if (credentials) |c| c.secret_key else null) catch return "out of memory";
     defer self.allocator.free(section);
     if (std.mem.eql(u8, path, backup.remote_config_path)) {
@@ -5369,9 +5514,9 @@ fn backupWriteConfig(self: *Context, server_id: []const u8, job: *const backup.J
         defer if (existing.len > 0) self.allocator.free(existing);
         const merged = backup.configMergeSection(self.allocator, existing, remote, section) catch return "out of memory";
         defer self.allocator.free(merged);
-        if (sshkeysWrite(self, server_id, path, merged, 0o600, null)) |msg| return msg;
+        if (sshkeysWrite(self, server_id, path, merged, 0o600, null, write_err_buf)) |msg| return msg;
     } else {
-        if (sshkeysWrite(self, server_id, path, section, 0o600, null)) |msg| return msg;
+        if (sshkeysWrite(self, server_id, path, section, 0o600, null, write_err_buf)) |msg| return msg;
     }
     return null;
 }
@@ -5379,7 +5524,7 @@ fn backupWriteConfig(self: *Context, server_id: []const u8, job: *const backup.J
 /// Enables a job's unattended schedule: dedicated config, run wrapper,
 /// crontab line (idempotent). `credentials` are copied into the config
 /// on the server — the documented remote-secret disclosure (spec 10 §8).
-fn backupInstallSchedule(self: *Context, output: []u8, job: *const backup.Job, credentials: ?BackupCredentials) ?[]const u8 {
+fn backupInstallSchedule(self: *Context, output: []u8, job: *const backup.Job, credentials: ?BackupCredentials, write_err_buf: []u8) ?[]const u8 {
     _ = output;
     var mkdir_buf: [512]u8 = undefined;
     const mkdir = std.fmt.bufPrint(&mkdir_buf, "mkdir -p ~/.config/oars && chmod 700 ~/.config/oars && mkdir -p {s}/{s} && chmod 700 {s}/{s}", .{ backup.state_dir, job.id, backup.state_dir, job.id }) catch return "out of memory";
@@ -5387,7 +5532,7 @@ fn backupInstallSchedule(self: *Context, output: []u8, job: *const backup.Job, c
 
     const remote = backup.remoteName(self.allocator, job.id) catch return "out of memory";
     defer self.allocator.free(remote);
-    if (backupWriteConfig(self, job.server_id, job, remote, backup.remote_config_path, credentials)) |msg| return msg;
+    if (backupWriteConfig(self, job.server_id, job, remote, backup.remote_config_path, credentials, write_err_buf)) |msg| return msg;
 
     const invocation = backupRcloneInvocation(self, job, remote, backup.remote_config_path) catch return "out of memory";
     defer self.allocator.free(invocation);
@@ -5395,7 +5540,7 @@ fn backupInstallSchedule(self: *Context, output: []u8, job: *const backup.Job, c
     defer self.allocator.free(script);
     var wrapper_path_buf: [512]u8 = undefined;
     const wrapper_path = std.fmt.bufPrint(&wrapper_path_buf, "{s}/{s}/run.sh", .{ backup.state_dir, job.id }) catch return "out of memory";
-    if (sshkeysWrite(self, job.server_id, wrapper_path, script, 0o700, null)) |msg| return msg;
+    if (sshkeysWrite(self, job.server_id, wrapper_path, script, 0o700, null, write_err_buf)) |msg| return msg;
 
     const expr = backupScheduleExpr(self.allocator, job) catch return "out of memory";
     defer self.allocator.free(expr);
@@ -5565,7 +5710,8 @@ fn handleBackupJobsSave(context: *anyopaque, invocation: native_sdk.bridge.Invoc
 
     if (backupSessionReady(self, output, saved.server_id)) |err| return err;
     if (saved.schedule.enabled and !std.mem.eql(u8, saved.schedule.mode, "manual")) {
-        if (backupInstallSchedule(self, output, &saved, payload.schedule_credentials)) |msg| return respondError(output, msg);
+        var write_err_buf: [256]u8 = undefined;
+        if (backupInstallSchedule(self, output, &saved, payload.schedule_credentials, &write_err_buf)) |msg| return respondError(output, msg);
     } else {
         if (backupRemoveSchedule(self, saved.id, saved.server_id)) |msg| return respondError(output, msg);
     }
@@ -5664,7 +5810,8 @@ fn handleBackupTest(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
     const sentinel = std.fmt.bufPrint(&sentinel_buf, "/tmp/oars-sentinel-{s}", .{ts}) catch return respondError(output, "out of memory");
     const sentinel_name = std.fmt.bufPrint(&sentinel_buf, "oars-sentinel-{s}", .{ts}) catch return respondError(output, "out of memory");
 
-    if (backupWriteConfig(self, server_id, &job, remote, cfg, payload.credentials)) |msg| return respondError(output, msg);
+    var write_err_buf: [256]u8 = undefined;
+    if (backupWriteConfig(self, server_id, &job, remote, cfg, payload.credentials, &write_err_buf)) |msg| return respondError(output, msg);
     defer _ = backupCheck(self, server_id, std.fmt.bufPrint(&ts_buf, "rm -f {s}", .{cfg}) catch "rm -f /tmp/oars-rclone-test.conf");
 
     const dest = backup.destinationArg(self.allocator, &job, remote) catch return respondError(output, "out of memory");
@@ -5757,7 +5904,8 @@ fn handleBackupRun(context: *anyopaque, invocation: native_sdk.bridge.Invocation
     const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.Io.Timestamp.now(self.io, .real).nanoseconds}) catch return respondError(output, "out of memory");
     var cfg_buf: [256]u8 = undefined;
     const cfg = std.fmt.bufPrint(&cfg_buf, "/tmp/oars-rclone-run-{s}.conf", .{ts}) catch return respondError(output, "out of memory");
-    if (backupWriteConfig(self, payload.server_id, &job, remote, cfg, payload.credentials)) |msg| return respondError(output, msg);
+    var write_err_buf: [256]u8 = undefined;
+    if (backupWriteConfig(self, payload.server_id, &job, remote, cfg, payload.credentials, &write_err_buf)) |msg| return respondError(output, msg);
 
     const invocation_cmd = backupRcloneInvocation(self, &job, remote, cfg) catch return respondError(output, "out of memory");
     defer self.allocator.free(invocation_cmd);
@@ -6817,8 +6965,10 @@ fn handleAgentForward(context: *anyopaque, invocation: native_sdk.bridge.Invocat
     };
     defer parsed.deinit();
 
-    var outcome: sessions.ForwardSetOutcome = .{};
-    self.manager.setForwarding(parsed.value.server_id, parsed.value.on, &outcome) catch |err| {
+    const outcome = self.allocator.create(sessions.ForwardSetOutcome) catch return respondError(output, "out of memory");
+    outcome.* = .{ .allocator = self.allocator };
+    self.manager.setForwarding(parsed.value.server_id, parsed.value.on, outcome) catch |err| {
+        self.allocator.destroy(outcome);
         return respondError(output, switch (err) {
             error.NoSession => "no session for this server",
             error.NotReady => "server is not connected",
@@ -6827,6 +6977,10 @@ fn handleAgentForward(context: *anyopaque, invocation: native_sdk.bridge.Invocat
     };
     const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + 20 * std.time.ns_per_s;
     outcome.wait(self.io, deadline);
+    // On a deadline the op keeps the outcome (its eventual set frees it);
+    // otherwise it is destroyed after the result is read.
+    if (!outcome.isDone() and !outcome.abandon()) return respondError(output, "timed out waiting for the server");
+    defer self.allocator.destroy(outcome);
     if (!outcome.ok) {
         return respondError(output, outcome.message());
     }

@@ -1632,7 +1632,133 @@ shows compact long-install feedback, and the manual dialog has one Close
 action. The fixture validates the detached state lifecycle through separate SSH
 exec channels in addition to the full XFCE framebuffer and input path.
 
-## 29. Next implementation target
+## 29. Session handover — 2026-08-07: idle-session segfault (worker teardown poisoned map-held sessions)
+
+Reported crash: `Segmentation fault at address 0xaaaaaaaaaaaaaaaa` in
+`pollChannels` (`sessions.zig:1422`) after the app sat idle. Root cause
+chain: an idle connection trips the worker's 30 s keepalive → worker
+returns → `sessionDone` ran on the dying worker thread and `deinit`ed the
+session's ArrayLists → Zig 0.16's unmanaged `ArrayList.deinit` writes
+`undefined` into the list (0xAA-filled in Debug) → the session stayed in
+the manager map (only `disconnect` removes it) → the next 80 ms frontend
+poll called `get()` successfully and iterated a poisoned slice.
+
+The regression test connects to 127.0.0.1:1 (instant ECONNREFUSED →
+worker exits on its own), waits for teardown, then polls/inputs/execs —
+it reproduced the exact crash (same address, same line) before the fix
+and passes after (`zig build test`, 191/191 with the dev containers).
+
+Fix shape (sessions.zig, sftp.zig): `sessionDone` now leaves every
+bridge-reachable container VALID-but-empty — `clearAndFree` for plain
+lists (channels, ops, tunnels, jump_tunnels, forward_queue/active,
+folder_size_cache), locked deinit for monitor_cache, new
+`Transfers.reset` for the SFTP registry — and nulls `session.shell`
+under channels_mutex. A new `Session.worker_done` atomic is published
+inside sessionDone's final ops_mutex section (ops drain moved to the
+end); every op-enqueue path checks it under ops_mutex, so an op racing
+the worker's exit is either drained by sessionDone or rejected with
+`error.NotReady` — never stranded. `input()` now takes channels_mutex so
+a keystroke can't append into an entry being destroyed. A drained
+`jump_start` op now sets its outcome (`"jump host disconnected"`):
+`JumpStartOutcome.wait` has no deadline, so an unset outcome hung the
+target session's worker (and `disconnect`'s join) forever.
+
+Known issues found in the same sweep, NOT fixed in this diff (need
+design decisions):
+
+1. **Deadlock disconnecting a jump host with live targets (HIGH).**
+   `disconnect` holds the manager mutex across `thread.join()`; the via
+   worker's sessionDone jump-tunnel cascade calls `owner.get()` which
+   spins on the same mutex — join never completes, main thread freezes.
+   Likely fix: remove the map entry under the mutex, join+destroy after
+   unlocking. A narrow post-`get()` destroy race (via-worker cascade vs
+   target's `disconnect` destroy) survives that reorder and wants
+   refcounting or mutex-held use.
+2. **Reconnect-after-clean-close leaks the old session (LOW).**
+   `connect` allows a new session when the existing one is `.closed`,
+   then `sessions.put` overwrites the map entry without freeing the old
+   session or key.
+3. `Session.via` (raw `*Session`) is assigned at connect and never read
+   — it dangles if the via session is disconnected while the target
+   lives. Latent only; any future reader must re-resolve via
+   `owner.get(via_server_id)` instead.
+
+### New pitfalls (extend §7 — do not repeat)
+
+37. **`ArrayList.deinit` is a poison write, not just a free.** 0.16's
+    unmanaged list sets `self.* = undefined` — any struct that outlives
+    its `deinit` (session in the manager map after worker death) must be
+    torn down with `clearAndFree` (or deinit + immediate `.{}` reset,
+    the existing `clearStdin` idiom). Before deiniting any field, ask
+    which threads can still reach the struct.
+
+## 30. Session handover — 2026-08-07: abandoned-outcome UAF (stack outcomes vs handler deadlines)
+
+Second crash from the same user session: `thread panic: reached
+unreachable code` — `std.atomic.Mutex.unlock`'s assert fired inside
+`TunnelStartOutcome.set` on the SSH worker, called from `tunnelStartOp`
+after `openTunnel` returned `error.Timeout`. Mechanism: `handleVncStart`
+stack-allocated the outcome and waited `vnc_start_timeout_ns` (5 s);
+`openTunnel` retries EAGAIN up to `handshake_timeout_ms` (longer). On a
+slow/half-dead connection the handler timed out and returned — its stack
+frame died — then the worker's late `set()` wrote into recycled stack
+memory: the mutex byte was no longer `.locked` at unlock → panic on the
+worker → process dead (pitfall 14 again).
+
+Every op outcome type had the same window (all were stack-allocated with
+bounded waits): `SftpOutcome` (~20 sites incl. the sshkeys/access/backup/
+deploy chains), `ClearOutcome`, `TunnelStartOutcome`,
+`ForwardSetOutcome`. Fix shape:
+
+- The four outcome structs now carry `allocator` (required field — the
+  compiler enumerated every construction site) plus an `abandoned` flag,
+  and `set`/`setJson` free the struct when it was abandoned. Ownership
+  rule: the handler heap-allocates, and either reads a completed result
+  and destroys it, or calls `abandon()` on deadline — under the mutex,
+  so exactly one side owns the free. `abandon()` returning true means
+  the worker set first; the handler keeps ownership.
+- Handler sites: heap + `if (!o.isDone() and !o.abandon()) return …`
+  (ownership transfers to the op) with `defer destroy` only on the owned
+  path. `sftpSyncOutcome` owns the funnel for sync SFTP calls.
+- `sessionDone`'s op drain completes every never-processed outcome with
+  `set(false, "session disconnected")` — waking any still-waiting
+  handler honestly and freeing any abandoned one.
+- `sftp_rm`'s op outcome is now `?*SftpOutcome` (recursive deletes pass
+  null; the `dummy` stack outcomes are gone from bridge.zig AND from
+  `sftpOpDownload`/`sftpOpUnzip`/`sftpOpZipDownload`, whose sftpInit
+  failures now mark the transfer record failed instead of leaving it
+  stuck at `queued`).
+- `outcome.message()` returns a slice INTO the outcome struct — with
+  heap outcomes destroyed before helpers return, every dynamic-message
+  consumer needed an explicit lifetime: `sshkeysWrite`/`backupWriteConfig`/
+  `backupInstallSchedule` take a caller-owned `write_err_buf`
+  (`accessItemError` dupes, so only a local buffer there);
+  `deployWriteFile` maps to a static string because `deploy.Step.error`
+  is static-text-by-contract (the old code returned a stack-outcome
+  slice — already dangling before this change).
+
+Tests: `sessions.zig` unit tests pin the abandonment protocol
+(abandon-before-set frees; set-before-abandon keeps handler ownership;
+setJson frees the payload; sessionDone's drain completes queued outcomes
+and frees abandoned ones) and integration_keys' direct outcome uses are
+heap + handshake. 193/193 with the dev containers.
+
+### New pitfalls (extend §7 — do not repeat)
+
+38. **A bridge op outcome must never be a stack struct.** The handler's
+    wait is bounded but the worker's processing is not (queueing delay,
+    EAGAIN retry loops with their own longer deadlines). If the handler
+    can return first, the op's `outcome.set` writes into a dead stack
+    frame — in Debug that trips the spinlock unlock assert and panics
+    the worker thread (pitfall 14: any-thread panic = process death).
+    Heap-allocate, and settle ownership with the mutex-guarded
+    `abandon()` handshake; the op's `set` frees an abandoned outcome.
+39. **Never return a slice into an outcome/short-lived struct.**
+    `Outcome.message()` aliases the struct. Consumers with registry
+    lifetimes (deploy.Step, access items) must dupe or use static text;
+    respondError paths need a caller-owned buffer threaded down.
+
+## 31. Next implementation target
 
 Implement the spec 05 File Manager frontend. Follow `docs/NEXT-SPEC.md`; it
 records the exact SFTP backend contract, the raw-path identity rule, the editor

@@ -254,7 +254,7 @@ const Op = union(enum) {
     },
     sftp_save: struct { path: []const u8, data: []const u8, outcome: *SftpOutcome },
     sftp_mkdir: struct { path: []const u8, outcome: *SftpOutcome },
-    sftp_rm: struct { path: []const u8, recursive: bool, transfer_id: u32, outcome: *SftpOutcome },
+    sftp_rm: struct { path: []const u8, recursive: bool, transfer_id: u32, outcome: ?*SftpOutcome },
     sftp_rename: struct { from: []const u8, to: []const u8, outcome: *SftpOutcome },
     sftp_chmod: struct { path: []const u8, mode: u32, outcome: *SftpOutcome },
     sftp_download: struct {
@@ -306,10 +306,20 @@ const Op = union(enum) {
 /// the full success JSON (owned), the handler copies it into its output
 /// buffer and frees it. Async ops (download/unzip/zip_download/recursive rm)
 /// signal through the transfer record instead and pass a null outcome.
+///
+/// Lifetime: heap-allocated by the handler. The handler either reads a
+/// completed result and destroys it, or its wait deadline expires and it
+/// calls `abandon` — transferring ownership to the op, whose eventual
+/// set()/setJson() (worker processing, or sessionDone's drain) then frees
+/// the struct. The handshake happens under the mutex, so exactly one side
+/// owns the free; a late set can never write into a dead stack frame
+/// (the tunnel-start worker panic this design fixes).
 pub const SftpOutcome = struct {
+    allocator: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
     done: bool = false,
     ok: bool = false,
+    abandoned: bool = false,
     msg_buf: [256]u8 = undefined,
     msg_len: usize = 0,
     /// Owned success payload (worker-built JSON). Read only after `isDone`.
@@ -317,20 +327,37 @@ pub const SftpOutcome = struct {
 
     pub fn set(self: *SftpOutcome, ok: bool, msg: []const u8) void {
         lockSpin(&self.mutex);
-        defer self.mutex.unlock();
         self.ok = ok;
         const n = @min(msg.len, self.msg_buf.len - 1);
         @memcpy(self.msg_buf[0..n], msg[0..n]);
         self.msg_len = n;
         self.done = true;
+        const free = self.abandoned;
+        self.mutex.unlock();
+        if (free) self.allocator.destroy(self);
     }
 
     pub fn setJson(self: *SftpOutcome, json: []u8) void {
         lockSpin(&self.mutex);
-        defer self.mutex.unlock();
         self.json = json;
         self.ok = true;
         self.done = true;
+        const free = self.abandoned;
+        self.mutex.unlock();
+        if (free) {
+            self.allocator.free(json);
+            self.allocator.destroy(self);
+        }
+    }
+
+    /// Handler-side deadline escape: marks the outcome abandoned so the
+    /// op's eventual set frees it. Returns true when the worker already
+    /// completed it — the handler keeps ownership and reads the result.
+    pub fn abandon(self: *SftpOutcome) bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        self.abandoned = true;
+        return self.done;
     }
 
     pub fn message(self: *SftpOutcome) []const u8 {
@@ -367,11 +394,14 @@ pub const ClearExpected = struct {
 
 /// Completion record for the clear op: the worker writes it (under its
 /// mutex), the bridge handler waits on it (bounded). The path is validated
-/// by the handler before the op is queued.
+/// by the handler before the op is queued. Heap + abandonment lifetime:
+/// see SftpOutcome's doc comment.
 pub const ClearOutcome = struct {
+    allocator: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
     done: bool = false,
     ok: bool = false,
+    abandoned: bool = false,
     msg_buf: [256]u8 = undefined,
     msg_len: usize = 0,
     before_size: u64 = 0,
@@ -379,12 +409,22 @@ pub const ClearOutcome = struct {
 
     pub fn set(self: *ClearOutcome, ok: bool, msg: []const u8) void {
         lockSpin(&self.mutex);
-        defer self.mutex.unlock();
         self.ok = ok;
         const n = @min(msg.len, self.msg_buf.len - 1);
         @memcpy(self.msg_buf[0..n], msg[0..n]);
         self.msg_len = n;
         self.done = true;
+        const free = self.abandoned;
+        self.mutex.unlock();
+        if (free) self.allocator.destroy(self);
+    }
+
+    /// Handler-side deadline escape; see SftpOutcome.abandon.
+    pub fn abandon(self: *ClearOutcome) bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        self.abandoned = true;
+        return self.done;
     }
 
     pub fn message(self: *ClearOutcome) []const u8 {
@@ -501,22 +541,34 @@ pub const Tunnel = struct {
 /// Completion record for `oars.vnc.start`: the worker binds the listener
 /// and opens the SSH channel, then reports the ephemeral port.
 pub const TunnelStartOutcome = struct {
+    allocator: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
     done: bool = false,
     ok: bool = false,
+    abandoned: bool = false,
     port: u16 = 0,
     msg_buf: [160]u8 = undefined,
     msg_len: usize = 0,
 
     pub fn set(self: *TunnelStartOutcome, ok: bool, port: u16, msg: []const u8) void {
         lockSpin(&self.mutex);
-        defer self.mutex.unlock();
         self.ok = ok;
         self.port = port;
         const n = @min(msg.len, self.msg_buf.len - 1);
         @memcpy(self.msg_buf[0..n], msg[0..n]);
         self.msg_len = n;
         self.done = true;
+        const free = self.abandoned;
+        self.mutex.unlock();
+        if (free) self.allocator.destroy(self);
+    }
+
+    /// Handler-side deadline escape; see SftpOutcome.abandon.
+    pub fn abandon(self: *TunnelStartOutcome) bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        self.abandoned = true;
+        return self.done;
     }
 
     pub fn message(self: *TunnelStartOutcome) []const u8 {
@@ -620,21 +672,34 @@ pub const JumpTunnel = struct {
 };
 
 /// Spec 18: cross-thread handoff for the agent-forwarding toggle.
+/// Heap + abandonment lifetime: see SftpOutcome's doc comment.
 pub const ForwardSetOutcome = struct {
+    allocator: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
     done: bool = false,
     ok: bool = false,
+    abandoned: bool = false,
     msg_buf: [160]u8 = undefined,
     msg_len: usize = 0,
 
     pub fn set(self: *ForwardSetOutcome, ok: bool, msg: []const u8) void {
         lockSpin(&self.mutex);
-        defer self.mutex.unlock();
         self.ok = ok;
         const n = @min(msg.len, self.msg_buf.len - 1);
         @memcpy(self.msg_buf[0..n], msg[0..n]);
         self.msg_len = n;
         self.done = true;
+        const free = self.abandoned;
+        self.mutex.unlock();
+        if (free) self.allocator.destroy(self);
+    }
+
+    /// Handler-side deadline escape; see SftpOutcome.abandon.
+    pub fn abandon(self: *ForwardSetOutcome) bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        self.abandoned = true;
+        return self.done;
     }
 
     pub fn message(self: *ForwardSetOutcome) []const u8 {
@@ -692,6 +757,14 @@ pub const Session = struct {
     error_len: usize = 0,
     trust: TrustState = .{},
     stop_flag: std.atomic.Value(bool) = .init(false),
+    /// Set by sessionDone inside its final ops_mutex section, after every
+    /// list has been torn down. Op-enqueue paths check it under ops_mutex,
+    /// so an op racing the worker's exit is either drained by sessionDone
+    /// or rejected — never stranded in a queue nobody reads. The session
+    /// itself outlives its worker (the manager map holds it until
+    /// disconnect), so every teardown below must leave a valid empty
+    /// container, never deinit-poisoned memory.
+    worker_done: std.atomic.Value(bool) = .init(false),
     channels_mutex: std.atomic.Mutex = .unlocked,
     channels: std.ArrayList(*ChannelEntry) = .empty,
     shell: ?*ChannelEntry = null,
@@ -935,9 +1008,13 @@ pub const Manager = struct {
         for (ids.items) |id| self.disconnect(id);
     }
 
-    /// Appends bytes to the shell channel's stdin.
+    /// Appends bytes to the shell channel's stdin. channels_mutex is held
+    /// so sessionDone cannot destroy the shell entry mid-append (the
+    /// worker owns entry teardown; lock order channels→stdin matches it).
     pub fn input(self: *Manager, server_id: []const u8, bytes: []const u8) !void {
         const session = self.get(server_id) orelse return error.NoSession;
+        lockSpin(&session.channels_mutex);
+        defer session.channels_mutex.unlock();
         const shell = session.shell orelse return error.NotReady;
         lockSpin(&shell.stdin_mutex);
         defer shell.stdin_mutex.unlock();
@@ -957,6 +1034,7 @@ pub const Manager = struct {
         errdefer self.allocator.free(owned);
         lockSpin(&session.ops_mutex);
         defer session.ops_mutex.unlock();
+        if (session.worker_done.load(.acquire)) return error.NotReady;
         try session.ops.append(self.allocator, .{ .exec = .{ .id = id, .command = owned } });
         return id;
     }
@@ -976,6 +1054,7 @@ pub const Manager = struct {
         }
         lockSpin(&session.ops_mutex);
         defer session.ops_mutex.unlock();
+        if (session.worker_done.load(.acquire)) return error.NotReady;
         try session.ops.append(self.allocator, .{ .exec = .{
             .id = id,
             .command = owned,
@@ -1015,6 +1094,7 @@ pub const Manager = struct {
         };
         lockSpin(&session.ops_mutex);
         defer session.ops_mutex.unlock();
+        if (session.worker_done.load(.acquire)) return error.NotReady;
         try session.ops.append(self.allocator, .{ .exec = .{
             .id = id,
             .command = owned,
@@ -1035,6 +1115,7 @@ pub const Manager = struct {
         errdefer self.allocator.free(owned);
         lockSpin(&session.ops_mutex);
         defer session.ops_mutex.unlock();
+        if (session.worker_done.load(.acquire)) return error.NotReady;
         try session.ops.append(self.allocator, .{ .follow = .{ .id = id, .command = owned } });
         return id;
     }
@@ -1049,6 +1130,7 @@ pub const Manager = struct {
         errdefer self.allocator.free(owned);
         lockSpin(&session.ops_mutex);
         defer session.ops_mutex.unlock();
+        if (session.worker_done.load(.acquire)) return error.NotReady;
         try session.ops.append(self.allocator, .{ .clear = .{ .path = owned, .expected = expected, .outcome = outcome } });
     }
 
@@ -1058,6 +1140,7 @@ pub const Manager = struct {
     fn queueSftp(self: *Manager, session: *Session, op: Op) !void {
         lockSpin(&session.ops_mutex);
         defer session.ops_mutex.unlock();
+        if (session.worker_done.load(.acquire)) return error.NotReady;
         try session.ops.append(self.allocator, op);
     }
 
@@ -1130,8 +1213,9 @@ pub const Manager = struct {
     }
 
     /// Remove. Recursive deletes run as an async transfer (per-entry
-    /// progress, cancelable); plain deletes are synchronous.
-    pub fn sftpRm(self: *Manager, server_id: []const u8, path: []const u8, recursive: bool, transfer_id: u32, outcome: *SftpOutcome) !void {
+    /// progress, cancelable) and pass a null outcome; plain deletes are
+    /// synchronous and carry one.
+    pub fn sftpRm(self: *Manager, server_id: []const u8, path: []const u8, recursive: bool, transfer_id: u32, outcome: ?*SftpOutcome) !void {
         const session = try self.sftpSession(server_id);
         const owned = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(owned);
@@ -1345,6 +1429,7 @@ pub const Manager = struct {
         if (channel_id == 0) return error.InvalidChannel;
         lockSpin(&session.ops_mutex);
         defer session.ops_mutex.unlock();
+        if (session.worker_done.load(.acquire)) return error.NotReady;
         try session.ops.append(self.allocator, .{ .close_channel = .{ .id = channel_id } });
     }
 
@@ -1352,6 +1437,7 @@ pub const Manager = struct {
         const session = self.get(server_id) orelse return error.NoSession;
         lockSpin(&session.ops_mutex);
         defer session.ops_mutex.unlock();
+        if (session.worker_done.load(.acquire)) return error.NotReady;
         try session.ops.append(self.allocator, .{ .resize = .{ .cols = @intCast(cols), .rows = @intCast(rows) } });
     }
 
@@ -1359,6 +1445,7 @@ pub const Manager = struct {
         const session = self.get(server_id) orelse return error.NoSession;
         lockSpin(&session.ops_mutex);
         defer session.ops_mutex.unlock();
+        if (session.worker_done.load(.acquire)) return error.NotReady;
         try session.ops.append(self.allocator, .close);
     }
 
@@ -1511,6 +1598,7 @@ pub const Manager = struct {
         errdefer self.allocator.free(host_owned);
         lockSpin(&session.ops_mutex);
         defer session.ops_mutex.unlock();
+        if (session.worker_done.load(.acquire)) return error.NotReady;
         try session.ops.append(self.allocator, .{ .tunnel_start = .{
             .id = id,
             .token = token_owned,
@@ -1525,6 +1613,7 @@ pub const Manager = struct {
         const session = self.get(server_id) orelse return error.NoSession;
         lockSpin(&session.ops_mutex);
         defer session.ops_mutex.unlock();
+        if (session.worker_done.load(.acquire)) return error.NotReady;
         try session.ops.append(self.allocator, .{ .tunnel_stop = .{ .id = id } });
     }
 
@@ -1536,6 +1625,7 @@ pub const Manager = struct {
         if (session.status.load(.acquire) != .ready) return error.NotReady;
         lockSpin(&session.ops_mutex);
         defer session.ops_mutex.unlock();
+        if (session.worker_done.load(.acquire)) return error.NotReady;
         try session.ops.append(self.allocator, .{ .forward_set = .{ .on = on, .outcome = outcome } });
     }
 
@@ -3515,9 +3605,9 @@ fn sftpAttrs(attrs: ssh.c.LIBSSH2_SFTP_ATTRIBUTES) sftpmod.Attrs {
     };
 }
 
-fn sftpSessionHandle(session: *Session, outcome: *SftpOutcome) ?*ssh.c.LIBSSH2_SFTP {
+fn sftpSessionHandle(session: *Session, outcome: ?*SftpOutcome) ?*ssh.c.LIBSSH2_SFTP {
     return session.transport.sftpInit(session.io) catch {
-        outcome.set(false, "sftp unavailable");
+        if (outcome) |o| o.set(false, "sftp unavailable");
         return null;
     };
 }
@@ -3940,19 +4030,20 @@ fn sftpDeleteRecursive(session: *Session, sftp: *ssh.c.LIBSSH2_SFTP, path_z: [:0
     return true;
 }
 
-fn sftpOpRm(session: *Session, path: []const u8, recursive: bool, transfer_id: u32, outcome: *SftpOutcome) void {
+fn sftpOpRm(session: *Session, path: []const u8, recursive: bool, transfer_id: u32, outcome: ?*SftpOutcome) void {
     const allocator = session.allocator;
     defer allocator.free(path);
-    const sftp = sftpSessionHandle(session, outcome) orelse return;
-    const path_z = allocator.dupeZ(u8, path) catch return outcome.set(false, "out of memory");
-    defer allocator.free(path_z);
-    const deadline = sftpDeadline(session);
 
     if (!recursive) {
+        const out = outcome orelse return; // plain deletes always carry one
+        const sftp = sftpSessionHandle(session, out) orelse return;
+        const path_z = allocator.dupeZ(u8, path) catch return out.set(false, "out of memory");
+        defer allocator.free(path_z);
+        const deadline = sftpDeadline(session);
         var attrs: ssh.c.LIBSSH2_SFTP_ATTRIBUTES = undefined;
         if (!sftpLstat(session, sftp, path_z, &attrs, deadline)) {
             var msg_buf: [256]u8 = undefined;
-            outcome.set(false, sftpFail(session, "stat failed", &msg_buf));
+            out.set(false, sftpFail(session, "stat failed", &msg_buf));
             return;
         }
         const kind = attrs.permissions & ssh.c.LIBSSH2_SFTP_S_IFMT;
@@ -3962,15 +4053,36 @@ fn sftpOpRm(session: *Session, path: []const u8, recursive: bool, transfer_id: u
             sftpUnlink(session, sftp, path_z, deadline);
         if (!ok) {
             var msg_buf: [256]u8 = undefined;
-            outcome.set(false, sftpFail(session, "delete failed", &msg_buf));
+            out.set(false, sftpFail(session, "delete failed", &msg_buf));
             return;
         }
         sftpAudit(session, "sftp.rm", path);
-        sftpSetJson(session, outcome, .{ .ok = true });
+        sftpSetJson(session, out, .{ .ok = true });
         return;
     }
 
-    // Async recursive delete with per-entry progress (spec 05 §5).
+    // Async recursive delete with per-entry progress (spec 05 §5). Errors
+    // ride the transfer record; the op carries no outcome on this path.
+    const sftp = session.transport.sftpInit(session.io) catch {
+        session.sftp_transfers.lock();
+        if (session.sftp_transfers.get(transfer_id)) |t2| {
+            t2.status = .failed;
+            t2.err = "sftp unavailable";
+        }
+        session.sftp_transfers.unlock();
+        return;
+    };
+    const path_z = allocator.dupeZ(u8, path) catch {
+        session.sftp_transfers.lock();
+        if (session.sftp_transfers.get(transfer_id)) |t2| {
+            t2.status = .failed;
+            t2.err = "out of memory";
+        }
+        session.sftp_transfers.unlock();
+        return;
+    };
+    defer allocator.free(path_z);
+    const deadline = sftpDeadline(session);
     session.sftp_transfers.lock();
     const t = session.sftp_transfers.get(transfer_id) orelse {
         session.sftp_transfers.unlock();
@@ -4075,8 +4187,17 @@ fn sftpOpDownload(
     defer allocator.free(remote);
     defer allocator.free(local_partial);
     defer allocator.free(local_final);
-    var dummy: SftpOutcome = .{};
-    const sftp = sftpSessionHandle(session, outcome orelse &dummy) orelse return;
+    const sftp = sftpSessionHandle(session, outcome) orelse {
+        // With no outcome to report through, the failure rides the
+        // transfer record — never leave a download stuck at queued.
+        session.sftp_transfers.lock();
+        if (session.sftp_transfers.get(transfer_id)) |t| {
+            t.status = .failed;
+            t.err = "sftp unavailable";
+        }
+        session.sftp_transfers.unlock();
+        return;
+    };
     const deadline = sftpDeadline(session);
     const remote_z = allocator.dupeZ(u8, remote) catch {
         if (outcome) |o| o.set(false, "out of memory");
@@ -4169,8 +4290,17 @@ fn sftpOpUnzip(session: *Session, zip_path: []const u8, dest: []const u8, transf
     const allocator = session.allocator;
     defer allocator.free(zip_path);
     defer allocator.free(dest);
-    var dummy: SftpOutcome = .{};
-    const sftp = sftpSessionHandle(session, outcome orelse &dummy) orelse return;
+    const sftp = sftpSessionHandle(session, outcome) orelse {
+        // With no outcome to report through, the failure rides the
+        // transfer record — never leave an unzip stuck at queued.
+        session.sftp_transfers.lock();
+        if (session.sftp_transfers.get(transfer_id)) |t| {
+            t.status = .failed;
+            t.err = "sftp unavailable";
+        }
+        session.sftp_transfers.unlock();
+        return;
+    };
     const deadline = sftpDeadline(session);
     const zip_z = allocator.dupeZ(u8, zip_path) catch {
         if (outcome) |o| o.set(false, "out of memory");
@@ -4441,8 +4571,17 @@ fn sftpOpZipDownload(
         allocator.free(local_partial);
         allocator.free(local_final);
     }
-    var dummy: SftpOutcome = .{};
-    const sftp = sftpSessionHandle(session, outcome orelse &dummy) orelse return;
+    const sftp = sftpSessionHandle(session, outcome) orelse {
+        // With no outcome to report through, the failure rides the
+        // transfer record — never leave a zip download stuck at queued.
+        session.sftp_transfers.lock();
+        if (session.sftp_transfers.get(transfer_id)) |t| {
+            t.status = .failed;
+            t.err = "sftp unavailable";
+        }
+        session.sftp_transfers.unlock();
+        return;
+    };
     const deadline = sftpDeadline(session);
 
     session.sftp_transfers.lock();
@@ -4586,8 +4725,89 @@ fn reportKeyAuthError(session: *Session, error_buf: []u8, err: ssh.Error) void {
     session.setError(std.fmt.bufPrint(error_buf, "key authentication failed: {s} ({s})", .{ @errorName(err), msg }) catch "key authentication failed");
 }
 
-/// Cleans up channels and the transport at the end of the worker's life.
+/// Cleans up the session at the end of the worker's life. The session
+/// stays in the manager map until disconnect, so every container the
+/// bridge can reach must be left VALID-but-empty (clearAndFree, or a
+/// locked cache deinit), never deinit-poisoned: the 80 ms poll loop,
+/// keystrokes, and SFTP/monitor/tunnel handlers all keep arriving after
+/// the worker dies, and Zig 0.16's ArrayList.deinit writes `undefined`
+/// (0xAA in Debug) into the list — the idle-session segfault. The ops
+/// drain runs last and publishes `worker_done` inside its ops_mutex
+/// section, so op-enqueue paths checking the flag under the same mutex
+/// either have their op drained below or reject it.
 fn sessionDone(session: *Session) void {
+    // Channels first: nulling the shell under channels_mutex makes a
+    // concurrent input() fail honestly instead of writing into an entry
+    // being destroyed here.
+    lockSpin(&session.channels_mutex);
+    for (session.channels.items) |entry| {
+        if (!entry.raw_closed) entry.raw.close(session.io);
+        entry.clearStdin(session.allocator);
+        entry.freeCommandText(session.allocator);
+        entry.stream.deinit(session.allocator);
+        session.allocator.destroy(entry.stream);
+        session.allocator.destroy(entry);
+    }
+    session.shell = null;
+    session.channels.clearAndFree(session.allocator);
+    session.channels_mutex.unlock();
+
+    // The monitor cache has no internal lock; bridge handlers serialize
+    // against it, so teardown must take the same lock.
+    session.monitor_cache.lock();
+    session.monitor_cache.deinit(session.allocator);
+    session.monitor_cache.unlock();
+    session.logs_cache.deinit(session.allocator);
+    session.sftp_transfers.reset(session.allocator);
+    for (session.folder_size_cache.items) |e| session.allocator.free(e.path);
+    session.folder_size_cache.clearAndFree(session.allocator);
+
+    // VNC tunnels: everything dies with the session (spec 12 §8).
+    lockSpin(&session.tunnels_mutex);
+    for (session.tunnels.items) |t| {
+        t.setError("session disconnected");
+        t.state = .closed;
+        t.deinit(session.allocator, session.io);
+        session.allocator.destroy(t);
+    }
+    session.tunnels.clearAndFree(session.allocator);
+    session.tunnels_mutex.unlock();
+
+    // Jump-host tunnels (spec 18): everything dies with the via session,
+    // and dependants get a clear cascade close state.
+    lockSpin(&session.tunnels_mutex);
+    for (session.jump_tunnels.items) |jt| {
+        if (session.owner.get(jt.target_server_id)) |target| {
+            if (target.status.load(.acquire) == .ready) {
+                target.status.store(.@"error", .release);
+                var msg_buf: [256]u8 = undefined;
+                target.setError(std.fmt.bufPrint(&msg_buf, "jump host {s} disconnected", .{session.server.name}) catch "jump host disconnected");
+            }
+        }
+        jt.deinit(session.allocator, session.io);
+        session.allocator.destroy(jt);
+    }
+    session.jump_tunnels.clearAndFree(session.allocator);
+    session.tunnels_mutex.unlock();
+    if (session.via_name) |n| session.allocator.free(n);
+
+    // Agent forwarding (spec 18): close every accepted agent channel.
+    lockSpin(&session.forward_mutex);
+    for (session.forward_queue.items) |ch| ch.close(session.io);
+    session.forward_queue.clearAndFree(session.allocator);
+    for (session.forward_active.items) |ft| {
+        _ = ssh.c.close(ft.agent_fd);
+        ft.channel.close(session.io);
+        session.allocator.destroy(ft);
+    }
+    session.forward_active.clearAndFree(session.allocator);
+    session.forward_mutex.unlock();
+    if (session.forward_agent_path) |p| session.allocator.free(p);
+
+    session.transport.disconnect(session.io);
+    const status = session.status.load(.acquire);
+    if (status != .@"error" and status != .closed) session.status.store(.closed, .release);
+
     lockSpin(&session.ops_mutex);
     for (session.ops.items) |op| {
         switch (op) {
@@ -4605,119 +4825,90 @@ fn sessionDone(session: *Session) void {
                 }
             },
             .follow => |f| session.allocator.free(f.command),
-            .clear => |cl| session.allocator.free(cl.path),
-            .sftp_ls => |so| session.allocator.free(so.path),
-            .sftp_stat => |so| session.allocator.free(so.path),
-            .sftp_read => |so| session.allocator.free(so.path),
+            .clear => |cl| {
+                session.allocator.free(cl.path);
+                cl.outcome.set(false, "session disconnected");
+            },
+            .sftp_ls => |so| {
+                session.allocator.free(so.path);
+                so.outcome.set(false, "session disconnected");
+            },
+            .sftp_stat => |so| {
+                session.allocator.free(so.path);
+                so.outcome.set(false, "session disconnected");
+            },
+            .sftp_read => |so| {
+                session.allocator.free(so.path);
+                so.outcome.set(false, "session disconnected");
+            },
             .sftp_write_chunk => |so| {
                 session.allocator.free(so.path);
                 session.allocator.free(so.data);
+                so.outcome.set(false, "session disconnected");
             },
             .sftp_save => |so| {
                 session.allocator.free(so.path);
                 session.allocator.free(so.data);
+                so.outcome.set(false, "session disconnected");
             },
-            .sftp_mkdir => |so| session.allocator.free(so.path),
-            .sftp_rm => |so| session.allocator.free(so.path),
+            .sftp_mkdir => |so| {
+                session.allocator.free(so.path);
+                so.outcome.set(false, "session disconnected");
+            },
+            .sftp_rm => |so| {
+                session.allocator.free(so.path);
+                if (so.outcome) |o| o.set(false, "session disconnected");
+            },
             .sftp_rename => |so| {
                 session.allocator.free(so.from);
                 session.allocator.free(so.to);
+                so.outcome.set(false, "session disconnected");
             },
-            .sftp_chmod => |so| session.allocator.free(so.path),
+            .sftp_chmod => |so| {
+                session.allocator.free(so.path);
+                so.outcome.set(false, "session disconnected");
+            },
             .sftp_download => |so| {
                 session.allocator.free(so.remote);
                 session.allocator.free(so.local_partial);
                 session.allocator.free(so.local_final);
+                if (so.outcome) |o| o.set(false, "session disconnected");
             },
             .sftp_unzip => |so| {
                 session.allocator.free(so.zip_path);
                 session.allocator.free(so.dest);
+                if (so.outcome) |o| o.set(false, "session disconnected");
             },
             .sftp_zip_download => |so| {
                 for (so.paths) |p| session.allocator.free(p);
                 session.allocator.free(so.paths);
                 session.allocator.free(so.local_partial);
                 session.allocator.free(so.local_final);
+                if (so.outcome) |o| o.set(false, "session disconnected");
             },
             .tunnel_start => |t| {
                 session.allocator.free(t.token);
                 session.allocator.free(t.host);
+                t.outcome.set(false, 0, "session disconnected");
             },
+            .forward_set => |f| f.outcome.set(false, "session disconnected"),
             .jump_start => |j| {
                 session.allocator.free(j.host);
                 session.allocator.free(j.target_server_id);
-                if (!j.outcome.isDone()) _ = ssh.c.close(j.fd);
+                if (!j.outcome.isDone()) {
+                    // The target session's worker spin-waits on this
+                    // outcome with no deadline: leaving it unset hangs
+                    // that worker (and disconnect's join) forever.
+                    j.outcome.set(false, "jump host disconnected");
+                    _ = ssh.c.close(j.fd);
+                }
             },
             else => {},
         }
     }
-    session.ops.deinit(session.allocator);
+    session.ops.clearAndFree(session.allocator);
+    session.worker_done.store(true, .release);
     session.ops_mutex.unlock();
-
-    lockSpin(&session.channels_mutex);
-    for (session.channels.items) |entry| {
-        if (!entry.raw_closed) entry.raw.close(session.io);
-        entry.clearStdin(session.allocator);
-        entry.freeCommandText(session.allocator);
-        entry.stream.deinit(session.allocator);
-        session.allocator.destroy(entry.stream);
-        session.allocator.destroy(entry);
-    }
-    session.channels.deinit(session.allocator);
-    session.channels_mutex.unlock();
-
-    session.monitor_cache.deinit(session.allocator);
-    session.logs_cache.deinit(session.allocator);
-    session.sftp_transfers.deinit(session.allocator);
-    for (session.folder_size_cache.items) |e| session.allocator.free(e.path);
-    session.folder_size_cache.deinit(session.allocator);
-
-    // VNC tunnels: everything dies with the session (spec 12 §8).
-    lockSpin(&session.tunnels_mutex);
-    for (session.tunnels.items) |t| {
-        t.setError("session disconnected");
-        t.state = .closed;
-        t.deinit(session.allocator, session.io);
-        session.allocator.destroy(t);
-    }
-    session.tunnels.clearRetainingCapacity();
-    session.tunnels.deinit(session.allocator);
-    session.tunnels_mutex.unlock();
-
-    // Jump-host tunnels (spec 18): everything dies with the via session,
-    // and dependants get a clear cascade close state.
-    lockSpin(&session.tunnels_mutex);
-    for (session.jump_tunnels.items) |jt| {
-        if (session.owner.get(jt.target_server_id)) |target| {
-            if (target.status.load(.acquire) == .ready) {
-                target.status.store(.@"error", .release);
-                var msg_buf: [256]u8 = undefined;
-                target.setError(std.fmt.bufPrint(&msg_buf, "jump host {s} disconnected", .{session.server.name}) catch "jump host disconnected");
-            }
-        }
-        jt.deinit(session.allocator, session.io);
-        session.allocator.destroy(jt);
-    }
-    session.jump_tunnels.deinit(session.allocator);
-    session.tunnels_mutex.unlock();
-    if (session.via_name) |n| session.allocator.free(n);
-
-    // Agent forwarding (spec 18): close every accepted agent channel.
-    lockSpin(&session.forward_mutex);
-    for (session.forward_queue.items) |ch| ch.close(session.io);
-    session.forward_queue.deinit(session.allocator);
-    for (session.forward_active.items) |ft| {
-        _ = ssh.c.close(ft.agent_fd);
-        ft.channel.close(session.io);
-        session.allocator.destroy(ft);
-    }
-    session.forward_active.deinit(session.allocator);
-    session.forward_mutex.unlock();
-    if (session.forward_agent_path) |p| session.allocator.free(p);
-
-    session.transport.disconnect(session.io);
-    const status = session.status.load(.acquire);
-    if (status != .@"error" and status != .closed) session.status.store(.closed, .release);
 }
 
 /// Stop signal for the transport's deadline loops: disconnect sets the
@@ -4816,4 +5007,164 @@ test "status json names are stable" {
     try std.testing.expectEqualStrings("needs_trust", Status.needs_trust.jsonName());
     try std.testing.expectEqualStrings("ready", Status.ready.jsonName());
     try std.testing.expectEqualStrings("exec", ChannelKind.exec.jsonName());
+}
+
+test "dead worker leaves the session pollable: post-mortem access never crashes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const now = std.Io.Timestamp.now(io, .real).nanoseconds;
+    var dir_buf: [128]u8 = undefined;
+    var store_path_buf: [512]u8 = undefined;
+    var audit_path_buf: [512]u8 = undefined;
+    var history_path_buf: [512]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "oars-sessions-test-{d}", .{now});
+    const store_path = try std.fmt.bufPrint(&store_path_buf, "/tmp/{s}/servers.json", .{dir});
+    const audit_path = try std.fmt.bufPrint(&audit_path_buf, "/tmp/{s}/audit.jsonl", .{dir});
+    const history_path = try std.fmt.bufPrint(&history_path_buf, "/tmp/{s}/history.jsonl", .{dir});
+    var store: servers.Store = .{ .allocator = allocator, .path = store_path };
+    var audit: history.AuditStore = .{ .allocator = allocator, .path = audit_path };
+    var history_store: history.HistoryStore = .{ .allocator = allocator, .path = history_path };
+    var manager = Manager.init(allocator, io, &store, &audit, &history_store, null);
+    defer manager.deinit();
+
+    // 127.0.0.1:1 refuses the TCP connect instantly: the worker errors and
+    // exits on its own, exactly as a keepalive-dropped idle session does.
+    const server = servers.Server{
+        .id = "dead-1",
+        .name = "dead",
+        .host = "127.0.0.1",
+        .port = 1,
+        .user = "u",
+    };
+    _ = try manager.connect(server, null, null);
+
+    // Wait for the worker to die and its teardown to complete.
+    const session = manager.get("dead-1").?;
+    const deadline = std.Io.Timestamp.now(io, .real).nanoseconds + 10 * std.time.ns_per_s;
+    while (!session.worker_done.load(.acquire)) {
+        if (std.Io.Timestamp.now(io, .real).nanoseconds >= deadline) return error.WorkerStuck;
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(5), .awake) catch {};
+    }
+
+    // The reported crash: the frontend poll timer kept firing after the
+    // worker died, and pollChannels iterated the torn-down channel list.
+    const polls = try manager.pollChannels("dead-1", &.{}, false, 1024, 1024);
+    try std.testing.expectEqual(@as(usize, 0), polls.len);
+    allocator.free(polls);
+
+    // Keystrokes, execs, and resizes against the dead session fail honestly.
+    try std.testing.expectError(error.NotReady, manager.input("dead-1", "x"));
+    try std.testing.expectError(error.NotReady, manager.exec("dead-1", "ls"));
+    try std.testing.expectError(error.NotReady, manager.resize("dead-1", 80, 24));
+
+    manager.disconnect("dead-1");
+}
+
+test "op outcomes survive handler abandonment: late set frees exactly once" {
+    const allocator = std.testing.allocator;
+
+    // Handler still waiting when the set arrives: the worker leaves
+    // ownership with the handler, which destroys it after reading.
+    const o1 = try allocator.create(SftpOutcome);
+    o1.* = .{ .allocator = allocator };
+    o1.set(false, "boom");
+    try std.testing.expect(o1.isDone());
+    try std.testing.expectEqualStrings("boom", o1.message());
+    allocator.destroy(o1);
+
+    // Handler's deadline expired first: abandon moves ownership to the
+    // op, and the late set frees the struct itself (the test allocator
+    // fails the run on a leak or double free).
+    const o2 = try allocator.create(SftpOutcome);
+    o2.* = .{ .allocator = allocator };
+    try std.testing.expect(!o2.abandon()); // not done -> the op owns it now
+    o2.set(false, "too late");
+
+    // Set lands between the handler's isDone check and its abandon: the
+    // handler keeps ownership and reads the result normally.
+    const o3 = try allocator.create(TunnelStartOutcome);
+    o3.* = .{ .allocator = allocator };
+    o3.set(true, 5900, "");
+    try std.testing.expect(o3.abandon()); // was already done -> handler owns
+    allocator.destroy(o3);
+
+    // setJson on an abandoned outcome frees the payload as well.
+    const o4 = try allocator.create(SftpOutcome);
+    o4.* = .{ .allocator = allocator };
+    try std.testing.expect(!o4.abandon());
+    o4.setJson(try allocator.dupe(u8, "{\"ok\":true}"));
+}
+
+test "sessionDone completes queued op outcomes honestly" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const now = std.Io.Timestamp.now(io, .real).nanoseconds;
+    var dir_buf: [128]u8 = undefined;
+    var store_path_buf: [512]u8 = undefined;
+    var audit_path_buf: [512]u8 = undefined;
+    var history_path_buf: [512]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "oars-sessions-test-{d}", .{now});
+    const store_path = try std.fmt.bufPrint(&store_path_buf, "/tmp/{s}/servers.json", .{dir});
+    const audit_path = try std.fmt.bufPrint(&audit_path_buf, "/tmp/{s}/audit.jsonl", .{dir});
+    const history_path = try std.fmt.bufPrint(&history_path_buf, "/tmp/{s}/history.jsonl", .{dir});
+    var store: servers.Store = .{ .allocator = allocator, .path = store_path };
+    var audit: history.AuditStore = .{ .allocator = allocator, .path = audit_path };
+    var history_store: history.HistoryStore = .{ .allocator = allocator, .path = history_path };
+    var manager = Manager.init(allocator, io, &store, &audit, &history_store, null);
+    defer manager.deinit();
+
+    // A session whose worker never ran: ops sit queued until teardown.
+    // (transport.init establishes nothing; disconnect inside sessionDone
+    // is a documented no-op on it.)
+    const session = try allocator.create(Session);
+    session.* = .{
+        .id = 99,
+        .server = .{ .id = "s", .name = "s", .host = "s", .user = "s" },
+        .allocator = allocator,
+        .threaded = std.Io.Threaded.init(allocator, .{}),
+        .io = undefined,
+        .transport = try ssh.Session.init(allocator),
+        .store = &store,
+        .audit = &audit,
+        .history = &history_store,
+        .owner = &manager,
+        .started_at_ns = now,
+    };
+    session.io = session.threaded.io();
+    defer {
+        session.threaded.deinit();
+        allocator.destroy(session);
+    }
+
+    // One outcome the handler is still waiting on...
+    const waited = try allocator.create(SftpOutcome);
+    waited.* = .{ .allocator = allocator };
+    // ...and one its handler already abandoned after a deadline.
+    const abandoned = try allocator.create(ClearOutcome);
+    abandoned.* = .{ .allocator = allocator };
+    try std.testing.expect(!abandoned.abandon());
+    {
+        lockSpin(&session.ops_mutex);
+        defer session.ops_mutex.unlock();
+        try session.ops.append(allocator, .{ .sftp_ls = .{
+            .path = try allocator.dupe(u8, "/etc"),
+            .outcome = waited,
+        } });
+        try session.ops.append(allocator, .{ .clear = .{
+            .path = try allocator.dupe(u8, "/var/log/a.log"),
+            .expected = .{ .size = 1, .mtime = 2, .mode = 0o644 },
+            .outcome = abandoned,
+        } });
+    }
+
+    sessionDone(session);
+
+    // The waiting handler wakes to an honest failure and frees; the
+    // abandoned outcome was freed by the drain's set (no leak).
+    try std.testing.expect(waited.isDone());
+    try std.testing.expect(!waited.ok);
+    try std.testing.expectEqualStrings("session disconnected", waited.message());
+    allocator.destroy(waited);
+    try std.testing.expect(session.worker_done.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), session.ops.items.len);
 }

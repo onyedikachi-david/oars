@@ -291,6 +291,17 @@ pub const Transfers = struct {
         self.list.deinit(allocator);
     }
 
+    /// Worker-teardown variant of deinit: the session outlives its worker
+    /// (the manager map holds it until disconnect), and late bridge polls
+    /// keep reading the registry — leave it valid-but-empty instead of
+    /// deinit-poisoned (0.16's ArrayList.deinit writes `undefined`).
+    pub fn reset(self: *Transfers, allocator: std.mem.Allocator) void {
+        self.lock();
+        defer self.unlock();
+        for (self.list.items) |t| allocator.free(t.path);
+        self.list.clearAndFree(allocator);
+    }
+
     /// Adds a transfer; returns its id. Caller holds the lock.
     pub fn add(self: *Transfers, allocator: std.mem.Allocator, kind: []const u8, path: []const u8) !u32 {
         const id = self.next_id;

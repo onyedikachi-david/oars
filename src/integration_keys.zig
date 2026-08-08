@@ -344,8 +344,17 @@ test "integration: sshkeys add/connect/revoke/rotate, roles, and deploy keys" {
     try std.testing.expect(shell_exit != 0);
 
     // SFTP reads are permitted.
-    var read_out: sessions.SftpOutcome = .{};
-    try rig.manager.sftpRead("itest-keys-ro", "/etc/hostname", 0, 4096, &read_out);
+    const read_out = try std.testing.allocator.create(sessions.SftpOutcome);
+    read_out.* = .{ .allocator = std.testing.allocator };
+    // A completed outcome is freed here; an unfinished one belongs to the
+    // op (its eventual set frees it) — never destroy a live one.
+    rig.manager.sftpRead("itest-keys-ro", "/etc/hostname", 0, 4096, read_out) catch |err| {
+        std.testing.allocator.destroy(read_out);
+        return err;
+    };
+    // A completed outcome is freed here; an unfinished one belongs to
+    // the op (its eventual set frees it) — never destroy a live one.
+    defer if (read_out.isDone() or read_out.abandon()) std.testing.allocator.destroy(read_out);
     const deadline = std.Io.Timestamp.now(io, .real).nanoseconds + 20 * std.time.ns_per_s;
     read_out.wait(io, deadline);
     try std.testing.expect(read_out.isDone());
@@ -353,29 +362,64 @@ test "integration: sshkeys add/connect/revoke/rotate, roles, and deploy keys" {
     if (read_out.json) |j| std.testing.allocator.free(j);
 
     // Every filesystem mutation is refused.
-    var write_out: sessions.SftpOutcome = .{};
-    try rig.manager.sftpSave("itest-keys-ro", "/tmp/ro-write-test", "x", &write_out);
+    const write_out = try std.testing.allocator.create(sessions.SftpOutcome);
+    write_out.* = .{ .allocator = std.testing.allocator };
+    rig.manager.sftpSave("itest-keys-ro", "/tmp/ro-write-test", "x", write_out) catch |err| {
+        std.testing.allocator.destroy(write_out);
+        return err;
+    };
+    // A completed outcome is freed here; an unfinished one belongs to
+    // the op (its eventual set frees it) — never destroy a live one.
+    defer if (write_out.isDone() or write_out.abandon()) std.testing.allocator.destroy(write_out);
     write_out.wait(io, deadline);
     try std.testing.expect(write_out.isDone());
     try std.testing.expect(!write_out.ok);
 
-    var mkdir_out: sessions.SftpOutcome = .{};
-    try rig.manager.sftpMkdir("itest-keys-ro", "/tmp/ro-dir", &mkdir_out);
+    const mkdir_out = try std.testing.allocator.create(sessions.SftpOutcome);
+    mkdir_out.* = .{ .allocator = std.testing.allocator };
+    rig.manager.sftpMkdir("itest-keys-ro", "/tmp/ro-dir", mkdir_out) catch |err| {
+        std.testing.allocator.destroy(mkdir_out);
+        return err;
+    };
+    // A completed outcome is freed here; an unfinished one belongs to
+    // the op (its eventual set frees it) — never destroy a live one.
+    defer if (mkdir_out.isDone() or mkdir_out.abandon()) std.testing.allocator.destroy(mkdir_out);
     mkdir_out.wait(io, deadline);
     try std.testing.expect(mkdir_out.isDone() and !mkdir_out.ok);
 
-    var rm_out: sessions.SftpOutcome = .{};
-    try rig.manager.sftpRm("itest-keys-ro", "/etc/hostname", false, 0, &rm_out);
+    const rm_out = try std.testing.allocator.create(sessions.SftpOutcome);
+    rm_out.* = .{ .allocator = std.testing.allocator };
+    rig.manager.sftpRm("itest-keys-ro", "/etc/hostname", false, 0, rm_out) catch |err| {
+        std.testing.allocator.destroy(rm_out);
+        return err;
+    };
+    // A completed outcome is freed here; an unfinished one belongs to
+    // the op (its eventual set frees it) — never destroy a live one.
+    defer if (rm_out.isDone() or rm_out.abandon()) std.testing.allocator.destroy(rm_out);
     rm_out.wait(io, deadline);
     try std.testing.expect(rm_out.isDone() and !rm_out.ok);
 
-    var rename_out: sessions.SftpOutcome = .{};
-    try rig.manager.sftpRename("itest-keys-ro", "/etc/hostname", "/etc/hostname2", &rename_out);
+    const rename_out = try std.testing.allocator.create(sessions.SftpOutcome);
+    rename_out.* = .{ .allocator = std.testing.allocator };
+    rig.manager.sftpRename("itest-keys-ro", "/etc/hostname", "/etc/hostname2", rename_out) catch |err| {
+        std.testing.allocator.destroy(rename_out);
+        return err;
+    };
+    // A completed outcome is freed here; an unfinished one belongs to
+    // the op (its eventual set frees it) — never destroy a live one.
+    defer if (rename_out.isDone() or rename_out.abandon()) std.testing.allocator.destroy(rename_out);
     rename_out.wait(io, deadline);
     try std.testing.expect(rename_out.isDone() and !rename_out.ok);
 
-    var chmod_out: sessions.SftpOutcome = .{};
-    try rig.manager.sftpChmod("itest-keys-ro", "/etc/hostname", 0o644, &chmod_out);
+    const chmod_out = try std.testing.allocator.create(sessions.SftpOutcome);
+    chmod_out.* = .{ .allocator = std.testing.allocator };
+    rig.manager.sftpChmod("itest-keys-ro", "/etc/hostname", 0o644, chmod_out) catch |err| {
+        std.testing.allocator.destroy(chmod_out);
+        return err;
+    };
+    // A completed outcome is freed here; an unfinished one belongs to
+    // the op (its eventual set frees it) — never destroy a live one.
+    defer if (chmod_out.isDone() or chmod_out.abandon()) std.testing.allocator.destroy(chmod_out);
     chmod_out.wait(io, deadline);
     try std.testing.expect(chmod_out.isDone() and !chmod_out.ok);
 
@@ -385,10 +429,17 @@ test "integration: sshkeys add/connect/revoke/rotate, roles, and deploy keys" {
     // root session (whose exec is not replaced); the inner ssh authenticates
     // as ro-alice with the uploaded role key, so the refusal is about
     // `restrict`, not about auth.
-    var up_out: sessions.SftpOutcome = .{};
+    const up_out = try std.testing.allocator.create(sessions.SftpOutcome);
+    up_out.* = .{ .allocator = std.testing.allocator };
     const role_key_bytes = try std.Io.Dir.cwd().readFileAlloc(io, gen3.value.result.private_path, std.testing.allocator, .limited(256 * 1024));
     defer std.testing.allocator.free(role_key_bytes);
-    try rig.manager.sftpSave("itest-keys", "/tmp/oars-role-key", role_key_bytes, &up_out);
+    rig.manager.sftpSave("itest-keys", "/tmp/oars-role-key", role_key_bytes, up_out) catch |err| {
+        std.testing.allocator.destroy(up_out);
+        return err;
+    };
+    // A completed outcome is freed here; an unfinished one belongs to
+    // the op (its eventual set frees it) — never destroy a live one.
+    defer if (up_out.isDone() or up_out.abandon()) std.testing.allocator.destroy(up_out);
     up_out.wait(io, deadline);
     try std.testing.expect(up_out.isDone() and up_out.ok);
     if (up_out.json) |j| std.testing.allocator.free(j);
