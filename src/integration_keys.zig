@@ -364,7 +364,7 @@ test "integration: sshkeys add/connect/revoke/rotate, roles, and deploy keys" {
     // Every filesystem mutation is refused.
     const write_out = try std.testing.allocator.create(sessions.SftpOutcome);
     write_out.* = .{ .allocator = std.testing.allocator };
-    rig.manager.sftpSave("itest-keys-ro", "/tmp/ro-write-test", "x", write_out) catch |err| {
+    rig.manager.sftpSave("itest-keys-ro", "/tmp/ro-write-test", "x", null, write_out) catch |err| {
         std.testing.allocator.destroy(write_out);
         return err;
     };
@@ -433,7 +433,7 @@ test "integration: sshkeys add/connect/revoke/rotate, roles, and deploy keys" {
     up_out.* = .{ .allocator = std.testing.allocator };
     const role_key_bytes = try std.Io.Dir.cwd().readFileAlloc(io, gen3.value.result.private_path, std.testing.allocator, .limited(256 * 1024));
     defer std.testing.allocator.free(role_key_bytes);
-    rig.manager.sftpSave("itest-keys", "/tmp/oars-role-key", role_key_bytes, up_out) catch |err| {
+    rig.manager.sftpSave("itest-keys", "/tmp/oars-role-key", role_key_bytes, null, up_out) catch |err| {
         std.testing.allocator.destroy(up_out);
         return err;
     };

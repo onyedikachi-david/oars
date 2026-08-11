@@ -311,7 +311,11 @@ pub fn build(b: *std.Build) void {
     const package_step = b.step("package", "Create a local package artifact");
     package_step.dependOn(&package.step);
 
-    const tests = b.addTest(.{ .root_module = app_mod });
+    const test_filter = b.option([]const u8, "test-filter", "Run only tests whose name contains this text");
+    const tests = b.addTest(.{
+        .root_module = app_mod,
+        .filters = if (test_filter) |filter| &.{filter} else &.{},
+    });
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 }

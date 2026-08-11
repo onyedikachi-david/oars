@@ -711,6 +711,21 @@ pub const Channel = struct {
         return .{ .data = @intCast(rc) };
     }
 
+    /// Reads a long-lived byte-stream channel such as direct-tcpip or an
+    /// auth-agent proxy. libssh2 documents zero as a valid "no payload"
+    /// result, so these channels use the separate EOF flag and stay open
+    /// while quiet. Short-lived exec channels retain read(), whose zero-read
+    /// completion behavior is part of the existing worker contract.
+    pub fn readOpenStream(self: *Channel, buf: []u8) ReadResult {
+        const rc = c.libssh2_channel_read_ex(self.raw, 0, buf.ptr, buf.len);
+        if (rc == 0) return if (c.libssh2_channel_eof(self.raw) != 0) .eof else .again;
+        if (rc < 0) {
+            const code: c_int = @intCast(rc);
+            return if (isEagain(code)) .again else .eof;
+        }
+        return .{ .data = @intCast(rc) };
+    }
+
     /// Writes data; returns bytes accepted (0 if EAGAIN).
     pub fn write(self: *Channel, data: []const u8) usize {
         const rc = c.libssh2_channel_write_ex(self.raw, 0, data.ptr, data.len);

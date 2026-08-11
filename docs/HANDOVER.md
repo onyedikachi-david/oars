@@ -1799,8 +1799,52 @@ into the comptime block — pitfall 24) caught two more real bugs:
 
 196/196 with the dev containers (1m17s — the env gates really ran).
 
-## 32. Next implementation target
+## 32. Previous implementation target
 
-Implement the spec 05 File Manager frontend. Follow `docs/NEXT-SPEC.md`; it
-records the exact SFTP backend contract, the raw-path identity rule, the editor
-concurrency gap, transfer requirements, preview fixtures, and validation gate.
+Spec 05 File Manager is complete in this checkout. The implementation and
+validation evidence are in §33. `docs/NEXT-SPEC.md` now records the maintenance
+contract for the completed feature.
+
+## 33. Session handover — 2026-08-11: matched local/remote file manager and direct native transfers
+
+The file workspace now has two functional panes. The local pane lists an
+approved native folder. The remote pane lists SFTP content. Both panes use the
+same header height, path-bar height, three-column grid, 50 px rows, typography,
+hover, selection, loading, error, and empty states. Desktop uses equal-width
+panes. A 390 px layout stacks them without horizontal page overflow.
+
+`oars.local.ls` validates absolute local paths, lists at most 5,000 entries,
+and does not follow symlinks. `oars.sftp.uploadLocal` opens a regular local
+file on the session worker and streams it to a remote partial file. Bytes do
+not cross the JSON bridge. Completion uses a no-clobber rename. Remote
+downloads use the selected local folder and refresh that pane when complete.
+The native folder picker uses `native-sdk.dialog.openFile` with
+`allowDirectories`; the installed macOS host maps this to
+`NSOpenPanel.canChooseDirectories`.
+
+The review also fixed a shared SSH transport regression. libssh2 documents a
+zero result from `libssh2_channel_read_ex` as a valid no-payload read, not an
+EOF signal. Long-lived direct-tcpip, VNC, and agent-proxy channels now use
+`readOpenStream`, which checks `libssh2_channel_eof`. Existing one-shot exec
+channels keep their established completion contract. This fixes the nested
+SSH jump handshake without causing exec, log, SFTP, script, or deployment
+timeouts. Primary references:
+[`libssh2_channel_read_ex`](https://libssh2.org/libssh2_channel_read_ex.html)
+and [`libssh2_channel_eof`](https://libssh2.org/libssh2_channel_eof.html).
+
+Validation in this checkout:
+
+- `zig build -j1 test` with the Docker SSH and MinIO fixtures: 198/198 passed.
+- Focused jump-host integration: passed.
+- Focused SFTP CRUD, editor, transfer, cancellation, and ZIP integration:
+  passed, including local listing and direct local upload/read-back.
+- `zig build`, `zig build test`, and `git diff --check`: passed.
+- Frontend typecheck: passed.
+- Frontend Vitest: 7 files and 59 tests passed.
+- Frontend production build: passed. Vite reports the existing main-chunk size
+  warning; it is not a build failure.
+- Live preview: local and remote panes measured 547 px each at 1440 × 1000;
+  both headers measured 64 px, both path bars 35 px, and both row grids used
+  `335px 72px 98px` columns with 50 px rows. The 390 × 844 layout had no
+  horizontal page overflow. Direct upload and download payloads used the
+  selected local path and current remote path.

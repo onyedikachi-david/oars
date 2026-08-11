@@ -15,7 +15,7 @@ already exists.
 | 02 | [Terminal (SSH)](02-terminal.md) | Partial: shell, exec, trust, per-tab cursors, resize, canonical fingerprints land; exec/trust UI and mirrored-tab wiring pending |
 | 03 | [Infra Monitoring](03-monitoring.md) | ✅ v1 frontend + backend implemented; Oars+ PM2 and alerts planned |
 | 04 | [Log Management](04-logs.md) | ✅ v1 frontend + backend implemented: grouped scan, virtualized viewer/search, byte-cursor Follow, SFTP download, identity-bound Clear, binary/unreadable states |
-| 05 | [File Manager (SFTP)](05-file-manager.md) | 📋 |
+| 05 | [File Manager (SFTP)](05-file-manager.md) | ✅ v1 frontend + backend implemented: matched local/remote panes, direct native transfers, progress/cancel, editor conflict checks, safe ZIP flows |
 | 06 | [Scripts + Safe Broadcast](06-scripts.md) | 📋 |
 | 07 | [One-Click Deployment](07-deployment.md) | 📋 |
 | 08 | [SSH Management](08-ssh-management.md) | 📋 |

@@ -7,6 +7,14 @@ import type {
   LogScanResult,
   LogReadResult,
   LogClearResult,
+  RemotePath,
+  LocalLsResult,
+  SftpLsResult,
+  SftpStatResult,
+  SftpReadResult,
+  SftpWriteResult,
+  SftpSaveParams,
+  SftpFolderSizeResult,
   SftpTransferSnapshot,
   SftpOpStart,
   VncStartResult,
@@ -96,6 +104,16 @@ export async function pickFile(title: string, allowDirectories = false): Promise
   return result && result.length > 0 ? result[0] : null;
 }
 
+export async function pickDirectory(title: string, defaultPath?: string): Promise<string | null> {
+  const result = await invoke<string[] | null>("native-sdk.dialog.openFile", {
+    title,
+    defaultPath,
+    allowMultiple: false,
+    allowDirectories: true,
+  });
+  return result && result.length > 0 ? result[0] : null;
+}
+
 // Native save dialog (native-sdk.dialog.saveFile). Resolves to the chosen
 // path, or null when the user cancels. The caller owns the path: local
 // files are only ever written by the SFTP transfer machinery, never by
@@ -116,6 +134,9 @@ export async function pickSaveFile(
 // --- Oars commands --------------------------------------------------------
 
 export const api = {
+  local: {
+    ls: (path: string) => invoke<LocalLsResult>("oars.local.ls", { path }),
+  },
   servers: {
     list: () => invoke<{ servers: Server[]; recovery_error?: string }>("oars.servers.list", {}),
     save: (server: ServerDraft) => invoke<{ server: Server }>("oars.servers.save", server),
@@ -159,15 +180,40 @@ export const api = {
   sftp: {
     // Whole-file download through the binary SFTP transfer machinery
     // (spec 04 §5 / spec 05 §5); `localPath` must come from pickSaveFile.
-    download: (serverId: string, remotePath: string, localPath: string) =>
-      invoke<SftpOpStart>("oars.sftp.download", { server_id: serverId, remote_path: { utf8: remotePath }, local_path: localPath }),
+    download: (serverId: string, remotePath: RemotePath, localPath: string) =>
+      invoke<SftpOpStart>("oars.sftp.download", { server_id: serverId, remote_path: remotePath, local_path: localPath }),
+    uploadLocal: (serverId: string, localPath: string, remotePath: RemotePath) =>
+      invoke<SftpOpStart>("oars.sftp.uploadLocal", { server_id: serverId, local_path: localPath, remote_path: remotePath }),
     poll: (serverId: string) => invoke<SftpTransferSnapshot>("oars.sftp.poll", { server_id: serverId }),
     cancel: (serverId: string, transferId: number) => invoke<{ ok: boolean }>("oars.sftp.cancel", { server_id: serverId, transfer_id: transferId }),
-    ls: (serverId: string, path: string) => invoke<{ entries: Array<{ name: { utf8?: string; base64?: string }; display: string; kind: string; size: number; mtime: number; mode: string; uid: number; gid: number; link_target: string | null }> }>("oars.sftp.ls", { server_id: serverId, path: { utf8: path } }),
-    mkdir: (serverId: string, path: string) => invoke<{ ok: boolean }>("oars.sftp.mkdir", { server_id: serverId, path: { utf8: path } }),
-    rm: (serverId: string, path: string) => invoke<{ ok: boolean }>("oars.sftp.rm", { server_id: serverId, path: { utf8: path } }),
-    rename: (serverId: string, from: string, to: string) => invoke<{ ok: boolean }>("oars.sftp.rename", { server_id: serverId, from: { utf8: from }, to: { utf8: to } }),
-    stat: (serverId: string, path: string) => invoke<any>("oars.sftp.stat", { server_id: serverId, path: { utf8: path } }),
+    ls: (serverId: string, path: RemotePath) => invoke<SftpLsResult>("oars.sftp.ls", { server_id: serverId, path }),
+    stat: (serverId: string, path: RemotePath) => invoke<SftpStatResult>("oars.sftp.stat", { server_id: serverId, path }),
+    read: (serverId: string, path: RemotePath, offset: number, max = 65536) =>
+      invoke<SftpReadResult>("oars.sftp.read", { server_id: serverId, path, offset, max }),
+    write: (serverId: string, path: RemotePath, offset: number, base64: string, transferId: number, total?: number) =>
+      invoke<SftpWriteResult>("oars.sftp.write", { server_id: serverId, path, offset, base64, transfer_id: transferId, ...(total === undefined ? {} : { total }) }),
+    save: (serverId: string, path: RemotePath, base64: string, expected?: SftpSaveParams) =>
+      invoke<{ ok: boolean }>("oars.sftp.save", {
+        server_id: serverId,
+        path,
+        base64,
+        ...(expected?.expected_size === undefined ? {} : { expected_size: expected.expected_size }),
+        ...(expected?.expected_mtime === undefined ? {} : { expected_mtime: expected.expected_mtime }),
+        ...(expected?.expected_sha256 === undefined ? {} : { expected_sha256: expected.expected_sha256 }),
+      }),
+    mkdir: (serverId: string, path: RemotePath) => invoke<{ ok: boolean }>("oars.sftp.mkdir", { server_id: serverId, path }),
+    rm: (serverId: string, path: RemotePath, recursive = false) =>
+      invoke<SftpOpStart | { ok: boolean }>("oars.sftp.rm", { server_id: serverId, path, recursive }),
+    rename: (serverId: string, from: RemotePath, to: RemotePath) =>
+      invoke<{ ok: boolean }>("oars.sftp.rename", { server_id: serverId, from, to }),
+    chmod: (serverId: string, path: RemotePath, mode: number) =>
+      invoke<{ ok: boolean }>("oars.sftp.chmod", { server_id: serverId, path, mode }),
+    unzip: (serverId: string, zipPath: RemotePath, destDir?: RemotePath) =>
+      invoke<SftpOpStart>("oars.sftp.unzip", { server_id: serverId, zip_path: zipPath, ...(destDir ? { dest_dir: destDir } : {}), overwrite: false }),
+    zipDownload: (serverId: string, paths: RemotePath[], localPath: string) =>
+      invoke<SftpOpStart>("oars.sftp.zipDownload", { server_id: serverId, paths, local_path: localPath }),
+    folderSize: (serverId: string, path: RemotePath) =>
+      invoke<SftpFolderSizeResult>("oars.sftp.folderSize", { server_id: serverId, path }),
   },
   scripts: {
     list: () => invoke<{ scripts: Array<{ id: string; name: string; description: string; tags: string[]; color: string; body: string; run_count: number; last_run_at: number | null; variables: Array<{ name: string; secret: boolean }> }> }>("oars.scripts.list", {}),

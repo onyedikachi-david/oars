@@ -224,6 +224,7 @@ export function TerminalTab({ server, onStatus, onServerUpdated }: Props) {
     };
 
     const connect = async () => {
+      const priorStatus = statusRef.current;
       setError(null);
       setInputError(null);
       trustShownRef.current = false;
@@ -254,7 +255,7 @@ export function TerminalTab({ server, onStatus, onServerUpdated }: Props) {
           }
           passphrase = secret;
         }
-        if (statusRef.current === "error" || statusRef.current === "closed") {
+        if (priorStatus === "error" || priorStatus === "closed") {
           await api.ssh.disconnect(server.id).catch(() => {});
         }
         sawSession = false;

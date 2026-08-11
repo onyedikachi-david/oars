@@ -334,14 +334,16 @@ primitive in the used `std.Io` path.
 - **Reusable for:** DB tunnels (their planned Database Manager), SSH-agent forwarding,
   any local-port ↔ remote-service bridge.
 
-### Stage 4 — File manager (SFTP) 🔨 next
+### Stage 4 — File manager (SFTP) ✅ implemented
 - The worker-owned `oars.sftp.*` backend and container integration path are
   implemented: listing/stat/read/write/save/download, mkdir/rm/rename/chmod,
   unzip, zip-download, folder size, transfer polling, and cancellation.
-- Frontend v1: one remote pane plus native file dialogs, hidden-items toggle,
-  per-file progress and cancel, Finder/Explorer upload drops, inline editor,
-  validated ZIP expansion, Download-as-zip, folder sizes on demand, and
-  grid/list/compact views.
+- Frontend v1: a responsive local/remote split workspace, native local folder
+  listing, direct local-to-remote transfers, remote downloads into the active
+  local folder, native dialog and Finder/Explorer fallbacks, hidden-items
+  toggle, per-file progress and cancel, inline editor, validated ZIP expansion,
+  Download-as-zip, and folder sizes on demand. Both panes use the same header,
+  path bar, three-column list, row geometry, and responsive state treatment.
 
 ### Stage 5 — Scripts + Deployments
 - `oars.scripts.*` — local script store: name/description/tags/color, `{{var}}` templating with run-time prompts, run on current server with output in a pane, run counts.
@@ -389,7 +391,8 @@ primitive in the used `std.Io` path.
 
 ## 7. Immediate next steps
 
-1. Complete the spec 05 file-manager frontend over the existing SFTP backend.
-2. Run the remaining spec 12 packaged live-framebuffer input acceptance check.
-3. Continue with the spec 06 scripts frontend after spec 05 passes its full
-   transfer, editor, archive, and responsive validation gate.
+1. Continue with the spec 06 scripts frontend over the existing worker and
+   approval patterns.
+2. Keep the spec 05 direct-transfer and responsive checks in the release gate.
+3. Preserve the completed spec 12 packaged live-framebuffer input acceptance
+   path while extending shared SSH transport code.

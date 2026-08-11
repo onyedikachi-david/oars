@@ -262,7 +262,14 @@ const Op = union(enum) {
         transfer_id: u32,
         outcome: *SftpOutcome,
     },
-    sftp_save: struct { path: []const u8, data: []const u8, outcome: *SftpOutcome },
+    sftp_save: struct {
+        path: []const u8,
+        data: []const u8,
+        /// A null identity keeps the non-editor save behavior. The SHA-256
+        /// slice inside a non-null value is owned by this operation.
+        expected: ?SftpExpectedIdentity = null,
+        outcome: *SftpOutcome,
+    },
     sftp_mkdir: struct { path: []const u8, outcome: *SftpOutcome },
     sftp_rm: struct { path: []const u8, recursive: bool, transfer_id: u32, outcome: ?*SftpOutcome },
     sftp_rename: struct { from: []const u8, to: []const u8, outcome: *SftpOutcome },
@@ -273,6 +280,11 @@ const Op = union(enum) {
         local_final: []const u8,
         transfer_id: u32,
         outcome: ?*SftpOutcome,
+    },
+    sftp_upload_local: struct {
+        local: []const u8,
+        remote: []const u8,
+        transfer_id: u32,
     },
     sftp_unzip: struct {
         zip_path: []const u8,
@@ -394,6 +406,15 @@ pub const SftpOutcome = struct {
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch return;
         }
     }
+};
+
+/// The exact remote-file version that an editor opened. Keeping the fields
+/// together prevents save call sites from mixing identities from different
+/// reads (spec 05 §4.2).
+pub const SftpExpectedIdentity = struct {
+    size: ?u64 = null,
+    mtime: ?u64 = null,
+    sha256: ?[]const u8 = null,
 };
 
 pub const ClearExpected = struct {
@@ -1254,14 +1275,38 @@ pub const Manager = struct {
     }
 
     /// Editor save: writes a temp file next to `path` and atomically
-    /// replaces it via posix-rename (spec 05 §4.2).
-    pub fn sftpSave(self: *Manager, server_id: []const u8, path: []const u8, data: []const u8, outcome: *SftpOutcome) !void {
+    /// replaces it via posix-rename (spec 05 §4.2). When an expected
+    /// identity is supplied, the worker refuses the save with a conflict
+    /// error if the remote file no longer matches it.
+    pub fn sftpSave(
+        self: *Manager,
+        server_id: []const u8,
+        path: []const u8,
+        data: []const u8,
+        expected: ?SftpExpectedIdentity,
+        outcome: *SftpOutcome,
+    ) !void {
         const session = try self.sftpSession(server_id);
         const owned = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(owned);
         const owned_data = try self.allocator.dupe(u8, data);
         errdefer self.allocator.free(owned_data);
-        try self.queueSftp(session, .{ .sftp_save = .{ .path = owned, .data = owned_data, .outcome = outcome } });
+        const owned_sha: ?[]u8 = if (expected) |identity|
+            if (identity.sha256) |sha| try self.allocator.dupe(u8, sha) else null
+        else
+            null;
+        errdefer if (owned_sha) |s| self.allocator.free(s);
+        const owned_expected: ?SftpExpectedIdentity = if (expected) |identity| .{
+            .size = identity.size,
+            .mtime = identity.mtime,
+            .sha256 = owned_sha,
+        } else null;
+        try self.queueSftp(session, .{ .sftp_save = .{
+            .path = owned,
+            .data = owned_data,
+            .expected = owned_expected,
+            .outcome = outcome,
+        } });
     }
 
     pub fn sftpMkdir(self: *Manager, server_id: []const u8, path: []const u8, outcome: *SftpOutcome) !void {
@@ -1326,6 +1371,28 @@ pub const Manager = struct {
             .local_final = owned_final,
             .transfer_id = transfer_id,
             .outcome = outcome,
+        } });
+    }
+
+    /// Local→remote upload selected from the native local pane. The session
+    /// worker owns both file handles, progress, cancellation, and no-clobber
+    /// finalization, so file bytes never cross the JSON bridge.
+    pub fn sftpUploadLocal(
+        self: *Manager,
+        server_id: []const u8,
+        local: []const u8,
+        remote: []const u8,
+        transfer_id: u32,
+    ) !void {
+        const session = try self.sftpSession(server_id);
+        const owned_local = try self.allocator.dupe(u8, local);
+        errdefer self.allocator.free(owned_local);
+        const owned_remote = try self.allocator.dupe(u8, remote);
+        errdefer self.allocator.free(owned_remote);
+        try self.queueSftp(session, .{ .sftp_upload_local = .{
+            .local = owned_local,
+            .remote = owned_remote,
+            .transfer_id = transfer_id,
         } });
     }
 
@@ -1779,22 +1846,19 @@ fn workerMain(session: *Session) void {
         // tunnel target:22 through it and handshake over the local
         // socketpair end. The chain recurses: the via session's own
         // worker resolves its own via (depth ≤ 3 enforced at save).
-        const via_record = blk: {
-            var loaded = session.store.loadParsed(io) catch {
-                session.status.store(.@"error", .release);
-                session.setError("jump host lookup failed");
-                return;
-            };
-            defer loaded.deinit(allocator);
-            for (loaded.parsed.value) |s| {
-                if (std.mem.eql(u8, s.id, via_id)) break :blk s;
-            }
-            break :blk null;
-        } orelse {
+        // `Store.find` returns a deep copy. Do not retain a `Server` borrowed
+        // from `loadParsed`: that record points into the parsed file buffer
+        // and becomes invalid as soon as `Loaded.deinit` runs.
+        var via_record = (session.store.find(io, via_id) catch {
+            session.status.store(.@"error", .release);
+            session.setError("jump host lookup failed");
+            return;
+        }) orelse {
             session.status.store(.@"error", .release);
             session.setError("jump host not found — edit the server and pick a valid jump host");
             return;
         };
+        defer via_record.deinit(allocator);
         var via_session = session.owner.get(via_id) orelse blk: {
             const started = session.owner.connect(via_record, null, null) catch {
                 session.status.store(.@"error", .release);
@@ -2138,7 +2202,6 @@ fn workerMain(session: *Session) void {
                 shell.stdin_mutex.unlock();
             }
         }
-
         // queued ops
         processOps(session);
         if (session.stop_flag.load(.acquire)) break;
@@ -2162,7 +2225,6 @@ fn workerMain(session: *Session) void {
                 i += 1;
                 continue;
             }
-
             switch (entry.raw.read(&read_buf)) {
                 .eof => {
                     if (!entry.eof_seen) {
@@ -2211,7 +2273,6 @@ fn workerMain(session: *Session) void {
                 .again => i += 1,
             }
         }
-
         // --- VNC tunnels (spec 12) -------------------------------------
         processTunnels(session, io, std.Io.Timestamp.now(io, .real).nanoseconds);
 
@@ -2496,12 +2557,13 @@ fn processOps(session: *Session) void {
             .sftp_stat => |so| sftpOpStat(session, so.path, so.outcome),
             .sftp_read => |so| sftpOpRead(session, so.path, so.offset, so.max, so.outcome),
             .sftp_write_chunk => |so| sftpOpWriteChunk(session, so.path, so.offset, so.data, so.total, so.transfer_id, so.outcome),
-            .sftp_save => |so| sftpOpSave(session, so.path, so.data, so.outcome),
+            .sftp_save => |so| sftpOpSave(session, so.path, so.data, so.expected, so.outcome),
             .sftp_mkdir => |so| sftpOpMkdir(session, so.path, so.outcome),
             .sftp_rm => |so| sftpOpRm(session, so.path, so.recursive, so.transfer_id, so.outcome),
             .sftp_rename => |so| sftpOpRename(session, so.from, so.to, so.outcome),
             .sftp_chmod => |so| sftpOpChmod(session, so.path, so.mode, so.outcome),
             .sftp_download => |so| sftpOpDownload(session, so.remote, so.local_partial, so.local_final, so.transfer_id, so.outcome),
+            .sftp_upload_local => |so| sftpOpUploadLocal(session, so.local, so.remote, so.transfer_id),
             .sftp_unzip => |so| sftpOpUnzip(session, so.zip_path, so.dest, so.transfer_id, so.outcome),
             .sftp_zip_download => |so| sftpOpZipDownload(session, so.paths, so.local_partial, so.local_final, so.transfer_id, so.outcome),
             .sftp_cancel => |so| sftpOpCancel(session, so.transfer_id),
@@ -2683,7 +2745,7 @@ fn processJumpTunnels(session: *Session, io: std.Io) void {
         // channel → to_fd_buf (only while the buffer has room — a full
         // buffer backpressures instead of blocking or dropping bytes).
         if (!remove and jt.to_fd_buf.items.len < jump_frame_cap) {
-            switch (jt.channel.read(&buf)) {
+            switch (jt.channel.readOpenStream(&buf)) {
                 .eof => remove = true,
                 .again => {},
                 .data => |n| {
@@ -3147,7 +3209,7 @@ fn processForwardChannels(session: *Session, io: std.Io) void {
         }
         // channel → to_socket_buf (backpressures when the buffer is full).
         if (!remove and ft.to_socket_buf.items.len < jump_frame_cap) {
-            switch (ft.channel.read(&buf)) {
+            switch (ft.channel.readOpenStream(&buf)) {
                 .eof => remove = true,
                 .again => {},
                 .data => |n| {
@@ -3287,7 +3349,7 @@ fn processTunnels(session: *Session, io: std.Io, now_ns: i128) void {
                 // queued libssh2 packets before returning to other channels.
                 var remote_closed = false;
                 read_remote: while (tunnel.send_buf.items.len + tunnel_ws_chunk + 14 <= wsmod.max_connection_buffer) {
-                    switch (tunnel.raw.?.read(&chunk)) {
+                    switch (tunnel.raw.?.readOpenStream(&chunk)) {
                         .eof => {
                             remote_closed = true;
                             break :read_remote;
@@ -3934,7 +3996,9 @@ fn sftpOpWriteChunk(
     const written = attrs.filesize;
     _ = ssh.c.libssh2_sftp_close_handle(handle);
 
-    const done = total > 0 and written >= total;
+    // `total == 0` is a real empty-file upload. The opened/truncated partial
+    // file must still be finalized instead of reporting a UI-only success.
+    const done = written >= total;
     if (done) {
         // No-clobber finalize: rename with no overwrite flag. A target that
         // appeared meanwhile is a conflict, not a silent overwrite.
@@ -3968,12 +4032,91 @@ fn sftpOpWriteChunk(
     sftpSetJson(session, outcome, .{ .ok = true, .written = written, .done = done });
 }
 
-fn sftpOpSave(session: *Session, path: []const u8, data: []const u8, outcome: *SftpOutcome) void {
+/// Editor-save conflict preflight (spec 05 §4.2): the save only proceeds
+/// when the remote file still matches the identity the editor opened
+/// (size, mtime, and content hash — all optional). Returns a conflict
+/// message when the check fails; null when it passes. The check is
+/// advisory: the atomic rename itself replaces whatever is there, so the
+/// window between check and rename is inherently racy — the conflict
+/// prompt is the protection, not a lock.
+fn sftpSaveConflict(
+    session: *Session,
+    sftp: *ssh.c.LIBSSH2_SFTP,
+    path_z: [:0]const u8,
+    expected: ?SftpExpectedIdentity,
+    deadline: i128,
+) ?[]const u8 {
+    const identity = expected orelse return null;
+    var attrs: ssh.c.LIBSSH2_SFTP_ATTRIBUTES = undefined;
+    if (!sftpLstat(session, sftp, path_z, &attrs, deadline)) {
+        return "conflict: the file disappeared from the server; reload and review before saving";
+    }
+    if (identity.size) |want| {
+        if (attrs.filesize != want) {
+            return "conflict: the file changed on the server (size); reload and review before saving";
+        }
+    }
+    if (identity.mtime) |want| {
+        if (attrs.mtime != want) {
+            return "conflict: the file changed on the server (modification time); reload and review before saving";
+        }
+    }
+    if (identity.sha256) |want_hex| {
+        // Hash the remote file in full and compare. Bounded by the
+        // editor's 1 MiB ceiling; anything larger cannot be verified.
+        if (attrs.filesize > sftpmod.max_inline_bytes) {
+            return "conflict: the file is too large to verify; reload and review before saving";
+        }
+        const handle = sftpOpen(session, sftp, path_z, ssh.c.LIBSSH2_FXF_READ, 0, ssh.c.LIBSSH2_SFTP_OPENFILE, deadline) orelse {
+            return "conflict: cannot re-read the file to verify it; reload and review before saving";
+        };
+        defer _ = ssh.c.libssh2_sftp_close_handle(handle);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var buf: [sftpmod.chunk_size]u8 = undefined;
+        while (true) {
+            const n = sftpRead(session, handle, &buf, deadline) orelse {
+                return "conflict: cannot re-read the file to verify it; reload and review before saving";
+            };
+            if (n == 0) break;
+            hash.update(buf[0..n]);
+        }
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        var hex_buf: [64]u8 = undefined;
+        // Zig 0.16 has no fmtSliceHexLower; encode by hand.
+        const hex_chars = "0123456789abcdef";
+        for (digest, 0..) |byte, i| {
+            hex_buf[i * 2] = hex_chars[byte >> 4];
+            hex_buf[i * 2 + 1] = hex_chars[byte & 0xf];
+        }
+        const hex = hex_buf[0..64];
+        if (want_hex.len != hex.len or !std.ascii.eqlIgnoreCase(want_hex, hex)) {
+            return "conflict: the file changed on the server (content); reload and review before saving";
+        }
+    }
+    return null;
+}
+
+fn sftpOpSave(
+    session: *Session,
+    path: []const u8,
+    data: []const u8,
+    expected: ?SftpExpectedIdentity,
+    outcome: *SftpOutcome,
+) void {
     const allocator = session.allocator;
     defer allocator.free(path);
     defer allocator.free(data);
+    defer if (expected) |identity| if (identity.sha256) |sha| allocator.free(sha);
     const sftp = sftpSessionHandle(session, outcome) orelse return;
     const deadline = sftpDeadline(session);
+
+    const path_z = allocator.dupeZ(u8, path) catch return outcome.set(false, "out of memory");
+    defer allocator.free(path_z);
+    if (sftpSaveConflict(session, sftp, path_z, expected, deadline)) |conflict| {
+        outcome.set(false, conflict);
+        return;
+    }
 
     const tmp = std.fmt.allocPrint(allocator, "{s}.oars-tmp-{d}", .{ path, session.next_channel_id.fetchAdd(1, .monotonic) }) catch return outcome.set(false, "out of memory");
     defer allocator.free(tmp);
@@ -3993,8 +4136,15 @@ fn sftpOpSave(session: *Session, path: []const u8, data: []const u8, outcome: *S
     }
     _ = ssh.c.libssh2_sftp_close_handle(handle);
 
-    const path_z = allocator.dupeZ(u8, path) catch return outcome.set(false, "out of memory");
-    defer allocator.free(path_z);
+    // Re-check after the potentially long temp-file write. SFTP has no
+    // compare-and-swap rename primitive, so this closes the material race
+    // window while the final protocol round trip remains advisory.
+    if (sftpSaveConflict(session, sftp, path_z, expected, deadline)) |conflict| {
+        _ = ssh.c.libssh2_sftp_unlink_ex(sftp, tmp_z.ptr, @intCast(tmp_z.len));
+        outcome.set(false, conflict);
+        return;
+    }
+
     if (!sftpPosixRename(session, sftp, tmp_z, path_z, deadline)) {
         const fx = ssh.c.libssh2_sftp_last_error(sftp);
         _ = ssh.c.libssh2_sftp_unlink_ex(sftp, tmp_z.ptr, @intCast(tmp_z.len));
@@ -4313,6 +4463,129 @@ fn sftpStreamRemoteToLocal(
         return false;
     };
     return true;
+}
+
+fn sftpOpUploadLocal(session: *Session, local: []const u8, remote: []const u8, transfer_id: u32) void {
+    const allocator = session.allocator;
+    defer allocator.free(local);
+    defer allocator.free(remote);
+
+    const fail = struct {
+        fn call(s: *Session, id: u32, message: []const u8) void {
+            s.sftp_transfers.lock();
+            if (s.sftp_transfers.get(id)) |transfer| {
+                transfer.status = if (transfer.cancel_flag) .canceled else .failed;
+                transfer.err = if (transfer.cancel_flag) "canceled" else message;
+            }
+            s.sftp_transfers.unlock();
+        }
+    }.call;
+
+    var file = std.Io.Dir.openFileAbsolute(session.io, local, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    }) catch {
+        fail(session, transfer_id, "cannot open local file");
+        return;
+    };
+    defer file.close(session.io);
+    const stat = file.stat(session.io) catch {
+        fail(session, transfer_id, "cannot stat local file");
+        return;
+    };
+    if (stat.kind != .file) {
+        fail(session, transfer_id, "local selection is not a regular file");
+        return;
+    }
+
+    const sftp = sftpSessionHandle(session, null) orelse {
+        fail(session, transfer_id, "sftp unavailable");
+        return;
+    };
+    const deadline = sftpDeadline(session);
+    const partial = partialPath(allocator, remote) catch {
+        fail(session, transfer_id, "out of memory");
+        return;
+    };
+    defer allocator.free(partial);
+    const partial_z = allocator.dupeZ(u8, partial) catch {
+        fail(session, transfer_id, "out of memory");
+        return;
+    };
+    defer allocator.free(partial_z);
+    const remote_z = allocator.dupeZ(u8, remote) catch {
+        fail(session, transfer_id, "out of memory");
+        return;
+    };
+    defer allocator.free(remote_z);
+
+    session.sftp_transfers.lock();
+    if (session.sftp_transfers.get(transfer_id)) |transfer| {
+        transfer.status = .running;
+        transfer.bytes_total = stat.size;
+    }
+    session.sftp_transfers.unlock();
+
+    const flags: c_ulong = ssh.c.LIBSSH2_FXF_WRITE | ssh.c.LIBSSH2_FXF_CREAT | ssh.c.LIBSSH2_FXF_TRUNC;
+    const remote_handle = sftpOpen(session, sftp, partial_z, flags, 0o600, ssh.c.LIBSSH2_SFTP_OPENFILE, deadline) orelse {
+        fail(session, transfer_id, "cannot create remote partial file");
+        return;
+    };
+    var remote_open = true;
+    defer if (remote_open) {
+        _ = ssh.c.libssh2_sftp_close_handle(remote_handle);
+    };
+
+    var reader_buffer: [sftpmod.chunk_size]u8 = undefined;
+    var file_reader = file.reader(session.io, &reader_buffer);
+    var chunk: [sftpmod.chunk_size]u8 = undefined;
+    var written: u64 = 0;
+    while (true) {
+        if (transferCanceled(session, transfer_id)) {
+            _ = ssh.c.libssh2_sftp_close_handle(remote_handle);
+            remote_open = false;
+            _ = ssh.c.libssh2_sftp_unlink_ex(sftp, partial_z.ptr, @intCast(partial_z.len));
+            fail(session, transfer_id, "canceled");
+            return;
+        }
+        const n = file_reader.interface.readSliceShort(&chunk) catch {
+            _ = ssh.c.libssh2_sftp_close_handle(remote_handle);
+            remote_open = false;
+            _ = ssh.c.libssh2_sftp_unlink_ex(sftp, partial_z.ptr, @intCast(partial_z.len));
+            fail(session, transfer_id, "local read failed");
+            return;
+        };
+        if (n == 0) break;
+        if (!sftpWriteAll(session, remote_handle, chunk[0..n], deadline)) {
+            _ = ssh.c.libssh2_sftp_close_handle(remote_handle);
+            remote_open = false;
+            _ = ssh.c.libssh2_sftp_unlink_ex(sftp, partial_z.ptr, @intCast(partial_z.len));
+            fail(session, transfer_id, "remote write failed");
+            return;
+        }
+        written += n;
+        session.sftp_transfers.lock();
+        if (session.sftp_transfers.get(transfer_id)) |transfer| transfer.bytes_done = written;
+        session.sftp_transfers.unlock();
+    }
+    _ = ssh.c.libssh2_sftp_close_handle(remote_handle);
+    remote_open = false;
+
+    if (written != stat.size or !sftpRenameEx(session, sftp, partial_z, remote_z, 0, deadline)) {
+        _ = ssh.c.libssh2_sftp_unlink_ex(sftp, partial_z.ptr, @intCast(partial_z.len));
+        fail(session, transfer_id, if (written != stat.size) "local file changed during upload" else "target already exists; upload refused");
+        return;
+    }
+    var detail_buf: [256]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "local={s} remote={s} bytes={d}", .{ local, remote, written }) catch "sftp.upload_local";
+    sftpAudit(session, "sftp.upload_local", detail);
+    session.sftp_transfers.lock();
+    if (session.sftp_transfers.get(transfer_id)) |transfer| {
+        transfer.bytes_done = written;
+        transfer.status = .done;
+    }
+    session.sftp_transfers.unlock();
 }
 
 fn sftpOpDownload(
@@ -4991,6 +5264,7 @@ fn sessionDone(session: *Session) void {
             .sftp_save => |so| {
                 session.allocator.free(so.path);
                 session.allocator.free(so.data);
+                if (so.expected) |identity| if (identity.sha256) |sha| session.allocator.free(sha);
                 so.outcome.set(false, "session disconnected");
             },
             .sftp_mkdir => |so| {
@@ -5015,6 +5289,16 @@ fn sessionDone(session: *Session) void {
                 session.allocator.free(so.local_partial);
                 session.allocator.free(so.local_final);
                 if (so.outcome) |o| o.set(false, "session disconnected");
+            },
+            .sftp_upload_local => |so| {
+                session.allocator.free(so.local);
+                session.allocator.free(so.remote);
+                session.sftp_transfers.lock();
+                if (session.sftp_transfers.get(so.transfer_id)) |transfer| {
+                    transfer.status = .failed;
+                    transfer.err = "session disconnected";
+                }
+                session.sftp_transfers.unlock();
             },
             .sftp_unzip => |so| {
                 session.allocator.free(so.zip_path);

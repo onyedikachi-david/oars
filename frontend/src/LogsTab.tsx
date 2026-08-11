@@ -635,7 +635,7 @@ export function LogsTab({ server }: { server: Server }) {
     downloadLocalRef.current = localPath;
     setDownload({ status: "starting", opId: null, bytes: 0, total: 0, localPath, error: null });
     try {
-      const r = await api.sftp.download(serverId, selected, localPath);
+      const r = await api.sftp.download(serverId, { utf8: selected }, localPath);
       if (!mountedRef.current) return;
       downloadOpRef.current = r.op_id;
       setDownload({ status: "running", opId: r.op_id, bytes: 0, total: 0, localPath, error: null });

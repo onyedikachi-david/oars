@@ -13,6 +13,7 @@ const monitor = @import("monitor.zig");
 const history = @import("history.zig");
 const json = @import("json.zig");
 const logs = @import("logs.zig");
+const localfs = @import("localfs.zig");
 const shellquote = @import("shellquote.zig");
 const sftpmod = @import("sftp.zig");
 const scripts = @import("scripts.zig");
@@ -30,7 +31,7 @@ const ssh = @import("ssh.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 98;
+const handler_count = 100;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -73,12 +74,14 @@ pub const Context = struct {
             .{ .name = "oars.logs.follow", .context = self, .invoke_fn = handleLogsFollow },
             .{ .name = "oars.logs.clear", .context = self, .invoke_fn = handleLogsClear },
             .{ .name = "oars.logs.addSource", .context = self, .invoke_fn = handleLogsAddSource },
+            .{ .name = "oars.local.ls", .context = self, .invoke_fn = handleLocalLs },
             .{ .name = "oars.sftp.ls", .context = self, .invoke_fn = handleSftpLs },
             .{ .name = "oars.sftp.stat", .context = self, .invoke_fn = handleSftpStat },
             .{ .name = "oars.sftp.read", .context = self, .invoke_fn = handleSftpRead },
             .{ .name = "oars.sftp.write", .context = self, .invoke_fn = handleSftpWrite },
             .{ .name = "oars.sftp.save", .context = self, .invoke_fn = handleSftpSave },
             .{ .name = "oars.sftp.download", .context = self, .invoke_fn = handleSftpDownload },
+            .{ .name = "oars.sftp.uploadLocal", .context = self, .invoke_fn = handleSftpUploadLocal },
             .{ .name = "oars.sftp.mkdir", .context = self, .invoke_fn = handleSftpMkdir },
             .{ .name = "oars.sftp.rm", .context = self, .invoke_fn = handleSftpRm },
             .{ .name = "oars.sftp.rename", .context = self, .invoke_fn = handleSftpRename },
@@ -173,12 +176,14 @@ pub const Context = struct {
             .{ .name = "oars.logs.follow", .origins = &allowed_origins },
             .{ .name = "oars.logs.clear", .origins = &allowed_origins },
             .{ .name = "oars.logs.addSource", .origins = &allowed_origins },
+            .{ .name = "oars.local.ls", .origins = &allowed_origins },
             .{ .name = "oars.sftp.ls", .origins = &allowed_origins },
             .{ .name = "oars.sftp.stat", .origins = &allowed_origins },
             .{ .name = "oars.sftp.read", .origins = &allowed_origins },
             .{ .name = "oars.sftp.write", .origins = &allowed_origins },
             .{ .name = "oars.sftp.save", .origins = &allowed_origins },
             .{ .name = "oars.sftp.download", .origins = &allowed_origins },
+            .{ .name = "oars.sftp.uploadLocal", .origins = &allowed_origins },
             .{ .name = "oars.sftp.mkdir", .origins = &allowed_origins },
             .{ .name = "oars.sftp.rm", .origins = &allowed_origins },
             .{ .name = "oars.sftp.rename", .origins = &allowed_origins },
@@ -1695,6 +1700,43 @@ fn handleLogsAddSource(context: *anyopaque, invocation: native_sdk.bridge.Invoca
     return ok_json;
 }
 
+// --- Local files (spec 05 two-pane browser) ---------------------------------
+
+const LocalLsPayload = struct { path: []const u8 };
+
+fn handleLocalLs(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(LocalLsPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    var listing = localfs.list(self.allocator, self.io, parsed.value.path) catch |err| {
+        return respondError(output, switch (err) {
+            error.InvalidPath => "select an absolute local folder",
+            error.FileNotFound => "local folder not found",
+            error.AccessDenied => "permission denied for this local folder",
+            error.NotDir => "the selected local path is not a folder",
+            else => "cannot read this local folder",
+        });
+    };
+    defer listing.deinit(self.allocator);
+
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"entries\":[") catch return output[0..0];
+    for (listing.entries, 0..) |entry, index| {
+        if (index > 0) writer.writeByte(',') catch return output[0..0];
+        writer.writeAll("{\"name\":") catch return output[0..0];
+        json.writeJsonString(&writer, entry.name) catch return output[0..0];
+        writer.writeAll(",\"path\":") catch return output[0..0];
+        json.writeJsonString(&writer, entry.path) catch return output[0..0];
+        writer.writeAll(",\"kind\":") catch return output[0..0];
+        json.writeJsonString(&writer, entry.kind.jsonName()) catch return output[0..0];
+        writer.print(",\"size\":{d},\"mtime\":{d}}}", .{ entry.size, entry.mtime }) catch return output[0..0];
+    }
+    writer.print("],\"truncated\":{s}}}", .{if (listing.truncated) "true" else "false"}) catch return output[0..0];
+    return writer.buffered();
+}
+
 // --- SFTP (spec 05) ----------------------------------------------------------
 
 const sftp_wait_ns = 20 * std.time.ns_per_s;
@@ -1727,12 +1769,24 @@ const SftpSavePayload = struct {
     server_id: []const u8,
     path: sftpmod.RemotePathJson,
     base64: []const u8,
+    /// Editor conflict preflight (spec 05 §4.2): when any expected field
+    /// is present, the worker refuses the save with a "conflict:" error if
+    /// the remote file no longer matches the identity the editor opened.
+    expected_size: ?u64 = null,
+    expected_mtime: ?u64 = null,
+    expected_sha256: ?[]const u8 = null,
 };
 
 const SftpDownloadPayload = struct {
     server_id: []const u8,
     remote_path: sftpmod.RemotePathJson,
     local_path: []const u8,
+};
+
+const SftpUploadLocalPayload = struct {
+    server_id: []const u8,
+    local_path: []const u8,
+    remote_path: sftpmod.RemotePathJson,
 };
 
 const SftpRmPayload = struct {
@@ -1979,13 +2033,18 @@ fn handleSftpWrite(context: *anyopaque, invocation: native_sdk.bridge.Invocation
 }
 
 /// Editor save (spec 05 §4.2): temp file + atomic posix-rename on the
-/// worker; refusal when the server lacks the extension.
+/// worker; refusal when the server lacks the extension. An expected
+/// identity (size/mtime/sha256) makes the save refuse with a conflict
+/// error when the remote file changed since the editor opened it.
 fn handleSftpSave(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
     var parsed = parsePayload(SftpSavePayload, self.allocator, invocation.request.payload) catch {
         return respondError(output, "invalid payload");
     };
     defer parsed.deinit();
+    if (parsed.value.expected_sha256) |h| {
+        if (h.len != 64) return respondError(output, "invalid expected hash");
+    }
     var path: ?[]u8 = null;
     if (decodeSftpPathArg(self, output, parsed.value.path, &path)) |err_response| return err_response;
     defer self.allocator.free(path.?);
@@ -1994,7 +2053,19 @@ fn handleSftpSave(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
     defer self.allocator.free(data.?);
     const outcome = self.allocator.create(sessions.SftpOutcome) catch return respondError(output, "out of memory");
     outcome.* = .{ .allocator = self.allocator };
-    self.manager.sftpSave(parsed.value.server_id, path.?, data.?, outcome) catch |err| {
+    const has_expected = parsed.value.expected_size != null or parsed.value.expected_mtime != null or parsed.value.expected_sha256 != null;
+    const expected: ?sessions.SftpExpectedIdentity = if (has_expected) .{
+        .size = parsed.value.expected_size,
+        .mtime = parsed.value.expected_mtime,
+        .sha256 = parsed.value.expected_sha256,
+    } else null;
+    self.manager.sftpSave(
+        parsed.value.server_id,
+        path.?,
+        data.?,
+        expected,
+        outcome,
+    ) catch |err| {
         self.allocator.destroy(outcome);
         return sftpQueueError(output, err);
     };
@@ -2022,6 +2093,30 @@ fn handleSftpDownload(context: *anyopaque, invocation: native_sdk.bridge.Invocat
     if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
     const op_id = self.manager.sftpStartTransfer(session, "download", remote.?) catch return respondError(output, "out of memory");
     self.manager.sftpDownload(payload.server_id, remote.?, partial, payload.local_path, op_id, null) catch |err| {
+        sftpFailTransfer(session, op_id, "failed to queue");
+        return sftpQueueError(output, err);
+    };
+    return sftpOpIdResponse(output, op_id);
+}
+
+/// Local→remote transfer from a path returned by the native directory
+/// picker. The worker reads the file directly; bytes never enter bridge JSON.
+fn handleSftpUploadLocal(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(SftpUploadLocalPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const payload = parsed.value;
+    localfs.validateAbsolutePath(payload.local_path) catch return respondError(output, "select an absolute local file");
+    var remote: ?[]u8 = null;
+    if (decodeSftpPathArg(self, output, payload.remote_path, &remote)) |err_response| return err_response;
+    defer self.allocator.free(remote.?);
+
+    const session = self.manager.get(payload.server_id) orelse return respondError(output, "not connected");
+    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
+    const op_id = self.manager.sftpStartTransfer(session, "upload", remote.?) catch return respondError(output, "out of memory");
+    self.manager.sftpUploadLocal(payload.server_id, payload.local_path, remote.?, op_id) catch |err| {
         sftpFailTransfer(session, op_id, "failed to queue");
         return sftpQueueError(output, err);
     };
@@ -2971,7 +3066,7 @@ fn deployCursor(cursors: std.json.Value, channel: u32) u64 {
 fn deployWriteFile(self: *Context, server_id: []const u8, path: []const u8, data: []const u8) ?[]const u8 {
     const outcome = self.allocator.create(sessions.SftpOutcome) catch return "out of memory";
     outcome.* = .{ .allocator = self.allocator };
-    self.manager.sftpSave(server_id, path, data, outcome) catch |err| {
+    self.manager.sftpSave(server_id, path, data, null, outcome) catch |err| {
         self.allocator.destroy(outcome);
         return switch (err) {
             error.NoSession => "not connected",
@@ -3479,7 +3574,7 @@ fn sshkeysRead(self: *Context, server_id: []const u8, path: []const u8) ?[]u8 {
 fn sshkeysWrite(self: *Context, server_id: []const u8, path: []const u8, content: []const u8, mode: ?u32, owner: ?[]const u8, err_buf: []u8) ?[]const u8 {
     const out = self.allocator.create(sessions.SftpOutcome) catch return "out of memory";
     out.* = .{ .allocator = self.allocator };
-    self.manager.sftpSave(server_id, path, content, out) catch |err| {
+    self.manager.sftpSave(server_id, path, content, null, out) catch |err| {
         self.allocator.destroy(out);
         return switch (err) {
             error.NoSession => "not connected",

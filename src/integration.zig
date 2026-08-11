@@ -189,7 +189,10 @@ pub fn waitForStatus(
             std.debug.print("TEST session error: {s}\n", .{info.@"error"});
             return error.TestUnexpectedResult;
         }
-        if (std.Io.Timestamp.now(std.testing.io, .real).nanoseconds >= deadline) return error.TestUnexpectedResult;
+        if (std.Io.Timestamp.now(std.testing.io, .real).nanoseconds >= deadline) {
+            std.debug.print("TEST session timeout: status={s} error={s}\n", .{ info.status.jsonName(), info.@"error" });
+            return error.TestUnexpectedResult;
+        }
         testSleep(50);
     }
 }
@@ -272,6 +275,7 @@ pub fn execWait(manager: *sessions.Manager, server_id: []const u8, command: []co
         }
         testSleep(50);
     }
+    std.debug.print("TEST exec timeout: channel={d} eof={} exit={any} output={s}\n", .{ channel, saw_eof, exit, acc.items });
     return error.TestUnexpectedResult;
 }
 
@@ -1024,6 +1028,38 @@ test "integration: sftp crud, editor save, transfers, cancel, and zip paths" {
     const w2 = rig.dispatch(write2);
     try std.testing.expect(std.mem.indexOf(u8, w2, "\"done\":true") != null);
 
+    // An empty upload still performs one write. It must create and finalize
+    // the remote file instead of waiting for a non-existent data chunk.
+    const empty_write = rig.dispatch(
+        \\{"id":"46","command":"oars.sftp.write","payload":{"server_id":"itest-sftp","path":{"utf8":"/tmp/oars-sftp-itest/dir/empty.txt"},"offset":0,"base64":"","transfer_id":1002,"total":0}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, empty_write, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, empty_write, "\"written\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, empty_write, "\"done\":true") != null);
+    try execWait(&rig.manager, "itest-sftp", "test -f /tmp/oars-sftp-itest/dir/empty.txt && test ! -s /tmp/oars-sftp-itest/dir/empty.txt", 0, "");
+
+    // --- native local pane listing and direct local→remote upload ---
+    const local_source_dir = try std.fmt.allocPrint(allocator, "/tmp/{s}", .{rig.dir_name});
+    defer allocator.free(local_source_dir);
+    const local_source = try std.fmt.allocPrint(allocator, "{s}/local-pane.txt", .{local_source_dir});
+    defer allocator.free(local_source);
+    var local_file = try std.Io.Dir.cwd().createFile(io, local_source, .{ .truncate = true });
+    try local_file.writeStreamingAll(io, "local pane\n");
+    local_file.close(io);
+    var local_ls_buf: [1024]u8 = undefined;
+    const local_ls_req = std.fmt.bufPrint(&local_ls_buf, "{{\"id\":\"47\",\"command\":\"oars.local.ls\",\"payload\":{{\"path\":\"{s}\"}}}}", .{local_source_dir}) catch unreachable;
+    const local_ls = rig.dispatch(local_ls_req);
+    try std.testing.expect(std.mem.indexOf(u8, local_ls, "\"name\":\"local-pane.txt\"") != null);
+    var local_upload_buf: [1536]u8 = undefined;
+    const local_upload_req = std.fmt.bufPrint(&local_upload_buf, "{{\"id\":\"48\",\"command\":\"oars.sftp.uploadLocal\",\"payload\":{{\"server_id\":\"itest-sftp\",\"local_path\":\"{s}\",\"remote_path\":{{\"utf8\":\"/tmp/oars-sftp-itest/dir/from-local.txt\"}}}}}}", .{local_source}) catch unreachable;
+    const local_upload = rig.dispatch(local_upload_req);
+    const local_upload_id = sftpOpId(local_upload) orelse return error.TestUnexpectedResult;
+    try sftpWaitTransfer(&rig, local_upload_id, "done");
+    const local_upload_read = rig.dispatch(
+        \\{"id":"49","command":"oars.sftp.read","payload":{"server_id":"itest-sftp","path":{"utf8":"/tmp/oars-sftp-itest/dir/from-local.txt"},"offset":0,"max":65536}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, local_upload_read, "bG9jYWwgcGFuZQo=") != null);
+
     // --- read back ---
     const read = rig.dispatch(
         \\{"id":"4","command":"oars.sftp.read","payload":{"server_id":"itest-sftp","path":{"utf8":"/tmp/oars-sftp-itest/dir/file.txt"},"offset":0,"max":65536}}
@@ -1067,6 +1103,53 @@ test "integration: sftp crud, editor save, transfers, cancel, and zip paths" {
         \\{"id":"10","command":"oars.sftp.read","payload":{"server_id":"itest-sftp","path":{"utf8":"/tmp/oars-sftp-itest/dir/renamed.txt"},"offset":0,"max":65536}}
     );
     try std.testing.expect(std.mem.indexOf(u8, read_back, "ZWRpdGVkIGNvbnRlbnQK") != null);
+
+    // --- editor save conflict preflight (spec 05 §4.2) ---
+    // Pin the remote mtime so every identity check is deterministic.
+    try execWait(&rig.manager, "itest-sftp", "touch -t 202001010000 /tmp/oars-sftp-itest/dir/renamed.txt", 0, "");
+    try execWait(&rig.manager, "itest-sftp", "stat -c %Y /tmp/oars-sftp-itest/dir/renamed.txt", 0, "1577836800");
+    const expect_size: u64 = 15; // "edited content\n"
+    const expect_mtime: u64 = 1577836800;
+    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    sha.update(save_content);
+    var sha_buf: [32]u8 = undefined;
+    sha.final(&sha_buf);
+    var want_hex: [64]u8 = undefined;
+    const hex_chars = "0123456789abcdef";
+    for (sha_buf, 0..) |byte, i| {
+        want_hex[i * 2] = hex_chars[byte >> 4];
+        want_hex[i * 2 + 1] = hex_chars[byte & 0xf];
+    }
+    // A save whose expected identity matches proceeds.
+    var ok_save_buf: [1024]u8 = undefined;
+    const ok_save_req = std.fmt.bufPrint(&ok_save_buf, "{{\"id\":\"40\",\"command\":\"oars.sftp.save\",\"payload\":{{\"server_id\":\"itest-sftp\",\"path\":{{\"utf8\":\"/tmp/oars-sftp-itest/dir/renamed.txt\"}},\"base64\":\"{s}\",\"expected_size\":{d},\"expected_mtime\":{d},\"expected_sha256\":\"{s}\"}}}}", .{ b64_save, expect_size, expect_mtime, want_hex }) catch unreachable;
+    const ok_saved = rig.dispatch(ok_save_req);
+    try std.testing.expect(std.mem.indexOf(u8, ok_saved, "\"ok\":true") != null);
+    // A stale identity is refused with a conflict error.
+    var stale_size_buf: [1024]u8 = undefined;
+    const stale_size_req = std.fmt.bufPrint(&stale_size_buf, "{{\"id\":\"41\",\"command\":\"oars.sftp.save\",\"payload\":{{\"server_id\":\"itest-sftp\",\"path\":{{\"utf8\":\"/tmp/oars-sftp-itest/dir/renamed.txt\"}},\"base64\":\"{s}\",\"expected_size\":999,\"expected_mtime\":{d}}}}}", .{ b64_save, expect_mtime }) catch unreachable;
+    const stale_size = rig.dispatch(stale_size_req);
+    try std.testing.expect(std.mem.indexOf(u8, stale_size, "\"conflict") != null);
+    var stale_mtime_buf: [1024]u8 = undefined;
+    const stale_mtime_req = std.fmt.bufPrint(&stale_mtime_buf, "{{\"id\":\"42\",\"command\":\"oars.sftp.save\",\"payload\":{{\"server_id\":\"itest-sftp\",\"path\":{{\"utf8\":\"/tmp/oars-sftp-itest/dir/renamed.txt\"}},\"base64\":\"{s}\",\"expected_size\":{d},\"expected_mtime\":{d}}}}}", .{ b64_save, expect_size, expect_mtime + 9999 }) catch unreachable;
+    const stale_mtime = rig.dispatch(stale_mtime_req);
+    try std.testing.expect(std.mem.indexOf(u8, stale_mtime, "\"conflict") != null);
+    var wrong_hash_buf: [1024]u8 = undefined;
+    const wrong_hash_req = std.fmt.bufPrint(&wrong_hash_buf, "{{\"id\":\"43\",\"command\":\"oars.sftp.save\",\"payload\":{{\"server_id\":\"itest-sftp\",\"path\":{{\"utf8\":\"/tmp/oars-sftp-itest/dir/renamed.txt\"}},\"base64\":\"{s}\",\"expected_sha256\":\"{s}\"}}}}", .{ b64_save, "0000000000000000000000000000000000000000000000000000000000000000" }) catch unreachable;
+    const wrong_hash = rig.dispatch(wrong_hash_req);
+    try std.testing.expect(std.mem.indexOf(u8, wrong_hash, "\"conflict") != null);
+    // None of the refused saves may have touched the file.
+    const after_conflicts = rig.dispatch(
+        \\{"id":"44","command":"oars.sftp.read","payload":{"server_id":"itest-sftp","path":{"utf8":"/tmp/oars-sftp-itest/dir/renamed.txt"},"offset":0,"max":65536}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, after_conflicts, "ZWRpdGVkIGNvbnRlbnQK") != null);
+    // A mismatched size is reported before the hash is consulted, and a
+    // correct full identity (size + mtime + hash) saves again.
+    try execWait(&rig.manager, "itest-sftp", "touch -t 202001010000 /tmp/oars-sftp-itest/dir/renamed.txt", 0, "");
+    var fresh_save_buf: [1024]u8 = undefined;
+    const fresh_save_req = std.fmt.bufPrint(&fresh_save_buf, "{{\"id\":\"45\",\"command\":\"oars.sftp.save\",\"payload\":{{\"server_id\":\"itest-sftp\",\"path\":{{\"utf8\":\"/tmp/oars-sftp-itest/dir/renamed.txt\"}},\"base64\":\"{s}\",\"expected_size\":{d},\"expected_mtime\":{d},\"expected_sha256\":\"{s}\"}}}}", .{ b64_save, expect_size, expect_mtime, want_hex }) catch unreachable;
+    const fresh_saved = rig.dispatch(fresh_save_req);
+    try std.testing.expect(std.mem.indexOf(u8, fresh_saved, "\"ok\":true") != null);
 
     // --- folderSize (du -sb, cached) ---
     const folder_size = rig.dispatch(

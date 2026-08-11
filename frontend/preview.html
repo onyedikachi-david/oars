@@ -17,6 +17,7 @@
         const vncPollMode = new URLSearchParams(window.location.search).get("vncPoll") || "listening";
         const vncCredsMode = new URLSearchParams(window.location.search).get("vncCreds") || "none";
         const vncTunnelMode = new URLSearchParams(window.location.search).get("vncTunnel") || "ok";
+        const filesMode = new URLSearchParams(window.location.search).get("files") || "default";
         let nextDiagnosticChannel = 900;
         // Logs fixtures (spec 04): deterministic sources, lines with
         // repeatable search matches, one very long line, a follow channel
@@ -176,10 +177,123 @@
           let recorded = payload;
           if (command === "native-sdk.credentials.set" && payload && "secret" in payload) recorded = { ...payload, secret: "<redacted>" };
           if (command === "oars.vnc.setup" && payload && "password" in payload) recorded = { ...payload, password: "<redacted>" };
+          if ((command === "oars.sftp.write" || command === "oars.sftp.save") && payload && "base64" in payload) {
+            let byteLength = 0;
+            try { byteLength = atob(payload.base64).length; } catch { /* malformed payload stays length zero */ }
+            recorded = { ...payload, base64: `<file-content:${byteLength}-bytes>` };
+          }
           calls.push({ command, payload: recorded, at: performance.now() });
           document.documentElement.dataset.oarsCalls = JSON.stringify(calls);
         }
         window.__oarsMock = { calls, servers };
+        // Capture runtime errors for the preview harness (React unmounts
+        // on uncaught render errors; the record survives for inspection).
+        window.__oarsErrors = [];
+        window.addEventListener("error", (e) => {
+          window.__oarsErrors.push(String((e.error && (e.error.stack || e.error.message)) || e.message));
+        });
+        window.addEventListener("unhandledrejection", (e) => {
+          window.__oarsErrors.push("REJECTION: " + String((e.reason && (e.reason.stack || e.reason.message)) || e.reason));
+        });
+        {
+          const origError = console.error.bind(console);
+          console.error = (...args) => {
+            window.__oarsErrors.push(args.map((a) => { try { return typeof a === "string" ? a : (a && (a.stack || a.message)) || String(a); } catch { return String(a); } }).join(" "));
+            origError(...args);
+          };
+        }
+        // ── File manager fixtures (spec 05) ──────────────────────────
+        // A tiny deterministic remote filesystem. Entry names are
+        // `{utf8}|{base64}` exactly like the backend; keys use latin-1
+        // byte strings so non-UTF-8 names round-trip byte-exact.
+        const textEncoder = new TextEncoder();
+        const b64Bytes = (bytes) => { let bin = ""; for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000)); return btoa(bin); };
+        const textContent = (s) => textEncoder.encode(s);
+        const pathKey = (rp) => {
+          if (!rp) return "";
+          if (rp.utf8 !== undefined) return rp.utf8;
+          if (rp.base64 !== undefined) {
+            const bin = atob(rp.base64);
+            let out = "";
+            for (let i = 0; i < bin.length; i++) out += String.fromCharCode(bin.charCodeAt(i));
+            return out;
+          }
+          return "";
+        };
+        const BIN_NAME = "\xff\xfe.bin"; // raw bytes 0xff 0xfe — not valid UTF-8
+        // Fixture names are latin-1 byte strings: charCode & 0xff gives the
+        // exact bytes (TextEncoder would UTF-8-encode code points > 0x7f).
+        const latin1Bytes = (s) => { const b = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i) & 0xff; return b; };
+        function entry(name, kind, size, mtime, extra) {
+          const bytes = latin1Bytes(name);
+          let isUtf8 = true;
+          let display = name;
+          try { display = new TextDecoder("utf-8").decode(bytes); } catch { isUtf8 = false; }
+          try { new TextDecoder("utf-8", { fatal: true }).decode(bytes); } catch { isUtf8 = false; }
+          return {
+            name: isUtf8 ? { utf8: name } : { base64: b64Bytes(bytes) },
+            display,
+            kind,
+            size,
+            mtime,
+            mode: extra?.mode || (kind === "dir" ? "drwxr-xr-x" : "-rw-r--r--"),
+            uid: extra?.uid ?? 0,
+            gid: extra?.gid ?? 0,
+            link_target: extra?.link_target ?? null,
+          };
+        }
+        const CONTENT = {
+          "/etc/hostname": textContent("preview-host\n"),
+          "/etc/nginx/nginx.conf": textContent("server {\n  listen 80;\n}\n"),
+          "/var/www/index.html": textContent("<h1>hello</h1>\n"),
+          "/app.js": textContent("const answer = 42;\n"),
+          "/.env": textContent("SECRET=preview-value\n"),
+          ["/srv/" + BIN_NAME]: new Uint8Array([0xff, 0xfe, 0x00, 0x01, 0x02, 0x7f]),
+        };
+        const FSTREE = {
+          "/": [
+            entry("etc", "dir", 0, now / 1000 - 3600),
+            entry("var", "dir", 0, now / 1000 - 7200),
+            entry("srv", "dir", 0, now / 1000 - 1800),
+            entry("app.js", "file", 15, now / 1000 - 60),
+            entry("release.zip", "file", 2048, now / 1000 - 300),
+            entry(".env", "file", 20, now / 1000 - 90),
+            entry(BIN_NAME, "file", 6, now / 1000 - 120),
+            entry("link-to-etc", "symlink", 0, now / 1000 - 500, { link_target: "/etc" }),
+          ],
+          "/etc": [entry("nginx", "dir", 0, now / 1000 - 3600), entry("hostname", "file", 13, now / 1000 - 600)],
+          "/etc/nginx": [entry("nginx.conf", "file", 28, now / 1000 - 200)],
+          "/var": [entry("www", "dir", 0, now / 1000 - 7200)],
+          "/var/www": [entry("index.html", "file", 15, now / 1000 - 100)],
+          "/srv": [entry(BIN_NAME, "file", 6, now / 1000 - 120)],
+        };
+        const LOCAL_ROOT = "/Users/preview/Documents";
+        const LOCAL_TREE = {
+          [LOCAL_ROOT]: [
+            { name: "Projects", path: LOCAL_ROOT + "/Projects", kind: "dir", size: 0, mtime: now / 1000 - 900 },
+            { name: "release-notes.md", path: LOCAL_ROOT + "/release-notes.md", kind: "file", size: 4280, mtime: now / 1000 - 180 },
+            { name: "brand-assets.zip", path: LOCAL_ROOT + "/brand-assets.zip", kind: "file", size: 1854000, mtime: now / 1000 - 320 },
+          ],
+          [LOCAL_ROOT + "/Projects"]: [
+            { name: "oars-roadmap.txt", path: LOCAL_ROOT + "/Projects/oars-roadmap.txt", kind: "file", size: 8192, mtime: now / 1000 - 60 },
+          ],
+        };
+        function fsResolve(key) {
+          if (key === "/") return null;
+          const parent = key.slice(0, key.lastIndexOf("/")) || "/";
+          const name = key.slice(key.lastIndexOf("/") + 1);
+          const list = FSTREE[parent];
+          if (!list) return null;
+          for (const e of list) {
+            if (pathKey(e.name) === name) {
+              const content = CONTENT[key];
+              if (e.kind === "file" && content) return { entry: e, content };
+              return { entry: e, content: e.kind === "dir" ? new Uint8Array(0) : CONTENT[key] || new Uint8Array(e.size) };
+            }
+          }
+          return null;
+        }
+        const fsState = { conflictArmed: filesMode === "conflict", uploads: new Map() };
         window.zero = {
           async invoke(command, payload = {}) {
             recordCall(command, payload);
@@ -333,20 +447,139 @@
             }
             if (command === "oars.sftp.download") {
               const id = dlNextId++;
-              dlTransfers.set(id, { id, kind: "download", path: payload.remote_path.utf8, bytes: 0, total: 472000, status: "running", error: "" });
+              dlTransfers.set(id, { id, kind: "download", path: pathKey(payload.remote_path), bytes: 0, total: 472000, status: "running", error: "" });
               return { ok: true, op_id: id };
+            }
+            if (command === "oars.local.ls") {
+              const entries = LOCAL_TREE[payload.path];
+              if (!entries) return { ok: false, error: "local folder not found" };
+              return { ok: true, entries, truncated: false };
+            }
+            if (command === "oars.sftp.uploadLocal") {
+              const id = dlNextId++;
+              const local = Object.values(LOCAL_TREE).flat().find((item) => item.path === payload.local_path);
+              dlTransfers.set(id, { id, kind: "upload", path: pathKey(payload.remote_path), bytes: 0, total: local?.size || 65536, status: "running", error: "" });
+              return { ok: true, op_id: id };
+            }
+            // ── File manager fixtures (spec 05) ──────────────────────
+            if (command === "oars.sftp.ls") {
+              const p = pathKey(payload.path);
+              if (filesMode === "empty" && p === "/") return { ok: true, entries: [], truncated: false };
+              if (filesMode === "slow" && p === "/etc") await delay(700);
+              if (filesMode === "unreadable" && p === "/var") return { ok: false, error: "permission denied (13) — the account cannot read this folder" };
+              const entries = FSTREE[p];
+              if (entries === undefined) return { ok: false, error: "no such directory: " + p };
+              if (filesMode === "truncated" && p === "/") return { ok: true, entries: entries.slice(0, 3), truncated: true };
+              return { ok: true, entries, truncated: false };
+            }
+            if (command === "oars.sftp.stat") {
+              const found = fsResolve(pathKey(payload.path));
+              if (!found) return { ok: false, error: "no such file" };
+              return { ok: true, entry: found.entry };
+            }
+            if (command === "oars.sftp.read") {
+              const found = fsResolve(pathKey(payload.path));
+              if (!found) return { ok: false, error: "no such file" };
+              const bytes = found.content;
+              const start = Math.min(payload.offset || 0, bytes.length);
+              const slice = bytes.subarray(start, start + (payload.max || 65536));
+              return { ok: true, base64: b64Bytes(slice), eof: start + slice.length >= bytes.length };
+            }
+            if (command === "oars.sftp.write") {
+              const rec = fsState.uploads.get(payload.transfer_id) || {
+                id: payload.transfer_id,
+                kind: "upload",
+                path: pathKey(payload.path),
+                bytes: 0,
+                total: payload.total || 0,
+                status: "running",
+                error: "",
+              };
+              if (filesMode === "upload-fail" && rec.bytes === 0) {
+                return { ok: false, error: "write failed: permission denied" };
+              }
+              const chunkBytes = atob(payload.base64).length;
+              rec.bytes = (payload.offset || 0) + chunkBytes;
+              const done = rec.total > 0 ? rec.bytes >= rec.total : true;
+              if (done) rec.status = "done";
+              fsState.uploads.set(payload.transfer_id, rec);
+              return { ok: true, written: rec.bytes, done };
+            }
+            if (command === "oars.sftp.save") {
+              if (filesMode === "conflict" && fsState.conflictArmed && (payload.expected_size !== undefined || payload.expected_sha256 !== undefined)) {
+                // The editor's conflict preflight refuses once; a reload
+                // (fresh identity) or "keep my version" then succeeds.
+                fsState.conflictArmed = false;
+                return { ok: false, error: "conflict: the file changed on the server (size); reload and review before saving" };
+              }
+              fsState.conflictArmed = filesMode === "conflict";
+              return { ok: true };
+            }
+            if (command === "oars.sftp.mkdir") {
+              const key = pathKey(payload.path);
+              if (FSTREE[key] !== undefined) return { ok: false, error: "already exists" };
+              FSTREE[key] = [];
+              const parent = key.slice(0, key.lastIndexOf("/")) || "/";
+              const name = key.slice(key.lastIndexOf("/") + 1);
+              if (FSTREE[parent]) FSTREE[parent].push(entry(name, "dir", 0, now / 1000, {}));
+              return { ok: true };
+            }
+            if (command === "oars.sftp.rename") {
+              const from = pathKey(payload.from);
+              const to = pathKey(payload.to);
+              const parent = to.slice(0, to.lastIndexOf("/")) || "/";
+              const name = to.slice(to.lastIndexOf("/") + 1);
+              const entries = FSTREE[from.slice(0, from.lastIndexOf("/")) || "/"];
+              const idx = entries ? entries.findIndex((e) => e.name.utf8 === from.slice(from.lastIndexOf("/") + 1)) : -1;
+              if (idx >= 0) entries[idx] = entry(name, entries[idx].kind, entries[idx].size, entries[idx].mtime, { link_target: entries[idx].link_target });
+              if (FSTREE[from] !== undefined) { FSTREE[to] = FSTREE[from]; delete FSTREE[from]; }
+              return { ok: true };
+            }
+            if (command === "oars.sftp.chmod") return { ok: true };
+            if (command === "oars.sftp.rm") {
+              const key = pathKey(payload.path);
+              if (payload.recursive) {
+                const id = dlNextId++;
+                dlTransfers.set(id, { id, kind: "rm", path: key, bytes: 0, total: 8, status: "running", error: "" });
+                return { ok: true, op_id: id };
+              }
+              const parent = key.slice(0, key.lastIndexOf("/")) || "/";
+              const name = key.slice(key.lastIndexOf("/") + 1);
+              const list = FSTREE[parent] || [];
+              const idx = list.findIndex((e) => e.name.utf8 === name);
+              if (idx >= 0) list.splice(idx, 1);
+              delete FSTREE[key];
+              return { ok: true };
+            }
+            if (command === "oars.sftp.unzip") {
+              const id = dlNextId++;
+              dlTransfers.set(id, { id, kind: "unzip", path: pathKey(payload.zip_path), bytes: 0, total: 2048, status: "running", error: "" });
+              return { ok: true, op_id: id };
+            }
+            if (command === "oars.sftp.zipDownload") {
+              const id = dlNextId++;
+              dlTransfers.set(id, { id, kind: "zip_download", path: payload.paths.map(pathKey).join(", "), bytes: 0, total: 65536, status: "running", error: "" });
+              return { ok: true, op_id: id };
+            }
+            if (command === "oars.sftp.folderSize") {
+              return { ok: true, size: 1234567 };
             }
             if (command === "oars.sftp.poll") {
               for (const t of dlTransfers.values()) {
                 if (t.status !== "running") continue;
-                if (logsMode === "dlfail") { t.status = "failed"; t.error = "permission denied"; continue; }
+                if ((filesMode === "dlfail" || logsMode === "dlfail") && t.kind === "download") { t.status = "failed"; t.error = "permission denied"; continue; }
                 t.bytes = Math.min(t.total, t.bytes + 110000);
                 if (t.bytes >= t.total) t.status = "done";
               }
-              return { ok: true, transfers: [...dlTransfers.values()] };
+              for (const t of fsState.uploads.values()) {
+                if (t.status !== "running") continue;
+                t.bytes = Math.min(t.total, t.bytes + 240000);
+                if (t.bytes >= t.total) t.status = "done";
+              }
+              return { ok: true, transfers: [...dlTransfers.values(), ...fsState.uploads.values()] };
             }
             if (command === "oars.sftp.cancel") {
-              const t = dlTransfers.get(payload.transfer_id);
+              const t = dlTransfers.get(payload.transfer_id) || fsState.uploads.get(payload.transfer_id);
               if (t && t.status === "running") t.status = "canceled";
               return { ok: true };
             }
@@ -391,6 +624,9 @@
             if (command === "native-sdk.dialog.saveFile") {
               if (logsMode === "nodialog") return null;
               return "/Users/preview/Downloads/" + (payload.defaultName || "download.log");
+            }
+            if (command === "native-sdk.dialog.openFile" && payload.allowDirectories) {
+              return [payload.defaultPath && LOCAL_TREE[payload.defaultPath] ? payload.defaultPath : LOCAL_ROOT];
             }
             if (command === "oars.ssh.closeChannel") {
               if (payload.channel === followState.channel) followState.closed = true;

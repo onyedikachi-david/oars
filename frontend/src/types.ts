@@ -132,10 +132,83 @@ export interface LogClearResult {
 }
 
 export type SftpTransferStatus = "queued" | "running" | "done" | "failed" | "canceled";
+export type SftpTransferKind = "upload" | "download" | "rm" | "unzip" | "zip_download";
+
+/**
+ * `RemotePath = {utf8:string}|{base64:string}` (spec 05 §5): the base64
+ * form carries raw server bytes; `display` text is UI-only and must never
+ * be used to rebuild an operation path.
+ */
+export type RemotePath =
+  | { utf8: string; base64?: never }
+  | { utf8?: never; base64: string };
+
+export type SftpEntryKind = "file" | "dir" | "symlink" | "other";
+
+export interface LocalEntry {
+  name: string;
+  path: string;
+  kind: SftpEntryKind;
+  size: number;
+  mtime: number;
+}
+
+export interface LocalLsResult {
+  ok: boolean;
+  entries: LocalEntry[];
+  truncated: boolean;
+}
+
+export interface SftpEntry {
+  name: RemotePath;
+  display: string;
+  kind: SftpEntryKind;
+  size: number;
+  mtime: number;
+  mode: string;
+  uid: number;
+  gid: number;
+  link_target: string | null;
+}
+
+export interface SftpLsResult {
+  ok: boolean;
+  entries: SftpEntry[];
+  truncated: boolean;
+}
+
+export interface SftpStatResult {
+  ok: boolean;
+  entry: SftpEntry;
+}
+
+export interface SftpReadResult {
+  ok: boolean;
+  base64: string;
+  eof: boolean;
+}
+
+export interface SftpWriteResult {
+  ok: boolean;
+  written: number;
+  done: boolean;
+}
+
+export interface SftpSaveParams {
+  expected_size?: number;
+  expected_mtime?: number;
+  /** Hex-encoded SHA-256 of the content the editor opened. */
+  expected_sha256?: string;
+}
+
+export interface SftpFolderSizeResult {
+  ok: boolean;
+  size: number;
+}
 
 export interface SftpTransfer {
   id: number;
-  kind: string;
+  kind: SftpTransferKind;
   path: string;
   bytes: number;
   total: number;

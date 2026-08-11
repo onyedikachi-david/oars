@@ -988,7 +988,7 @@ export default function App() {
                   />
                 ) : activeTab.view === "monitor" ? <MonitorTab key={activeTab.key} server={activeTab.server} />
                   : activeTab.view === "logs" ? <LogsTab key={activeTab.key} server={activeTab.server} />
-                  : activeTab.view === "files" ? <FilesTab key={activeTab.key} serverId={activeTab.server.id} />
+                  : activeTab.view === "files" ? <FilesTab key={activeTab.key} serverId={activeTab.server.id} onNavigateToDeploy={() => setView("deploy")} />
                   : activeTab.view === "scripts" ? <ScriptsTab key={activeTab.key} serverId={activeTab.server.id} />
                   : activeTab.view === "deploy" ? <DeployTab key={activeTab.key} serverId={activeTab.server.id} />
                   : activeTab.view === "keys" ? <KeysTab key={activeTab.key} serverId={activeTab.server.id} />
