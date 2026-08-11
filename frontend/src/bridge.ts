@@ -21,6 +21,12 @@ import type {
   VncProbeResult,
   VncSetupResult,
   VncPollResult,
+  ScriptsListResult,
+  ScriptDraft,
+  Script,
+  ScriptRunVars,
+  BroadcastPreview,
+  BroadcastPollResult,
 } from "./types";
 
 // Typed bridge client over window.zero.
@@ -216,10 +222,24 @@ export const api = {
       invoke<SftpFolderSizeResult>("oars.sftp.folderSize", { server_id: serverId, path }),
   },
   scripts: {
-    list: () => invoke<{ scripts: Array<{ id: string; name: string; description: string; tags: string[]; color: string; body: string; run_count: number; last_run_at: number | null; variables: Array<{ name: string; secret: boolean }> }> }>("oars.scripts.list", {}),
-    save: (script: { id?: string; name: string; description?: string; tags?: string[]; color?: string; body: string }) => invoke<{ script: any }>("oars.scripts.save", { script }),
+    list: () => invoke<ScriptsListResult>("oars.scripts.list", {}),
+    validate: (body: string) => invoke<{ ok: boolean }>("oars.scripts.validate", { body }),
+    save: (script: ScriptDraft) => invoke<{ ok: boolean; script: Script }>("oars.scripts.save", { script }),
     delete: (id: string) => invoke<{ ok: boolean }>("oars.scripts.delete", { id }),
-    run: (serverId: string, scriptId: string, vars: Record<string, { value: string; secret: boolean }>) => invoke<{ channel: number }>("oars.scripts.run", { server_id: serverId, script_id: scriptId, vars }),
+    run: (serverId: string, scriptId: string, vars: ScriptRunVars) =>
+      invoke<{ ok: boolean; channel: number }>("oars.scripts.run", { server_id: serverId, script_id: scriptId, vars }),
+    // Two-phase safe broadcast (spec 06 §5): prepare freezes the exact
+    // command; commit executes the frozen record; prepareCancel drops it.
+    broadcastPrepare: (scriptId: string, serverIds: string[], vars: ScriptRunVars) =>
+      invoke<BroadcastPreview>("oars.scripts.broadcastPrepare", { script_id: scriptId, server_ids: serverIds, vars }),
+    broadcast: (previewId: number) =>
+      invoke<{ ok: boolean; run_id: number }>("oars.scripts.broadcast", { preview_id: previewId }),
+    broadcastPrepareCancel: (previewId: number) =>
+      invoke<{ ok: boolean }>("oars.scripts.broadcastPrepareCancel", { preview_id: previewId }),
+    broadcastPoll: (runId: number, cursors: Record<string, number>) =>
+      invoke<BroadcastPollResult>("oars.scripts.broadcastPoll", { run_id: runId, cursors }),
+    broadcastCancel: (runId: number) =>
+      invoke<{ ok: boolean }>("oars.scripts.broadcastCancel", { run_id: runId }),
   },
   deploy: {
     list: (serverId: string) => invoke<{ ok: boolean; apps: any[] }>("oars.deploy.apps.list", { server_id: serverId }),

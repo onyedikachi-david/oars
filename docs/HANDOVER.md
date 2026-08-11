@@ -1848,3 +1848,133 @@ Validation in this checkout:
   `335px 72px 98px` columns with 50 px rows. The 390 × 844 layout had no
   horizontal page overflow. Direct upload and download payloads used the
   selected local path and current remote path.
+
+## 34. Session handover — 2026-08-11: spec 06 scripts + safe broadcast complete
+
+Spec 06 is implemented end to end. `docs/NEXT-SPEC.md` now points at spec 07.
+
+### What landed (backend)
+
+- **Two-phase broadcast contract** (`docs/specs/06-scripts.md` §5): new
+  `oars.scripts.broadcastPrepare` / `oars.scripts.broadcast {preview_id}` /
+  `oars.scripts.broadcastPrepareCancel`; `broadcast` no longer takes
+  `{script_id, server_ids, vars}`. The core freezes the exact exec string,
+  check string, redacted copy, secret values, variable names, deduped
+  targets, and destructive state in a memory-only record
+  (`broadcast.Previews`, cap 32, 10-min TTL, cleared on shutdown); commit
+  replays it verbatim — preview-to-commit identity is structural, and an
+  edit between preview and confirm cannot change what runs. Prepare writes
+  no audit row and bumps no run count.
+- **Worker-driven syntax checks**: `bash -n -c` now runs as an internal
+  exec channel on the target's session worker (new `syntax_check` op +
+  heap `ScriptCheckOutcome` with the session-30 abandon() protocol;
+  `ChannelEntry.check_outcome`/`check_timeout_ns`; `dropEntryAt` helper).
+  The broadcast poll enqueues the check and reads the outcome on later
+  polls — a bridge call can never wait through 4 × 30 s checks. New
+  `checking` status occupies a concurrency slot; `done` only for exit 0,
+  nonzero exits are `failed` with the exact code; transitions are applied
+  before serialization so `done:true` and server results agree in one
+  response. Timeout (30 s) and session teardown complete the outcome
+  honestly; cancel abandons it.
+- **Checked interpreter = executing interpreter**: runs submit
+  `bash -c '<expanded>'` — the same single-quoted `-c` argument the check
+  validated (`scripts.execString`/`checkString`, unit-tested) — so a
+  non-Bash account shell can never reinterpret the script.
+- **Secret policy**: stored `secret_default` is the minimum policy
+  (`scriptsEnforceSecrets`); a caller may promote but never demote.
+- **Admission + audit**: 64 deduped servers/broadcast, 8 active
+  broadcasts, 32 previews; dedupe happens before preview/audit (duplicate
+  selections can't produce duplicate audit rows); audit rows are written
+  at commit only.
+- `broadcast.Run` gained `check_command` (frozen at start, never
+  re-derived); `ServerState.err` may now be owned (`err_owned`). Canceled
+  channels retain a bounded output snapshot with absolute cursor bounds
+  before close, so later consumers can replay the terminal output.
+  handler_count 100 → 103 (including core-owned editor validation).
+
+### What landed (frontend)
+
+- Wire model locked (`types.ts`): `Script`, `ScriptVariable`
+  (`secret_default`), `ScriptDraft`, `ScriptRunVars`, `BroadcastStatus`
+  (incl. `checking`), `BroadcastPollResult`, `BroadcastPreview`; the core
+  converts all real-time script and preview stamps to integer milliseconds
+  before JSON serialization (epoch nanoseconds exceed JS safe integers).
+- `ScriptsTab` rewritten: searchable library + detail pane (no cards),
+  no-data-loss editor (full draft every save, detected-variable table with
+  label + secret-default columns, six hex swatches, `{{` autocomplete,
+  core-owned full-body validation, unused-definition status, body never trimmed),
+  modal delete, single-run variable dialog (stored secrets locked and
+  masked, others promotable) with a cumulative output pane (absolute
+  cursors, gap-once reporting, exit code, copy/close/retry), two-phase
+  broadcast flow (grouped target selection → vars → prepare preview with
+  redacted-by-default command and reveal, destructive second
+  confirmation → per-server results with windowed output bodies),
+  honest cancel ("cancel requested", never "killed"). No browser
+  prompt/confirm anywhere; all dialogs use the oars-modal pattern with
+  focus trap + Escape + focus restore.
+- Pure helpers (`scripts-state.ts`, 19 Vitest tests): variable detection
+  with the backend charset, definition reconciliation, filtering,
+  last-run formatting, cumulative append with output cap, broadcast
+  summaries, destructive-tag rule. Nine rendered workspace tests cover the
+  hook-order crash, secret reuse, cursors/channel cleanup, focus stability,
+  tag filters, autocomplete, unavailable targets, and destructive double
+  confirmation. Full Vitest suite 87/87; tsc clean;
+  production build green (pre-existing chunk-size warning only).
+- Palette: "Run “<script>” on <server>" entries select a script and a
+  target server. Automation section no longer mounts against
+  `servers[0]` — it asks the user to pick a server.
+- `preview.html` gained `?scripts=` fixture modes (empty, recovery,
+  populated, run, run-fail, run-fail-check, run-gap, broadcast,
+  broadcast-fail, broadcast-cancel, unreachable, destructive, expired);
+  script run-time var values are redacted as `***` in the call inspector.
+- The application shell now separates the sidebar, global header, open-view
+  tabs, and active workspace with a consistent bordered surface, 12 px corner
+  radius, and 10 px gutter. The server sub-tabs use a compact segmented
+  surface. Mobile uses an 8 px gutter and 11 px radius.
+
+### Validation (this checkout)
+
+- `zig build` clean; `zig build test` 205/205 without containers.
+- Container suite: the spec 06 integration test passes (two-phase
+  prepare/commit, edit-after-preview identity, deduped servers, secret
+  demotion masked, nonzero exit → failed with exact code, unreachable →
+  skipped, cancel with retained output, session loss, and six audit rows
+  asserted). The repository-wide container run passes 205/205. The last
+  jump-host failure was a real socketpair pump stall, not a missing fixture:
+  poll-gating the local read/write paths keeps the via worker responsive
+  during SSH handshake backpressure.
+- Frontend: tsc clean, Vitest 87/87, production build green. The populated
+  preview passed dark/light visual checks, shell geometry and horizontal
+  overflow checks at 1327 × 964, dialog focus/Escape/restore, autocomplete,
+  unavailable targets, destructive double confirmation, default secret
+  redaction, call-inspector redaction, and a clean console.
+- `git diff --check` clean (run at session end).
+
+### New pitfalls (extend §7 — do not repeat)
+
+40. **Zig 0.16 fmt brace escaping is not intuitive.** `{s}}}` (3 trailing
+    braces) and `{s}}}}}` (5) both compile and emit value + 2 literal
+    braces; `{s}}}}` (4) fails with "missing opening {". Copy a known-good
+    format string rather than counting braces; verify with a scratch
+    `zig run` when unsure. This cost several full-suite cycles.
+41. **TestApp/TestRig responses alias one shared output buffer.** A slice
+    parsed from a dispatch response (e.g. `preview_id`) is dead after the
+    NEXT dispatch — the dispatcher test's commit "failed" with a request
+    containing `"preview_id":i` (the letter from the clobbered buffer).
+    Build any request that embeds a parsed id BEFORE the next dispatch
+    (bufPrint copies), or parse with `.allocate = .alloc_always`.
+42. **A registry record pointer is invalidated by remove().** The commit
+    handler called `previews.remove()` then `touchRun(preview.script_id)`
+    — reading freed memory, so run counts silently never bumped (caught by
+    the container test's `run_count:2` assertion). Touch/read before
+    remove, or dupe.
+43. **The patch tool mangles `@"error"` into `@\"error\"`** (injects a
+    literal backslash) — the Zig @-escape is `@"error"` with a plain
+    quote. After any patch touching `@\"`-style fields, verify the raw
+    bytes (od) — a compile error "expected type expression, found
+    'invalid token'" at the field is the tell.
+44. **O_NONBLOCK alone did not keep the jump socketpair pump responsive.**
+    The via worker stalled on the local fd during handshake backpressure,
+    even though both socketpair ends went through `fcntl`. Poll for `POLLIN`
+    or `POLLOUT` before each libc read or write. Treat a readable zero-byte
+    result as EOF, and handle `ERR`, `HUP`, and `NVAL` explicitly.

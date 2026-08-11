@@ -264,3 +264,102 @@ export interface VncPollResult {
   bytes_down: number;
   error: string;
 }
+
+// --- scripts (spec 06) ------------------------------------------------------
+//
+// Timestamp wire unit: the backend stores real-time nanoseconds but sends
+// scripts as integer milliseconds, which stay safe in JavaScript numbers.
+
+/** Stored variable definition (spec 06 §7). `secret_default` marks the
+ *  editor's input mode; run-time secrets come in the run payload. */
+export interface ScriptVariable {
+  name: string;
+  label: string;
+  secret_default: boolean;
+}
+
+export interface Script {
+  id: string;
+  name: string;
+  description: string;
+  tags: string[];
+  color: string;
+  body: string;
+  variables: ScriptVariable[];
+  /** Integer milliseconds since epoch, converted by the backend before JSON serialization. */
+  created_at: number;
+  updated_at: number;
+  run_count: number;
+  last_run_at: number | null;
+}
+
+/** The complete save payload: the editor must send the full draft on
+ *  every save, or stored variables are erased (spec 06 — no data loss). */
+export interface ScriptDraft {
+  id?: string;
+  name: string;
+  description: string;
+  tags: string[];
+  color: string;
+  body: string;
+  variables: ScriptVariable[];
+}
+
+/** Run-time values, separate from stored definitions. `secret` may only
+ *  PROMOTE a value: the stored `secret_default` is the minimum policy and
+ *  the backend refuses demotion. Never persisted. */
+export interface ScriptRunVars {
+  [name: string]: { value: string; secret: boolean };
+}
+
+export interface ScriptsListResult {
+  ok: boolean;
+  scripts: Script[];
+  recovery_error?: string;
+}
+
+export type BroadcastStatus =
+  | "queued"
+  | "checking"
+  | "running"
+  | "done"
+  | "failed"
+  | "canceled"
+  | "skipped";
+
+export interface BroadcastServerResult {
+  server_id: string;
+  status: BroadcastStatus;
+  exit: number | null;
+  error: string;
+  cursor?: number;
+  gap?: number;
+  eof?: boolean;
+  data?: string;
+}
+
+export interface BroadcastPollResult {
+  ok: boolean;
+  run_id: number;
+  script_name: string;
+  canceled: boolean;
+  done: boolean;
+  servers: BroadcastServerResult[];
+}
+
+/** Two-phase broadcast step 1 (spec 06 §5): the exact command the commit
+ *  will submit, frozen at prepare time. `command` is the full exec string
+ *  (`bash -c '<expanded>'`); show `redacted_command` by default when
+ *  secrets exist. */
+export interface BroadcastPreview {
+  ok: boolean;
+  preview_id: number;
+  script_id: string;
+  script_name: string;
+  command: string;
+  redacted_command: string;
+  servers: Array<{ server_id: string }>;
+  destructive: boolean;
+  /** Integer milliseconds since epoch, converted by the backend before JSON serialization. */
+  expires_at: number;
+}

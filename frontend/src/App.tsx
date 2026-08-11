@@ -36,7 +36,7 @@ import {
 import { Button } from "./components/ui/button";
 import { OarsLoadingState, OarsRefreshStatus } from "./components/OarsLoadingState";
 import { api, BridgeError } from "./bridge";
-import type { Server as OarsServer, SessionStatus } from "./types";
+import type { Server as OarsServer, SessionStatus, Script } from "./types";
 import { TerminalTab } from "./TerminalTab";
 import { ServerModal } from "./ServerModal";
 import { MonitorTab } from "./MonitorTab";
@@ -529,7 +529,15 @@ export default function App() {
     const cleanup = startTransition();
     const vt = (document as unknown as { startViewTransition?: (cb: () => void) => { finished: Promise<void> } }).startViewTransition;
     if (vt && !prefersReduced) {
-      vt.call(document, doSwap).finished.finally(cleanup);
+      try {
+        // Strict Mode can start the same theme transition twice. The
+        // browser aborts the first transition; consume that expected
+        // rejection so it does not become a console error.
+        void vt.call(document, doSwap).finished.then(cleanup, cleanup);
+      } catch {
+        doSwap();
+        cleanup();
+      }
     } else {
       doSwap();
       cleanup();
@@ -546,6 +554,12 @@ export default function App() {
       next.set(serverId, status);
       return next;
     });
+  }, []);
+
+  const [pendingScriptId, setPendingScriptId] = useState<string | null>(null);
+  const [scriptsForPalette, setScriptsForPalette] = useState<Script[]>([]);
+  useEffect(() => {
+    api.scripts.list().then((r) => setScriptsForPalette(r.scripts)).catch(() => {});
   }, []);
 
   const openServer = useCallback((server: OarsServer) => {
@@ -758,6 +772,16 @@ export default function App() {
       items.push({ label: `Open ${s.name} (${s.host})`, action: () => { openServer(s); setPaletteOpen(false); } });
       items.push({ label: `Mirror ${s.name} in new tab`, action: () => { openMirrored(s); setPaletteOpen(false); } });
       for (const v of VIEWS) items.push({ label: `${s.name} → ${v.label}`, action: () => { openServerView(s, v.id); setPaletteOpen(false); } });
+    }
+    // Spec 06 palette entry point: pick a saved script and a target
+    // server — opens the server's Scripts view with the script selected.
+    for (const sc of scriptsForPalette) {
+      for (const s of servers) {
+        items.push({
+          label: `Run “${sc.name}” on ${s.name}`,
+          action: () => { openServerView(s, "scripts"); setPendingScriptId(sc.id); setPaletteOpen(false); },
+        });
+      }
     }
     items.push({ label: "Add server…", action: () => { setModal({}); setPaletteOpen(false); } });
     items.push({ label: `Theme: switch to ${theme === "dark" ? "light" : "dark"}`, action: () => { setTheme(theme === "dark" ? "light" : "dark"); setPaletteOpen(false); } });
@@ -989,7 +1013,7 @@ export default function App() {
                 ) : activeTab.view === "monitor" ? <MonitorTab key={activeTab.key} server={activeTab.server} />
                   : activeTab.view === "logs" ? <LogsTab key={activeTab.key} server={activeTab.server} />
                   : activeTab.view === "files" ? <FilesTab key={activeTab.key} serverId={activeTab.server.id} onNavigateToDeploy={() => setView("deploy")} />
-                  : activeTab.view === "scripts" ? <ScriptsTab key={activeTab.key} serverId={activeTab.server.id} />
+                  : activeTab.view === "scripts" ? <ScriptsTab key={activeTab.key} serverId={activeTab.server.id} servers={servers} statuses={statuses} connected={statuses.get(activeTab.server.id) === "ready"} initialScriptId={pendingScriptId} />
                   : activeTab.view === "deploy" ? <DeployTab key={activeTab.key} serverId={activeTab.server.id} />
                   : activeTab.view === "keys" ? <KeysTab key={activeTab.key} serverId={activeTab.server.id} />
                   : activeTab.view === "access" ? <AccessTab key={activeTab.key} />
@@ -1023,7 +1047,7 @@ export default function App() {
               {servers.length === 0 ? (
                 <div className="panel" style={{ padding: 22 }}><div className="empty-state"><div className="empty-icon"><Zap /></div><h3>No servers yet</h3><p>Add a server to run scripts and deployments.</p><Button onClick={() => setModal({})}>Add server</Button></div></div>
               ) : (
-                <div className="panel" style={{ padding: 0, overflow: "hidden", minHeight: 420 }}><ScriptsTab serverId={servers[0].id} /></div>
+                <div className="panel" style={{ padding: 0, overflow: "hidden", minHeight: 420 }}><ScriptsTab serverId={null} servers={servers} statuses={statuses} connected={false} onOpenServer={(id) => { const s = servers.find((x) => x.id === id); if (s) openServerView(s, "scripts"); }} /></div>
               )}
             </div>
           ) : activeSection === "Security" ? (

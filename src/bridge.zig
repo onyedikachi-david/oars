@@ -31,7 +31,7 @@ const ssh = @import("ssh.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 100;
+const handler_count = 103;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -92,10 +92,13 @@ pub const Context = struct {
             .{ .name = "oars.sftp.poll", .context = self, .invoke_fn = handleSftpPoll },
             .{ .name = "oars.sftp.cancel", .context = self, .invoke_fn = handleSftpCancel },
             .{ .name = "oars.scripts.list", .context = self, .invoke_fn = handleScriptsList },
+            .{ .name = "oars.scripts.validate", .context = self, .invoke_fn = handleScriptsValidate },
             .{ .name = "oars.scripts.save", .context = self, .invoke_fn = handleScriptsSave },
             .{ .name = "oars.scripts.delete", .context = self, .invoke_fn = handleScriptsDelete },
             .{ .name = "oars.scripts.run", .context = self, .invoke_fn = handleScriptsRun },
+            .{ .name = "oars.scripts.broadcastPrepare", .context = self, .invoke_fn = handleScriptsBroadcastPrepare },
             .{ .name = "oars.scripts.broadcast", .context = self, .invoke_fn = handleScriptsBroadcast },
+            .{ .name = "oars.scripts.broadcastPrepareCancel", .context = self, .invoke_fn = handleScriptsBroadcastPrepareCancel },
             .{ .name = "oars.scripts.broadcastPoll", .context = self, .invoke_fn = handleScriptsBroadcastPoll },
             .{ .name = "oars.scripts.broadcastCancel", .context = self, .invoke_fn = handleScriptsBroadcastCancel },
             .{ .name = "oars.deploy.apps.list", .context = self, .invoke_fn = handleDeployAppsList },
@@ -194,10 +197,13 @@ pub const Context = struct {
             .{ .name = "oars.sftp.poll", .origins = &allowed_origins },
             .{ .name = "oars.sftp.cancel", .origins = &allowed_origins },
             .{ .name = "oars.scripts.list", .origins = &allowed_origins },
+            .{ .name = "oars.scripts.validate", .origins = &allowed_origins },
             .{ .name = "oars.scripts.save", .origins = &allowed_origins },
             .{ .name = "oars.scripts.delete", .origins = &allowed_origins },
             .{ .name = "oars.scripts.run", .origins = &allowed_origins },
+            .{ .name = "oars.scripts.broadcastPrepare", .origins = &allowed_origins },
             .{ .name = "oars.scripts.broadcast", .origins = &allowed_origins },
+            .{ .name = "oars.scripts.broadcastPrepareCancel", .origins = &allowed_origins },
             .{ .name = "oars.scripts.broadcastPoll", .origins = &allowed_origins },
             .{ .name = "oars.scripts.broadcastCancel", .origins = &allowed_origins },
             .{ .name = "oars.deploy.apps.list", .origins = &allowed_origins },
@@ -2377,9 +2383,14 @@ fn handleSftpCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
 const scripts_run_check_timeout_ns = 30 * std.time.ns_per_s;
 const scripts_check_cap: usize = 16 * 1024;
 const scripts_poll_data_budget: usize = 256 * 1024;
+const scripts_terminal_output_cap: usize = 200_000;
 
 const ScriptsSavePayload = struct {
     script: scripts.ScriptInput,
+};
+
+const ScriptsValidatePayload = struct {
+    body: []const u8,
 };
 
 const ScriptsIdPayload = struct {
@@ -2398,6 +2409,10 @@ const ScriptsBroadcastPayload = struct {
     vars: std.json.Value = .null,
 };
 
+const ScriptsPreviewPayload = struct {
+    preview_id: u32,
+};
+
 const ScriptsBroadcastPollPayload = struct {
     run_id: u32,
     cursors: std.json.Value = .null,
@@ -2406,6 +2421,36 @@ const ScriptsBroadcastPollPayload = struct {
 const ScriptsBroadcastCancelPayload = struct {
     run_id: u32,
 };
+
+const ScriptWire = struct {
+    id: []const u8,
+    name: []const u8,
+    description: []const u8,
+    tags: []const []const u8,
+    color: []const u8,
+    body: []const u8,
+    variables: []const scripts.Variable,
+    created_at: i64,
+    updated_at: i64,
+    run_count: u64,
+    last_run_at: ?i64,
+};
+
+fn scriptWire(script: scripts.Script) ScriptWire {
+    return .{
+        .id = script.id,
+        .name = script.name,
+        .description = script.description,
+        .tags = script.tags,
+        .color = script.color,
+        .body = script.body,
+        .variables = script.variables,
+        .created_at = @divTrunc(script.created_at, std.time.ns_per_ms),
+        .updated_at = @divTrunc(script.updated_at, std.time.ns_per_ms),
+        .run_count = script.run_count,
+        .last_run_at = if (script.last_run_at) |stamp| @divTrunc(stamp, std.time.ns_per_ms) else null,
+    };
+}
 
 /// Extracts `{name: {value, secret}}` from the payload. The returned
 /// RunVars reference the parsed tree (valid until the parse is freed —
@@ -2428,33 +2473,71 @@ fn scriptsVars(self: *Context, output: []u8, value: std.json.Value, out: *std.Ar
 /// Appends one audit entry: script id/name, variable names, and the
 /// redacted command (spec 06 §8 — secret values never written). Returns
 /// the error response on failure.
-fn scriptsAudit(self: *Context, output: []u8, action: []const u8, server_id: []const u8, script: *const scripts.Script, expansion: *const scripts.Expansion) ?[]const u8 {
+fn scriptsAudit(self: *Context, output: []u8, action: []const u8, server_id: []const u8, script_id: []const u8, script_name: []const u8, names: []const scripts.NameInfo, redacted: []const u8) ?[]const u8 {
     var names_buf: std.ArrayList(u8) = .empty;
     defer names_buf.deinit(self.allocator);
-    for (expansion.names, 0..) |n, i| {
+    for (names, 0..) |n, i| {
         if (names_buf.items.len >= 256) break;
         if (i > 0) names_buf.append(self.allocator, ',') catch return respondError(output, "out of memory");
         names_buf.appendSlice(self.allocator, n.name) catch return respondError(output, "out of memory");
     }
-    const redacted = if (expansion.redacted.len > 1000) expansion.redacted[0..1000] else expansion.redacted;
+    const redacted_trim = if (redacted.len > 1000) redacted[0..1000] else redacted;
     var detail_buf: [1800]u8 = undefined;
-    const detail = std.fmt.bufPrint(&detail_buf, "script={s} name={s} vars={s} command={s}", .{ script.id, script.name, names_buf.items, redacted }) catch "scripts.run";
+    const detail = std.fmt.bufPrint(&detail_buf, "script={s} name={s} vars={s} command={s}", .{ script_id, script_name, names_buf.items, redacted_trim }) catch "scripts.run";
     self.audit.append(self.io, action, server_id, detail) catch return respondError(output, "audit failed");
     return null;
 }
 
-/// Loads the script, expands the template with the payload vars, and
-/// writes one audit entry per server (redacted command + variable names).
-/// On failure writes an error response and returns null.
-fn scriptsPrepare(
+/// Enforces the stored `secret_default` as the minimum policy (spec 06
+/// §8): a caller may promote a value to secret but must not demote a
+/// stored secret — a demoted value could otherwise reach audit or
+/// history unmasked. Mutates the parsed RunVars in place.
+fn scriptsEnforceSecrets(vars: *std.ArrayList(scripts.RunVar), definitions: []const scripts.Variable) void {
+    for (vars.items) |*v| {
+        if (v.secret) continue;
+        for (definitions) |d| {
+            if (std.mem.eql(u8, d.name, v.name) and d.secret_default) {
+                v.secret = true;
+                break;
+            }
+        }
+    }
+}
+
+/// A script with an exact, case-insensitive `destructive` tag requires a
+/// second confirmation (spec 06 §4.2). Color alone never marks a script
+/// destructive.
+fn scriptsDestructive(script: *const scripts.Script) bool {
+    for (script.tags) |tag| {
+        if (std.ascii.eqlIgnoreCase(tag, "destructive")) return true;
+    }
+    return false;
+}
+
+const LoadedExpansion = struct {
+    /// Owned.
+    script: scripts.Script,
+    /// Owned.
+    expansion: scripts.Expansion,
+
+    pub fn deinit(self: *LoadedExpansion, allocator: std.mem.Allocator) void {
+        scripts.deinit(allocator, &self.script);
+        self.expansion.deinit(allocator);
+    }
+};
+
+/// Loads the script, parses the payload vars, enforces stored secret
+/// policy, and expands the template. No audit, no run state — pure
+/// preparation (spec 06 §5: an uncommitted preview writes no audit row
+/// and bumps no run count). On failure writes an error response and
+/// returns null.
+fn scriptsLoadAndExpand(
     self: *Context,
     output: []u8,
     err_response: *[]const u8,
-    action: []const u8,
-    server_ids: []const []const u8,
     script_id: []const u8,
     vars: std.json.Value,
-) ?scripts.Expansion {
+) ?LoadedExpansion {
     err_response.* = "";
     var owned_script = self.scripts.find(self.io, script_id) catch {
         err_response.* = respondError(output, "script library is unreadable");
@@ -2463,17 +2546,20 @@ fn scriptsPrepare(
         err_response.* = respondError(output, "script not found");
         return null;
     };
-    defer scripts.deinit(self.allocator, &owned_script);
 
     var var_list: std.ArrayList(scripts.RunVar) = .empty;
     defer var_list.deinit(self.allocator);
     if (scriptsVars(self, output, vars, &var_list)) |resp| {
+        scripts.deinit(self.allocator, &owned_script);
         err_response.* = resp;
         return null;
     }
+    scriptsEnforceSecrets(&var_list, owned_script.variables);
 
     var missing: []const u8 = undefined;
-    var expansion = scripts.expandTemplate(self.allocator, owned_script.body, var_list.items, &missing) catch |err| {
+    const expansion = scripts.expandTemplate(self.allocator, owned_script.body, var_list.items, &missing) catch |err| {
+        // The message bytes are copied into `output` by respondError
+        // BEFORE the script (which owns the missing-name slice) is freed.
         err_response.* = respondError(output, switch (err) {
             error.MissingVariable => blk: {
                 var buf: [256]u8 = undefined;
@@ -2486,17 +2572,10 @@ fn scriptsPrepare(
             error.TooManyVariables => "script references too many variables",
             error.OutOfMemory => "out of memory",
         });
+        scripts.deinit(self.allocator, &owned_script);
         return null;
     };
-    errdefer expansion.deinit(self.allocator);
-
-    for (server_ids) |sid| {
-        if (scriptsAudit(self, output, action, sid, &owned_script, &expansion)) |resp| {
-            err_response.* = resp;
-            return null;
-        }
-    }
-    return expansion;
+    return .{ .script = owned_script, .expansion = expansion };
 }
 
 fn handleScriptsList(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
@@ -2507,8 +2586,12 @@ fn handleScriptsList(context: *anyopaque, invocation: native_sdk.bridge.Invocati
     };
     defer loaded.deinit(self.allocator);
     var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,\"scripts\":") catch return output[0..0];
-    std.json.Stringify.value(loaded.parsed.value, .{}, &writer) catch return output[0..0];
+    writer.writeAll("{\"ok\":true,\"scripts\":[") catch return output[0..0];
+    for (loaded.parsed.value, 0..) |script, i| {
+        if (i > 0) writer.writeAll(",") catch return output[0..0];
+        std.json.Stringify.value(scriptWire(script), .{}, &writer) catch return output[0..0];
+    }
+    writer.writeAll("]") catch return output[0..0];
     if (loaded.quarantined) |q| {
         var msg_buf: [640]u8 = undefined;
         const msg = std.fmt.bufPrint(&msg_buf, "scripts.json was unreadable and was moved to {s}; the script library starts fresh", .{q}) catch "scripts.json was unreadable and was moved aside";
@@ -2517,6 +2600,28 @@ fn handleScriptsList(context: *anyopaque, invocation: native_sdk.bridge.Invocati
     }
     writer.writeAll("}") catch return output[0..0];
     return writer.buffered();
+}
+
+/// Validates every placeholder without saving or executing. The core lexer
+/// remains authoritative and scans the complete body before it returns.
+fn handleScriptsValidate(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(ScriptsValidatePayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    scripts.validateTemplate(self.allocator, parsed.value.body) catch |err| {
+        return switch (err) {
+            error.MissingVariable => unreachable,
+            error.MultilineValue => respondError(output, "multiline variable values are not supported"),
+            error.UnterminatedPlaceholder => respondError(output, "script contains an unterminated placeholder"),
+            error.InvalidPlaceholderName => respondError(output, "script contains an invalid placeholder name"),
+            error.AmbiguousPlaceholder => respondError(output, "a placeholder appears in an ambiguous shell context (quotes, redirection, assignment, or command name)"),
+            error.TooManyVariables => respondError(output, "script references too many variables"),
+            error.OutOfMemory => respondError(output, "out of memory"),
+        };
+    };
+    return ok_json;
 }
 
 /// Upserts a script (spec 06 §7); ids are generated for creates. The body
@@ -2567,7 +2672,7 @@ fn handleScriptsSave(context: *anyopaque, invocation: native_sdk.bridge.Invocati
     defer scripts.deinit(self.allocator, &saved);
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":true,\"script\":") catch return output[0..0];
-    std.json.Stringify.value(saved, .{}, &writer) catch return output[0..0];
+    std.json.Stringify.value(scriptWire(saved), .{}, &writer) catch return output[0..0];
     writer.writeAll("}") catch return output[0..0];
     return writer.buffered();
 }
@@ -2585,7 +2690,9 @@ fn handleScriptsDelete(context: *anyopaque, invocation: native_sdk.bridge.Invoca
 }
 
 /// Runs a script on one server: expand, `bash -n` syntax check on the
-/// server, then exec (spec 06 §5). The channel id carries the output.
+/// server, then exec the same `bash -c '<expanded>'` string the check
+/// validated (spec 06 §5 — the checked interpreter is the executing
+/// interpreter). The channel id carries the output.
 fn handleScriptsRun(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
     var parsed = parsePayload(ScriptsRunPayload, self.allocator, invocation.request.payload) catch {
@@ -2595,12 +2702,13 @@ fn handleScriptsRun(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
     const payload = parsed.value;
 
     var err_response: []const u8 = "";
-    var expansion = scriptsPrepare(self, output, &err_response, "scripts.run", &.{payload.server_id}, payload.script_id, payload.vars) orelse return err_response;
-    defer expansion.deinit(self.allocator);
+    var loaded = scriptsLoadAndExpand(self, output, &err_response, payload.script_id, payload.vars) orelse return err_response;
+    defer loaded.deinit(self.allocator);
+    if (scriptsAudit(self, output, "scripts.run", payload.server_id, loaded.script.id, loaded.script.name, loaded.expansion.names, loaded.expansion.redacted)) |resp| {
+        return resp;
+    }
 
-    const quoted = shellquote.quote(self.allocator, expansion.command) catch return respondError(output, "out of memory");
-    defer self.allocator.free(quoted);
-    const check_cmd = std.fmt.allocPrint(self.allocator, "bash -n -c {s}", .{quoted}) catch return respondError(output, "out of memory");
+    const check_cmd = scripts.checkString(self.allocator, loaded.expansion.command) catch return respondError(output, "out of memory");
     defer self.allocator.free(check_cmd);
     var check = self.manager.execWait(payload.server_id, check_cmd, scripts_check_cap, scripts_run_check_timeout_ns) catch |err| {
         return respondError(output, switch (err) {
@@ -2617,8 +2725,12 @@ fn handleScriptsRun(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
         const msg = std.fmt.bufPrint(&msg_buf, "syntax check failed (exit {d}): {s}", .{ check.exit, tail }) catch "syntax check failed";
         return respondError(output, msg);
     }
-    const redacted_command: ?[]const u8 = if (std.mem.eql(u8, expansion.command, expansion.redacted)) null else expansion.redacted;
-    const channel = self.manager.execTracked(payload.server_id, expansion.command, "script", redacted_command, expansion.secrets) catch |err| {
+    const exec_cmd = scripts.execString(self.allocator, loaded.expansion.command) catch return respondError(output, "out of memory");
+    defer self.allocator.free(exec_cmd);
+    const redacted_exec = scripts.execString(self.allocator, loaded.expansion.redacted) catch return respondError(output, "out of memory");
+    defer self.allocator.free(redacted_exec);
+    const redacted_command: ?[]const u8 = if (std.mem.eql(u8, exec_cmd, redacted_exec)) null else redacted_exec;
+    const channel = self.manager.execTracked(payload.server_id, exec_cmd, "script", redacted_command, loaded.expansion.secrets) catch |err| {
         return respondError(output, switch (err) {
             error.NoSession => "not connected",
             error.NotReady => "session not ready",
@@ -2631,38 +2743,12 @@ fn handleScriptsRun(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
     return writer.buffered();
 }
 
-/// `bash -n` syntax check on one broadcast server (spec 06 §5). On failure
-/// the server state carries the reason; returns whether it may run.
-fn scriptsCheckSyntax(self: *Context, server: *broadcast.ServerState, command: []const u8) bool {
-    const quoted = shellquote.quote(self.allocator, command) catch {
-        server.status = .failed;
-        server.err = "out of memory";
-        return false;
-    };
-    defer self.allocator.free(quoted);
-    const check_cmd = std.fmt.allocPrint(self.allocator, "bash -n -c {s}", .{quoted}) catch {
-        server.status = .failed;
-        server.err = "out of memory";
-        return false;
-    };
-    defer self.allocator.free(check_cmd);
-    var check = self.manager.execWait(server.server_id, check_cmd, scripts_check_cap, scripts_run_check_timeout_ns) catch {
-        server.status = .skipped;
-        server.err = "unreachable";
-        return false;
-    };
-    defer check.output.deinit(self.allocator);
-    if (check.exit != 0) {
-        server.status = .failed;
-        server.err = if (check.exit == 127) "bash unavailable" else "syntax check failed";
-        return false;
-    }
-    return true;
-}
-
-/// Safe broadcast (spec 06 §4.2/§6): expands once, audits per server, and
-/// registers the run. Queued servers start as slots free during polling.
-fn handleScriptsBroadcast(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+/// Two-phase safe broadcast, step 1 (spec 06 §5): expands once, enforces
+/// stored secret policy, dedupes the target list (bounded to 64), freezes
+/// the exact exec + check strings, and stores a memory-only preview.
+/// Writes NO audit row and bumps NO run count — an uncommitted preview is
+/// invisible to history. Secret values never appear in the preview id.
+fn handleScriptsBroadcastPrepare(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
     var parsed = parsePayload(ScriptsBroadcastPayload, self.allocator, invocation.request.payload) catch {
         return respondError(output, "invalid payload");
@@ -2672,19 +2758,146 @@ fn handleScriptsBroadcast(context: *anyopaque, invocation: native_sdk.bridge.Inv
     if (payload.server_ids.len == 0) return respondError(output, "no servers selected");
 
     var err_response: []const u8 = "";
-    var expansion = scriptsPrepare(self, output, &err_response, "scripts.broadcast", payload.server_ids, payload.script_id, payload.vars) orelse return err_response;
-    defer expansion.deinit(self.allocator);
+    var loaded = scriptsLoadAndExpand(self, output, &err_response, payload.script_id, payload.vars) orelse return err_response;
+    defer loaded.deinit(self.allocator);
 
-    const run_id = self.manager.broadcasts.start(payload.script_id, "", expansion.command, expansion.redacted, expansion.secrets, payload.server_ids) catch |err| {
+    // Dedupe once, before anything is audited or started: duplicate
+    // selections must not produce duplicate audit rows (spec 06 §10).
+    var server_list: std.ArrayList([]const u8) = .empty;
+    defer server_list.deinit(self.allocator);
+    for (payload.server_ids) |sid| {
+        var dup = false;
+        for (server_list.items) |seen| {
+            if (std.mem.eql(u8, seen, sid)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        if (server_list.items.len >= broadcast.max_servers_per_broadcast) return respondError(output, "too many servers (max 64 per broadcast)");
+        server_list.append(self.allocator, sid) catch return respondError(output, "out of memory");
+    }
+    if (server_list.items.len == 0) return respondError(output, "no servers selected");
+
+    const exec = scripts.execString(self.allocator, loaded.expansion.command) catch return respondError(output, "out of memory");
+    defer self.allocator.free(exec);
+    const check = scripts.checkString(self.allocator, loaded.expansion.command) catch return respondError(output, "out of memory");
+    defer self.allocator.free(check);
+    const redacted = scripts.execString(self.allocator, loaded.expansion.redacted) catch return respondError(output, "out of memory");
+    defer self.allocator.free(redacted);
+    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+
+    var preview = broadcast.previewInit(
+        self.allocator,
+        loaded.script.id,
+        loaded.script.name,
+        exec,
+        check,
+        redacted,
+        loaded.expansion.secrets,
+        loaded.expansion.names,
+        server_list.items,
+        scriptsDestructive(&loaded.script),
+        now,
+    ) catch return respondError(output, "out of memory");
+    var adopted = false;
+    errdefer if (!adopted) preview.deinit(self.allocator);
+
+    self.manager.previews.lock();
+    self.manager.previews.expire(now);
+    const preview_id = self.manager.previews.add(preview) catch |err| {
+        self.manager.previews.unlock();
+        return respondError(output, switch (err) {
+            error.TooManyPreviews => "too many prepared broadcasts — commit or cancel one first",
+            else => "out of memory",
+        });
+    };
+    self.manager.previews.unlock();
+    adopted = true;
+
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"preview_id\":") catch return output[0..0];
+    writer.print("{d}", .{preview_id}) catch return output[0..0];
+    writer.writeAll(",\"script_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, loaded.script.id) catch return output[0..0];
+    writer.writeAll(",\"script_name\":") catch return output[0..0];
+    json.writeJsonString(&writer, loaded.script.name) catch return output[0..0];
+    writer.writeAll(",\"command\":") catch return output[0..0];
+    json.writeJsonString(&writer, exec) catch return output[0..0];
+    writer.writeAll(",\"redacted_command\":") catch return output[0..0];
+    json.writeJsonString(&writer, redacted) catch return output[0..0];
+    writer.writeAll(",\"servers\":[") catch return output[0..0];
+    for (server_list.items, 0..) |sid, i| {
+        if (i > 0) writer.writeAll(",") catch return output[0..0];
+        writer.writeAll("{\"server_id\":") catch return output[0..0];
+        json.writeJsonString(&writer, sid) catch return output[0..0];
+        writer.writeAll("}") catch return output[0..0];
+    }
+    writer.writeAll("],\"destructive\":") catch return output[0..0];
+    writer.writeAll(if (scriptsDestructive(&loaded.script)) "true" else "false") catch return output[0..0];
+    writer.writeAll(",\"expires_at\":") catch return output[0..0];
+    writer.print("{d}}}", .{@divTrunc(now + broadcast.preview_ttl_ns, std.time.ns_per_ms)}) catch return output[0..0];
+    return writer.buffered();
+}
+
+/// Two-phase safe broadcast, step 2 — commit (spec 06 §5): executes the
+/// frozen preview record verbatim, so a script edit between preview and
+/// confirm can never change what runs. Audits one row per server, bumps
+/// the run count, and admits at most `max_active_runs` broadcasts.
+fn handleScriptsBroadcast(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(ScriptsPreviewPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+
+    self.manager.previews.lock();
+    defer self.manager.previews.unlock();
+    self.manager.previews.expire(now);
+    const preview = self.manager.previews.get(parsed.value.preview_id) orelse {
+        return respondError(output, "preview expired or unknown — prepare again");
+    };
+
+    self.manager.broadcasts.lock();
+    const active = self.manager.broadcasts.activeCount();
+    self.manager.broadcasts.unlock();
+    if (active >= broadcast.max_active_runs) return respondError(output, "too many active broadcasts (max 8)");
+
+    for (preview.servers) |sid| {
+        if (scriptsAudit(self, output, "scripts.broadcast", sid, preview.script_id, preview.script_name, preview.names, preview.redacted_command)) |resp| {
+            return resp;
+        }
+    }
+    const run_id = self.manager.broadcasts.start(preview.script_id, preview.script_name, preview.command, preview.check_command, preview.redacted_command, preview.secrets, preview.servers) catch |err| {
         return respondError(output, switch (err) {
             error.NoServers => "no servers selected",
             else => "out of memory",
         });
     };
-    self.scripts.touchRun(self.io, payload.script_id, std.Io.Timestamp.now(self.io, .real).nanoseconds);
+    // touchRun BEFORE removing the preview: `preview` aliases the
+    // registry record, and remove() frees it.
+    self.scripts.touchRun(self.io, preview.script_id, now);
+    _ = self.manager.previews.remove(parsed.value.preview_id);
     var writer = std.Io.Writer.fixed(output);
     writer.print("{{\"ok\":true,\"run_id\":{d}}}", .{run_id}) catch return output[0..0];
     return writer.buffered();
+}
+
+/// Two-phase safe broadcast, cleanup: drops the prepared record without
+/// executing it (spec 06 §5 — records are removed on commit, explicit
+/// cancel, expiry, and shutdown).
+fn handleScriptsBroadcastPrepareCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(ScriptsPreviewPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    self.manager.previews.lock();
+    self.manager.previews.expire(std.Io.Timestamp.now(self.io, .real).nanoseconds);
+    _ = self.manager.previews.remove(parsed.value.preview_id);
+    self.manager.previews.unlock();
+    return ok_json;
 }
 
 /// The broadcast cursor map value for one server (absolute stream cursor;
@@ -2699,9 +2912,78 @@ fn scriptsCursor(cursors: std.json.Value, server_id: []const u8) u64 {
     };
 }
 
-/// Starts queued servers as slots free, polls running channels with the
-/// caller's cursors, and returns the per-server status/output snapshot
-/// (spec 06 §5 — non-destructive: nothing is consumed).
+fn writeScriptsBroadcastServer(
+    writer: *std.Io.Writer,
+    server: *const broadcast.ServerState,
+    cursor: u64,
+    gap: u64,
+    eof: bool,
+    data: []const u8,
+) !void {
+    try writer.writeAll("{\"server_id\":");
+    try json.writeJsonString(writer, server.server_id);
+    try writer.writeAll(",\"status\":");
+    try json.writeJsonString(writer, server.status.jsonName());
+    try writer.writeAll(",\"exit\":");
+    if (server.exit) |exit_v| {
+        try writer.print("{d}", .{exit_v});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"error\":");
+    try json.writeJsonString(writer, server.err);
+    try writer.print(",\"cursor\":{d},\"gap\":{d},\"eof\":{s},\"data\":", .{ cursor, gap, if (eof) "true" else "false" });
+    try json.writeJsonString(writer, data);
+    try writer.writeAll("}");
+}
+
+/// Copies the newest bounded output window before cancellation closes and
+/// removes a channel. The absolute range preserves cursor and gap behavior
+/// for consumers that poll after cancellation.
+fn captureScriptsTerminalOutput(self: *Context, server: *broadcast.ServerState, channel: u32) void {
+    const metadata = self.manager.pollChannels(server.server_id, &.{.{ .id = channel, .pos = 0 }}, false, 0, 0) catch return;
+    defer {
+        for (metadata) |*poll| poll.deinit(self.allocator);
+        self.allocator.free(metadata);
+    }
+    var retained_start: u64 = 0;
+    var retained_bytes: u64 = 0;
+    for (metadata) |*poll| {
+        if (poll.id != channel) continue;
+        retained_start = poll.cursor;
+        retained_bytes = poll.pending;
+        break;
+    }
+    const desired = retained_start + (retained_bytes -| scripts_terminal_output_cap);
+    const snapshots = self.manager.pollChannels(
+        server.server_id,
+        &.{.{ .id = channel, .pos = desired }},
+        false,
+        scripts_terminal_output_cap,
+        scripts_terminal_output_cap,
+    ) catch return;
+    defer {
+        for (snapshots) |*poll| poll.deinit(self.allocator);
+        self.allocator.free(snapshots);
+    }
+    for (snapshots) |*poll| {
+        if (poll.id != channel or poll.data.len == 0) continue;
+        const owned = self.allocator.dupe(u8, poll.data) catch return;
+        if (server.retained_data.len > 0) self.allocator.free(server.retained_data);
+        server.retained_data = owned;
+        server.retained_end = poll.cursor;
+        server.retained_start = poll.cursor - poll.data.len;
+        return;
+    }
+}
+
+/// Starts queued servers as slots free (enqueuing worker-driven syntax
+/// checks — never blocking a bridge call), completes in-flight checks,
+/// polls running channels with the caller's cursors, and returns the
+/// per-server status/output snapshot (spec 06 §5 — non-destructive:
+/// nothing is consumed). Status transitions are applied BEFORE the
+/// response serializes each server, so `done:true` and every server
+/// result agree in the same response.
 fn handleScriptsBroadcastPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
     var parsed = parsePayload(ScriptsBroadcastPollPayload, self.allocator, invocation.request.payload) catch {
@@ -2719,6 +3001,67 @@ fn handleScriptsBroadcastPoll(context: *anyopaque, invocation: native_sdk.bridge
     // The bridge is single-threaded: no other handler can mutate or evict
     // the run while this one runs, so the pointer stays valid.
 
+    // Start queued servers as slots free (spec 06 §6: at most four at a
+    // time — checks included; polling drives the queue). The check runs
+    // on the session worker; enqueueing is O(1).
+    while (run.running < broadcast.max_concurrent and run.next_to_start < run.servers.items.len and !run.canceled) {
+        const idx = run.next_to_start;
+        run.next_to_start += 1;
+        const server = &run.servers.items[idx];
+        if (server.status != .queued) continue;
+        const outcome = self.allocator.create(broadcast.ScriptCheckOutcome) catch {
+            server.status = .failed;
+            server.err = "out of memory";
+            continue;
+        };
+        outcome.* = .{ .allocator = self.allocator };
+        self.manager.enqueueSyntaxCheck(server.server_id, run.check_command, scripts_run_check_timeout_ns, outcome) catch {
+            self.allocator.destroy(outcome);
+            server.status = .skipped;
+            server.err = "unreachable";
+            continue;
+        };
+        server.status = .checking;
+        server.check_outcome = outcome;
+        run.running += 1;
+    }
+
+    // Complete in-flight checks: a done check either starts the tracked
+    // exec (exit 0) or fails the server with the exact reason.
+    for (run.servers.items) |*server| {
+        if (server.status != .checking) continue;
+        const outcome = server.check_outcome orelse continue;
+        if (!outcome.isDone()) continue;
+        server.check_outcome = null;
+        if (outcome.exit != null and outcome.exit.? == 0) {
+            const redacted_command: ?[]const u8 = if (std.mem.eql(u8, run.command, run.redacted_command)) null else run.redacted_command;
+            const channel = self.manager.execTracked(server.server_id, run.command, "script", redacted_command, run.secrets) catch {
+                self.allocator.destroy(outcome);
+                server.status = .failed;
+                server.err = "unreachable";
+                run.running -= 1;
+                continue;
+            };
+            server.status = .running;
+            server.channel = channel;
+            self.allocator.destroy(outcome);
+        } else {
+            // Copy the message before the outcome is freed (it aliases
+            // the struct — never return a slice into a freed outcome).
+            const check_exit = outcome.exitStatus();
+            const err, const err_owned = if (self.allocator.dupe(u8, outcome.message())) |owned|
+                .{ owned, true }
+            else |_|
+                .{ @as([]const u8, "syntax check failed"), false };
+            self.allocator.destroy(outcome);
+            server.status = .failed;
+            server.exit = check_exit;
+            server.err = err;
+            server.err_owned = err_owned;
+            run.running -= 1;
+        }
+    }
+
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":true,\"run_id\":") catch return output[0..0];
     writer.print("{d}", .{run.id}) catch return output[0..0];
@@ -2726,81 +3069,87 @@ fn handleScriptsBroadcastPoll(context: *anyopaque, invocation: native_sdk.bridge
     json.writeJsonString(&writer, run.script_name) catch return output[0..0];
     writer.print(",\"canceled\":{s}", .{if (run.canceled) "true" else "false"}) catch return output[0..0];
 
-    // Start queued servers as slots free (spec 06 §6: at most four at a
-    // time; polling drives the queue).
-    while (run.running < broadcast.max_concurrent and run.next_to_start < run.servers.items.len and !run.canceled) {
-        const idx = run.next_to_start;
-        run.next_to_start += 1;
-        const server = &run.servers.items[idx];
-        if (!scriptsCheckSyntax(self, server, run.command)) continue;
-        const redacted_command: ?[]const u8 = if (std.mem.eql(u8, run.command, run.redacted_command)) null else run.redacted_command;
-        const channel = self.manager.execTracked(server.server_id, run.command, "script", redacted_command, run.secrets) catch {
-            server.status = .skipped;
-            server.err = "unreachable";
-            continue;
-        };
-        server.status = .running;
-        server.channel = channel;
-        run.running += 1;
-    }
-
     writer.writeAll(",\"servers\":[") catch return output[0..0];
     var first = true;
     var budget = scripts_poll_data_budget;
     for (run.servers.items) |*server| {
-        if (!first) writer.writeAll(",") catch return output[0..0];
-        first = false;
-        writer.writeAll("{\"server_id\":") catch return output[0..0];
-        json.writeJsonString(&writer, server.server_id) catch return output[0..0];
-        writer.writeAll(",\"status\":") catch return output[0..0];
-        json.writeJsonString(&writer, server.status.jsonName()) catch return output[0..0];
-        writer.writeAll(",\"exit\":") catch return output[0..0];
-        if (server.exit) |exit| {
-            writer.print("{d}", .{exit}) catch return output[0..0];
-        } else {
-            writer.writeAll("null") catch return output[0..0];
-        }
-        writer.writeAll(",\"error\":") catch return output[0..0];
-        json.writeJsonString(&writer, server.err) catch return output[0..0];
+        // Poll the channel and apply the EOF transition BEFORE writing
+        // this server's status/exit (the response must agree with the
+        // state this poll just observed — spec 06 §5). Successful and
+        // nonzero-exit channels remain pollable with another view's cursor.
+        var cursor = scriptsCursor(payload.cursors, server.server_id);
+        var gap: u64 = 0;
+        var eof = switch (server.status) {
+            .done, .failed, .canceled, .skipped => true,
+            else => false,
+        };
+        var data: []const u8 = &.{};
+        var polls_owned: ?[]sessions.ChannelPoll = null;
+        defer if (polls_owned) |polls| {
+            for (polls) |*poll| poll.deinit(self.allocator);
+            self.allocator.free(polls);
+        };
 
-        if (server.status == .running or server.status == .done) {
-            const channel = server.channel orelse continue;
-            const cursor = scriptsCursor(payload.cursors, server.server_id);
-            const polls = self.manager.pollChannels(server.server_id, &.{.{ .id = channel, .pos = cursor }}, false, budget, 128 * 1024) catch {
+        if (server.channel == null and server.retained_data.len > 0) {
+            const read_from = @min(@max(cursor, server.retained_start), server.retained_end);
+            gap = server.retained_start -| cursor;
+            if (read_from < server.retained_end) {
+                const offset: usize = @intCast(read_from - server.retained_start);
+                const take = @min(server.retained_data.len - offset, @min(budget, 128 * 1024));
+                data = server.retained_data[offset .. offset + take];
+                cursor = read_from + take;
+                budget -= take;
+            } else {
+                cursor = read_from;
+            }
+            eof = true;
+        }
+
+        const should_poll = server.channel != null and
+            (server.status == .running or server.status == .done or (server.status == .failed and server.exit != null));
+        if (should_poll) {
+            const channel = server.channel.?;
+            const requested_cursor = cursor;
+            const polls = self.manager.pollChannels(server.server_id, &.{.{ .id = channel, .pos = requested_cursor }}, false, budget, 128 * 1024) catch {
+                const occupied_slot = server.status == .running;
                 server.status = .failed;
                 server.err = "session lost";
-                run.running -= 1;
+                server.channel = null;
+                eof = true;
+                if (occupied_slot) run.running -= 1;
+                if (!first) writer.writeAll(",") catch return output[0..0];
+                first = false;
+                writeScriptsBroadcastServer(&writer, server, requested_cursor, 0, true, "") catch return output[0..0];
                 continue;
             };
-            var data: []u8 = &.{};
-            var new_cursor = cursor;
-            var eof = false;
+            polls_owned = polls;
             var exit: ?i32 = null;
-            var gap: u64 = 0;
             for (polls) |*poll| {
                 if (poll.id != channel) continue;
                 data = poll.data;
-                new_cursor = poll.cursor;
+                cursor = poll.cursor;
                 eof = poll.eof;
                 exit = poll.exit_status;
                 gap = poll.gap;
             }
             budget = budget -| data.len;
-            writer.print(",\"cursor\":{d},\"gap\":{d},\"eof\":{s},\"data\":", .{ new_cursor, gap, if (eof) "true" else "false" }) catch return output[0..0];
-            json.writeJsonString(&writer, data) catch return output[0..0];
-            // The serialized data must be written BEFORE the polls are
-            // freed (poll.deinit owns the data buffer).
-            for (polls) |*poll| poll.deinit(self.allocator);
-            self.allocator.free(polls);
-            // Done servers keep being polled (late cursors still get their
-            // retained data), so the transition happens exactly once.
+            // Transition exactly once (a done server's later polls skip
+            // it). `done` only for exit 0; anything else is `failed` with
+            // the exact exit code.
             if (eof and server.status == .running) {
-                server.status = .done;
                 server.exit = exit;
+                if (exit == 0) {
+                    server.status = .done;
+                } else {
+                    server.status = .failed;
+                }
                 run.running -= 1;
             }
         }
-        writer.writeAll("}") catch return output[0..0];
+        if (!first) writer.writeAll(",") catch return output[0..0];
+        first = false;
+        // Data aliases `polls_owned`; serialize it before the defer frees it.
+        writeScriptsBroadcastServer(&writer, server, cursor, gap, eof, data) catch return output[0..0];
     }
     writer.writeAll("]") catch return output[0..0];
 
@@ -2811,9 +3160,11 @@ fn handleScriptsBroadcastPoll(context: *anyopaque, invocation: native_sdk.bridge
     return writer.buffered();
 }
 
-/// Cancels a broadcast: queued servers never start; running channels are
-/// closed and reported `canceled` ("cancel requested" — closing a channel
-/// does not prove the remote process died; spec 06 §10).
+/// Cancels a broadcast: queued servers never start; checking channels are
+/// abandoned (the worker completes and frees the outcome); running
+/// channels are closed and reported `canceled` ("cancel requested" —
+/// closing a channel does not prove the remote process died; spec 06
+/// §10).
 fn handleScriptsBroadcastCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
     var parsed = parsePayload(ScriptsBroadcastCancelPayload, self.allocator, invocation.request.payload) catch {
@@ -2829,8 +3180,22 @@ fn handleScriptsBroadcastCancel(context: *anyopaque, invocation: native_sdk.brid
     for (run.servers.items) |*server| {
         switch (server.status) {
             .queued => server.status = .canceled,
+            .checking => {
+                // The check op may still complete on the worker; hand the
+                // outcome to it (abandon) so its set() frees the struct.
+                server.status = .canceled;
+                if (server.check_outcome) |oc| {
+                    server.check_outcome = null;
+                    if (oc.abandon()) self.allocator.destroy(oc);
+                }
+                run.running -= 1;
+            },
             .running => {
-                if (server.channel) |ch| self.manager.closeChannel(server.server_id, ch) catch {};
+                if (server.channel) |ch| {
+                    captureScriptsTerminalOutput(self, server, ch);
+                    self.manager.closeChannel(server.server_id, ch) catch {};
+                }
+                server.channel = null;
                 server.status = .canceled;
                 server.err = "cancel requested";
                 run.running -= 1;

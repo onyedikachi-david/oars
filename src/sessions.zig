@@ -207,6 +207,13 @@ pub const ChannelEntry = struct {
     /// Worker-internal channel (monitor probe): never exposed in polls;
     /// its output is consumed by the worker at EOF.
     internal: bool = false,
+    /// Spec 06: worker-driven `bash -n` syntax check in flight. The worker
+    /// completes the outcome at EOF, on timeout, or in session teardown;
+    /// the handler owns it until abandoned (cancel). Only set on internal
+    /// channels.
+    check_outcome: ?*broadcast.ScriptCheckOutcome = null,
+    /// Bounded wait for the syntax check (0 = no deadline).
+    check_timeout_ns: i128 = 0,
 
     /// Frees the command text and the optional history strings. Every
     /// path that drops an entry (eviction, close, teardown) must call
@@ -321,6 +328,16 @@ const Op = union(enum) {
         fd: std.posix.socket_t,
         target_server_id: []const u8,
         outcome: *JumpStartOutcome,
+    },
+    /// Spec 06: worker-driven `bash -n -c` syntax check for a broadcast
+    /// server. Runs as an internal channel so the worker pump drives it
+    /// without blocking; the poll handler reads the outcome on later
+    /// polls. Owns `command`; the outcome follows the heap + abandon()
+    /// protocol.
+    syntax_check: struct {
+        command: []const u8,
+        timeout_ns: i128,
+        outcome: *broadcast.ScriptCheckOutcome,
     },
 };
 
@@ -927,6 +944,9 @@ pub const Manager = struct {
     /// Safe-broadcast runs (spec 06 §6): bridge handlers drive the state
     /// machine; the manager owns the registry and its memory.
     broadcasts: broadcast.Runs = .{},
+    /// Prepared (uncommitted) broadcast previews (spec 06 §5): memory-only,
+    /// bounded, expired after 10 minutes, cleared on shutdown.
+    previews: broadcast.Previews = .{},
     /// One-click deploy runs (spec 07 §6): poll-driven sequential steps;
     /// the manager owns the registry and its memory.
     deploys: deploy.Runs = .{},
@@ -942,6 +962,7 @@ pub const Manager = struct {
             .sessions = std.StringHashMap(*Session).init(allocator),
         };
         self.broadcasts = .{ .allocator = allocator };
+        self.previews = .{ .allocator = allocator };
         self.deploys = .{ .allocator = allocator };
         return self;
     }
@@ -950,6 +971,7 @@ pub const Manager = struct {
         self.shutdownAll();
         self.sessions.deinit();
         self.broadcasts.deinit();
+        self.previews.deinit();
         self.deploys.deinit();
     }
 
@@ -1198,6 +1220,27 @@ pub const Manager = struct {
         if (session.worker_done.load(.acquire)) return error.NotReady;
         try session.ops.append(self.allocator, .{ .follow = .{ .id = id, .command = owned } });
         return id;
+    }
+
+    /// Queues a worker-driven `bash -n -c` syntax check for a broadcast
+    /// server (spec 06 §5): the check runs on the session worker as an
+    /// internal channel, so a slow check can never block a bridge poll.
+    /// The outcome is completed at EOF, on timeout, or in session
+    /// teardown; the handler reads it on later polls (heap + abandon()
+    /// ownership — session 30 protocol).
+    pub fn enqueueSyntaxCheck(self: *Manager, server_id: []const u8, command: []const u8, timeout_ns: i128, outcome: *broadcast.ScriptCheckOutcome) !void {
+        const session = self.get(server_id) orelse return error.NoSession;
+        if (session.status.load(.acquire) != .ready) return error.NotReady;
+        const owned = try self.allocator.dupe(u8, command);
+        errdefer self.allocator.free(owned);
+        lockSpin(&session.ops_mutex);
+        defer session.ops_mutex.unlock();
+        if (session.worker_done.load(.acquire)) return error.NotReady;
+        try session.ops.append(self.allocator, .{ .syntax_check = .{
+            .command = owned,
+            .timeout_ns = timeout_ns,
+            .outcome = outcome,
+        } });
     }
 
     /// Queues the identity-bound SFTP truncate (spec 04 clear). The
@@ -2225,6 +2268,20 @@ fn workerMain(session: *Session) void {
                 i += 1;
                 continue;
             }
+            // Spec 06: a syntax check that outlives its deadline is closed
+            // and completed honestly instead of occupying a broadcast slot
+            // forever.
+            if (entry.check_outcome != null and entry.check_timeout_ns > 0 and
+                std.Io.Timestamp.now(io, .real).nanoseconds - entry.started_ns >= entry.check_timeout_ns)
+            {
+                entry.raw.sendEof();
+                entry.raw.close(session.io);
+                entry.raw_closed = true;
+                entry.check_outcome.?.set(null, "syntax check timed out");
+                entry.check_outcome = null;
+                if (!dropEntryAt(session, i, entry)) i += 1;
+                continue;
+            }
             switch (entry.raw.read(&read_buf)) {
                 .eof => {
                     if (!entry.eof_seen) {
@@ -2237,25 +2294,20 @@ fn workerMain(session: *Session) void {
                         entry.raw.close(session.io);
                         entry.raw_closed = true;
                         if (entry.internal) {
-                            drainProbe(session, entry);
-                            session.monitor_probe_active.store(false, .release);
+                            if (entry.check_outcome) |oc| {
+                                drainSyntaxCheck(session, entry, oc);
+                                entry.check_outcome = null;
+                            } else {
+                                drainProbe(session, entry);
+                                session.monitor_probe_active.store(false, .release);
+                            }
                         }
                     }
                     if (entry.internal) {
                         // Consumed by the worker; drop the entry now (the
                         // next item shifts into slot i).
-                        lockSpin(&session.channels_mutex);
-                        const still = i < session.channels.items.len and session.channels.items[i] == entry;
-                        if (still) _ = session.channels.orderedRemove(i);
-                        session.channels_mutex.unlock();
-                        if (still) {
-                            entry.clearStdin(allocator);
-                            entry.freeCommandText(allocator);
-                            entry.stream.deinit(allocator);
-                            allocator.destroy(entry.stream);
-                            allocator.destroy(entry);
-                            continue;
-                        }
+                        if (!dropEntryAt(session, i, entry)) i += 1;
+                        continue;
                     } else if (entry.kind == .exec or entry.kind == .log) {
                         // Spec 15: a completed tracked exec lands in
                         // command history with exit, duration, and a
@@ -2500,6 +2552,115 @@ fn storeProbeFailure(session: *Session, msg: []const u8) void {
     session.monitor_cache.commit(session.allocator, snap, null);
 }
 
+/// Removes and frees the channel entry at index `i` (worker side, under
+/// channels_mutex). Returns false when the slot changed under us (the
+/// entry was already removed by a concurrent path) — the caller then
+/// skips the slot instead of touching the stale pointer.
+fn dropEntryAt(session: *Session, i: usize, entry: *ChannelEntry) bool {
+    lockSpin(&session.channels_mutex);
+    const still = i < session.channels.items.len and session.channels.items[i] == entry;
+    if (still) _ = session.channels.orderedRemove(i);
+    session.channels_mutex.unlock();
+    if (still) {
+        entry.clearStdin(session.allocator);
+        entry.freeCommandText(session.allocator);
+        entry.stream.deinit(session.allocator);
+        session.allocator.destroy(entry.stream);
+        session.allocator.destroy(entry);
+    }
+    return still;
+}
+
+/// Completes a worker-driven `bash -n -c` syntax check at channel EOF
+/// (spec 06 §5): exit 0 means the checked command is valid; any other
+/// exit is reported with a bounded output tail (127 = bash unavailable).
+/// The outcome follows the heap + abandon() protocol, so a canceled run's
+/// handler-side free is never double-freed here.
+fn drainSyntaxCheck(session: *Session, entry: *ChannelEntry, outcome: *broadcast.ScriptCheckOutcome) void {
+    const allocator = session.allocator;
+    var total: std.ArrayList(u8) = .empty;
+    defer total.deinit(allocator);
+    var buf: [1024]u8 = undefined;
+    var cursor = entry.stream.start();
+    while (true) {
+        const n = entry.stream.readAt(cursor, &buf);
+        if (n == 0) break;
+        total.appendSlice(allocator, buf[0..n]) catch break;
+        cursor += n;
+    }
+    // The message carries only a bounded tail (syntax errors are one line).
+    var tail = total.items;
+    if (tail.len > 512) tail = tail[tail.len - 512 ..];
+    while (tail.len > 0 and (tail[tail.len - 1] == '\n' or tail[tail.len - 1] == '\r' or tail[tail.len - 1] == ' ' or tail[tail.len - 1] == '\t')) tail = tail[0 .. tail.len - 1];
+    const exit = entry.stream.exit_status;
+    var msg_buf: [640]u8 = undefined;
+    const msg = if (exit != null and exit.? == 0)
+        "syntax ok"
+    else if (exit != null and exit.? == 127)
+        "bash unavailable"
+    else
+        std.fmt.bufPrint(&msg_buf, "syntax check failed (exit {d}): {s}", .{ exit orelse -1, tail }) catch "syntax check failed";
+    outcome.set(exit, msg);
+}
+
+/// Opens an internal exec channel for a `bash -n -c` syntax check (spec
+/// 06 §5). The worker pump reads the channel; at EOF (or the deadline)
+/// the outcome is completed and the entry dropped. Owns `sc.command` on
+/// every path.
+fn syntaxCheckOp(session: *Session, sc: anytype) void {
+    const allocator = session.allocator;
+    const raw = session.transport.openChannel(session.io) catch {
+        allocator.free(sc.command);
+        sc.outcome.set(null, "could not open a channel for the syntax check");
+        return;
+    };
+    raw.exec(session.io, sc.command) catch {
+        raw.close(session.io);
+        allocator.free(sc.command);
+        sc.outcome.set(null, "syntax check could not start");
+        return;
+    };
+    const stream = allocator.create(Stream) catch {
+        raw.close(session.io);
+        allocator.free(sc.command);
+        sc.outcome.set(null, "out of memory");
+        return;
+    };
+    stream.* = Stream.init(allocator);
+    // The check's output is diagnostics only; bound the retained buffer.
+    stream.max_bytes = 16 * 1024;
+    const entry = allocator.create(ChannelEntry) catch {
+        allocator.destroy(stream);
+        raw.close(session.io);
+        allocator.free(sc.command);
+        sc.outcome.set(null, "out of memory");
+        return;
+    };
+    entry.* = .{
+        .id = session.next_channel_id.fetchAdd(1, .monotonic),
+        .kind = .exec,
+        .command = sc.command,
+        .stream = stream,
+        .raw = raw,
+        .internal = true,
+        .check_outcome = sc.outcome,
+        .check_timeout_ns = sc.timeout_ns,
+        .started_ns = std.Io.Timestamp.now(session.io, .real).nanoseconds,
+    };
+    lockSpin(&session.channels_mutex);
+    session.channels.append(allocator, entry) catch {
+        session.channels_mutex.unlock();
+        entry.clearStdin(allocator);
+        entry.freeCommandText(allocator);
+        allocator.destroy(entry);
+        allocator.destroy(stream);
+        raw.close(session.io);
+        sc.outcome.set(null, "out of memory");
+        return;
+    };
+    session.channels_mutex.unlock();
+}
+
 fn processOps(session: *Session) void {
     const allocator = session.allocator;
     while (true) {
@@ -2571,6 +2732,7 @@ fn processOps(session: *Session) void {
             .tunnel_stop => |s| tunnelStopOp(session, s),
             .jump_start => |j| jumpStartOp(session, j),
             .forward_set => |f| forwardSetOp(session, f),
+            .syntax_check => |sc| syntaxCheckOp(session, sc),
         }
     }
 }
@@ -2720,18 +2882,28 @@ fn processJumpTunnels(session: *Session, io: std.Io) void {
 
         var remove = false;
         var buf: [16 * 1024]u8 = undefined;
-        // Drain pending sends first — the fd and channel are both
-        // non-blocking, so these never stall the worker loop; whatever
-        // does not fit stays buffered for the next pass.
+        // Drain pending sends first. The socketpair is non-blocking, but
+        // poll-gating is still required: it makes the no-stall contract
+        // independent of platform fcntl behavior and avoids entering a
+        // blocking libc write when the peer has applied backpressure.
         if (jt.to_fd_buf.items.len > 0) {
-            const w = ssh.c.write(jt.fd, jt.to_fd_buf.items.ptr, jt.to_fd_buf.items.len);
-            if (w < 0) {
-                if (__error().* != EAGAIN) remove = true;
-            } else if (w > 0) {
-                const n: usize = @intCast(w);
-                jt.bytes_down += n;
-                std.mem.copyForwards(u8, jt.to_fd_buf.items[0 .. jt.to_fd_buf.items.len - n], jt.to_fd_buf.items[n..]);
-                jt.to_fd_buf.items.len -= n;
+            var write_fds = [_]std.posix.pollfd{.{ .fd = jt.fd, .events = std.posix.POLL.OUT, .revents = 0 }};
+            const ready = std.posix.poll(&write_fds, 0) catch 0;
+            if (ready > 0) {
+                const revents = write_fds[0].revents;
+                if (revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) {
+                    remove = true;
+                } else if (revents & std.posix.POLL.OUT != 0) {
+                    const w = ssh.c.write(jt.fd, jt.to_fd_buf.items.ptr, jt.to_fd_buf.items.len);
+                    if (w < 0) {
+                        if (__error().* != EAGAIN) remove = true;
+                    } else if (w > 0) {
+                        const n: usize = @intCast(w);
+                        jt.bytes_down += n;
+                        std.mem.copyForwards(u8, jt.to_fd_buf.items[0 .. jt.to_fd_buf.items.len - n], jt.to_fd_buf.items[n..]);
+                        jt.to_fd_buf.items.len -= n;
+                    }
+                }
             }
         }
         if (!remove and jt.to_channel_buf.items.len > 0) {
@@ -2753,18 +2925,29 @@ fn processJumpTunnels(session: *Session, io: std.Io) void {
                 },
             }
         }
-        // fd → to_channel_buf (non-blocking: EAGAIN means quiet, EOF and
-        // real errors retire the tunnel).
+        // fd → to_channel_buf. Poll before the read so a failed or ignored
+        // O_NONBLOCK setup cannot freeze the via worker. A readable zero-byte
+        // result is EOF; HUP is drained first when POLLIN is also present.
         if (!remove and jt.to_channel_buf.items.len < jump_frame_cap) {
-            const n = std.posix.read(jt.fd, &buf) catch |err| switch (err) {
-                error.WouldBlock => 0,
-                else => {
+            var read_fds = [_]std.posix.pollfd{.{ .fd = jt.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&read_fds, 0) catch 0;
+            if (ready > 0) {
+                const revents = read_fds[0].revents;
+                if (revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) {
                     remove = true;
-                    continue;
-                },
-            };
-            if (n > 0) {
-                jt.to_channel_buf.appendSlice(allocator, buf[0..n]) catch {};
+                } else if (revents & std.posix.POLL.IN != 0) {
+                    const n = std.posix.read(jt.fd, &buf) catch |err| blk: {
+                        if (err != error.WouldBlock) remove = true;
+                        break :blk 0;
+                    };
+                    if (n == 0) {
+                        if (!remove) remove = true;
+                    } else {
+                        jt.to_channel_buf.appendSlice(allocator, buf[0..n]) catch {};
+                    }
+                } else if (revents & std.posix.POLL.HUP != 0) {
+                    remove = true;
+                }
             }
         }
         if (remove) {
@@ -5155,6 +5338,12 @@ fn sessionDone(session: *Session) void {
     lockSpin(&session.channels_mutex);
     for (session.channels.items) |entry| {
         if (!entry.raw_closed) entry.raw.close(session.io);
+        // Spec 06: an in-flight syntax check must complete honestly — the
+        // broadcast poll reads the outcome and frees the slot; without
+        // this it would poll a dead session's check forever.
+        if (entry.check_outcome) |oc| {
+            oc.set(null, "session disconnected");
+        }
         entry.clearStdin(session.allocator);
         entry.freeCommandText(session.allocator);
         entry.stream.deinit(session.allocator);
@@ -5240,6 +5429,10 @@ fn sessionDone(session: *Session) void {
                 }
             },
             .follow => |f| session.allocator.free(f.command),
+            .syntax_check => |sc| {
+                session.allocator.free(sc.command);
+                sc.outcome.set(null, "session disconnected");
+            },
             .clear => |cl| {
                 session.allocator.free(cl.path);
                 cl.outcome.set(false, "session disconnected");

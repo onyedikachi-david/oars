@@ -1002,38 +1002,107 @@ test "scripts.run and broadcast require a session and validate inputs" {
     );
     try std.testing.expect(std.mem.indexOf(u8, ambiguous, "ambiguous shell context") != null);
 
-    // Broadcast requires servers.
+    const invalid_editor_body = app.dispatch(
+        \\{"id":"7a","command":"oars.scripts.validate","payload":{"body":"echo {{first}}; echo \"{{value}}\""}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, invalid_editor_body, "ambiguous shell context") != null);
+    const valid_editor_body = app.dispatch(
+        \\{"id":"7b","command":"oars.scripts.validate","payload":{"body":"echo /srv/{{value}}/current"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, valid_editor_body, "\"ok\":true") != null);
+
+    // Broadcast requires servers (preparation is the gate).
     const no_servers = app.dispatch(
-        \\{"id":"8","command":"oars.scripts.broadcast","payload":{"script_id":"sc-run","server_ids":[],"vars":{"who":{"value":"world"}}}}
+        \\{"id":"8","command":"oars.scripts.broadcastPrepare","payload":{"script_id":"sc-run","server_ids":[],"vars":{"who":{"value":"world"}}}}
     );
     try std.testing.expect(std.mem.indexOf(u8, no_servers, "no servers selected") != null);
 
-    // Broadcasting to a ghost server still registers the run (the run
-    // reports it skipped/unreachable when polled).
-    const broadcast = app.dispatch(
-        \\{"id":"9","command":"oars.scripts.broadcast","payload":{"script_id":"sc-run","server_ids":["ghost"],"vars":{"who":{"value":"world"}}}}
+    // Preparing does not need a session and does not bump run counts.
+    const list_before = app.dispatch(
+        \\{"id":"9","command":"oars.scripts.list","payload":{}}
     );
+    try std.testing.expect(std.mem.indexOf(u8, list_before, "\"run_count\":0") != null);
+
+    const prepared = app.dispatch(
+        \\{"id":"10","command":"oars.scripts.broadcastPrepare","payload":{"script_id":"sc-run","server_ids":["ghost","ghost"],"vars":{"who":{"value":"world"}}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, prepared, "\"preview_id\"") != null);
+    // The preview freezes the exact exec string and the script name.
+    try std.testing.expect(std.mem.indexOf(u8, prepared, "\"command\":\"bash -c 'echo '") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prepared, "\"script_name\":\"hello\"") != null);
+    // Duplicate server ids are deduped in the prepared record.
+    try std.testing.expect(std.mem.indexOf(u8, prepared, "\"servers\":[{\"server_id\":\"ghost\"}]") != null);
+    // Real-time nanoseconds exceed JavaScript's safe integer range. The
+    // bridge must serialize the preview expiry as integer milliseconds.
+    const expiry_pos = std.mem.indexOf(u8, prepared, "\"expires_at\":") orelse return error.TestUnexpectedResult;
+    var expiry_end = expiry_pos + "\"expires_at\":".len;
+    while (expiry_end < prepared.len and prepared[expiry_end] >= '0' and prepared[expiry_end] <= '9') expiry_end += 1;
+    const expiry = try std.fmt.parseInt(u64, prepared[expiry_pos + "\"expires_at\":".len .. expiry_end], 10);
+    try std.testing.expect(expiry < 10_000_000_000_000);
+    const preview_id_pos = std.mem.indexOf(u8, prepared, "\"preview_id\":") orelse return error.TestUnexpectedResult;
+    var preview_id_end: usize = preview_id_pos + "\"preview_id\":".len;
+    while (preview_id_end < prepared.len and prepared[preview_id_end] >= '0' and prepared[preview_id_end] <= '9') preview_id_end += 1;
+    const preview_id = prepared[preview_id_pos + "\"preview_id\":".len .. preview_id_end];
+    // Build the commit request NOW: the slice aliases the shared dispatch
+    // buffer, and the next dispatch overwrites it (TestApp pitfall).
+    var commit_buf: [256]u8 = undefined;
+    const commit_req = try std.fmt.bufPrint(&commit_buf, "{{\"id\":\"12\",\"command\":\"oars.scripts.broadcast\",\"payload\":{{\"preview_id\":{s}}}}}", .{preview_id});
+
+    // Preparation alone must not bump run counts (no audit, no run).
+    const list_mid = app.dispatch(
+        \\{"id":"11","command":"oars.scripts.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, list_mid, "\"run_count\":0") != null);
+
+    // Committing to a ghost server still registers the run (the run
+    // reports it skipped/unreachable when polled).
+    const broadcast = app.dispatch(commit_req);
     try std.testing.expect(std.mem.indexOf(u8, broadcast, "\"run_id\"") != null);
     const run_id_pos = std.mem.indexOf(u8, broadcast, "\"run_id\":") orelse return error.TestUnexpectedResult;
     var run_id_end: usize = run_id_pos + "\"run_id\":".len;
     while (run_id_end < broadcast.len and broadcast[run_id_end] >= '0' and broadcast[run_id_end] <= '9') run_id_end += 1;
     const run_id = broadcast[run_id_pos + "\"run_id\":".len .. run_id_end];
     var poll_buf: [256]u8 = undefined;
-    const poll_req = try std.fmt.bufPrint(&poll_buf, "{{\"id\":\"10\",\"command\":\"oars.scripts.broadcastPoll\",\"payload\":{{\"run_id\":{s}}}}}", .{run_id});
+    const poll_req = try std.fmt.bufPrint(&poll_buf, "{{\"id\":\"13\",\"command\":\"oars.scripts.broadcastPoll\",\"payload\":{{\"run_id\":{s}}}}}", .{run_id});
     const poll = app.dispatch(poll_req);
     // The ghost server is marked skipped (unreachable), never dropped.
     try std.testing.expect(std.mem.indexOf(u8, poll, "\"status\":\"skipped\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, poll, "unreachable") != null);
+    // The run carries the real script name, not an empty string.
+    try std.testing.expect(std.mem.indexOf(u8, poll, "\"script_name\":\"hello\"") != null);
 
     // Unknown run ids are explicit errors.
     const unknown = app.dispatch(
-        \\{"id":"11","command":"oars.scripts.broadcastPoll","payload":{"run_id":9999}}
+        \\{"id":"14","command":"oars.scripts.broadcastPoll","payload":{"run_id":9999}}
     );
     try std.testing.expect(std.mem.indexOf(u8, unknown, "unknown run") != null);
     const cancel_unknown = app.dispatch(
-        \\{"id":"12","command":"oars.scripts.broadcastCancel","payload":{"run_id":9999}}
+        \\{"id":"15","command":"oars.scripts.broadcastCancel","payload":{"run_id":9999}}
     );
     try std.testing.expect(std.mem.indexOf(u8, cancel_unknown, "unknown run") != null);
+
+    // A consumed preview cannot be committed twice.
+    const again = app.dispatch(commit_req);
+    try std.testing.expect(std.mem.indexOf(u8, again, "preview expired or unknown") != null);
+
+    // Cancel drops an uncommitted preview; committing it then fails.
+    const prepared2 = app.dispatch(
+        \\{"id":"16","command":"oars.scripts.broadcastPrepare","payload":{"script_id":"sc-run","server_ids":["ghost"],"vars":{"who":{"value":"world"}}}}
+    );
+    const preview2_pos = std.mem.indexOf(u8, prepared2, "\"preview_id\":") orelse return error.TestUnexpectedResult;
+    var preview2_end: usize = preview2_pos + "\"preview_id\":".len;
+    while (preview2_end < prepared2.len and prepared2[preview2_end] >= '0' and prepared2[preview2_end] <= '9') preview2_end += 1;
+    const preview2 = prepared2[preview2_pos + "\"preview_id\":".len .. preview2_end];
+    // Build both requests NOW — the slice aliases the shared dispatch
+    // buffer, and every later dispatch overwrites it.
+    var cancel_buf: [256]u8 = undefined;
+    const cancel_req = try std.fmt.bufPrint(&cancel_buf, "{{\"id\":\"17\",\"command\":\"oars.scripts.broadcastPrepareCancel\",\"payload\":{{\"preview_id\":{s}}}}}", .{preview2});
+    var commit2_buf: [256]u8 = undefined;
+    const commit2_req = try std.fmt.bufPrint(&commit2_buf, "{{\"id\":\"18\",\"command\":\"oars.scripts.broadcast\",\"payload\":{{\"preview_id\":{s}}}}}", .{preview2});
+    const canceled = app.dispatch(cancel_req);
+    try std.testing.expect(std.mem.indexOf(u8, canceled, "\"ok\":true") != null);
+    const after_cancel = app.dispatch(commit2_req);
+    try std.testing.expect(std.mem.indexOf(u8, after_cancel, "preview expired or unknown") != null);
 }
 
 test "deploy apps save/list/delete round trip through the dispatcher" {

@@ -1,6 +1,6 @@
 # Spec 06 — Scripts + Safe Broadcast
 
-**Status:** ✅ backend in (frontend UI pending) · **Depends on:** 02 (exec), 01 · **Spec owner:** core + frontend
+**Status:** ✅ v1 frontend + backend implemented (2026-08-11) · **Depends on:** 02 (exec), 01 · **Spec owner:** core + frontend
 
 ## 1. Overview
 
@@ -60,10 +60,17 @@ fan-out.
 
 ## 5. Bridge API
 
-### `oars.scripts.list` → `{ok, scripts}` · `oars.scripts.save` `{script}` → `{ok, script}` · `oars.scripts.delete` `{id}` → `{ok}`
+### `oars.scripts.list` → `{ok, scripts}` · `oars.scripts.validate` `{body}` → `{ok}` · `oars.scripts.save` `{script}` → `{ok, script}` · `oars.scripts.delete` `{id}` → `{ok}`
 - Save is an upsert by id (the core generates ids for creates); edits
   preserve `created_at`, `run_count`, and `last_run_at`. Body > 64 KB,
-  duplicate/invalid variables, and bad tags/colors are rejected.
+  duplicate/invalid variables, and bad tags/colors are rejected. The
+  stored `secret_default` is the **minimum secret policy**: a caller may
+  promote a run-time value to secret but can never demote a stored one.
+- The wire carries `secret_default` (not `secret`) on stored definitions.
+- The core sends real-time script timestamps and preview expiry as integer
+  epoch milliseconds. Epoch nanoseconds never cross JSON as a JavaScript
+  number. `validate` scans the complete body with the core lexer, so an
+  earlier valid placeholder cannot hide a later invalid context.
 ### `oars.scripts.run` `{server_id, script_id, vars: {name: {value, secret}}}` → `{ok, channel}`
 - Each placeholder must occupy a shell word by itself. Placeholders inside
   quotes, redirections, command names, assignments, or shell syntax are
@@ -80,32 +87,78 @@ fan-out.
 - `bash -n` runs on the server (exit 127 = bash unavailable); a missing
   variable blocks the run with `missing variable: X` (no partial
   substitution). The command is never executed when the check fails.
+- **The checked interpreter executes the command**: the run submits the
+  exact exec string `bash -c '<expanded command>'` (single-quoted via the
+  shared shell-quote helper) — the same `-c` argument the `bash -n -c`
+  check validated — so a non-Bash account shell can never interpret the
+  script differently from the check.
 - Runs bump `run_count`/`last_run_at` and write an audit entry
   (`scripts.run`) with the variable names and the redacted command —
   secret values are masked as `***` and never written.
-### `oars.scripts.broadcast` `{script_id, server_ids[], vars}` → `{ok, run_id}`
-- Duplicate server ids are deduped; the expansion happens once; every
-  server is audited (`scripts.broadcast`, one entry per server). At most
-  four servers run at a time; polling starts queued work as slots free.
+### Two-phase safe broadcast (spec 06 §4.2/§5): `oars.scripts.broadcastPrepare` → `oars.scripts.broadcast` → `oars.scripts.broadcastPrepareCancel`
+- `oars.scripts.broadcastPrepare` `{script_id, server_ids[], vars}` →
+  `{ok, preview_id, script_id, script_name, command, redacted_command,
+  servers:[{server_id}], destructive, expires_at}`. The core expands the
+  template once, enforces stored secret policy, dedupes server ids
+  (≤ 64), and **freezes the exact exec + check strings** in a memory-only
+  preview record. Writes NO audit row and bumps NO run count. Expires
+  after 10 minutes; at most 32 prepared records exist at once. Secret
+  values never appear in the preview id.
+- `oars.scripts.broadcast` `{preview_id}` → `{ok, run_id}` executes the
+  frozen record **verbatim** — a script edit between preview and confirm
+  can never change what runs. Audits one row per unique server
+  (`scripts.broadcast`), bumps the run count, admits at most 8 active
+  broadcasts, and removes the preview.
+- `oars.scripts.broadcastPrepareCancel` `{preview_id}` → `{ok}` drops an
+  uncommitted preview.
+- Duplicate server ids are deduped once, before preview or audit, so
+  duplicate selections can never produce duplicate audit rows.
 ### `oars.scripts.broadcastPoll` `{run_id, cursors: {server_id: cursor}}` → per-server status/output deltas
 - Streams are keyed by server id and channel. Each caller returns its own
   absolute cursor map under the spec 02 protocol; polling one broadcast view
   cannot drain another view. Response: `{ok, run_id, script_name, canceled,
   done, servers:[{server_id, status, exit, error, cursor, gap, eof, data}]}`
-  with status ∈ queued | running | done | failed | canceled | skipped
-  (skipped = unreachable at start, reported not dropped). Terminal runs
-  stay readable for a bounded history.
+  with status ∈ queued | **checking** | running | done | failed | canceled |
+  skipped. `checking` = the server worker is running `bash -n`; it occupies
+  one of the four concurrency slots but never blocks the bridge poll (the
+  check runs on the session worker as an internal channel — syntax
+  preparation is worker-driven, so one bridge call can never wait through
+  several 30 s checks). `done` only for exit 0; `failed` for a nonzero
+  exit (exact code retained), a syntax-check failure, or a session
+  failure; `skipped` = unreachable at start (reported, not dropped).
+  Transitions are applied before the response serializes each server, so
+  `done:true` and every server result agree in the same response. Terminal
+  runs stay readable for a bounded history.
 ### `oars.scripts.broadcastCancel` `{run_id}`
 - Queued servers never start; running channels are closed and reported
   `canceled` with "cancel requested" — closing a channel does not prove
-  the remote process died.
+  the remote process died. In-flight syntax checks are abandoned; their
+  worker completion frees the outcome. Before close, the core captures a
+  bounded terminal output window with its absolute range so independent
+  consumers can still read canceled output and receive an honest gap.
 
 ## 6. Zig core design
 
-- `src/scripts.zig` — Script model + store (`<data>/scripts.json`), template expansion (`expandTemplate` with `{{name}}` scan — pure, unit-tested), quoting helper.
+- `src/scripts.zig` — Script model + store (`<data>/scripts.json`), template expansion (`expandTemplate` with `{{name}}` scan — pure, unit-tested), quoting helper, and the `bash -c`/`bash -n -c` exec/check string builders (checked interpreter = executing interpreter).
 - Broadcast runner: `BroadcastRun {id, script, servers[], per_server:
-  {channel, stream, status}}` in a manager map. Run at most four servers at a
-  time by default. Polling starts queued work as slots become free.
+  {channel, stream, status}}` in a manager map. Run at most four servers at
+  a time by default (syntax checks occupy the same slots). Polling starts
+  queued work as slots become free.
+- **Worker-driven syntax checks** (spec 06 §5): each `bash -n -c` runs as an
+  internal exec channel on the target's session worker (`syntax_check` op +
+  heap `ScriptCheckOutcome` following the session-30 abandon() protocol).
+  The bridge poll enqueues the check and reads the outcome on later polls —
+  a slow or absent server can never block a bridge call, and `checking`
+  status is honest.
+- **Two-phase broadcast** (spec 06 §5): `broadcast.Previews` — a bounded
+  (32), memory-only registry of prepared records holding the frozen exec
+  string, check string, redacted copy, secret values, variable names,
+  deduped targets, and destructive state. Records expire after 10 minutes,
+  are removed on commit/cancel, and are cleared on manager shutdown. Commit
+  (`oars.scripts.broadcast`) replays the record verbatim: audit one row per
+  unique server, then `Runs.start`.
+- Admission limits (v1): 64 deduplicated servers per broadcast, 8 active
+  broadcasts, 32 prepared previews.
 
 ## 7. Data model
 
@@ -153,11 +206,19 @@ fan-out.
 - [x] Variable injection attempts are neutralized (tested against the
       live container: a value containing `'; touch …` stays a literal
       argument).
-- [ ] Broadcast shows a per-server expansion preview, confirms, streams
-      side-by-side, and reports per-server results (backend done; the
-      preview/confirm UI is frontend).
+- [x] Broadcast shows a per-server expansion preview, confirms, streams
+      side-by-side, and reports per-server results — two-phase
+      prepare/commit, worker-driven `checking`, `done` only for exit 0,
+      mixed done/failed/skipped results, preview-to-commit identity
+      (edit-after-preview runs the prepared command), and cancel
+      (verified against the live container; UI reviewed in the preview
+      harness).
 - [x] Audit entries written for every run (redacted command, variable
-      names; secret values never written — verified).
+      names; secret values never written — verified). Stored
+      `secret_default` is the minimum policy: a demoted value is still
+      masked (verified against the live container).
+- [x] No browser prompt/confirm; all dialogs follow the product modal
+      pattern; secrets never recorded in the preview call inspector.
 
 ## 13. Research & References
 
@@ -220,3 +281,33 @@ language (opengroup), rclone docs (quoting section).
   `ChannelPoll.deinit` owns the data buffer; writing after the frees
   emitted DebugAllocator's 0xAA fill (caught by the container test's
   UTF-8 check).
+- **2026-08-11 (spec 06 completion): the broadcast contract is
+  two-phase.** `oars.scripts.broadcast` no longer accepts
+  `{script_id, server_ids, vars}`; callers prepare first
+  (`broadcastPrepare`), review the frozen command, then commit by
+  `preview_id`. Rationale: a client-side copy of the Zig lexer can never
+  guarantee that a preview equals what the core submits, and a script
+  edit between preview and start previously invalidated the preview.
+  The frozen record makes preview-to-commit identity structural.
+- **2026-08-11: `checking` is a first-class broadcast status.** Syntax
+  checks moved from the blocking poll path (up to 4 × 30 s per bridge
+  call) to the session worker via an internal channel + heap outcome
+  (the session-30 abandon() protocol). A check occupies one of the four
+  concurrency slots; `done` is emitted only for exit 0 and nonzero exits
+  are `failed` with the exact code; transitions serialize after they are
+  applied.
+- **2026-08-11: the checked interpreter is the executing interpreter.**
+  The old bridge validated `bash -n -c <quoted>` but exec'd the unwrapped
+  command through the account shell. Runs now submit
+  `bash -c '<expanded>'` — the same single-quoted `-c` argument the check
+  validated (spec 06 §13's `bash -c` reference now applies to execution
+  as well as checking).
+- **2026-08-11: stored `secret_default` is the minimum policy.** A caller
+  may promote a run-time value to secret but cannot demote a stored
+  secret; a demoted value could otherwise reach audit/history unmasked.
+- **2026-08-11: admission limits.** 64 deduplicated servers per
+  broadcast, 8 active broadcasts, 32 prepared previews, 10-minute preview
+  TTL — all enforced with explicit errors. Duplicate server ids are
+  deduped before preview/audit so duplicate selections cannot produce
+  duplicate audit rows; audit rows are written at commit, never at
+  prepare.

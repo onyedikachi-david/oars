@@ -1315,11 +1315,44 @@ const BroadcastResp = struct {
     result: struct {
         ok: bool,
         run_id: u32,
+        script_name: []const u8 = "",
         servers: []BroadcastServer = &.{},
         done: bool = false,
         canceled: bool = false,
     },
 };
+
+const PreviewResp = struct {
+    result: struct {
+        ok: bool,
+        preview_id: u32,
+        script_id: []const u8,
+        script_name: []const u8,
+        command: []const u8,
+        servers: []struct { server_id: []const u8 } = &.{},
+        destructive: bool = false,
+    },
+};
+
+/// Prepares a broadcast (two-phase step 1) and returns the parsed preview
+/// (alloc_always — the caller must deinit before the next dispatch, the
+/// response aliases the rig's shared output buffer).
+fn broadcastPrepare(rig: *TestRig, id: []const u8, script_id: []const u8, server_ids: []const []const u8, vars: []const u8) !std.json.Parsed(PreviewResp) {
+    const allocator = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.print("{{\"id\":\"{s}\",\"command\":\"oars.scripts.broadcastPrepare\",\"payload\":{{\"script_id\":\"{s}\",\"server_ids\":[", .{ id, script_id });
+    for (server_ids, 0..) |sid, i| {
+        if (i > 0) try out.writer.writeAll(",");
+        try out.writer.print("\"{s}\"", .{sid});
+    }
+    try out.writer.print("],\"vars\":{s}}}}}", .{vars});
+    const resp = rig.dispatch(out.writer.buffered());
+    return std.json.parseFromSlice(PreviewResp, allocator, resp, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return error.TestUnexpectedResult;
+}
 
 /// Polls a broadcast until every server is terminal; returns the last
 /// response (alloc_always — the caller must deinit). Cursors stay empty,
@@ -1336,7 +1369,7 @@ fn broadcastWaitFor(rig: *TestRig, run_id: u32) !std.json.Parsed(BroadcastResp) 
         }) catch return error.TestUnexpectedResult;
         var all_terminal = true;
         for (parsed.value.result.servers) |s| {
-            if (std.mem.eql(u8, s.status, "queued") or std.mem.eql(u8, s.status, "running")) all_terminal = false;
+            if (std.mem.eql(u8, s.status, "queued") or std.mem.eql(u8, s.status, "checking") or std.mem.eql(u8, s.status, "running")) all_terminal = false;
         }
         if (all_terminal) return parsed;
         parsed.deinit();
@@ -1398,7 +1431,7 @@ test "integration: scripts run with variables, injection neutralization, broadca
         \\{"id":"3","command":"oars.scripts.save","payload":{"script":{"id":"sc-secret","name":"secret","body":"echo {{pw}}"}}}
     );
     _ = rig.dispatch(
-        \\{"id":"4","command":"oars.scripts.save","payload":{"script":{"id":"sc-sleep","name":"sleep","body":"sleep 30"}}}
+        \\{"id":"4","command":"oars.scripts.save","payload":{"script":{"id":"sc-sleep","name":"sleep","body":"echo broadcast-started; sleep 30"}}}
     );
 
     // --- run with a variable ---
@@ -1432,28 +1465,122 @@ test "integration: scripts run with variables, injection neutralization, broadca
     );
     try std.testing.expect(std.mem.indexOf(u8, broken, "syntax check failed") != null);
 
-    // --- broadcast to both servers ---
-    const broadcast = rig.dispatch(
-        \\{"id":"10","command":"oars.scripts.broadcast","payload":{"script_id":"sc-hello","server_ids":["itest-scr-a","itest-scr-b"],"vars":{"who":{"value":"alice"}}}}
+    // --- a nonzero exit is reported with the exact code ---
+    _ = rig.dispatch(
+        \\{"id":"10","command":"oars.scripts.save","payload":{"script":{"id":"sc-exit7","name":"exit7","body":"exit 7"}}}
     );
-    const run_id = scriptsRunId(broadcast) orelse return error.TestUnexpectedResult;
+    const exit_run = rig.dispatch(
+        \\{"id":"11","command":"oars.scripts.run","payload":{"server_id":"itest-scr-a","script_id":"sc-exit7","vars":{}}}
+    );
+    const exit_channel = scriptsChannel(exit_run) orelse return error.TestUnexpectedResult;
+    try execChannelWait(&rig.manager, "itest-scr-a", exit_channel, 7, "");
+
+    // --- stored secret_default is the minimum policy ---
+    _ = rig.dispatch(
+        \\{"id":"12","command":"oars.scripts.save","payload":{"script":{"id":"sc-secdef","name":"secdef","body":"echo {{pw}}","variables":[{"name":"pw","label":"Password","secret_default":true}]}}}
+    );
+    // The caller tries to DEMOTE the stored secret; the run must still
+    // mask it in audit/history (spec 06 §8).
+    const demote_run = rig.dispatch(
+        \\{"id":"13","command":"oars.scripts.run","payload":{"server_id":"itest-scr-b","script_id":"sc-secdef","vars":{"pw":{"value":"s3cret-policy","secret":false}}}}
+    );
+    const demote_channel = scriptsChannel(demote_run) orelse return error.TestUnexpectedResult;
+    try execChannelWait(&rig.manager, "itest-scr-b", demote_channel, 0, "s3cret-policy");
+
+    // --- two-phase broadcast: prepare freezes the command; an edit after
+    //     the preview must not change what executes ---
+    var preview = try broadcastPrepare(&rig, "14", "sc-hello", &.{ "itest-scr-a", "itest-scr-b", "itest-scr-a" }, "{\"who\":{\"value\":\"alice\"}}");
+    defer preview.deinit();
+    try std.testing.expectEqualStrings("hello", preview.value.result.script_name);
+    try std.testing.expect(std.mem.indexOf(u8, preview.value.result.command, "bash -c 'echo hello '") != null);
+    try std.testing.expect(!preview.value.result.destructive);
+    try std.testing.expectEqual(@as(usize, 2), preview.value.result.servers.len); // deduped
+    const preview_id = preview.value.result.preview_id;
+
+    // Edit the script between preview and commit.
+    const edited = rig.dispatch(
+        \\{"id":"15","command":"oars.scripts.save","payload":{"script":{"id":"sc-hello","name":"hello","body":"echo edited {{who}}"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, edited, "\"ok\":true") != null);
+
+    var commit_buf: [256]u8 = undefined;
+    const commit_req = try std.fmt.bufPrint(&commit_buf, "{{\"id\":\"16\",\"command\":\"oars.scripts.broadcast\",\"payload\":{{\"preview_id\":{d}}}}}", .{preview_id});
+    const committed = rig.dispatch(commit_req);
+    const run_id = scriptsRunId(committed) orelse return error.TestUnexpectedResult;
     var final_poll = try broadcastWaitFor(&rig, run_id);
     defer final_poll.deinit();
     try std.testing.expect(final_poll.value.result.done);
+    try std.testing.expectEqualStrings("hello", final_poll.value.result.script_name); // real name, never empty
     var saw_a = false;
     var saw_b = false;
     for (final_poll.value.result.servers) |s| {
         try std.testing.expectEqualStrings("done", s.status);
         try std.testing.expectEqual(@as(i32, 0), s.exit orelse -1);
+        // Preview-to-commit identity: the PREPARED body ran, not the edit.
         try std.testing.expect(std.mem.indexOf(u8, s.data, "hello alice") != null);
+        try std.testing.expect(std.mem.indexOf(u8, s.data, "edited alice") == null);
         if (std.mem.eql(u8, s.server_id, "itest-scr-a")) saw_a = true;
         if (std.mem.eql(u8, s.server_id, "itest-scr-b")) saw_b = true;
     }
     try std.testing.expect(saw_a and saw_b);
 
-    // --- secret values never reach the audit file ---
+    // --- an unreachable server is skipped, never dropped; the reachable
+    //     one still runs (mixed results) ---
+    var ghost_preview = try broadcastPrepare(&rig, "17", "sc-echo", &.{ "itest-scr-a", "ghost-server" }, "{\"x\":{\"value\":\"hi\"}}");
+    defer ghost_preview.deinit();
+    var ghost_commit_buf: [256]u8 = undefined;
+    const ghost_commit_req = try std.fmt.bufPrint(&ghost_commit_buf, "{{\"id\":\"18\",\"command\":\"oars.scripts.broadcast\",\"payload\":{{\"preview_id\":{d}}}}}", .{ghost_preview.value.result.preview_id});
+    const ghost_committed = rig.dispatch(ghost_commit_req);
+    const ghost_run = scriptsRunId(ghost_committed) orelse return error.TestUnexpectedResult;
+    var ghost_poll = try broadcastWaitFor(&rig, ghost_run);
+    defer ghost_poll.deinit();
+    var saw_done = false;
+    var saw_skipped = false;
+    for (ghost_poll.value.result.servers) |s| {
+        if (std.mem.eql(u8, s.status, "done")) {
+            saw_done = true;
+            try std.testing.expectEqual(@as(i32, 0), s.exit orelse -1);
+            try std.testing.expect(std.mem.indexOf(u8, s.data, "hi") != null);
+        } else if (std.mem.eql(u8, s.status, "skipped")) {
+            saw_skipped = true;
+            try std.testing.expect(std.mem.indexOf(u8, s.@"error", "unreachable") != null);
+        } else {
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expect(saw_done and saw_skipped);
+
+    // --- nonzero broadcast exit is `failed` with the exact code ---
+    var fail_preview = try broadcastPrepare(&rig, "19", "sc-exit7", &.{"itest-scr-a"}, "{}");
+    defer fail_preview.deinit();
+    var fail_commit_buf: [256]u8 = undefined;
+    const fail_commit_req = try std.fmt.bufPrint(&fail_commit_buf, "{{\"id\":\"20\",\"command\":\"oars.scripts.broadcast\",\"payload\":{{\"preview_id\":{d}}}}}", .{fail_preview.value.result.preview_id});
+    const fail_committed = rig.dispatch(fail_commit_req);
+    const fail_run = scriptsRunId(fail_committed) orelse return error.TestUnexpectedResult;
+    var fail_poll = try broadcastWaitFor(&rig, fail_run);
+    defer fail_poll.deinit();
+    for (fail_poll.value.result.servers) |s| {
+        try std.testing.expectEqualStrings("failed", s.status);
+        try std.testing.expectEqual(@as(i32, 7), s.exit orelse -1);
+    }
+
+    // --- a broadcast syntax failure keeps bash's exact exit code ---
+    var syntax_preview = try broadcastPrepare(&rig, "20b", "sc-broken", &.{"itest-scr-a"}, "{}");
+    defer syntax_preview.deinit();
+    var syntax_commit_buf: [256]u8 = undefined;
+    const syntax_commit_req = try std.fmt.bufPrint(&syntax_commit_buf, "{{\"id\":\"20c\",\"command\":\"oars.scripts.broadcast\",\"payload\":{{\"preview_id\":{d}}}}}", .{syntax_preview.value.result.preview_id});
+    const syntax_committed = rig.dispatch(syntax_commit_req);
+    const syntax_run = scriptsRunId(syntax_committed) orelse return error.TestUnexpectedResult;
+    var syntax_poll = try broadcastWaitFor(&rig, syntax_run);
+    defer syntax_poll.deinit();
+    try std.testing.expectEqual(@as(usize, 1), syntax_poll.value.result.servers.len);
+    try std.testing.expectEqualStrings("failed", syntax_poll.value.result.servers[0].status);
+    try std.testing.expectEqual(@as(i32, 2), syntax_poll.value.result.servers[0].exit orelse -1);
+
+    // --- secret values never reach the audit file; a demoted stored
+    //     secret is masked too ---
     const secret_run = rig.dispatch(
-        \\{"id":"11","command":"oars.scripts.run","payload":{"server_id":"itest-scr-b","script_id":"sc-secret","vars":{"pw":{"value":"s3cret-value","secret":true}}}}
+        \\{"id":"21","command":"oars.scripts.run","payload":{"server_id":"itest-scr-b","script_id":"sc-secret","vars":{"pw":{"value":"s3cret-value","secret":true}}}}
     );
     const secret_channel = scriptsChannel(secret_run) orelse return error.TestUnexpectedResult;
     try execChannelWait(&rig.manager, "itest-scr-b", secret_channel, 0, "s3cret-value");
@@ -1462,27 +1589,43 @@ test "integration: scripts run with variables, injection neutralization, broadca
     try std.testing.expect(std.mem.indexOf(u8, audit_content, "scripts.run") != null);
     try std.testing.expect(std.mem.indexOf(u8, audit_content, "scripts.broadcast") != null);
     try std.testing.expect(std.mem.indexOf(u8, audit_content, "s3cret-value") == null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_content, "s3cret-policy") == null);
     try std.testing.expect(std.mem.indexOf(u8, audit_content, "***") != null);
+    // One audit row per UNIQUE server, written at commit: the first
+    // broadcast ran on a+b, the ghost one on a+ghost, exit7 on a, and the
+    // syntax-check failure on a.
+    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, audit_content, "scripts.broadcast"));
 
-    // --- run counts and last-run stamps persist ---
+    // --- run counts and last-run stamps persist; preparation bumps nothing ---
     const list = rig.dispatch(
-        \\{"id":"12","command":"oars.scripts.list","payload":{}}
+        \\{"id":"22","command":"oars.scripts.list","payload":{}}
     );
     try std.testing.expect(std.mem.indexOf(u8, list, "\"run_count\":2") != null); // sc-hello: run + broadcast
-    try std.testing.expect(std.mem.indexOf(u8, list, "\"run_count\":1") != null); // sc-echo / sc-secret
+    try std.testing.expect(std.mem.indexOf(u8, list, "\"run_count\":1") != null); // sc-echo / sc-secret / sc-exit7 / sc-secdef
     try std.testing.expect(std.mem.indexOf(u8, list, "\"last_run_at\":") != null);
 
+    // --- cancel drops an uncommitted preview ---
+    var cancel_preview = try broadcastPrepare(&rig, "23", "sc-sleep", &.{"itest-scr-a"}, "{}");
+    defer cancel_preview.deinit();
+    var cancel_preview_buf: [256]u8 = undefined;
+    const cancel_preview_req = try std.fmt.bufPrint(&cancel_preview_buf, "{{\"id\":\"24\",\"command\":\"oars.scripts.broadcastPrepareCancel\",\"payload\":{{\"preview_id\":{d}}}}}", .{cancel_preview.value.result.preview_id});
+    _ = rig.dispatch(cancel_preview_req);
+    const commit_canceled_preview = rig.dispatch(commit_req); // reuses a consumed id — must fail
+    try std.testing.expect(std.mem.indexOf(u8, commit_canceled_preview, "preview expired or unknown") != null);
+
     // --- cancel a running broadcast ---
-    const cancel_broadcast = rig.dispatch(
-        \\{"id":"13","command":"oars.scripts.broadcast","payload":{"script_id":"sc-sleep","server_ids":["itest-scr-a","itest-scr-b"],"vars":{}}}
-    );
+    var sleep_preview = try broadcastPrepare(&rig, "25", "sc-sleep", &.{ "itest-scr-a", "itest-scr-b" }, "{}");
+    defer sleep_preview.deinit();
+    var sleep_commit_buf: [256]u8 = undefined;
+    const sleep_commit_req = try std.fmt.bufPrint(&sleep_commit_buf, "{{\"id\":\"26\",\"command\":\"oars.scripts.broadcast\",\"payload\":{{\"preview_id\":{d}}}}}", .{sleep_preview.value.result.preview_id});
+    const cancel_broadcast = rig.dispatch(sleep_commit_req);
     const cancel_run = scriptsRunId(cancel_broadcast) orelse return error.TestUnexpectedResult;
     // Give the runner a moment to start both, then cancel.
     var saw_running = false;
     var req_buf: [256]u8 = undefined;
     const start_deadline = std.Io.Timestamp.now(io, .real).nanoseconds + 10 * std.time.ns_per_s;
     while (std.Io.Timestamp.now(io, .real).nanoseconds < start_deadline) {
-        const req = std.fmt.bufPrint(&req_buf, "{{\"id\":\"14\",\"command\":\"oars.scripts.broadcastPoll\",\"payload\":{{\"run_id\":{d},\"cursors\":{{}}}}}}", .{cancel_run}) catch unreachable;
+        const req = std.fmt.bufPrint(&req_buf, "{{\"id\":\"27\",\"command\":\"oars.scripts.broadcastPoll\",\"payload\":{{\"run_id\":{d},\"cursors\":{{}}}}}}", .{cancel_run}) catch unreachable;
         const resp = rig.dispatch(req);
         var parsed = std.json.parseFromSlice(BroadcastResp, allocator, resp, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return error.TestUnexpectedResult;
         defer parsed.deinit();
@@ -1493,8 +1636,9 @@ test "integration: scripts run with variables, injection neutralization, broadca
         testSleep(100);
     }
     try std.testing.expect(saw_running);
+    testSleep(150);
     var cancel_buf: [128]u8 = undefined;
-    const cancel_req = std.fmt.bufPrint(&cancel_buf, "{{\"id\":\"15\",\"command\":\"oars.scripts.broadcastCancel\",\"payload\":{{\"run_id\":{d}}}}}", .{cancel_run}) catch unreachable;
+    const cancel_req = std.fmt.bufPrint(&cancel_buf, "{{\"id\":\"28\",\"command\":\"oars.scripts.broadcastCancel\",\"payload\":{{\"run_id\":{d}}}}}", .{cancel_run}) catch unreachable;
     const canceled_resp = rig.dispatch(cancel_req);
     try std.testing.expect(std.mem.indexOf(u8, canceled_resp, "\"ok\":true") != null);
 
@@ -1504,9 +1648,41 @@ test "integration: scripts run with variables, injection neutralization, broadca
     for (canceled_poll.value.result.servers) |s| {
         try std.testing.expectEqualStrings("canceled", s.status);
         try std.testing.expect(std.mem.indexOf(u8, s.@"error", "cancel requested") != null);
+        try std.testing.expect(std.mem.indexOf(u8, s.data, "broadcast-started") != null);
     }
 
+    // --- losing a session mid-run returns one valid failed result ---
+    var lost_preview = try broadcastPrepare(&rig, "29", "sc-sleep", &.{"itest-scr-a"}, "{}");
+    defer lost_preview.deinit();
+    var lost_commit_buf: [256]u8 = undefined;
+    const lost_commit_req = try std.fmt.bufPrint(&lost_commit_buf, "{{\"id\":\"30\",\"command\":\"oars.scripts.broadcast\",\"payload\":{{\"preview_id\":{d}}}}}", .{lost_preview.value.result.preview_id});
+    const lost_committed = rig.dispatch(lost_commit_req);
+    const lost_run = scriptsRunId(lost_committed) orelse return error.TestUnexpectedResult;
+    var lost_req_buf: [256]u8 = undefined;
+    const lost_deadline = std.Io.Timestamp.now(io, .real).nanoseconds + 10 * std.time.ns_per_s;
+    var lost_started = false;
+    while (std.Io.Timestamp.now(io, .real).nanoseconds < lost_deadline) {
+        const req = std.fmt.bufPrint(&lost_req_buf, "{{\"id\":\"31\",\"command\":\"oars.scripts.broadcastPoll\",\"payload\":{{\"run_id\":{d},\"cursors\":{{}}}}}}", .{lost_run}) catch unreachable;
+        const resp = rig.dispatch(req);
+        var parsed = std.json.parseFromSlice(BroadcastResp, allocator, resp, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return error.TestUnexpectedResult;
+        defer parsed.deinit();
+        if (parsed.value.result.servers.len == 1 and std.mem.eql(u8, parsed.value.result.servers[0].status, "running")) {
+            lost_started = true;
+            break;
+        }
+        testSleep(100);
+    }
+    try std.testing.expect(lost_started);
     rig.manager.disconnect("itest-scr-a");
+    testSleep(100);
+    const lost_poll_req = std.fmt.bufPrint(&lost_req_buf, "{{\"id\":\"32\",\"command\":\"oars.scripts.broadcastPoll\",\"payload\":{{\"run_id\":{d},\"cursors\":{{}}}}}}", .{lost_run}) catch unreachable;
+    const lost_poll_resp = rig.dispatch(lost_poll_req);
+    var lost_poll = std.json.parseFromSlice(BroadcastResp, allocator, lost_poll_resp, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return error.TestUnexpectedResult;
+    defer lost_poll.deinit();
+    try std.testing.expectEqual(@as(usize, 1), lost_poll.value.result.servers.len);
+    try std.testing.expectEqualStrings("failed", lost_poll.value.result.servers[0].status);
+    try std.testing.expect(std.mem.indexOf(u8, lost_poll.value.result.servers[0].@"error", "session lost") != null);
+
     rig.manager.disconnect("itest-scr-b");
 }
 

@@ -391,8 +391,9 @@ primitive in the used `std.Io` path.
 
 ## 7. Immediate next steps
 
-1. Continue with the spec 06 scripts frontend over the existing worker and
-   approval patterns.
+1. Implement spec 07 (One-Click Deployment) over the existing
+   `oars.deploy.*` backend and DeployTab, following the spec 06
+   audit-first procedure (contract corrections together with code).
 2. Keep the spec 05 direct-transfer and responsive checks in the release gate.
 3. Preserve the completed spec 12 packaged live-framebuffer input acceptance
    path while extending shared SSH transport code.

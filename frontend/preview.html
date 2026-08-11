@@ -18,6 +18,7 @@
         const vncCredsMode = new URLSearchParams(window.location.search).get("vncCreds") || "none";
         const vncTunnelMode = new URLSearchParams(window.location.search).get("vncTunnel") || "ok";
         const filesMode = new URLSearchParams(window.location.search).get("files") || "default";
+        const scriptsMode = new URLSearchParams(window.location.search).get("scripts") || "populated";
         let nextDiagnosticChannel = 900;
         // Logs fixtures (spec 04): deterministic sources, lines with
         // repeatable search matches, one very long line, a follow channel
@@ -182,6 +183,11 @@
             try { byteLength = atob(payload.base64).length; } catch { /* malformed payload stays length zero */ }
             recorded = { ...payload, base64: `<file-content:${byteLength}-bytes>` };
           }
+          // Scripts (spec 06): run-time variable values are secrets in
+          // the call inspector — never record real or fixture values.
+          if ((command === "oars.scripts.run" || command === "oars.scripts.broadcastPrepare") && payload && payload.vars) {
+            recorded = { ...payload, vars: Object.fromEntries(Object.entries(payload.vars).map(([k, v]) => [k, { ...v, value: "***" }])) };
+          }
           calls.push({ command, payload: recorded, at: performance.now() });
           document.documentElement.dataset.oarsCalls = JSON.stringify(calls);
         }
@@ -322,6 +328,50 @@
               return { server };
             }
             if (command === "oars.ssh.poll") {
+              // Script run channel (spec 06): deterministic output per
+              // `scripts` mode — cumulative deltas, then EOF + exit.
+              const cur = payload.cursors && payload.cursors[0];
+              if (cur && cur.channel === 77) {
+                recordCall(command, payload);
+                const p = (polls.get("script-run") || 0) + 1;
+                polls.set("script-run", p);
+                const from = cur.cursor || 0;
+                let data = "";
+                let eof = false;
+                let exit = null;
+                let dropped = 0;
+                if (scriptsMode === "run-gap" && p === 2) dropped = 4096;
+                if (scriptsMode === "run-fail") {
+                  if (p === 1) data = "error: boom\n";
+                  if (p >= 2) eof = true;
+                  exit = 2;
+                } else if (scriptsMode === "run-fail-check") {
+                  if (p === 1) data = "bash: line 1: syntax error near unexpected token `fi'\n";
+                  if (p >= 2) eof = true;
+                  exit = 2;
+                } else {
+                  if (p === 1) data = "hello ";
+                  if (p === 2) data = "world\n";
+                  if (p >= 3) eof = true;
+                  exit = 0;
+                }
+                const emitted = "hello world\n";
+                return {
+                  ok: true,
+                  status: "ready",
+                  channels: [{
+                    id: 77,
+                    kind: "exec",
+                    command: "bash -c 'echo hello world'",
+                    cursor: eof ? utf8Length(emitted) : Math.min(from + utf8Length(data), utf8Length(emitted)),
+                    dropped,
+                    pending: 0,
+                    eof,
+                    exit,
+                    data: data.slice(Math.max(0, from - (eof ? utf8Length(emitted) : 0))),
+                  }],
+                };
+              }
               const count = (polls.get(payload.server_id) || 0) + 1;
               polls.set(payload.server_id, count);
               if (payload.server_id === "staging-web") {
@@ -390,6 +440,162 @@
                   : "sync complete; wrote drop_caches level "+payload.level+".\n";
               window.__oarsMock.diagChannels.set(ch, { label, done: false });
               return { ok: true, channel: ch };
+            }
+            // ── Scripts (spec 06) fixtures ───────────────────────────
+            const scriptFixtures = [
+              { id: "sc-tail", name: "Tail error logs", description: "Follow the error log of a service", tags: ["logs", "diagnostics"], color: "#3f6d7a", body: "sudo tail -f /var/log/{{service}}/error.log", variables: [{ name: "service", label: "Service", secret_default: false }], created_at: now, updated_at: now, run_count: 12, last_run_at: now - 3600e3 },
+              { id: "sc-cleanup", name: "Disk cleanup", description: "Vacuum journals and clear the APT cache", tags: ["destructive", "maintenance"], color: "#d97757", body: "journalctl --vacuum-size={{size}}; apt-get clean", variables: [{ name: "size", label: "Keep under (MB)", secret_default: false }], created_at: now - 86400e3, updated_at: now - 3600e3, run_count: 3, last_run_at: now - 86400e3 },
+              { id: "sc-hello", name: "Hello fleet", description: "Announce across the fleet", tags: [], color: "", body: "echo hello from {{who}}", variables: [{ name: "who", label: "Who", secret_default: false }], created_at: now - 172800e3, updated_at: now - 172800e3, run_count: 0, last_run_at: null },
+              { id: "sc-deploy-check", name: "Deploy health check", description: "Check the storefront is serving", tags: ["deploy"], color: "#5d7a52", body: "curl -fsS https://storefront.dev/health && echo OK", variables: [], created_at: now - 300000e3, updated_at: now - 700e3, run_count: 27, last_run_at: now - 700e3 },
+            ];
+            let scriptStore = scriptsMode === "empty" ? [] : scriptsMode === "recovery" ? [] : scriptFixtures.map((s) => ({ ...s, variables: s.variables.map((v) => ({ ...v })) }));
+            const scriptPreviews = new Map();
+            const broadcastRuns = new Map();
+            let scriptPreviewSeq = 1;
+            let scriptRunSeq = 1;
+            const expandFixture = (script, vars, redact = false) => (script.body || "").replace(/\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}/g, (_, name) => {
+              const value = vars && vars[name];
+              const definition = (script.variables || []).find((variable) => variable.name === name);
+              if (redact && (value?.secret || definition?.secret_default)) return "***";
+              return value?.value ?? `{{${name}}}`;
+            });
+            const previewCommand = (script, vars, redact = false) => `bash -c '${expandFixture(script, vars, redact)}'`;
+            const makeBroadcast = (script, serverIds) => {
+              const runId = scriptRunSeq++;
+              const servers = serverIds.map((id) => ({ server_id: id, status: "queued", exit: null, error: "", emitted: "", cursor: 0 }));
+              const run = { runId, scriptName: script.name, servers, canceled: false, done: false, polls: 0 };
+              broadcastRuns.set(runId, run);
+              return runId;
+            };
+            const broadcastRows = (run) => run.servers.map((s) => ({
+              server_id: s.server_id,
+              status: s.status,
+              exit: s.exit,
+              error: s.error,
+              cursor: s.cursor,
+              gap: 0,
+              eof: s.status === "done" || s.status === "failed" || s.status === "canceled" || s.status === "skipped",
+              data: s.status === "done" || s.status === "failed" ? s.emitted : "",
+            }));
+            if (command === "oars.scripts.list") {
+              return { ok: true, scripts: scriptStore, ...(scriptsMode === "recovery" ? { recovery_error: "scripts.json was unreadable and was moved to scripts.json.corrupt-1234; the script library starts fresh" } : {}) };
+            }
+            if (command === "oars.scripts.validate") {
+              const body = String(payload?.body || "");
+              if (/(["'`]|\$\(|\$\{)[^\n]*\{\{/.test(body) || /^\s*\{\{/.test(body)) {
+                return { ok: false, error: "a placeholder appears in an ambiguous shell context (quotes, redirection, assignment, or command name)" };
+              }
+              return { ok: true };
+            }
+            if (command === "oars.scripts.save") {
+              const input = payload.script;
+              const existing = scriptStore.find((s) => s.id === input.id);
+              const saved = {
+                id: input.id || "sc-new",
+                name: input.name,
+                description: input.description || "",
+                tags: input.tags || [],
+                color: input.color || "",
+                body: input.body,
+                variables: input.variables || [],
+                created_at: existing ? existing.created_at : now,
+                updated_at: now,
+                run_count: existing ? existing.run_count : 0,
+                last_run_at: existing ? existing.last_run_at : null,
+              };
+              if (existing) Object.assign(existing, saved);
+              else scriptStore.push(saved);
+              return { ok: true, script: saved };
+            }
+            if (command === "oars.scripts.delete") {
+              scriptStore = scriptStore.filter((s) => s.id !== payload.id);
+              return { ok: true };
+            }
+            if (command === "oars.scripts.run") {
+              const script = scriptStore.find((s) => s.id === payload.script_id);
+              if (!script) return { ok: false, error: "script not found" };
+              if (scriptsMode === "run-fail-check") return { ok: false, error: "syntax check failed (exit 2): bash: line 1: syntax error" };
+              return { ok: true, channel: 77 };
+            }
+            if (command === "oars.scripts.broadcastPrepare") {
+              const script = scriptStore.find((s) => s.id === payload.script_id);
+              if (!script) return { ok: false, error: "script not found" };
+              const ids = [...new Set(payload.server_ids || [])];
+              if (ids.length === 0) return { ok: false, error: "no servers selected" };
+              const destructive = (scriptsMode === "destructive") || (script.tags || []).some((t) => t.toLowerCase() === "destructive");
+              const previewId = scriptPreviewSeq++;
+              if (scriptsMode !== "expired") scriptPreviews.set(previewId, { script, ids });
+              return {
+                ok: true,
+                preview_id: previewId,
+                script_id: script.id,
+                script_name: script.name,
+                command: previewCommand(script, payload.vars),
+                redacted_command: previewCommand(script, payload.vars, true),
+                servers: ids.map((server_id) => ({ server_id })),
+                destructive,
+                expires_at: now + 600e3,
+              };
+            }
+            if (command === "oars.scripts.broadcast") {
+              const rec = scriptPreviews.get(payload.preview_id);
+              if (!rec) return { ok: false, error: "preview expired or unknown — prepare again" };
+              scriptPreviews.delete(payload.preview_id);
+              const runId = makeBroadcast(rec.script, rec.ids);
+              if (scriptsMode === "unreachable") {
+                const run = broadcastRuns.get(runId);
+                if (run.servers.length > 1) {
+                  run.servers[1].status = "skipped";
+                  run.servers[1].error = "unreachable";
+                }
+              }
+              return { ok: true, run_id: runId };
+            }
+            if (command === "oars.scripts.broadcastPrepareCancel") {
+              scriptPreviews.delete(payload.preview_id);
+              return { ok: true };
+            }
+            if (command === "oars.scripts.broadcastPoll") {
+              const run = broadcastRuns.get(payload.run_id);
+              if (!run) return { ok: false, error: "unknown run" };
+              run.polls += 1;
+              const p = run.polls;
+              for (const s of run.servers) {
+                if (s.status === "queued") s.status = "checking";
+                else if (s.status === "checking") {
+                  s.status = "running";
+                  if (scriptsMode === "broadcast-fail" && s.server_id === "prod-db") s.emitted = "traceback: connection refused\n";
+                  else s.emitted = "hello fleet from preview\n";
+                  s.cursor = utf8Length(s.emitted);
+                } else if (s.status === "running" && run.canceled) {
+                  s.status = "canceled";
+                  s.error = "cancel requested";
+                } else if (s.status === "running" && p >= 3) {
+                  if (scriptsMode === "broadcast-cancel") {
+                    s.emitted += "still sleeping...\n";
+                    s.cursor = utf8Length(s.emitted);
+                  } else if (scriptsMode === "broadcast-fail" && s.server_id === "prod-db") {
+                    s.status = "failed";
+                    s.exit = 1;
+                    s.error = "exit 1";
+                  } else {
+                    s.status = "done";
+                    s.exit = 0;
+                  }
+                }
+              }
+              run.done = run.servers.every((s) => s.status === "done" || s.status === "failed" || s.status === "canceled" || s.status === "skipped");
+              return { ok: true, run_id: run.runId, script_name: run.scriptName, canceled: run.canceled, done: run.done, servers: broadcastRows(run) };
+            }
+            if (command === "oars.scripts.broadcastCancel") {
+              const run = broadcastRuns.get(payload.run_id);
+              if (!run) return { ok: false, error: "unknown run" };
+              run.canceled = true;
+              for (const s of run.servers) {
+                if (s.status === "queued") s.status = "canceled";
+                else if (s.status === "running" || s.status === "checking") { s.status = "canceled"; s.error = "cancel requested"; }
+              }
+              return { ok: true };
             }
             // ── Logs (spec 04) fixtures ──────────────────────────────
             if (command === "oars.logs.scan") {

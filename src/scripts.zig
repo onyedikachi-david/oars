@@ -670,6 +670,14 @@ fn scanBody(allocator: std.mem.Allocator, body: []const u8) ExpandError![]VarRef
     return refs.toOwnedSlice(allocator);
 }
 
+/// Validates every placeholder and shell context without requiring run-time
+/// values. Unlike expansion with an empty value map, this always scans the
+/// complete body, so a valid first placeholder cannot hide a later error.
+pub fn validateTemplate(allocator: std.mem.Allocator, body: []const u8) ExpandError!void {
+    const refs = try scanBody(allocator, body);
+    allocator.free(refs);
+}
+
 fn findVar(vars: []const RunVar, name: []const u8) ?*const RunVar {
     for (vars) |*v| {
         if (std.mem.eql(u8, v.name, name)) return v;
@@ -766,6 +774,26 @@ pub fn expandTemplate(
         .names = names.toOwnedSlice(allocator) catch return error.OutOfMemory,
         .secrets = secrets.toOwnedSlice(allocator) catch return error.OutOfMemory,
     };
+}
+
+/// `bash -c '<expanded>'` — the exact exec string submitted for a run
+/// (spec 06 §5: execution goes through the same Bash invocation the
+/// syntax check validates, so the checked interpreter is always the
+/// executing interpreter, whatever the account shell is). Caller owns.
+pub fn execString(allocator: std.mem.Allocator, expanded: []const u8) ![]u8 {
+    const quoted = try shellquote.quote(allocator, expanded);
+    defer allocator.free(quoted);
+    return std.fmt.allocPrint(allocator, "bash -c {s}", .{quoted});
+}
+
+/// `bash -n -c '<expanded>'` — the exact syntax-check string for a run.
+/// Quotes the same expanded command with the same helper as `execString`,
+/// so the check and the execution see identical bytes (spec 06 §5).
+/// Caller owns.
+pub fn checkString(allocator: std.mem.Allocator, expanded: []const u8) ![]u8 {
+    const quoted = try shellquote.quote(allocator, expanded);
+    defer allocator.free(quoted);
+    return std.fmt.allocPrint(allocator, "bash -n -c {s}", .{quoted});
 }
 
 // --- tests -----------------------------------------------------------------
@@ -960,6 +988,15 @@ test "template lexer rejects ambiguous contexts" {
     try testing.expectEqualStrings("echo {a,b}", exp.command);
 }
 
+test "template validation scans past the first valid placeholder" {
+    const allocator = testing.allocator;
+    try testing.expectError(
+        error.AmbiguousPlaceholder,
+        validateTemplate(allocator, "echo {{first}}; echo \"{{second}}\""),
+    );
+    try validateTemplate(allocator, "echo {{first}}; echo {{second}}");
+}
+
 test "missing variables and multiline values are refused before substitution" {
     const allocator = testing.allocator;
     const vars = [_]RunVar{.{ .name = "a", .value = "1" }};
@@ -984,4 +1021,21 @@ test "secret values are masked in the redacted command" {
     try testing.expectEqual(@as(usize, 2), exp.names.len);
     try testing.expect(!exp.names[0].secret);
     try testing.expect(exp.names[1].secret);
+}
+
+test "exec/check strings pin the same Bash invocation" {
+    const allocator = testing.allocator;
+    const expanded = "tail -f /var/log/'nginx'/error.log; echo 'it'\\''s'";
+    const exec = try execString(allocator, expanded);
+    defer allocator.free(exec);
+    try testing.expect(std.mem.startsWith(u8, exec, "bash -c '"));
+    try testing.expect(std.mem.endsWith(u8, exec, "'"));
+    // The check is the same -c argument under bash -n: identical quoted bytes.
+    const check = try checkString(allocator, expanded);
+    defer allocator.free(check);
+    try testing.expect(std.mem.startsWith(u8, check, "bash -n -c '"));
+    try testing.expectEqualStrings(exec["bash -c ".len..], check["bash -n -c ".len..]);
+    // Embedded quotes are spliced, never closed: the quoted argument is one word.
+    try testing.expect(std.mem.indexOf(u8, exec, "'tail") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, exec, "bash -c"));
 }

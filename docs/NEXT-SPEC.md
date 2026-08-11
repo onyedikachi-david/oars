@@ -2,8 +2,21 @@
 
 ## Target
 
-Implement [spec 06, Scripts + Safe Broadcast](specs/06-scripts.md). Treat the
-feature spec as the product contract. Do not reduce it to the small scripts UI
+Spec 06 (Scripts + Safe Broadcast) is **complete in this checkout** —
+see `docs/HANDOVER.md` §34 for the session evidence. The next
+implementation target is **spec 07 (One-Click Deployment)**; the
+`oars.deploy.*` backend and a basic DeployTab already exist, so follow the
+same audit-first procedure used here: re-read the spec, audit the current
+checkout against it, and correct the contract together with the code.
+
+The guide below remains the record of the spec 06 corrections and is kept
+for maintenance reference.
+
+---
+
+## Spec 06 implementation record (2026-08-11)
+
+Treat the feature spec as the product contract. Do not reduce it to the small scripts UI
 that exists in the current checkout.
 
 The current core has a script store, template expansion, single-server runs,
@@ -77,7 +90,8 @@ timestamps.
 `ScriptsTab` does not send `variables` when it saves. Editing a script can
 therefore erase all variable definitions. It sets a new script color to
 `blue`, although the core accepts only an empty string or a value that starts
-with `#`. It also formats nanosecond timestamps as JavaScript milliseconds.
+with `#`. It also received epoch nanoseconds as JavaScript numbers and lost
+precision before it converted them to milliseconds.
 The backend trusts the request's run-time `secret` flag and does not enforce a
 stored `secret_default`. A client can therefore demote a stored secret and let
 its value reach audit or history output. Stored secret policy must be the
@@ -235,7 +249,7 @@ each delta, surface `dropped`, record `exit`, and call
    run counts.
 
 4. **Build pure frontend state helpers.** Keep script filtering, variable
-   draft reconciliation, nanosecond timestamp display, cursor merging, output
+   draft reconciliation, millisecond timestamp display, cursor merging, output
    append and cap logic, broadcast summary counts, and stale-response guards
    outside the component. Add Vitest coverage. Define one timestamp wire unit:
    return display timestamps as integer milliseconds, or return nanoseconds as
