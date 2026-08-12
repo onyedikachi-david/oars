@@ -1031,7 +1031,7 @@ export function FilesTab({ serverId, onNavigateToDeploy }: FilesTabProps) {
                 <button type="button" className="fs-icon-btn" title="Upload a folder" aria-label="Upload a folder" onClick={() => dirInputRef.current?.click()} disabled={dir.loading}><FolderInput size={14} /></button>
               )}
               <button type="button" className="fs-icon-btn" title="New remote folder" aria-label="New remote folder" onClick={() => setDialog({ kind: "mkdir" })} disabled={dir.loading}><FolderPlus size={14} /></button>
-              {onNavigateToDeploy && <button type="button" className="fs-icon-btn" title="Add application from an archive" aria-label="Add application" onClick={onNavigateToDeploy}><FileArchive size={14} /></button>}
+              {onNavigateToDeploy && <button type="button" className="fs-icon-btn" title="Applications — open Deploy" aria-label="Applications" onClick={onNavigateToDeploy}>Applications</button>}
             </div>
           </div>
 

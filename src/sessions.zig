@@ -17,6 +17,7 @@ const sftpmod = @import("sftp.zig");
 const shellquote = @import("shellquote.zig");
 const broadcast = @import("broadcast.zig");
 const deploy = @import("deploy.zig");
+const preflight = @import("preflight.zig");
 const wsmod = @import("ws.zig");
 const agent = @import("agent.zig");
 
@@ -214,6 +215,11 @@ pub const ChannelEntry = struct {
     check_outcome: ?*broadcast.ScriptCheckOutcome = null,
     /// Bounded wait for the syntax check (0 = no deadline).
     check_timeout_ns: i128 = 0,
+    /// Spec 07: deploy preflight probe — read-only exec output buffered on
+    /// the internal channel; drained at EOF into the preflight outcome.
+    preflight_probe: ?*preflight.ProbeOutcome = null,
+    preflight_timeout_ns: i128 = 0,
+    preflight_id: ?[]const u8 = null,
 
     /// Frees the command text and the optional history strings. Every
     /// path that drops an entry (eviction, close, teardown) must call
@@ -338,6 +344,17 @@ const Op = union(enum) {
         command: []const u8,
         timeout_ns: i128,
         outcome: *broadcast.ScriptCheckOutcome,
+    },
+    /// Spec 07: deploy preflight probes — read-only execs run by the
+    /// session worker as internal channels (bounded output+deadline).
+    preflight_probe: struct {
+        id: []const u8,
+        /// Owned; one command per probe. Required snapshot reads for Phase 2
+        /// (os_release, node_version, etc.) inline as separate probes;
+        /// mutation is never performed.
+        command: []const u8,
+        timeout_ns: i128,
+        outcome: *preflight.ProbeOutcome,
     },
 };
 
@@ -950,6 +967,9 @@ pub const Manager = struct {
     /// One-click deploy runs (spec 07 §6): poll-driven sequential steps;
     /// the manager owns the registry and its memory.
     deploys: deploy.Runs = .{},
+    /// One-click preflights (spec 07 §5): memory-only, bounded, expiring,
+    /// capped at 32 — bridge handlers drive; worker owns probe channels.
+    preflights: preflight.Preflights = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, store: *servers.Store, audit_store: *history.AuditStore, history_store: *history.HistoryStore, home: ?[]const u8) Manager {
         var self: Manager = .{
@@ -964,6 +984,7 @@ pub const Manager = struct {
         self.broadcasts = .{ .allocator = allocator };
         self.previews = .{ .allocator = allocator };
         self.deploys = .{ .allocator = allocator };
+        self.preflights = .{ .allocator = allocator };
         return self;
     }
 
@@ -973,6 +994,7 @@ pub const Manager = struct {
         self.broadcasts.deinit();
         self.previews.deinit();
         self.deploys.deinit();
+        self.preflights.deinit();
     }
 
     pub fn get(self: *Manager, server_id: []const u8) ?*Session {
@@ -1816,6 +1838,26 @@ pub const Manager = struct {
         }
         return false;
     }
+
+    /// Spec 07: queues a read-only preflight probe on the session worker.
+    /// Each probe is a single exec whose exit/output land in the outcome.
+    pub fn enqueuePreflightProbe(self: *Manager, server_id: []const u8, id: []const u8, command: []const u8, timeout_ns: i128, outcome: *preflight.ProbeOutcome) !void {
+        const session = self.get(server_id) orelse return error.NoSession;
+        if (session.status.load(.acquire) != .ready) return error.NotReady;
+        const id_owned = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(id_owned);
+        const owned = try self.allocator.dupe(u8, command);
+        errdefer self.allocator.free(owned);
+        lockSpin(&session.ops_mutex);
+        defer session.ops_mutex.unlock();
+        if (session.worker_done.load(.acquire)) return error.NotReady;
+        try session.ops.append(self.allocator, .{ .preflight_probe = .{
+            .id = id_owned,
+            .command = owned,
+            .timeout_ns = timeout_ns,
+            .outcome = outcome,
+        } });
+    }
 };
 
 pub const Cursor = struct {
@@ -2282,6 +2324,23 @@ fn workerMain(session: *Session) void {
                 if (!dropEntryAt(session, i, entry)) i += 1;
                 continue;
             }
+            // Spec 07: a preflight probe that outlives its deadline is closed
+            // and completed honestly (read-only — no rollback needed).
+            if (entry.preflight_probe != null and entry.preflight_timeout_ns > 0 and
+                std.Io.Timestamp.now(io, .real).nanoseconds - entry.started_ns >= entry.preflight_timeout_ns)
+            {
+                entry.raw.sendEof();
+                entry.raw.close(session.io);
+                entry.raw_closed = true;
+                entry.preflight_probe.?.set(null, "", "preflight probe timed out");
+                entry.preflight_probe = null;
+                if (entry.preflight_id) |pid| {
+                    session.allocator.free(pid);
+                    entry.preflight_id = null;
+                }
+                if (!dropEntryAt(session, i, entry)) i += 1;
+                continue;
+            }
             switch (entry.raw.read(&read_buf)) {
                 .eof => {
                     if (!entry.eof_seen) {
@@ -2297,6 +2356,14 @@ fn workerMain(session: *Session) void {
                             if (entry.check_outcome) |oc| {
                                 drainSyntaxCheck(session, entry, oc);
                                 entry.check_outcome = null;
+                            } else if (entry.preflight_probe) |_| {
+                                drainPreflightProbe(session, entry);
+                                if (entry.preflight_id) |pid| {
+                                    session.allocator.free(pid);
+                                    entry.preflight_id = null;
+                                }
+                                entry.preflight_probe = null;
+                                entry.preflight_timeout_ns = 0;
                             } else {
                                 drainProbe(session, entry);
                                 session.monitor_probe_active.store(false, .release);
@@ -2661,6 +2728,86 @@ fn syntaxCheckOp(session: *Session, sc: anytype) void {
     session.channels_mutex.unlock();
 }
 
+/// Spec 07: read-only preflight probe — internal channel, bounded output.
+/// Mirrors syntaxCheckOp: owns `preflight_id`/`command`, completion frees via abandon().
+fn drainPreflightProbe(session: *Session, entry: *ChannelEntry) void {
+    var total: std.ArrayList(u8) = .empty;
+    defer total.deinit(session.allocator);
+    var buf: [4096]u8 = undefined;
+    var cursor = entry.stream.start();
+    while (true) {
+        const n = entry.stream.readAt(cursor, &buf);
+        if (n == 0) break;
+        total.appendSlice(session.allocator, buf[0..n]) catch break;
+        cursor += n;
+    }
+    var tail = total.items;
+    if (tail.len > 16 * 1024) tail = tail[tail.len - 16 * 1024 ..];
+    while (tail.len > 0 and (tail[tail.len - 1] == '\n' or tail[tail.len - 1] == '\r' or tail[tail.len - 1] == ' ' or tail[tail.len - 1] == '\t')) tail = tail[0 .. tail.len - 1];
+    const exit = entry.stream.exit_status;
+    const msg = if (exit != null and exit.? == 0) "ok" else if (tail.len > 0) tail else "probe failed";
+    const out = entry.preflight_probe orelse return;
+    out.set(exit, tail, msg);
+}
+
+fn preflightProbeOp(session: *Session, pp: anytype) void {
+    const allocator = session.allocator;
+    const raw = session.transport.openChannel(session.io) catch {
+        allocator.free(pp.id);
+        allocator.free(pp.command);
+        pp.outcome.set(null, "", "could not open a channel for the preflight probe");
+        return;
+    };
+    raw.exec(session.io, pp.command) catch {
+        raw.close(session.io);
+        allocator.free(pp.id);
+        allocator.free(pp.command);
+        pp.outcome.set(null, "", "preflight probe could not start");
+        return;
+    };
+    const stream = allocator.create(Stream) catch {
+        raw.close(session.io);
+        allocator.free(pp.id);
+        allocator.free(pp.command);
+        pp.outcome.set(null, "", "out of memory");
+        return;
+    };
+    stream.* = Stream.init(allocator);
+    stream.max_bytes = 64 * 1024;
+    const entry = allocator.create(ChannelEntry) catch {
+        allocator.destroy(stream);
+        raw.close(session.io);
+        allocator.free(pp.id);
+        allocator.free(pp.command);
+        pp.outcome.set(null, "", "out of memory");
+        return;
+    };
+    entry.* = .{
+        .id = session.next_channel_id.fetchAdd(1, .monotonic),
+        .kind = .exec,
+        .command = pp.command,
+        .stream = stream,
+        .raw = raw,
+        .internal = true,
+        .preflight_probe = pp.outcome,
+        .preflight_timeout_ns = pp.timeout_ns,
+        .preflight_id = pp.id,
+        .started_ns = std.Io.Timestamp.now(session.io, .real).nanoseconds,
+    };
+    lockSpin(&session.channels_mutex);
+    session.channels.append(allocator, entry) catch {
+        session.channels_mutex.unlock();
+        entry.freeCommandText(allocator);
+        if (entry.preflight_id) |pid| allocator.free(pid);
+        allocator.destroy(entry);
+        allocator.destroy(stream);
+        raw.close(session.io);
+        pp.outcome.set(null, "", "out of memory");
+        return;
+    };
+    session.channels_mutex.unlock();
+}
+
 fn processOps(session: *Session) void {
     const allocator = session.allocator;
     while (true) {
@@ -2733,6 +2880,7 @@ fn processOps(session: *Session) void {
             .jump_start => |j| jumpStartOp(session, j),
             .forward_set => |f| forwardSetOp(session, f),
             .syntax_check => |sc| syntaxCheckOp(session, sc),
+            .preflight_probe => |pp| preflightProbeOp(session, pp),
         }
     }
 }

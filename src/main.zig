@@ -1112,7 +1112,7 @@ test "deploy apps save/list/delete round trip through the dispatcher" {
 
     // Create on s1: the id is generated, secret values never persist.
     const created = app.dispatch(
-        \\{"id":"1","command":"oars.deploy.apps.save","payload":{"app":{"server_id":"s1","name":"storefront","folder":"/home/ubuntu/storefront","repo":{"url":"git@github.com:you/storefront.git","transport":"ssh","branch":"main"},"runtime":{"node_version":"22","type":"next","install":"npm ci","build":"npm run build","start":"npm start"},"env_vars":[{"name":"NODE_ENV","secret":false,"value":"production"},{"name":"DATABASE_URL","secret":true,"has_value":true}],"domains":["storefront.dev"],"ssl":true,"email":"ops@storefront.dev","app_port":3000}}}
+        \\{"id":"1","command":"oars.deploy.apps.save","payload":{"app":{"server_id":"s1","name":"storefront","folder":"/home/ubuntu/storefront","repo":{"url":"git@github.com:you/storefront.git","transport":"ssh","branch":"main"},"runtime":{"node_version":"22","type":"next","install":"npm ci","build":"npm run build","entry":"node_modules/next/dist/bin/next","args":"start"},"env_vars":[{"name":"NODE_ENV","secret":false,"value":"production"},{"name":"DATABASE_URL","secret":true,"has_value":true}],"domains":["storefront.dev"],"ssl":true,"email":"ops@storefront.dev","app_port":3000}}}
     );
     try std.testing.expect(std.mem.indexOf(u8, created, "\"ok\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, created, "postgres://secret") == null);
@@ -1146,7 +1146,7 @@ test "deploy apps save/list/delete round trip through the dispatcher" {
 
     // A second app on a different server stays out of s1's list.
     _ = app.dispatch(
-        \\{"id":"2","command":"oars.deploy.apps.save","payload":{"app":{"server_id":"s2","name":"api","folder":"/home/ubuntu/api","repo":{"url":"https://github.com/you/api.git","transport":"https"},"runtime":{"node_version":"22","type":"node","start":"node index.js"}}}}
+        \\{"id":"2","command":"oars.deploy.apps.save","payload":{"app":{"server_id":"s2","name":"api","folder":"/home/ubuntu/api","repo":{"url":"https://github.com/you/api.git","transport":"https"},"runtime":{"node_version":"22","type":"node","entry":"index.js"}}}}
     );
 
     const DeployListResp = struct {
@@ -1196,40 +1196,27 @@ test "deploy apps save/list/delete round trip through the dispatcher" {
     try std.testing.expectEqual(@as(usize, 0), after_parsed.value.result.apps.len);
 }
 
-test "deploy.run requires a session and validates secret values" {
+test "deploy.run requires a completed preflight" {
     var app: TestApp = undefined;
     try app.init();
     defer app.deinit();
 
-    // Unknown app.
+    // The public run route cannot bypass the immutable preflight contract.
     const unknown = app.dispatch(
         \\{"id":"1","command":"oars.deploy.run","payload":{"server_id":"ghost","app_id":"nope","secret_values":[]}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, unknown, "app not found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "completed preflight is required") != null);
 
     // Create an app on a different server: the server must own the app.
     const created = app.dispatch(
-        \\{"id":"2","command":"oars.deploy.apps.save","payload":{"app":{"id":"dep-1","server_id":"s1","name":"storefront","folder":"/home/ubuntu/storefront","repo":{"url":"git@github.com:you/storefront.git","transport":"ssh"},"runtime":{"node_version":"22","type":"node","install":"npm ci","build":"npm run build","start":"npm start"},"env_vars":[{"name":"DATABASE_URL","secret":true,"has_value":true}],"app_port":3000}}}
+        \\{"id":"2","command":"oars.deploy.apps.save","payload":{"app":{"id":"dep-1","server_id":"s1","name":"storefront","folder":"/home/ubuntu/storefront","repo":{"url":"git@github.com:you/storefront.git","transport":"ssh"},"runtime":{"node_version":"22","type":"node","install":"npm ci","build":"npm run build","entry":"server.js"},"env_vars":[{"name":"DATABASE_URL","secret":true,"has_value":true}],"app_port":3000}}}
     );
     try std.testing.expect(std.mem.indexOf(u8, created, "\"ok\":true") != null);
 
-    const wrong_server = app.dispatch(
-        \\{"id":"3","command":"oars.deploy.run","payload":{"server_id":"ghost","app_id":"dep-1","secret_values":[]}}
+    const bypass = app.dispatch(
+        \\{"id":"3","command":"oars.deploy.run","payload":{"server_id":"s1","app_id":"dep-1","secret_values":[{"name":"DATABASE_URL","value":"postgres://secret"}]}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, wrong_server, "app not found on this server") != null);
-
-    // Unknown secret variable names are rejected before any work.
-    const bad_secret = app.dispatch(
-        \\{"id":"4","command":"oars.deploy.run","payload":{"server_id":"s1","app_id":"dep-1","secret_values":[{"name":"NOPE","value":"x"}]}}
-    );
-    try std.testing.expect(std.mem.indexOf(u8, bad_secret, "unknown secret variable") != null);
-
-    // A declared secret name passes validation, then the missing session
-    // stops the run.
-    const no_session = app.dispatch(
-        \\{"id":"5","command":"oars.deploy.run","payload":{"server_id":"s1","app_id":"dep-1","secret_values":[{"name":"DATABASE_URL","value":"postgres://secret"}]}}
-    );
-    try std.testing.expect(std.mem.indexOf(u8, no_session, "not connected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bypass, "completed preflight is required") != null);
 
     // Unknown run ids are explicit errors; history is empty and never
     // leaks secret values.

@@ -17,7 +17,7 @@ already exists.
 | 04 | [Log Management](04-logs.md) | ✅ v1 frontend + backend implemented: grouped scan, virtualized viewer/search, byte-cursor Follow, SFTP download, identity-bound Clear, binary/unreadable states |
 | 05 | [File Manager (SFTP)](05-file-manager.md) | ✅ v1 frontend + backend implemented: matched local/remote panes, direct native transfers, progress/cancel, editor conflict checks, safe ZIP flows |
 | 06 | [Scripts + Safe Broadcast](06-scripts.md) | ✅ v1 frontend + backend implemented: library/editor, two-phase prepare→confirm broadcast, worker-driven syntax checks, per-server streams and results |
-| 07 | [One-Click Deployment](07-deployment.md) | 📋 |
+| 07 | [One-Click Deployment](07-deployment.md) | ✅ v1 frontend + backend implemented: managed-state-safe preflight with frozen plan and port checks, exact Node/PM2 releases, per-app SSH identity, verified cancellation, cursor polling, masked history |
 | 08 | [SSH Management](08-ssh-management.md) | 📋 |
 | 09 | [Access Management](09-access.md) | 📋 |
 | 10 | [Backups](10-backups.md) | 📋 |

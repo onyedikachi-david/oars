@@ -19,6 +19,7 @@
         const vncTunnelMode = new URLSearchParams(window.location.search).get("vncTunnel") || "ok";
         const filesMode = new URLSearchParams(window.location.search).get("files") || "default";
         const scriptsMode = new URLSearchParams(window.location.search).get("scripts") || "populated";
+        const deployMode = new URLSearchParams(window.location.search).get("deploy") || "populated";
         let nextDiagnosticChannel = 900;
         // Logs fixtures (spec 04): deterministic sources, lines with
         // repeatable search matches, one very long line, a follow channel
@@ -174,6 +175,20 @@
         const calls = [];
         const polls = new Map();
         const previewSecrets = new Map();
+        const deployApp = {
+          id: "app-storefront", server_id: "prod-api", name: "Storefront", environment: "production",
+          folder: "/home/deploy/apps/storefront", repo: { url: "git@github.com:acme/storefront.git", transport: "ssh", branch: "main" },
+          runtime: { node_version: "24", type: "next", package_manager: "pnpm", install: "", build: "pnpm build", entry: "node_modules/next/dist/bin/next", args: "start -p 3000", start_command: "", build_folder: ".next" },
+          env_vars: [{ name: "NODE_ENV", secret: false, value: "production", has_value: true }, { name: "DATABASE_URL", secret: true, value: "", has_value: true }],
+          domains: ["storefront.example.com"], ssl: true, email: "ops@example.com", app_port: 3000, revision: 3,
+          created_at_ms: now - 12 * 86400e3, updated_at_ms: now - 45 * 60e3,
+        };
+        let deployApps = deployMode === "empty" ? [] : [{ ...deployApp, repo: { ...deployApp.repo }, runtime: { ...deployApp.runtime }, env_vars: deployApp.env_vars.map((row) => ({ ...row })), domains: [...deployApp.domains] }];
+        let deployPreflightSeq = 40;
+        let deployRunSeq = 90;
+        const deployPreflights = new Map();
+        const deployRuns = new Map();
+        const deployHistory = [{ id: 88, server_id: "prod-api", app_id: "app-storefront", status: "done", action: "update", commit: "52cc437d927a7c9126f22c7fe218ab7dac4c4af0", started_at_ms: now - 45 * 60e3, finished_at_ms: now - 43 * 60e3, steps: [], output: "Deployment completed successfully.\n", truncated: false }];
         function recordCall(command, payload) {
           let recorded = payload;
           if (command === "native-sdk.credentials.set" && payload && "secret" in payload) recorded = { ...payload, secret: "<redacted>" };
@@ -440,6 +455,83 @@
                   : "sync complete; wrote drop_caches level "+payload.level+".\n";
               window.__oarsMock.diagChannels.set(ch, { label, done: false });
               return { ok: true, channel: ch };
+            }
+            // ── Deployment fixtures (spec 07) ───────────────────────
+            if (command === "oars.deploy.apps.list") return { ok: true, apps: deployApps.filter((app) => app.server_id === payload.server_id) };
+            if (command === "oars.deploy.apps.save") {
+              const input = payload.app;
+              const prior = deployApps.find((app) => app.id === input.id);
+              const saved = { ...input, id: input.id || "app-preview-" + (deployApps.length + 1), revision: (prior?.revision || 0) + 1, created_at_ms: prior?.created_at_ms || now, updated_at_ms: Date.now(), env_vars: (input.env_vars || []).map((row) => ({ ...row, value: row.secret ? "" : row.value, has_value: row.secret ? (prior?.env_vars.find((old) => old.name === row.name && old.secret)?.has_value || false) : Boolean(row.value) })) };
+              if (prior) Object.assign(prior, saved); else deployApps.push(saved);
+              return { ok: true, app: saved };
+            }
+            if (command === "oars.deploy.apps.secretPresence") {
+              const app = deployApps.find((item) => item.id === payload.app_id);
+              if (!app) return { ok: false, error: "app not found" };
+              app.env_vars = app.env_vars.map((row) => payload.names.includes(row.name) && row.secret ? { ...row, has_value: payload.present } : row);
+              app.revision += 1;
+              return { ok: true, app };
+            }
+            if (command === "oars.deploy.apps.delete") { deployApps = deployApps.filter((app) => !(app.id === payload.app_id && app.server_id === payload.server_id)); return { ok: true }; }
+            if (command === "oars.deploy.history") return { ok: true, runs: deployHistory.filter((run) => run.server_id === payload.server_id && run.app_id === payload.app_id).slice(0, payload.limit || 20) };
+            if (command === "oars.deploy.preflight") {
+              const app = deployApps.find((item) => item.id === payload.app_id && item.server_id === payload.server_id);
+              if (!app) return { ok: false, error: "app not found" };
+              const id = deployPreflightSeq++;
+              const rec = { id, polls: 0, app };
+              deployPreflights.set(id, rec);
+              return { ok: true, preflight: { id, server_id: app.server_id, app_id: app.id, app_revision: app.revision, status: "gathering", action: "update", target_fingerprint: 0, created_at_ms: now, expires_at_ms: now + 600e3, facts: { os: "", arch: "", libc: "", user: "", home: "", privilege: "", repository_commit: "", lockfiles: "" }, blockers: [], warnings: [], approvals: [], configs: { env: "", pm2: "", nginx: "" }, steps: [] } };
+            }
+            if (command === "oars.deploy.preflightPoll") {
+              const rec = deployPreflights.get(payload.preflight_id);
+              if (!rec) return { ok: false, error: "preflight expired or unknown" };
+              rec.polls += 1;
+              const blocked = deployMode === "blocked";
+              const failed = deployMode === "preflight-failed";
+              const gathering = rec.polls < 2;
+              const status = gathering ? "gathering" : failed ? "failed" : blocked ? "blocked" : "ready";
+              const commit = "52cc437d927a7c9126f22c7fe218ab7dac4c4af0";
+              return { ok: true, preflight: {
+                id: rec.id, server_id: rec.app.server_id, app_id: rec.app.id, app_revision: rec.app.revision, status, action: "update", target_fingerprint: 984321,
+                created_at_ms: now, expires_at_ms: now + 600e3, error: failed ? "The Node release metadata probe failed." : undefined,
+                facts: { os: "Ubuntu 24.04 LTS", arch: "x86_64", libc: "glibc", user: "deploy", home: "/home/deploy", privilege: "sudo", repository_commit: commit, lockfiles: "pnpm-lock.yaml" },
+                blockers: blocked ? [{ id: "foreign_nginx", message: "The existing nginx site is not owned by Oars. Remove it or choose another domain." }] : [],
+                warnings: [{ id: "nat_unproven", message: "Public port 80 cannot be proved from inside this server." }],
+                approvals: blocked || failed || gathering ? [] : [{ id: "install_node", label: "Install Node v24.7.0", detail: "Download the official linux-x64 archive and verify its SHA-256 checksum." }],
+                configs: { env: "NODE_ENV=production\nDATABASE_URL=***\n", pm2: "{\n  name: 'oars-app-storefront',\n  interpreter: '/home/deploy/.local/share/oars/node/v24.7.0/bin/node'\n}\n", nginx: "# oars:app=app-storefront schema=1\nserver { listen 80; server_name storefront.example.com; }\n" },
+                steps: gathering ? [] : [
+                  { id: "clone", label: "Update exact commit", mutation: "files", command: "git fetch origin main && git checkout --detach " + commit, skipped: false, files: [], guards: ["the checkout is clean and the remote commit is unchanged"], rollback: "the current checkout remains unchanged on failure" },
+                  { id: "install", label: "Install dependencies", mutation: "files", command: "pnpm install --frozen-lockfile", skipped: false, files: [{ path: "/home/deploy/apps/storefront/.env", mode: 384 }], guards: ["pnpm-lock.yaml is unchanged"], rollback: "the next run reinstalls dependencies" },
+                  { id: "build", label: "Build application", mutation: "files", command: "pnpm build", skipped: false, files: [], guards: [], rollback: "the running process stays unchanged" },
+                  { id: "pm2", label: "Start or reload process", mutation: "process", command: "pm2 startOrReload .oars-pm2.json", skipped: false, files: [{ path: "/home/deploy/apps/storefront/.oars-pm2.json", mode: 384 }], guards: ["no foreign process owns this name"], rollback: "the prior process generation remains active" },
+                  { id: "nginx", label: "Configure nginx", mutation: "service", command: "sudo -n nginx -t && sudo -n systemctl reload nginx", skipped: false, files: [{ path: "/etc/nginx/sites-available/oars-app-storefront", mode: 420 }], guards: ["the existing site is Oars-owned"], rollback: "restore the prior site and reload nginx" },
+                  { id: "certbot", label: "Issue SSL certificate", mutation: "certificate", command: "sudo -n certbot --nginx -d storefront.example.com", skipped: false, files: [], guards: ["DNS answers are unchanged"], rollback: "restore the prior nginx configuration" },
+                ], commit,
+              } };
+            }
+            if (command === "oars.deploy.preflightCancel") { deployPreflights.delete(payload.preflight_id); return { ok: true }; }
+            if (command === "oars.deploy.run") {
+              const rec = deployPreflights.get(payload.preflight_id);
+              if (!rec) return { ok: false, error: "preflight expired or unknown" };
+              deployPreflights.delete(payload.preflight_id);
+              const runId = deployRunSeq++;
+              deployRuns.set(runId, { polls: 0, canceled: false, app: rec.app });
+              return { ok: true, run_id: runId };
+            }
+            if (command === "oars.deploy.cancel") { const run = deployRuns.get(payload.run_id); if (!run) return { ok: false, error: "unknown run" }; run.canceled = true; return { ok: true }; }
+            if (command === "oars.deploy.poll") {
+              const run = deployRuns.get(payload.run_id); if (!run) return { ok: false, error: "unknown run" };
+              run.polls += 1;
+              const canceled = run.canceled && run.polls >= 3;
+              const failure = deployMode === "run-failed" && run.polls >= 3;
+              const done = canceled || failure || run.polls >= 5;
+              const status = canceled ? "canceled" : failure ? "failed" : run.canceled ? "cancel_requested" : done ? "done" : run.polls === 1 ? "queued" : "running";
+              const ids = ["clone", "install", "build", "pm2", "nginx", "certbot"];
+              const labels = ["Update exact commit", "Install dependencies", "Build application", "Start or reload process", "Configure nginx", "Issue SSL certificate"];
+              const active = Math.min(Math.max(run.polls - 1, 0), ids.length - 1);
+              const steps = ids.map((id, index) => ({ id, label: labels[index], state: index < active ? "success" : index === active && !done ? "running" : done && index <= active ? (failure && index === active ? "failed" : canceled && index === active ? "canceled" : "success") : "pending", channel: index <= active ? 700 + index : undefined, exit: failure && index === active ? 1 : done && index <= active ? 0 : undefined, error: failure && index === active ? "command failed" : "", cursor: index <= active ? 38 : 0, gap: 0, eof: done || index < active, data: index === active && !done ? labels[index] + "…\n" : "" }));
+              if (done && !run.recorded) { run.recorded = true; deployHistory.unshift({ id: payload.run_id, server_id: run.app.server_id, app_id: run.app.id, status, action: "update", commit: "52cc437d927a7c9126f22c7fe218ab7dac4c4af0", started_at_ms: now, finished_at_ms: Date.now(), steps: [], output: failure ? "build failed\n" : "deployment complete\n", truncated: false }); }
+              return { ok: true, run_id: payload.run_id, status, canceled, steps, done };
             }
             // ── Scripts (spec 06) fixtures ───────────────────────────
             const scriptFixtures = [

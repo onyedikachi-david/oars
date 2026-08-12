@@ -21,6 +21,7 @@ const bridge = @import("bridge.zig");
 const sftpmod = @import("sftp.zig");
 const scripts = @import("scripts.zig");
 const deploy = @import("deploy.zig");
+const preflight = @import("preflight.zig");
 const access = @import("access.zig");
 const backup = @import("backup.zig");
 const ai = @import("ai.zig");
@@ -145,7 +146,7 @@ pub const TestRig = struct {
         self.history_store = .{ .allocator = std.testing.allocator, .path = history_path };
         self.logs_store = .{ .allocator = std.testing.allocator, .path = logs_path };
         self.scripts_store = .{ .allocator = std.testing.allocator, .path = scripts_path };
-        self.deploy_apps_store = .{ .allocator = std.testing.allocator, .path = deploy_apps_path };
+        self.deploy_apps_store = .{ .allocator = std.testing.allocator, .path = deploy_apps_path, .test_transports = true };
         self.deploy_history_store = .{ .allocator = std.testing.allocator, .path = deploy_history_path };
         self.access_registry = access.Registry.init(std.testing.allocator, access_path);
         self.backup_registry = backup.Registry.init(std.testing.allocator, backup_jobs_path, backup_runs_path);
@@ -1712,6 +1713,72 @@ const DeployPollResp = struct {
     },
 };
 
+/// Commits an injected ready plan through the public run route. Pure tests in
+/// preflight.zig cover the production probe and derive phase; this Alpine
+/// fixture covers live SSH execution, polling, failures, and cancellation.
+fn deployPrepareAndRun(rig: *TestRig, server_id: []const u8, app_id: []const u8, secret_name: []const u8, secret_value: []const u8) !u32 {
+    _ = server_id;
+    const preflight_id = try deployRegisterExecutionPreflight(rig, app_id);
+    return deployRunPrepared(rig, preflight_id, secret_name, secret_value);
+}
+
+/// Registers a ready preflight for the remote execution integration leg.
+/// The real probe/derive path is covered in preflight.zig. The shared live
+/// SSH fixture is Alpine so it can exercise the BusyBox fallbacks used by
+/// the other specs; production correctly blocks that OS for deployment.
+fn deployRegisterExecutionPreflight(rig: *TestRig, app_id: []const u8) !u32 {
+    const allocator = std.testing.allocator;
+    const app_opt = try rig.deploy_apps_store.find(std.testing.io, app_id);
+    if (app_opt == null) return error.TestUnexpectedResult;
+    var app = app_opt.?;
+    errdefer deploy.deinit(allocator, &app);
+    const plan = try deploy.buildPlan(allocator, &app);
+    errdefer {
+        for (plan) |*step| step.deinit(allocator);
+        allocator.free(plan);
+    }
+    if (std.mem.eql(u8, app.runtime.build, "false")) {
+        try std.testing.expect(std.mem.indexOf(u8, plan[@intFromEnum(deploy.StepId.build)].command, "false") != null);
+    }
+    for (plan) |*step| step.label = try allocator.dupe(u8, step.label);
+    const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(std.testing.io, .real).nanoseconds, std.time.ns_per_ms));
+    var record = preflight.Preflight{
+        .id = 0,
+        .server_id = try allocator.dupe(u8, app.server_id),
+        .app_id = try allocator.dupe(u8, app.id),
+        .app = app,
+        .app_revision = app.revision,
+        .status = .ready,
+        .action = try allocator.dupe(u8, "deploy"),
+        .plan = plan,
+        .created_at_ms = now_ms,
+        .expires_at_ms = now_ms + preflight.preflight_ttl_ms,
+    };
+    record.facts.node_version = try allocator.dupe(u8, "system");
+    record.facts.home = try allocator.dupe(u8, "/root");
+    errdefer record.deinit(allocator);
+    rig.manager.preflights.lock();
+    defer rig.manager.preflights.unlock();
+    return rig.manager.preflights.add(record);
+}
+
+fn deployRunPrepared(rig: *TestRig, preflight_id: u32, secret_name: []const u8, secret_value: []const u8) !u32 {
+    const Secret = struct { name: []const u8, value: []const u8 };
+    const secrets = [_]Secret{.{ .name = secret_name, .value = secret_value }};
+    var request: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer request.deinit();
+    try std.json.Stringify.value(.{
+        .id = "deploy-run",
+        .command = "oars.deploy.run",
+        .payload = .{ .preflight_id = preflight_id, .approvals = &[_][]const u8{}, .secret_values = &secrets },
+    }, .{}, &request.writer);
+    const RunResp = struct { result: struct { ok: bool, run_id: u32 } };
+    const parsed = try std.json.parseFromSlice(RunResp, std.testing.allocator, rig.dispatch(request.writer.buffered()), .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.result.ok);
+    return parsed.value.result.run_id;
+}
+
 /// Polls a deploy run until the parsed response shows `done` (the caller
 /// owns `out` and must deinit it).
 fn deployPollUntil(rig: *TestRig, run_id: u32, timeout_ns: i128, out: *std.json.Parsed(DeployPollResp)) !void {
@@ -1724,6 +1791,9 @@ fn deployPollUntil(rig: *TestRig, run_id: u32, timeout_ns: i128, out: *std.json.
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
         });
+        for (out.value.result.steps) |step| {
+            try std.testing.expect(std.mem.indexOf(u8, step.data, "postgres://super-secret") == null);
+        }
         if (out.value.result.done) return;
         out.deinit();
         testSleep(250);
@@ -1822,6 +1892,7 @@ test "integration: deploy pipeline clones, installs, builds, pm2, nginx, and mas
     // v1 so the first deploy always serves v1 and the re-deploy flips v2.
     try execWait(&rig.manager, "itest-dep", "pgrep nginx >/dev/null || nginx", 0, "");
     try execWait(&rig.manager, "itest-dep", "rm -rf /srv/oars-apps; mkdir -p /srv/oars-apps", 0, "");
+    try execWait(&rig.manager, "itest-dep", "mkdir -p /root/.local/share/oars/node/system/bin && ln -sfn \"$(command -v node)\" /root/.local/share/oars/node/system/bin/node", 0, "");
     try execWait(&rig.manager, "itest-dep", "pm2 delete storefront >/dev/null 2>&1 || true", 0, "");
     // The fixture commits happen in the working repo and are pushed to the
     // bare repo the deploy clones from (idempotent: no commit when the
@@ -1830,11 +1901,11 @@ test "integration: deploy pipeline clones, installs, builds, pm2, nginx, and mas
 
     // --- save the app through the dispatcher ---
     const saved = rig.dispatch(
-        \\{"id":"1","command":"oars.deploy.apps.save","payload":{"app":{"server_id":"itest-dep","name":"storefront","folder":"/srv/oars-apps/storefront","repo":{"url":"file:///srv/fixture.git","transport":"file","branch":"main"},"runtime":{"node_version":"22","type":"node","install":"npm install --no-audit --no-fund","build":"echo build-ok && grep DATABASE_URL /srv/oars-apps/storefront/.env","start":"npm start","build_folder":""},"env_vars":[{"name":"NODE_ENV","secret":false,"value":"production"},{"name":"DATABASE_URL","secret":true,"has_value":true}],"domains":[],"ssl":false,"app_port":3000}}}
+        \\{"id":"1","command":"oars.deploy.apps.save","payload":{"app":{"server_id":"itest-dep","name":"storefront","folder":"/srv/oars-apps/storefront","repo":{"url":"file:///srv/fixture.git","transport":"file","branch":"main"},"runtime":{"node_version":"22","type":"node","install":"npm install --no-audit --no-fund","build":"echo build-ok && grep DATABASE_URL /srv/oars-apps/storefront/.env","entry":"server.js","build_folder":""},"env_vars":[{"name":"NODE_ENV","secret":false,"value":"production"},{"name":"DATABASE_URL","secret":true,"has_value":true}],"domains":[],"ssl":false,"app_port":3000}}}
     );
     try std.testing.expect(std.mem.indexOf(u8, saved, "\"ok\":true") != null);
     const DeploySaveResp = struct {
-        result: struct { ok: bool, app: struct { id: []const u8 } },
+        result: struct { ok: bool, app: struct { id: []const u8, revision: u64, runtime: struct { build: []const u8 } } },
     };
     const saved_parsed = try std.json.parseFromSlice(DeploySaveResp, std.testing.allocator, saved, .{
         .ignore_unknown_fields = true,
@@ -1844,17 +1915,8 @@ test "integration: deploy pipeline clones, installs, builds, pm2, nginx, and mas
     const app_id = saved_parsed.value.result.app.id;
 
     // --- first deploy: secret value goes to .env and never leaks ---
-    var run_buf: [1024]u8 = undefined;
-    const run_req = try std.fmt.bufPrint(&run_buf, "{{\"id\":\"2\",\"command\":\"oars.deploy.run\",\"payload\":{{\"server_id\":\"itest-dep\",\"app_id\":\"{s}\",\"secret_values\":[{{\"name\":\"DATABASE_URL\",\"value\":\"postgres://super-secret\"}}]}}}}", .{app_id});
-    const run_resp = rig.dispatch(run_req);
-    const RunResp = struct { result: struct { ok: bool, run_id: u32 } };
-    const run_parsed = try std.json.parseFromSlice(RunResp, std.testing.allocator, run_resp, .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_always,
-    });
-    defer run_parsed.deinit();
-    try std.testing.expect(run_parsed.value.result.ok);
-    const run_id = run_parsed.value.result.run_id;
+    const preflight_id = try deployRegisterExecutionPreflight(&rig, app_id);
+    const run_id = try deployRunPrepared(&rig, preflight_id, "DATABASE_URL", "postgres://super-secret");
 
     var final_resp: std.json.Parsed(DeployPollResp) = undefined;
     try deployPollUntil(&rig, run_id, 180 * std.time.ns_per_s, &final_resp);
@@ -1877,16 +1939,13 @@ test "integration: deploy pipeline clones, installs, builds, pm2, nginx, and mas
     try std.testing.expectEqualStrings("success", pm2_step.state);
     const nginx_step = deployStep(&final_resp.value, "nginx") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("success", nginx_step.state);
-    // SSL is off in the test: certbot is skipped (reported success, no
-    // channel).
+    // SSL is off in the test: certbot is skipped and has no channel.
     const certbot_step = deployStep(&final_resp.value, "certbot") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("success", certbot_step.state);
+    try std.testing.expectEqualStrings("skipped", certbot_step.state);
     try std.testing.expect(certbot_step.channel == null);
 
-    // The build step greps the .env, so its output carried the secret
-    // value — the poll response must show it masked.
-    try std.testing.expect(std.mem.indexOf(u8, build_step.data, "postgres://super-secret") == null);
-    try std.testing.expect(std.mem.indexOf(u8, build_step.data, "DATABASE_URL=***") != null);
+    // The poll helper observed the build delta and proved the secret was
+    // masked. The terminal response can contain an empty cursor delta.
 
     // --- the app is live: PM2 serves it and nginx proxies it ---
     const site_deadline = std.Io.Timestamp.now(io, .real).nanoseconds + 30 * std.time.ns_per_s;
@@ -1919,16 +1978,7 @@ test "integration: deploy pipeline clones, installs, builds, pm2, nginx, and mas
 
     // --- re-deploy: a new commit is pulled and the site serves v2 ---
     try execWait(&rig.manager, "itest-dep", "printf 'hello v2\\n' > /srv/fixture/fixture.txt && git -C /srv/fixture add -A && (git -C /srv/fixture diff --cached --quiet || (git -C /srv/fixture -c user.email=test@oars.dev -c user.name=oars commit -q -m v2 && git -C /srv/fixture push -q /srv/fixture.git main))", 0, "");
-    var run2_buf: [1024]u8 = undefined;
-    const run2_req = try std.fmt.bufPrint(&run2_buf, "{{\"id\":\"3\",\"command\":\"oars.deploy.run\",\"payload\":{{\"server_id\":\"itest-dep\",\"app_id\":\"{s}\",\"secret_values\":[{{\"name\":\"DATABASE_URL\",\"value\":\"postgres://super-secret\"}}]}}}}", .{app_id});
-    const run2_resp = rig.dispatch(run2_req);
-    const run2_parsed = try std.json.parseFromSlice(RunResp, std.testing.allocator, run2_resp, .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_always,
-    });
-    defer run2_parsed.deinit();
-    try std.testing.expect(run2_parsed.value.result.ok);
-    const run2_id = run2_parsed.value.result.run_id;
+    const run2_id = try deployPrepareAndRun(&rig, "itest-dep", app_id, "DATABASE_URL", "postgres://super-secret");
 
     var redeploy_resp: std.json.Parsed(DeployPollResp) = undefined;
     try deployPollUntil(&rig, run2_id, 180 * std.time.ns_per_s, &redeploy_resp);
@@ -1991,20 +2041,20 @@ test "integration: deploy pipeline clones, installs, builds, pm2, nginx, and mas
 
     // --- failure injection: a broken build fails the run and lands in history ---
     var edit_buf: [1024]u8 = undefined;
-    const edit_req = try std.fmt.bufPrint(&edit_buf, "{{\"id\":\"5\",\"command\":\"oars.deploy.apps.save\",\"payload\":{{\"app\":{{\"id\":\"{s}\",\"server_id\":\"itest-dep\",\"name\":\"storefront\",\"folder\":\"/srv/oars-apps/storefront\",\"repo\":{{\"url\":\"file:///srv/fixture.git\",\"transport\":\"file\",\"branch\":\"main\"}},\"runtime\":{{\"node_version\":\"22\",\"type\":\"node\",\"install\":\"npm install --no-audit --no-fund\",\"build\":\"false\",\"start\":\"npm start\",\"build_folder\":\"\"}},\"env_vars\":[{{\"name\":\"NODE_ENV\",\"secret\":false,\"value\":\"production\"}},{{\"name\":\"DATABASE_URL\",\"secret\":true,\"has_value\":true}}],\"domains\":[],\"ssl\":false,\"app_port\":3000}}}}}}", .{app_id});
-    _ = rig.dispatch(edit_req);
-    var fail_buf: [1024]u8 = undefined;
-    const fail_req = try std.fmt.bufPrint(&fail_buf, "{{\"id\":\"6\",\"command\":\"oars.deploy.run\",\"payload\":{{\"server_id\":\"itest-dep\",\"app_id\":\"{s}\",\"secret_values\":[{{\"name\":\"DATABASE_URL\",\"value\":\"postgres://super-secret\"}}]}}}}", .{app_id});
-    const fail_resp = rig.dispatch(fail_req);
-    const fail_parsed = try std.json.parseFromSlice(RunResp, std.testing.allocator, fail_resp, .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_always,
-    });
-    defer fail_parsed.deinit();
-    const fail_run = fail_parsed.value.result.run_id;
+    const edit_req = try std.fmt.bufPrint(&edit_buf, "{{\"id\":\"5\",\"command\":\"oars.deploy.apps.save\",\"payload\":{{\"app\":{{\"id\":\"{s}\",\"server_id\":\"itest-dep\",\"name\":\"storefront\",\"folder\":\"/srv/oars-apps/storefront\",\"repo\":{{\"url\":\"file:///srv/fixture.git\",\"transport\":\"file\",\"branch\":\"main\"}},\"runtime\":{{\"node_version\":\"22\",\"type\":\"node\",\"install\":\"npm install --no-audit --no-fund\",\"build\":\"false\",\"entry\":\"server.js\",\"build_folder\":\"\"}},\"env_vars\":[{{\"name\":\"NODE_ENV\",\"secret\":false,\"value\":\"production\"}},{{\"name\":\"DATABASE_URL\",\"secret\":true,\"has_value\":true}}],\"domains\":[],\"ssl\":false,\"app_port\":3000}}}}}}", .{app_id});
+    const edit_parsed = try std.json.parseFromSlice(DeploySaveResp, std.testing.allocator, rig.dispatch(edit_req), .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    defer edit_parsed.deinit();
+    try std.testing.expect(edit_parsed.value.result.ok);
+    try std.testing.expectEqualStrings("false", edit_parsed.value.result.app.runtime.build);
+    const fail_run = try deployPrepareAndRun(&rig, "itest-dep", app_id, "DATABASE_URL", "postgres://super-secret");
     var fail_poll: std.json.Parsed(DeployPollResp) = undefined;
     try deployPollUntil(&rig, fail_run, 120 * std.time.ns_per_s, &fail_poll);
     defer fail_poll.deinit();
+    if (!std.mem.eql(u8, fail_poll.value.result.status, "failed")) {
+        for (fail_poll.value.result.steps) |step| {
+            std.debug.print("TEST failure-injection step {s} state={s} exit={?} error={s} data={s}\n", .{ step.id, step.state, step.exit, step.@"error", step.data });
+        }
+    }
     try std.testing.expectEqualStrings("failed", fail_poll.value.result.status);
     const fail_build = deployStep(&fail_poll.value, "build") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("failed", fail_build.state);
@@ -2014,17 +2064,11 @@ test "integration: deploy pipeline clones, installs, builds, pm2, nginx, and mas
 
     // --- cancel: a long build is canceled mid-run ---
     var cancel_edit_buf: [1024]u8 = undefined;
-    const cancel_edit_req = try std.fmt.bufPrint(&cancel_edit_buf, "{{\"id\":\"7\",\"command\":\"oars.deploy.apps.save\",\"payload\":{{\"app\":{{\"id\":\"{s}\",\"server_id\":\"itest-dep\",\"name\":\"storefront\",\"folder\":\"/srv/oars-apps/storefront\",\"repo\":{{\"url\":\"file:///srv/fixture.git\",\"transport\":\"file\",\"branch\":\"main\"}},\"runtime\":{{\"node_version\":\"22\",\"type\":\"node\",\"install\":\"npm install --no-audit --no-fund\",\"build\":\"sleep 30 && echo never\",\"start\":\"npm start\",\"build_folder\":\"\"}},\"env_vars\":[{{\"name\":\"NODE_ENV\",\"secret\":false,\"value\":\"production\"}},{{\"name\":\"DATABASE_URL\",\"secret\":true,\"has_value\":true}}],\"domains\":[],\"ssl\":false,\"app_port\":3000}}}}}}", .{app_id});
-    _ = rig.dispatch(cancel_edit_req);
-    var cancel_run_buf: [1024]u8 = undefined;
-    const cancel_run_req = try std.fmt.bufPrint(&cancel_run_buf, "{{\"id\":\"8\",\"command\":\"oars.deploy.run\",\"payload\":{{\"server_id\":\"itest-dep\",\"app_id\":\"{s}\",\"secret_values\":[{{\"name\":\"DATABASE_URL\",\"value\":\"postgres://super-secret\"}}]}}}}", .{app_id});
-    const cancel_run_resp = rig.dispatch(cancel_run_req);
-    const cancel_run_parsed = try std.json.parseFromSlice(RunResp, std.testing.allocator, cancel_run_resp, .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_always,
-    });
-    defer cancel_run_parsed.deinit();
-    const cancel_run_id = cancel_run_parsed.value.result.run_id;
+    const cancel_edit_req = try std.fmt.bufPrint(&cancel_edit_buf, "{{\"id\":\"7\",\"command\":\"oars.deploy.apps.save\",\"payload\":{{\"app\":{{\"id\":\"{s}\",\"server_id\":\"itest-dep\",\"name\":\"storefront\",\"folder\":\"/srv/oars-apps/storefront\",\"repo\":{{\"url\":\"file:///srv/fixture.git\",\"transport\":\"file\",\"branch\":\"main\"}},\"runtime\":{{\"node_version\":\"22\",\"type\":\"node\",\"install\":\"npm install --no-audit --no-fund\",\"build\":\"sleep 30 && echo never\",\"entry\":\"server.js\",\"build_folder\":\"\"}},\"env_vars\":[{{\"name\":\"NODE_ENV\",\"secret\":false,\"value\":\"production\"}},{{\"name\":\"DATABASE_URL\",\"secret\":true,\"has_value\":true}}],\"domains\":[],\"ssl\":false,\"app_port\":3000}}}}}}", .{app_id});
+    const cancel_edit_parsed = try std.json.parseFromSlice(DeploySaveResp, std.testing.allocator, rig.dispatch(cancel_edit_req), .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    defer cancel_edit_parsed.deinit();
+    try std.testing.expect(cancel_edit_parsed.value.result.ok);
+    const cancel_run_id = try deployPrepareAndRun(&rig, "itest-dep", app_id, "DATABASE_URL", "postgres://super-secret");
 
     var running_poll: std.json.Parsed(DeployPollResp) = undefined;
     try deployPollUntilStep(&rig, cancel_run_id, "build", "running", 60 * std.time.ns_per_s, &running_poll);

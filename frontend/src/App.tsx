@@ -783,6 +783,21 @@ export default function App() {
         });
       }
     }
+    // Spec 07 palette: open Deploy for a saved app on a server
+    try {
+      const deployApps: Array<{ id: string; name: string; server_id: string }> = (window as unknown as { __oarsDeployPalette?: Array<{ id: string; name: string; server_id: string }> }).__oarsDeployPalette ?? [];
+      for (const app of deployApps) {
+        const s = servers.find((x) => x.id === app.server_id);
+        if (!s) continue;
+        const openDeployApp = () => {
+          (window as unknown as { __oarsRequestedDeployApp?: { appId: string; serverId: string } }).__oarsRequestedDeployApp = { appId: app.id, serverId: app.server_id };
+          openServerView(s, "deploy");
+          window.dispatchEvent(new CustomEvent("oars:select-deploy-app", { detail: { appId: app.id, serverId: app.server_id } }));
+          setPaletteOpen(false);
+        };
+        items.push({ label: `Open “${app.name}” deployments on ${s.name}`, action: openDeployApp });
+      }
+    } catch {}
     items.push({ label: "Add server…", action: () => { setModal({}); setPaletteOpen(false); } });
     items.push({ label: `Theme: switch to ${theme === "dark" ? "light" : "dark"}`, action: () => { setTheme(theme === "dark" ? "light" : "dark"); setPaletteOpen(false); } });
     if (!paletteQ) return items.slice(0, 20);

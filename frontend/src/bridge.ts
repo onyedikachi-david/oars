@@ -68,9 +68,9 @@ export async function invoke<T = unknown>(
 }
 
 // Keychain-backed secrets (native-sdk.credentials, permission-gated).
-// Secrets are cached in memory for the app's lifetime: on unsigned
-// (debug) builds macOS re-prompts for Keychain access on every read,
-// so each item is fetched at most once per run.
+// General credentials may be cached to avoid repeated prompts in unsigned
+// debug builds. Deployment reads use the transient path below and never enter
+// this process-lifetime cache.
 const secretCache = new Map<string, string>();
 
 export const vault = {
@@ -92,6 +92,18 @@ export const vault = {
     });
     if (typeof secret === "string") secretCache.set(account, secret);
     return secret;
+  },
+  // Transient deploy secrets: bypass cache, never store (prevents
+  // deploy values from lingering in secretCache for the session).
+  async deployTransientGet(account: string): Promise<string | null> {
+    const secret = await invoke<string | null>("native-sdk.credentials.get", {
+      service: this.service,
+      account,
+    });
+    return secret;
+  },
+  async transientForget(account: string): Promise<void> {
+    secretCache.delete(account);
   },
   async delete(account: string): Promise<void> {
     await invoke("native-sdk.credentials.delete", {
@@ -242,13 +254,19 @@ export const api = {
       invoke<{ ok: boolean }>("oars.scripts.broadcastCancel", { run_id: runId }),
   },
   deploy: {
-    list: (serverId: string) => invoke<{ ok: boolean; apps: any[] }>("oars.deploy.apps.list", { server_id: serverId }),
-    save: (app: any) => invoke<{ ok: boolean; app: any }>("oars.deploy.apps.save", { app }),
+    list: (serverId: string) => invoke<{ ok: boolean; apps: import("./types").DeployApp[] }>("oars.deploy.apps.list", { server_id: serverId }),
+    save: (app: import("./types").DeployAppInput) => invoke<{ ok: boolean; app: import("./types").DeployApp }>("oars.deploy.apps.save", { app }),
+    secretPresence: (appId: string, names: string[], present: boolean) => invoke<{ ok: boolean; app: import("./types").DeployApp }>("oars.deploy.apps.secretPresence", { app_id: appId, names, present }),
     remove: (serverId: string, appId: string) => invoke<{ ok: boolean }>("oars.deploy.apps.delete", { server_id: serverId, app_id: appId }),
-    run: (serverId: string, appId: string, secret_values: Array<{ name: string; value: string }>) => invoke<{ ok: boolean; run_id: number }>("oars.deploy.run", { server_id: serverId, app_id: appId, secret_values }),
-    poll: (runId: number, cursors?: Record<string, number>) => invoke<any>("oars.deploy.poll", { run_id: runId, cursors }),
+    keyGenerate: (serverId: string, appId: string) => invoke<{ ok: boolean; channel: number }>("oars.deploy.key.generate", { server_id: serverId, app_id: appId }),
+    hostTrust: (preflightId: number) => invoke<{ ok: boolean; channel: number }>("oars.deploy.hostTrust", { preflight_id: preflightId, accept: true }),
+    preflight: (serverId: string, appId: string) => invoke<{ ok: boolean; preflight: import("./types").DeployPreflight }>("oars.deploy.preflight", { server_id: serverId, app_id: appId }),
+    preflightPoll: (preflightId: number) => invoke<{ ok: boolean; preflight: import("./types").DeployPreflight }>("oars.deploy.preflightPoll", { preflight_id: preflightId }),
+    preflightCancel: (preflightId: number) => invoke<{ ok: boolean }>("oars.deploy.preflightCancel", { preflight_id: preflightId }),
+    run: (payload: { preflight_id: number; approvals: string[]; secret_values: Array<{ name: string; value: string }> }) => invoke<{ ok: boolean; run_id: number }>("oars.deploy.run", payload),
+    poll: (runId: number, cursors?: Record<string, number>) => invoke<import("./types").DeployPollResult>("oars.deploy.poll", { run_id: runId, cursors }),
     cancel: (runId: number) => invoke<{ ok: boolean }>("oars.deploy.cancel", { run_id: runId }),
-    history: (serverId: string, appId: string, limit?: number) => invoke<{ ok: boolean; runs: any[] }>("oars.deploy.history", { server_id: serverId, app_id: appId, limit }),
+    history: (serverId: string, appId: string, limit?: number) => invoke<{ ok: boolean; runs: import("./types").DeployHistoryRecord[] }>("oars.deploy.history", { server_id: serverId, app_id: appId, limit }),
   },
   sshkeys: {
     list: (serverId: string) => invoke<{ ok: boolean; keys: any[] }>("oars.sshkeys.list", { server_id: serverId }),

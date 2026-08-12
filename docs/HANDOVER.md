@@ -1978,3 +1978,237 @@ Spec 06 is implemented end to end. `docs/NEXT-SPEC.md` now points at spec 07.
     even though both socketpair ends went through `fcntl`. Poll for `POLLIN`
     or `POLLOUT` before each libc read or write. Treat a readable zero-byte
     result as EOF, and handle `ERR`, `HUP`, and `NVAL` explicitly.
+
+## 35. Previous implementation target
+
+Spec 06 Scripts is complete in this checkout. The implementation and
+validation evidence are in §34. `docs/NEXT-SPEC.md` now points at spec 07.
+
+## 36. Session handover — 2026-08-12: spec 07 one-click deployment implemented
+
+Spec 07 frontend and backend work is implemented. Automated checks pass. The
+real-host acceptance run uses `examples/oars-react-smoke` on the user's
+connected Contabo server. `docs/NEXT-SPEC.md` is archived before the next
+Stage 6 target is written.
+
+### What landed (backend)
+
+- **App model + store** (`src/deploy.zig`): `DeployApp` with
+  `package_manager: auto|npm|pnpm|yarn`, explicit `entry`+`args`,
+  `build_folder` required for React/static, monotonic `revision` / content
+  hash and Oars ownership IDs. Secret values never stored in `apps.json`
+  (Keychain account `deploy:<app_id>:<var>`); `file://` accepted only via
+  `test_transports` (integration fixtures). `apps.json` and
+  `deploy_runs.json` are atomic (sibling temp file + sync + rename) with
+  quarantine for corrupt input; 500 total / 100 per-server app caps;
+  `HistoryStore` prunes by age (30 days) then count (200) with the 200 KiB
+  per-run masked-output cap.
+- **Managed-state-safe preflight + bounded expiring immutable plan**
+  (`src/preflight.zig`, `src/deploy.zig`, `src/bridge.zig`,
+  `src/sessions.zig`): new
+  `oars.deploy.preflight` / `oars.deploy.preflightPoll` /
+  `oars.deploy.preflightCancel` produce a `DeployPreflight`
+  (`id, app_id, server_id, created_at_ms, expires_at_ms, app_revision,
+  target_fingerprint, facts, blockers, warnings, approvals, repository,
+  runtime, configs, steps`). Each step is
+  `(id, label, mutation, redacted command, files, guards, rollback)`.
+  `target_fingerprint` identifies the reviewed fact snapshot for diagnostics.
+  Frozen commands recheck repository, lockfile, nginx, static-root, and DNS
+  guards immediately before their mutations. `oars.deploy.run {preflight_id, approvals[],
+  secret_values[]}` rechecks guards and transfers ownership of the frozen
+  plan into the run — it never reloads the app, re-resolves Node, or
+  rebuilds commands. Records are memory-only, 10-min TTL, cap 32, evicted
+  on commit/cancel/expiry/disconnect/shutdown.
+- **Preflight facts** are worker-driven and do not change managed app or
+  service state: `/etc/os-release` +
+  kernel arch + libc family, connected user/home/effective UID +
+  `sudo -n` availability, free disk, Git/curl/wget/tar/xz/SHA-256/readlink/
+  `ss`/Node/npm/Corepack/PM2/nginx/Certbot/dig versions/paths,
+  folder Git state + frozen remote branch commit + fast-forward,
+  lockfile/manager metadata from the checkout or a removed-on-exit temporary
+  clone (multiple lockfiles = blocker unless one manager selected), app-port
+  plus port 80/443 listener ownership + nginx ownership/collision, A +
+  AAAA for all domains vs observable public addresses (NAT stated when
+  unprovable), SSH host fingerprint + deploy-key existence
+  + scoped-identity repository access. First OS adapter is data + tests:
+  Debian/Ubuntu on glibc x64/arm64 mapping exact releases to exact
+  package names and `sudo -n` commands; unknown distro/arch/libc/package
+  source returns a manual blocker (no guessed curl-to-shell).
+- **Node resolver + package managers**: production majors from official
+  release metadata; preflight freezes the latest patched release in the
+  selected LTS line, the official archive for arch/libc, its URL and
+  `SHASUMS256.txt` SHA-256. Preflight fetches current release metadata; the
+  token owns the version, so a later upstream release does not rewrite an
+  approved run). Install under `~/.local/share/oars/node/<version>` via
+  Oars-owned temp path, SHA-256 verify before extract, rename into place
+  (never replace system Node); every Node/Corepack/PM/package/build/PM2
+  command uses the frozen absolute `bin` path or PATH prefix. Manager
+  selection: `npm`+lock→`npm ci`, `pnpm`+lock→
+  `pnpm install --frozen-lockfile`, Yarn Berry+lock→
+  `yarn install --immutable`, no lockfile→normal install with preflight
+  warning. `packageManager` metadata is retained in the lockfile snapshot;
+  pnpm and Yarn activation uses the Corepack in the reviewed Node archive. A frozen failure
+  fails the step (no mutable fallback). User command overrides are
+  shell code (labeled, full redacted string, one documented shell;
+  never split an arbitrary start on whitespace for PM2).
+- **Repository identity**: HTTPS v1 = public only (no token in URL).
+  SSH = one Ed25519 per app, private half on server with mode 0600
+  (public half in setup view), per-app `known_hosts` with scoped
+  `GIT_SSH_COMMAND` (`IdentitiesOnly=yes`, strict checking); GitHub
+  `github.com` fingerprints vs GitHub's published list, other hosts need
+  user-confirmed fingerprint; `StrictHostKeyChecking=no` / global
+  `known_hosts` mutation forbidden; `ssh-keyscan` is discovery, never
+  proof. Preflight resolves the remote branch to the frozen exact commit;
+  clone checks out that commit; update verifies expected remote + clean
+  worktree + fast-forward before advancing (no reset/clean).
+- **Plan by app type** (`deploy.buildPlan`/config generators): Node.js
+  optional build + PM2 reverse proxy, Next.js required build (unless
+  prebuilt) + PM2, React SPA required build + `root <build_folder>` +
+  `try_files … /index.html` (no PM2), Static optional build + `try_files
+  … =404` (no PM2). App port + process entry required for Node/Next,
+  build folder inside app folder for React/static (traversal rejected at save;
+  real paths rechecked before nginx so a symlink cannot escape). PM2 ecosystem uses structured JSON
+  (`name,cwd,script,args,interpreter,env`) + `pm2 startOrReload
+  --only <name>`. Oars writes a mode-0600 `.env` before install/build and
+  also gives Node/Next processes the same values through structured PM2
+  `env`; this supports build-time and run-time use.
+- **Remote files, privilege & rollback**: the session worker streams `.env`,
+  the PM2 ecosystem, and the nginx candidate over channel stdin to
+  same-directory mode-0600 temporary files, then renames them. Deployment
+  SSH keys and per-app `known_hosts` are created by queued worker commands.
+  The nginx step installs its candidate as mode 0644 with `sudo -n`.
+  An existing site without the Oars marker blocks, and a changed Oars-owned
+  site after preflight returns `stale_preflight`. nginx saves the old file + link state →
+  install + enable candidate → full `nginx -t` → reload; on failure
+  restore old file+link → validate+reload restored config; record both
+  the failure in command output. Certbot receives only approved domains plus
+  `--non-interactive --agree-tos`; v1 has no separate Certbot rollback transaction. Dynamic values use
+  `shellquote.quote` (SSH exec is one shell string — no argv transport).
+- **Secrets & redaction**: `oars.deploy.run` rejects missing/unknown/
+  duplicate secret names; values copied into owned buffers, redaction
+  patterns built before remote work, `secureZero` + free after last
+  required remote write; if masking must continue, only the dedicated
+  redaction buffers remain and are zeroed at terminal status. Secrets
+  never touch app/preflight JSON, command arguments, audit detail, history,
+  URLs, preview fixtures, or bridge inspector. Exact-value masking is tested
+  for overlapping, empty, channel-split, and truncation cases. Withheld raw
+  overlap bytes are zeroed before a terminal run enters history.
+- **Streaming, concurrency & history**: each active step has an internal
+  capture cursor (appended masked deltas) + caller-owned view cursors
+  (`oars.deploy.poll {run_id, cursors}`). Internal cursor advanced after
+  every capture with gap accounting; channel closed+removed after
+  EOF+exit (exit code preserved; empty success → visible terminal state).
+  Deployment preflight probes, key setup, configuration writes, and run
+  commands use the owning session worker; bridge handlers use IDs + locked transitions. History appends
+  once per terminal transition; stored per-step masked output + gap/
+  truncation metadata within the 200 KiB cap (atomic write; 200-record /
+  30-day prune). V1 capacity: 1 active per app+folder, 8 global, 32
+  uncommitted preflights, 500 apps / 100 per server, 128 env rows +
+  16 domains per app, 200 KiB/run, 200 records / 30 days — rejected at
+  admission before audit/remote work.
+- **Verified cancellation**: each mutating step wrapped in a Linux
+  process-group controller (new session, control file with unguessable
+  token+PID+PGID+start identity, exit status preserved; all paths/tokens
+  quoted). Cancel uses a separate worker `cancel()` command validating
+  owner+token+start+group before TERM→grace→KILL then `kill -0` verify
+  before `canceled` is allowed. Otherwise `cancel_requested` retained
+  with exact error; `oars.deploy.cancel {run_id}` idempotent and
+  channel close is cleanup, not proof. Disconnect during run →
+  `interrupted` unless prior verified `canceled`.
+- Bridge wire: timestamps are integer milliseconds (no `epoch_ns` wire
+  JSON); `RunStatus` =
+  `queued|running|cancel_requested|canceled|done|failed|interrupted`,
+  `StepState` =
+  `pending|running|cancel_requested|canceled|success|failed|skipped`.
+  `oars.deploy.history {server_id,app_id,limit}` → newest 10 (cap 200,
+  30-day raw). Admission rejects before audit. Private-repo SSH piece
+  reuses the spec-08 deploy-key contract; 0600 mode asserted in
+  integration tests.
+
+### What landed (frontend)
+
+- Locked `types.ts` (`DeployApp`, `DeployAppInput`, `DeployRepo`,
+  `DeployRuntime`, `DeployEnvVar`, `DeployPreflight`,
+  `DeployPreflightStep`, `DeployStep`, `DeployPollResult`,
+  `DeployHistoryRecord`, `DeployRunStatus`, `DeployStepState`,
+  `DeployTransport`, `DeployEnvironment`, `DeployAppType`,
+  `DeployPackageManager`); no deploy `any` in bridge/types/poll/history.
+- `bridge.ts`: transient Keychain reads
+  `vault.deployTransientGet(account)` (bypasses `secretCache`) +
+  `vault.transientForget(account)`; typed
+  `api.deploy.{list,save,remove,keyGenerate,hostTrust,preflight,preflightPoll,preflightCancel,
+  run{preflight_id,approvals,secret_values},poll,cancel,history}`.
+  Saving is one user operation: snapshot prior metadata + `has_value`,
+  write new metadata, update Keychain per var, restore both sides on
+  Keychain failure; delete uses an Oars dialog, removes metadata then
+  `deploy:*` accounts (partial cleanup reported). `has_value` is built
+  from successful Keychain ops, not trusted from the browser.
+- Pure `deploy-state.ts` (tested): bulk `.env` import with Oars subset
+  (blanks/`#`-comments ignored, optional `export `, split at first `=`,
+  preserve value bytes incl. spaces/`#`/quotes, reject bad names/
+  dups/NUL/CR/LF/over-limit), preview before replace, cursor helpers
+  (`cursorsFromSteps`, per-channel gap-first UI event), 200 KiB cap,
+  dedicated redaction buffers.
+- `DeployTab` rebuilt: 1) **Identity** (name, environment, absolute
+  folder derived from server), 2) **Repository** (public HTTPS/SSH, URL,
+  branch — no `file://` in product UI; test-only constructor still
+  present for fixtures), 3) **Runtime** (app type, supported LTS lines
+  22/24, package manager, install/build/start+args, build folder, app
+  port when applicable), 4) **Environment** (secret switch default on,
+  detection suggests but never decides; bulk import with preview), 5)
+  **Domains** (explicit names, SSL switch, cert email — never invent
+  `www`/email). Read-only preflight panel has four groups (Target
+  facts, Blockers, Warnings, Exact mutations w/ redacted commands +
+  remote paths/modes + nginx/PM2 previews/diffs + deploy-key action +
+  cert request). Approvals are one-per-card with a focused destructive/
+  privileged confirmation. Commit executes the frozen token; `stale_` /
+  `expired` / `canceled` retry with a new preflight. Six-step rail
+  (Clone / Install+Node / Build / PM2-skipped for React/static /
+  Nginx / Certbot-skipped when SSL off) with collapsed success +
+  expanded failure output; verification shown in the final result card
+  (URL and commit), not a 7th step. Poll
+  uses caller-owned cursors (gap warning), timer retained, errors
+  surfaced, history for the selected app (not first). Applications
+  button lives in the Files toolbar; palette has
+  one `Open “<app>” deployments on <server>` entry with shared
+  active-server state — no second run controller. Dialogs are oars-modal
+  (focus trap + Escape + restore), bridged statuses, raw-button-free.
+- `preview.html` gained empty, populated, blocked, and running deployment
+  fixtures with secret-hidden values;
+  `DeployTab` lives beside `FilesTab`/`ScriptsTab` in one app workspace.
+- `deploy-state.test.ts` + renderer fixtures exercise bulk
+  preservation, rejection, suggestion, caps, cursors, masking incl.
+  overlapping/empty/chunked truncation.
+
+### Validation (this checkout)
+
+- `zig build test` passes with loopback access. The deployment-focused pure suite is 36/36 and includes
+  preflight derivation, exact releases, port policy, static-root containment,
+  output masking, history, and cancellation.
+- Integration uses the existing Alpine SSH fixture rather than a new Ubuntu
+  image. It exercises the public run/poll/cancel contract, quick output,
+  nonzero failure, and verified cancellation. Production Debian/Ubuntu policy
+  stays in pure tests; `examples/oars-react-smoke` is the manual real-host check that remains to run.
+- Frontend: `tsc --noEmit` clean, Vitest 10 files / 93 tests, `vite
+  build` green. Preview covers preflight with privileged and blocker
+  states, masked `DATABASE_URL=***` output, and the gap-then-truncate
+  history card.
+- `git diff --check` clean.
+
+### New pitfalls (extend §7 — do not repeat)
+
+45. **Bulk `.env` values are not trimmed.** Spec 07's bulk subset says
+    \"preserve all bytes after `=` including spaces, `#`, and quote
+    characters\" — trimming the value side is a spec violation. Keep the
+    slice `raw.slice(eq+1)` exact.
+46. **A frozen install must fail the step, not fall back.** `npm ci` with a
+    drifted lockfile, `pnpm --frozen-lockfile`, or
+    `yarn --immutable` failing and then silently running a mutable
+    install hides the drift; the contract is a hard step failure the
+    user can see.
+47. **No `StrictHostKeyChecking=no` / `ssh-keyscan`-as-proof / global
+    `known_hosts` mutation.** SSH repositories use a per-app
+    `known_hosts` with `GIT_SSH_COMMAND` scoped to that file + the
+    per-app deploy key and `IdentitiesOnly=yes`; GitHub fingerprints are
+    checked against GitHub's published list, other hosts require an
+    explicit user-confirmed fingerprint.

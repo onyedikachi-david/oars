@@ -21,6 +21,7 @@ const ai = @import("ai.zig");
 const vncmod = @import("vnc.zig");
 const broadcast = @import("broadcast.zig");
 const deploy = @import("deploy.zig");
+const preflight = @import("preflight.zig");
 const sshkeys = @import("sshkeys.zig");
 const keygen = @import("keygen.zig");
 const access = @import("access.zig");
@@ -31,7 +32,7 @@ const ssh = @import("ssh.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 103;
+const handler_count = 109;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -103,7 +104,13 @@ pub const Context = struct {
             .{ .name = "oars.scripts.broadcastCancel", .context = self, .invoke_fn = handleScriptsBroadcastCancel },
             .{ .name = "oars.deploy.apps.list", .context = self, .invoke_fn = handleDeployAppsList },
             .{ .name = "oars.deploy.apps.save", .context = self, .invoke_fn = handleDeployAppsSave },
+            .{ .name = "oars.deploy.apps.secretPresence", .context = self, .invoke_fn = handleDeployAppsSecretPresence },
             .{ .name = "oars.deploy.apps.delete", .context = self, .invoke_fn = handleDeployAppsDelete },
+            .{ .name = "oars.deploy.key.generate", .context = self, .invoke_fn = handleDeployKeyGenerate },
+            .{ .name = "oars.deploy.hostTrust", .context = self, .invoke_fn = handleDeployHostTrust },
+            .{ .name = "oars.deploy.preflight", .context = self, .invoke_fn = handleDeployPreflight },
+            .{ .name = "oars.deploy.preflightPoll", .context = self, .invoke_fn = handleDeployPreflightPoll },
+            .{ .name = "oars.deploy.preflightCancel", .context = self, .invoke_fn = handleDeployPreflightCancel },
             .{ .name = "oars.deploy.run", .context = self, .invoke_fn = handleDeployRun },
             .{ .name = "oars.deploy.poll", .context = self, .invoke_fn = handleDeployPoll },
             .{ .name = "oars.deploy.cancel", .context = self, .invoke_fn = handleDeployCancel },
@@ -208,7 +215,13 @@ pub const Context = struct {
             .{ .name = "oars.scripts.broadcastCancel", .origins = &allowed_origins },
             .{ .name = "oars.deploy.apps.list", .origins = &allowed_origins },
             .{ .name = "oars.deploy.apps.save", .origins = &allowed_origins },
+            .{ .name = "oars.deploy.apps.secretPresence", .origins = &allowed_origins },
             .{ .name = "oars.deploy.apps.delete", .origins = &allowed_origins },
+            .{ .name = "oars.deploy.key.generate", .origins = &allowed_origins },
+            .{ .name = "oars.deploy.hostTrust", .origins = &allowed_origins },
+            .{ .name = "oars.deploy.preflight", .origins = &allowed_origins },
+            .{ .name = "oars.deploy.preflightPoll", .origins = &allowed_origins },
+            .{ .name = "oars.deploy.preflightCancel", .origins = &allowed_origins },
             .{ .name = "oars.deploy.run", .origins = &allowed_origins },
             .{ .name = "oars.deploy.poll", .origins = &allowed_origins },
             .{ .name = "oars.deploy.cancel", .origins = &allowed_origins },
@@ -3207,22 +3220,309 @@ fn handleScriptsBroadcastCancel(context: *anyopaque, invocation: native_sdk.brid
     return ok_json;
 }
 
-// --- tests -----------------------------------------------------------------
 // --- one-click deployment (spec 07) ------------------------------------------
 
-const deploy_poll_data_budget: usize = 256 * 1024;
-const deploy_file_wait_ns = 20 * std.time.ns_per_s;
-const deploy_mkdir_cap: usize = 4 * 1024;
+// --- preflight (spec 07: read-only, bounded, expiring, capped) --------------
 
+const DeployPreflightPayload = struct { server_id: []const u8, app_id: []const u8 };
+const DeployPreflightPollPayload = struct { preflight_id: u32 };
+const DeployPreflightCancelPayload = struct { preflight_id: u32 };
+
+/// Builds the DeployPreflight bridge shape for a given preflight record.
+/// Redacted commands / configs are already on the record; this serializes them verbatim.
+fn deployPreflightJson(_: *Context, writer: *std.Io.Writer, pf: *preflight.Preflight) !void {
+    writer.writeAll("{\"ok\":true,\"preflight\":{") catch return;
+    writer.print("\"id\":{d}", .{pf.id}) catch return;
+    writer.writeAll(",\"app_id\":") catch return;
+    json.writeJsonString(writer, pf.app_id) catch return;
+    writer.writeAll(",\"server_id\":") catch return;
+    json.writeJsonString(writer, pf.server_id) catch return;
+    writer.print(",\"created_at_ms\":{d}", .{pf.created_at_ms}) catch return;
+    writer.print(",\"expires_at_ms\":{d}", .{pf.expires_at_ms}) catch return;
+    writer.print(",\"app_revision\":{d}", .{pf.app_revision}) catch return;
+    writer.print(",\"target_fingerprint\":\"{x}\"", .{pf.target_fingerprint}) catch return;
+    writer.writeAll(",\"status\":") catch return;
+    json.writeJsonString(writer, pf.status.jsonName()) catch return;
+    if (pf.error_text.len > 0) {
+        writer.writeAll(",\"error\":") catch return;
+        json.writeJsonString(writer, pf.error_text) catch return;
+    }
+    writer.writeAll(",\"facts\":{") catch return;
+    writer.writeAll("\"os\":") catch return;
+    json.writeJsonString(writer, pf.facts.os_pretty) catch return;
+    writer.writeAll(",\"arch\":") catch return;
+    json.writeJsonString(writer, pf.facts.arch) catch return;
+    writer.writeAll(",\"libc\":") catch return;
+    json.writeJsonString(writer, pf.facts.libc) catch return;
+    writer.writeAll(",\"user\":") catch return;
+    json.writeJsonString(writer, pf.facts.user) catch return;
+    writer.writeAll(",\"home\":") catch return;
+    json.writeJsonString(writer, pf.facts.home) catch return;
+    writer.writeAll(",\"privilege\":") catch return;
+    json.writeJsonString(writer, pf.facts.privilege.jsonName()) catch return;
+    writer.writeAll(",\"repository_commit\":") catch return;
+    json.writeJsonString(writer, pf.facts.repo.remote_commit) catch return;
+    writer.writeAll(",\"lockfiles\":") catch return;
+    json.writeJsonString(writer, pf.facts.repo.lockfiles) catch return;
+    writer.writeAll(",\"git_host_fingerprints\":") catch return;
+    json.writeJsonString(writer, pf.facts.repo.scanned_host_fingerprints) catch return;
+    writer.writeAll(",\"ports\":") catch return;
+    var ports_buf: [96]u8 = undefined;
+    const app_port = if (pf.app.runtime.type == .node or pf.app.runtime.type == .next)
+        std.fmt.bufPrint(&ports_buf, "{d}={s}; 80={s}; 443={s}", .{ pf.app.app_port, if (pf.facts.ports.app_port_in_use) "in-use" else if (pf.facts.ports.port_probe_ran) "free" else "unknown", pf.facts.ports.http_listener, pf.facts.ports.https_listener }) catch "unknown"
+    else
+        std.fmt.bufPrint(&ports_buf, "80={s}; 443={s}", .{ pf.facts.ports.http_listener, pf.facts.ports.https_listener }) catch "unknown";
+    json.writeJsonString(writer, app_port) catch return;
+    writer.writeAll("}") catch return;
+    writer.writeAll(",\"blockers\":[") catch return;
+    for (pf.blockers.items, 0..) |b, i| {
+        if (i > 0) writer.writeAll(",") catch return;
+        writer.writeAll("{\"id\":") catch return;
+        json.writeJsonString(writer, b.id) catch return;
+        writer.writeAll(",\"message\":") catch return;
+        json.writeJsonString(writer, b.message) catch return;
+        writer.writeAll("}") catch return;
+    }
+    writer.writeAll("],\"warnings\":[") catch return;
+    for (pf.warnings.items, 0..) |w, i| {
+        if (i > 0) writer.writeAll(",") catch return;
+        writer.writeAll("{\"id\":") catch return;
+        json.writeJsonString(writer, w.id) catch return;
+        writer.writeAll(",\"message\":") catch return;
+        json.writeJsonString(writer, w.message) catch return;
+        writer.writeAll("}") catch return;
+    }
+    writer.writeAll("],\"approvals\":[") catch return;
+    for (pf.approvals.items, 0..) |a, i| {
+        if (i > 0) writer.writeAll(",") catch return;
+        writer.writeAll("{\"id\":") catch return;
+        json.writeJsonString(writer, a.id) catch return;
+        writer.writeAll(",\"label\":") catch return;
+        json.writeJsonString(writer, a.label) catch return;
+        writer.writeAll(",\"detail\":") catch return;
+        json.writeJsonString(writer, a.detail) catch return;
+        writer.writeAll("}") catch return;
+    }
+    writer.writeAll("]") catch return;
+    writer.writeAll(",\"configs\":{") catch return;
+    writer.writeAll("\"env\":") catch return;
+    json.writeJsonString(writer, pf.env_preview) catch return;
+    writer.writeAll(",\"pm2\":") catch return;
+    json.writeJsonString(writer, pf.pm2_preview) catch return;
+    writer.writeAll(",\"nginx\":") catch return;
+    json.writeJsonString(writer, pf.nginx_preview) catch return;
+    writer.writeAll("}") catch return;
+    writer.writeAll(",\"steps\":[") catch return;
+    for (pf.steps.items, 0..) |*s, i| {
+        if (i > 0) writer.writeAll(",") catch return;
+        writer.writeAll("{") catch return;
+        writer.writeAll("\"id\":") catch return;
+        json.writeJsonString(writer, s.id) catch return;
+        writer.writeAll(",\"label\":") catch return;
+        json.writeJsonString(writer, s.label) catch return;
+        writer.writeAll(",\"mutation\":") catch return;
+        json.writeJsonString(writer, s.class.jsonName()) catch return;
+        writer.writeAll(",\"command\":") catch return;
+        json.writeJsonString(writer, s.command) catch return;
+        writer.print(",\"skipped\":{s}", .{if (s.skipped) "true" else "false"}) catch return;
+        writer.writeAll(",\"files\":[") catch return;
+        for (s.file_writes, 0..) |f, j| {
+            if (j > 0) writer.writeAll(",") catch return;
+            writer.writeAll("{\"path\":") catch return;
+            json.writeJsonString(writer, f.path) catch return;
+            writer.print(",\"mode\":{d}", .{f.mode}) catch return;
+            writer.writeAll("}") catch return;
+        }
+        writer.writeAll("],\"guards\":[") catch return;
+        for (s.guards, 0..) |g, j| {
+            if (j > 0) writer.writeAll(",") catch return;
+            json.writeJsonString(writer, g) catch return;
+        }
+        writer.writeAll("]") catch return;
+        writer.writeAll(",\"rollback\":") catch return;
+        json.writeJsonString(writer, s.rollback) catch return;
+        writer.writeAll("}") catch return;
+    }
+    writer.writeAll("]") catch return;
+    if (pf.facts.repo.remote_commit.len > 0) {
+        writer.writeAll(",\"commit\":") catch return;
+        json.writeJsonString(writer, pf.facts.repo.remote_commit) catch return;
+    }
+    writer.writeAll("}}") catch return;
+}
+
+fn handleDeployPreflight(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(DeployPreflightPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const now_ms = deployNowMs(self.io);
+    self.manager.preflights.lock();
+    self.manager.preflights.expire(now_ms);
+    const at_capacity = self.manager.preflights.list.items.len >= deploy.max_uncommitted_preflights;
+    self.manager.preflights.unlock();
+    if (at_capacity) return respondError(output, "preflight limit reached");
+    var owned_opt = self.apps.find(self.io, parsed.value.app_id) catch {
+        return respondError(output, "app registry is unreadable");
+    };
+    defer if (owned_opt) |*a| deploy.deinit(self.allocator, a);
+    const app = owned_opt orelse return respondError(output, "app not found");
+    if (!std.mem.eql(u8, app.server_id, parsed.value.server_id)) return respondError(output, "app not found on this server");
+    const session = self.manager.get(parsed.value.server_id) orelse return respondError(output, "not connected");
+    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
+    const probes = preflight.buildProbes(self.allocator, &app) catch return respondError(output, "failed to build preflight probes");
+    defer for (probes) |probe| self.allocator.free(probe);
+    var record = preflight.Preflight{
+        .id = 0,
+        .server_id = self.allocator.dupe(u8, app.server_id) catch return respondError(output, "out of memory"),
+        .app_id = self.allocator.dupe(u8, app.id) catch return respondError(output, "out of memory"),
+        .app = deploy.clone(self.allocator, app) catch return respondError(output, "out of memory"),
+        .app_revision = app.revision,
+        .created_at_ms = now_ms,
+        .expires_at_ms = now_ms + preflight.preflight_ttl_ms,
+    };
+    var record_owned = true;
+    defer if (record_owned) record.deinit(self.allocator);
+    for (0..preflight.probe_count) |i| {
+        const outcome = self.allocator.create(preflight.ProbeOutcome) catch return respondError(output, "out of memory");
+        outcome.* = preflight.ProbeOutcome.init(self.allocator);
+        record.probe_outcomes[i] = outcome;
+        self.manager.enqueuePreflightProbe(app.server_id, @tagName(@as(preflight.ProbeId, @enumFromInt(i))), probes[i], preflight.probe_timeout_ns, outcome) catch {
+            return respondError(output, "could not start the preflight probes");
+        };
+    }
+    self.manager.preflights.lock();
+    const id = self.manager.preflights.add(record) catch {
+        self.manager.preflights.unlock();
+        return respondError(output, "preflight limit reached");
+    };
+    record_owned = false;
+    const pf = self.manager.preflights.get(id).?;
+    var writer = std.Io.Writer.fixed(output);
+    deployPreflightJson(self, &writer, pf) catch {
+        self.manager.preflights.unlock();
+        return output[0..0];
+    };
+    self.manager.preflights.unlock();
+    var detail_buf: [64]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "preflight={d}", .{id}) catch "preflight";
+    self.audit.append(self.io, "deploy.preflight", parsed.value.server_id, detail) catch {};
+    return writer.buffered();
+}
+
+fn collectDeployPreflight(self: *Context, pf: *preflight.Preflight) void {
+    if (pf.status != .gathering) return;
+    var all_done = true;
+    for (0..preflight.probe_count) |i| {
+        const outcome = pf.probe_outcomes[i] orelse continue;
+        if (!outcome.isDone()) {
+            all_done = false;
+            continue;
+        }
+        if (!outcome.ok) {
+            pf.status = .failed;
+            if (pf.error_text.len == 0) {
+                pf.error_text = self.allocator.dupe(u8, outcome.message()) catch &.{};
+            }
+        } else {
+            pf.outputs[i] = self.allocator.dupe(u8, outcome.data.items) catch &.{};
+        }
+        pf.probe_outcomes[i] = null;
+        outcome.deinit();
+        self.allocator.destroy(outcome);
+    }
+    if (!all_done or pf.status == .failed) return;
+    preflight.parseSystem(self.allocator, pf.outputs[0], &pf.facts) catch {
+        pf.status = .failed;
+        pf.error_text = self.allocator.dupe(u8, "invalid system probe response") catch &.{};
+        return;
+    };
+    preflight.parseTools(self.allocator, pf.outputs[1], &pf.facts) catch {
+        pf.status = .failed;
+        pf.error_text = self.allocator.dupe(u8, "invalid tools probe response") catch &.{};
+        return;
+    };
+    preflight.parseRepo(self.allocator, pf.outputs[2], &pf.facts) catch {
+        pf.status = .failed;
+        pf.error_text = self.allocator.dupe(u8, "invalid repository probe response") catch &.{};
+        return;
+    };
+    preflight.parsePorts(self.allocator, pf.outputs[3], &pf.facts) catch {
+        pf.status = .failed;
+        pf.error_text = self.allocator.dupe(u8, "invalid port and DNS probe response") catch &.{};
+        return;
+    };
+    preflight.parseRuntime(self.allocator, pf.outputs[4], &pf.facts) catch {
+        pf.status = .failed;
+        pf.error_text = self.allocator.dupe(u8, "invalid Node release probe response") catch &.{};
+        return;
+    };
+    preflight.derive(self.allocator, pf) catch {
+        pf.status = .failed;
+        pf.error_text = self.allocator.dupe(u8, "failed to derive the deployment plan") catch &.{};
+    };
+}
+
+fn handleDeployPreflightPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(DeployPreflightPollPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    const now_ms = deployNowMs(self.io);
+    self.manager.preflights.lock();
+    const pf = self.manager.preflights.get(parsed.value.preflight_id) orelse {
+        self.manager.preflights.unlock();
+        return respondError(output, "unknown preflight");
+    };
+    defer self.manager.preflights.unlock();
+    if (now_ms >= pf.expires_at_ms) {
+        _ = self.manager.preflights.remove(parsed.value.preflight_id);
+        return respondError(output, "stale_preflight");
+    }
+    collectDeployPreflight(self, pf);
+    var writer = std.Io.Writer.fixed(output);
+    deployPreflightJson(self, &writer, pf) catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleDeployPreflightCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(DeployPreflightCancelPayload, self.allocator, invocation.request.payload) catch {
+        return respondError(output, "invalid payload");
+    };
+    defer parsed.deinit();
+    self.manager.preflights.lock();
+    if (self.manager.preflights.get(parsed.value.preflight_id) == null) {
+        self.manager.preflights.unlock();
+        return respondError(output, "unknown preflight");
+    }
+    _ = self.manager.preflights.remove(parsed.value.preflight_id);
+    self.manager.preflights.unlock();
+    var detail_buf: [64]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "preflight={d}", .{parsed.value.preflight_id}) catch "preflight canceled";
+    self.audit.append(self.io, "deploy.preflightCancel", "", detail) catch {};
+    return ok_json;
+}
+
+// --- tests -----------------------------------------------------------------
+
+const deploy_poll_data_budget: usize = 256 * 1024;
 const DeployAppsListPayload = struct { server_id: []const u8 };
 const DeployAppsSavePayload = struct { app: deploy.AppInput };
+const DeployAppsSecretPresencePayload = struct { app_id: []const u8, names: []const []const u8, present: bool };
 const DeployAppsDeletePayload = struct {
     server_id: []const u8,
     app_id: []const u8,
 };
+const DeployKeyPayload = struct { server_id: []const u8, app_id: []const u8 };
+const DeployHostTrustPayload = struct { preflight_id: u32, accept: bool };
 const DeployRunPayload = struct {
-    server_id: []const u8,
-    app_id: []const u8,
+    server_id: ?[]const u8 = null,
+    app_id: ?[]const u8 = null,
+    preflight_id: ?u32 = null,
+    approvals: ?[][]const u8 = null,
     secret_values: ?[]const deploy.SecretValue = null,
 };
 const DeployPollPayload = struct {
@@ -3238,33 +3538,83 @@ const DeployHistoryPayload = struct {
 
 fn deployTerminal(status: deploy.RunStatus) bool {
     return switch (status) {
-        .queued, .running => false,
+        .queued, .running, .cancel_requested => false,
         else => true,
     };
+}
+
+test "deploy cancellation remains pollable until termination is verified" {
+    try std.testing.expect(!deployTerminal(.cancel_requested));
+    try std.testing.expect(deployTerminal(.canceled));
+    try std.testing.expect(deployTerminal(.failed));
+    try std.testing.expect(deployTerminal(.done));
+}
+
+test "deployment SSH setup is queued as one scoped command" {
+    const allocator = std.testing.allocator;
+    const generated = try deployKeyGenerateCommand(allocator, "app one", "'github.com'", true);
+    defer allocator.free(generated);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "ssh-keyscan -T 5 'github.com'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, preflight.github_known_hosts[0]) != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "grep -Fqx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "mv -f \"$VERIFIED\" \"$KH\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "@public") != null);
+
+    const trusted = try deployWriteKnownHostsCommand(allocator, "app one", "host ssh-ed25519 AAAA");
+    defer allocator.free(trusted);
+    try std.testing.expect(std.mem.indexOf(u8, trusted, "APP_ID='app one'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, trusted, "chmod 600 \"$TMP\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, trusted, "mv -f \"$TMP\" \"$KH\"") != null);
+}
+
+/// Wire timestamps are integer milliseconds (NEXT-SPEC bridge contract);
+/// epoch nanoseconds do not survive the JS number round trip.
+fn deployNowMs(io: std.Io) i64 {
+    return @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
+}
+
+/// The initiating action for history: "update" once the app has a
+/// completed run on record, "deploy" before the first success.
+fn deployAction(self: *Context, server_id: []const u8, app_id: []const u8) []const u8 {
+    var loaded = self.deploy_history.loadParsed(self.io) catch return "deploy";
+    defer loaded.deinit(self.allocator);
+    for (loaded.parsed.value) |rec| {
+        if (std.mem.eql(u8, rec.server_id, server_id) and std.mem.eql(u8, rec.app_id, app_id) and rec.status == .done) return "update";
+    }
+    return "deploy";
 }
 
 fn deploySaveError(err: anyerror) []const u8 {
     return switch (err) {
         error.MissingId => "missing app id",
         error.MissingServer => "missing server",
+        error.ServerMismatch => "an application cannot move to another server",
         error.MissingName => "app name is required",
         error.InvalidName => "invalid app name",
         error.MissingFolder => "deploy folder is required",
         error.InvalidFolder => "invalid deploy folder",
         error.InvalidRepo => "invalid repository URL",
         error.InvalidTransport => "invalid repository transport",
+        error.UnsupportedTransport => "unsupported transport (public HTTPS or SSH only)",
         error.InvalidBranch => "invalid branch",
-        error.InvalidNodeVersion => "unsupported Node.js version (supported: 22, 24)",
+        error.InvalidNodeVersion => "invalid Node.js version line",
         error.InvalidAppType => "invalid app type",
+        error.InvalidPackageManager => "invalid package manager",
         error.InvalidCommand => "invalid install/build/start command",
+        error.MissingEntry => "a process entry or start command is required for this app type",
+        error.InvalidEntry => "invalid process entry path",
+        error.MissingBuildFolder => "a build folder is required for this app type",
+        error.InvalidBuildFolder => "invalid build folder",
         error.InvalidEnvVar => "invalid environment variable",
         error.DuplicateEnvVar => "duplicate environment variable",
         error.TooManyEnvVars => "too many environment variables",
         error.InvalidDomain => "invalid domain",
         error.TooManyDomains => "too many domains",
+        error.DuplicateDomain => "duplicate domain",
         error.EmailRequired => "an email is required when SSL is enabled",
         error.InvalidEmail => "invalid certificate email",
         error.InvalidPort => "invalid app port",
+        error.TooManyApps => "application limit reached (500 total, 100 per server)",
         error.SerializeFailed => "failed to save apps",
         error.StoreCorrupt => "app registry is unreadable",
         error.OutOfMemory => "out of memory",
@@ -3304,16 +3654,29 @@ fn handleDeployAppsSave(context: *anyopaque, invocation: native_sdk.bridge.Invoc
     };
     defer parsed.deinit();
     var input = parsed.value.app;
-    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+    const now_ns = std.Io.Timestamp.now(self.io, .real).nanoseconds;
     var owned_id: ?[]const u8 = null;
     defer if (owned_id) |o| self.allocator.free(o);
     if (input.id == null) {
-        owned_id = servers.makeId(self.allocator, now) catch return respondError(output, "out of memory");
+        owned_id = servers.makeId(self.allocator, now_ns) catch return respondError(output, "out of memory");
         input.id = owned_id;
     }
-    var saved = self.apps.saveApp(self.io, input, now) catch |err| {
+    var saved = self.apps.saveApp(self.io, input, deployNowMs(self.io)) catch |err| {
         return respondError(output, deploySaveError(err));
     };
+    defer deploy.deinit(self.allocator, &saved);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"app\":") catch return output[0..0];
+    std.json.Stringify.value(saved, .{}, &writer) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleDeployAppsSecretPresence(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(DeployAppsSecretPresencePayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    var saved = self.apps.setSecretPresence(self.io, parsed.value.app_id, parsed.value.names, parsed.value.present, deployNowMs(self.io)) catch |err| return respondError(output, deploySaveError(err));
     defer deploy.deinit(self.allocator, &saved);
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":true,\"app\":") catch return output[0..0];
@@ -3341,6 +3704,114 @@ fn handleDeployAppsDelete(context: *anyopaque, invocation: native_sdk.bridge.Inv
     return ok_json;
 }
 
+fn deployWriteKnownHostsCommand(allocator: std.mem.Allocator, app_id: []const u8, keys: []const u8) ![]u8 {
+    const q_id = try shellquote.quote(allocator, app_id);
+    defer allocator.free(q_id);
+    const q_keys = try shellquote.quote(allocator, keys);
+    defer allocator.free(q_keys);
+    return std.fmt.allocPrint(allocator, "APP_ID={s}; KEYS={s}; DIR=\"$HOME/.config/oars/deploy/$APP_ID\"; KH=\"$DIR/known_hosts\"; umask 077; mkdir -p \"$DIR\" && chmod 700 \"$DIR\" || exit 1; TMP=\"$KH.oars.$$\"; trap 'rm -f \"$TMP\"' EXIT HUP INT TERM; printf '%s\\n' \"$KEYS\" > \"$TMP\" && chmod 600 \"$TMP\" && mv -f \"$TMP\" \"$KH\"", .{ q_id, q_keys });
+}
+
+fn deployKeyGenerateCommand(allocator: std.mem.Allocator, app_id: []const u8, scan_target: []const u8, verify_github: bool) ![]u8 {
+    const q_id = try shellquote.quote(allocator, app_id);
+    defer allocator.free(q_id);
+    var command: std.ArrayList(u8) = .empty;
+    errdefer command.deinit(allocator);
+    try command.appendSlice(allocator, "APP_ID=");
+    try command.appendSlice(allocator, q_id);
+    try command.appendSlice(allocator, "; DIR=\"$HOME/.config/oars/deploy/$APP_ID\"; KEY=\"$DIR/id_ed25519\"; KH=\"$DIR/known_hosts\"; umask 077; mkdir -p \"$DIR\" && chmod 700 \"$DIR\" || exit 1; [ -f \"$KEY\" ] || ssh-keygen -q -t ed25519 -N '' -f \"$KEY\" -C \"oars-deploy-$APP_ID\" || exit 1; chmod 600 \"$KEY\"; ");
+    if (verify_github) {
+        try command.appendSlice(allocator, "SCAN=\"$DIR/.scan.$$\"; VERIFIED=\"$DIR/.verified.$$\"; trap 'rm -f \"$SCAN\" \"$VERIFIED\"' EXIT HUP INT TERM; ssh-keyscan -T 5 ");
+        try command.appendSlice(allocator, scan_target);
+        try command.appendSlice(allocator, " 2>/dev/null | head -8 > \"$SCAN\"; : > \"$VERIFIED\"; ");
+        for (preflight.github_known_hosts) |published| {
+            const q_published = try shellquote.quote(allocator, published);
+            defer allocator.free(q_published);
+            try command.appendSlice(allocator, "PUBLISHED=");
+            try command.appendSlice(allocator, q_published);
+            try command.appendSlice(allocator, "; grep -Fqx \"$PUBLISHED\" \"$SCAN\" && printf '%s\\n' \"$PUBLISHED\" >> \"$VERIFIED\"; ");
+        }
+        try command.appendSlice(allocator, "[ -s \"$VERIFIED\" ] || { echo \"github.com's scanned host key does not match GitHub's published entries\"; exit 1; }; chmod 600 \"$VERIFIED\" && mv -f \"$VERIFIED\" \"$KH\" || exit 1; ");
+    }
+    try command.appendSlice(allocator, "echo '@public'; cat \"$KEY.pub\"");
+    return command.toOwnedSlice(allocator);
+}
+
+/// Generates the exact per-app key consumed by deployment preflight. For
+/// github.com, the same explicit action also installs only a scanned key that
+/// matches GitHub's published known-host entries.
+fn handleDeployKeyGenerate(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(DeployKeyPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    var app_opt = self.apps.find(self.io, parsed.value.app_id) catch return respondError(output, "app registry is unreadable");
+    defer if (app_opt) |*app| deploy.deinit(self.allocator, app);
+    const app = app_opt orelse return respondError(output, "app not found");
+    if (!std.mem.eql(u8, app.server_id, parsed.value.server_id)) return respondError(output, "app not found on this server");
+    if (app.repo.transport != .ssh) return respondError(output, "this application does not use SSH repository access");
+
+    const host = preflight.repoHost(self.allocator, app.repo.url) catch return respondError(output, "invalid repository host");
+    defer self.allocator.free(host);
+    const scan_target = preflight.sshKeyscanTarget(self.allocator, app.repo.url) catch return respondError(output, "invalid repository host");
+    defer self.allocator.free(scan_target);
+    const command = deployKeyGenerateCommand(self.allocator, app.id, scan_target, std.mem.eql(u8, host, "github.com")) catch return respondError(output, "out of memory");
+    defer self.allocator.free(command);
+    self.audit.append(self.io, "deploy.key.generate", app.server_id, app.id) catch return respondError(output, "audit failed");
+    const channel = self.manager.execTracked(app.server_id, command, "deploy", "generate per-app deployment SSH key", &.{}) catch return respondError(output, "not connected");
+    var writer = std.Io.Writer.fixed(output);
+    writer.print("{{\"ok\":true,\"channel\":{d}}}", .{channel}) catch return output[0..0];
+    return writer.buffered();
+}
+
+/// Commits a non-GitHub host key only after the UI shows its SHA-256
+/// fingerprint and the user approves that exact preflight snapshot.
+fn handleDeployHostTrust(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(DeployHostTrustPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    if (!parsed.value.accept) return respondError(output, "host-key approval is required");
+    self.manager.preflights.lock();
+    const pf = self.manager.preflights.get(parsed.value.preflight_id) orelse {
+        self.manager.preflights.unlock();
+        return respondError(output, "unknown preflight");
+    };
+    var can_trust = false;
+    for (pf.approvals.items) |approval| {
+        if (std.mem.eql(u8, approval.id, "git-host-key")) can_trust = true;
+    }
+    if (!can_trust or pf.facts.repo.scanned_host_keys.len == 0 or pf.facts.repo.scanned_host_fingerprints.len == 0) {
+        self.manager.preflights.unlock();
+        return respondError(output, "this preflight has no independently verified host-key approval");
+    }
+    const server_id = self.allocator.dupe(u8, pf.server_id) catch {
+        self.manager.preflights.unlock();
+        return respondError(output, "out of memory");
+    };
+    defer self.allocator.free(server_id);
+    const app_id = self.allocator.dupe(u8, pf.app_id) catch {
+        self.manager.preflights.unlock();
+        return respondError(output, "out of memory");
+    };
+    defer self.allocator.free(app_id);
+    const keys = self.allocator.dupe(u8, pf.facts.repo.scanned_host_keys) catch {
+        self.manager.preflights.unlock();
+        return respondError(output, "out of memory");
+    };
+    defer self.allocator.free(keys);
+    self.manager.preflights.unlock();
+
+    const command = deployWriteKnownHostsCommand(self.allocator, app_id, keys) catch return respondError(output, "out of memory");
+    defer self.allocator.free(command);
+    self.audit.append(self.io, "deploy.hostTrust", server_id, app_id) catch return respondError(output, "audit failed");
+    const channel = self.manager.execTracked(server_id, command, "deploy", "store approved deployment Git host keys", &.{}) catch return respondError(output, "not connected");
+    self.manager.preflights.lock();
+    _ = self.manager.preflights.remove(parsed.value.preflight_id);
+    self.manager.preflights.unlock();
+    var writer = std.Io.Writer.fixed(output);
+    writer.print("{{\"ok\":true,\"channel\":{d}}}", .{channel}) catch return output[0..0];
+    return writer.buffered();
+}
+
 /// One audit entry per run with the planned command list (spec 07 §8:
 /// the Create/Update click is the approval). Commands never contain
 /// secret values — env values go to files, not commands. Returns the
@@ -3363,6 +3834,165 @@ fn deployAudit(self: *Context, output: []u8, action: []const u8, server_id: []co
 /// §6: steps execute sequentially, driven by the frontend's polls — no
 /// extra threads). Secret values are validated against the declared
 /// secret fields and kept only in the run's protected memory.
+fn handleDeployRunFromPreflight(self: *Context, invocation_id: []const u8, output: []u8, pf_id: u32, approvals: ?[][]const u8, secret_values: ?[]const deploy.SecretValue) []const u8 {
+    const now_ms = deployNowMs(self.io);
+    self.manager.preflights.lock();
+    const pf = self.manager.preflights.get(pf_id) orelse {
+        self.manager.preflights.unlock();
+        return respondError(output, "unknown preflight");
+    };
+    if (now_ms >= pf.expires_at_ms) {
+        _ = self.manager.preflights.remove(pf_id);
+        self.manager.preflights.unlock();
+        return respondError(output, "stale_preflight");
+    }
+    collectDeployPreflight(self, pf);
+    if (pf.status == .gathering) {
+        self.manager.preflights.unlock();
+        return respondError(output, "preflight still running");
+    }
+    if (pf.status == .failed) {
+        self.manager.preflights.unlock();
+        return respondError(output, if (pf.error_text.len > 0) pf.error_text else "preflight failed");
+    }
+    if (pf.status == .blocked or pf.blockers.items.len > 0) {
+        self.manager.preflights.unlock();
+        return respondError(output, "preflight has blockers");
+    }
+    // Guard: frozen app revision still current.
+    const app_opt_const = self.apps.find(self.io, pf.app_id) catch {
+        self.manager.preflights.unlock();
+        return respondError(output, "app registry is unreadable");
+    };
+    if (app_opt_const == null) {
+        self.manager.preflights.unlock();
+        return respondError(output, "app not found");
+    }
+    var app = app_opt_const.?;
+    defer deploy.deinit(self.allocator, &app);
+    if (app.revision != pf.app_revision) {
+        self.manager.preflights.unlock();
+        return respondError(output, "stale_preflight");
+    }
+    // Require approvals if the preflight demanded them (privileged/nginx etc.).
+    if (pf.approvals.items.len > 0) {
+        const got = approvals orelse {
+            self.manager.preflights.unlock();
+            return respondError(output, "missing required approval");
+        };
+        for (pf.approvals.items) |need| {
+            var ok = false;
+            for (got) |g| if (std.mem.eql(u8, g, need.id)) {
+                ok = true;
+                break;
+            };
+            if (!ok) {
+                self.manager.preflights.unlock();
+                return respondError(output, "missing required approval");
+            }
+        }
+    }
+    var values: std.ArrayList(deploy.SecretValue) = .empty;
+    defer values.deinit(self.allocator);
+    if (secret_values) |svs| {
+        var seen: std.StringHashMap(void) = .init(self.allocator);
+        defer seen.deinit();
+        for (svs) |sv| {
+            if (seen.contains(sv.name)) {
+                self.manager.preflights.unlock();
+                return respondError(output, "duplicate secret variable");
+            }
+            seen.put(sv.name, {}) catch {
+                self.manager.preflights.unlock();
+                return respondError(output, "out of memory");
+            };
+            var declared = false;
+            for (app.env_vars) |v| if (v.secret and std.mem.eql(u8, v.name, sv.name)) {
+                declared = true;
+                break;
+            };
+            if (!declared) {
+                self.manager.preflights.unlock();
+                return respondError(output, "unknown secret variable");
+            }
+            values.append(self.allocator, sv) catch {
+                self.manager.preflights.unlock();
+                return respondError(output, "out of memory");
+            };
+        }
+        for (app.env_vars) |v| if (v.secret and !seen.contains(v.name)) {
+            self.manager.preflights.unlock();
+            return respondError(output, "missing required secret");
+        };
+    } else {
+        for (app.env_vars) |v| if (v.secret) {
+            self.manager.preflights.unlock();
+            return respondError(output, "missing required secret");
+        };
+    }
+    const server_id_dup = self.allocator.dupe(u8, pf.server_id) catch {
+        self.manager.preflights.unlock();
+        return respondError(output, "out of memory");
+    };
+    const node_release = self.allocator.dupe(u8, pf.facts.node_version) catch {
+        self.manager.preflights.unlock();
+        self.allocator.free(server_id_dup);
+        return respondError(output, "out of memory");
+    };
+    defer self.allocator.free(node_release);
+    const commit = self.allocator.dupe(u8, pf.facts.repo.remote_commit) catch {
+        self.manager.preflights.unlock();
+        self.allocator.free(server_id_dup);
+        return respondError(output, "out of memory");
+    };
+    defer self.allocator.free(commit);
+    const node_interpreter = std.fmt.allocPrint(self.allocator, "{s}/.local/share/oars/node/{s}/bin/node", .{ pf.facts.home, pf.facts.node_version }) catch {
+        self.manager.preflights.unlock();
+        self.allocator.free(server_id_dup);
+        return respondError(output, "out of memory");
+    };
+    defer self.allocator.free(node_interpreter);
+    // Take the frozen plan (removes the preflight — single commit).
+    const frozen_plan = self.manager.preflights.takePlan(pf_id);
+    self.manager.preflights.unlock();
+    if (frozen_plan.len == 0) return respondError(output, "preflight has no plan");
+    defer {
+        for (frozen_plan) |*ps| {
+            self.allocator.free(ps.label);
+            ps.deinit(self.allocator);
+        }
+        self.allocator.free(frozen_plan);
+    }
+    defer self.allocator.free(server_id_dup);
+
+    const session = self.manager.get(server_id_dup) orelse return respondError(output, "not connected");
+    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
+
+    // Admission before audit + remote work (capacity is an Oars decision).
+    self.manager.deploys.lock();
+    defer self.manager.deploys.unlock();
+    var gate_same_folder: usize = 0;
+    var gate_total: usize = 0;
+    for (self.manager.deploys.list.items) |*r| {
+        const s = r.status;
+        if (s == .queued or s == .running or s == .cancel_requested) {
+            gate_total += 1;
+            if (std.mem.eql(u8, r.server_id, server_id_dup) and std.mem.eql(u8, r.app.folder, app.folder)) gate_same_folder += 1;
+        }
+    }
+    if (gate_same_folder >= 1) return respondError(output, "another deployment already owns this server folder");
+    if (gate_total >= deploy.max_active_runs_total) return respondError(output, "too many active deploys (8)");
+
+    if (deployAudit(self, output, "deploy.run", app.server_id, &app, frozen_plan)) |resp| return resp;
+    const run_id = self.manager.deploys.start(app.server_id, &app, frozen_plan, values.items, deployAction(self, app.server_id, app.id), commit, node_release, node_interpreter, self.io, now_ms) catch {
+        return respondError(output, "out of memory");
+    };
+    self.audit.append(self.io, "deploy.run", app.server_id, invocation_id) catch {};
+    var writer = std.Io.Writer.fixed(output);
+    writer.print("{{\"ok\":true,\"run_id\":{d}}}", .{run_id}) catch return output[0..0];
+    return writer.buffered();
+}
+
 fn handleDeployRun(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
     var parsed = parsePayload(DeployRunPayload, self.allocator, invocation.request.payload) catch {
@@ -3371,44 +4001,11 @@ fn handleDeployRun(context: *anyopaque, invocation: native_sdk.bridge.Invocation
     defer parsed.deinit();
     const payload = parsed.value;
 
-    var owned_opt = self.apps.find(self.io, payload.app_id) catch {
-        return respondError(output, "app registry is unreadable");
-    };
-    defer if (owned_opt) |*a| deploy.deinit(self.allocator, a);
-    const app = owned_opt orelse return respondError(output, "app not found");
-    if (!std.mem.eql(u8, app.server_id, payload.server_id)) return respondError(output, "app not found on this server");
-
-    var values: std.ArrayList(deploy.SecretValue) = .empty;
-    defer values.deinit(self.allocator);
-    if (payload.secret_values) |svs| {
-        for (svs) |sv| {
-            var declared = false;
-            for (app.env_vars) |v| {
-                if (v.secret and std.mem.eql(u8, v.name, sv.name)) {
-                    declared = true;
-                    break;
-                }
-            }
-            if (!declared) return respondError(output, "unknown secret variable");
-            values.append(self.allocator, sv) catch return respondError(output, "out of memory");
-        }
+    // A deployment can start only from one completed, reviewed preflight.
+    if (payload.preflight_id) |pf_id| {
+        return handleDeployRunFromPreflight(self, invocation.request.id, output, pf_id, payload.approvals, payload.secret_values);
     }
-
-    const session = self.manager.get(payload.server_id) orelse return respondError(output, "not connected");
-    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
-
-    const plan = deploy.buildPlan(self.allocator, &app) catch return respondError(output, "failed to plan the deploy");
-    defer {
-        for (plan) |*s| s.deinit(self.allocator);
-        self.allocator.free(plan);
-    }
-    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
-    if (deployAudit(self, output, "deploy.run", payload.server_id, &app, plan)) |resp| return resp;
-
-    const run_id = self.manager.deploys.start(payload.server_id, &app, plan, values.items, @intCast(now)) catch return respondError(output, "out of memory");
-    var writer = std.Io.Writer.fixed(output);
-    writer.print("{{\"ok\":true,\"run_id\":{d}}}", .{run_id}) catch return output[0..0];
-    return writer.buffered();
+    return respondError(output, "a completed preflight is required");
 }
 
 /// The caller's absolute cursor for a step channel (spec 02 protocol;
@@ -3425,98 +4022,149 @@ fn deployCursor(cursors: std.json.Value, channel: u32) u64 {
     };
 }
 
-/// Synchronous SFTP write for deploy config files (`.env`, PM2
-/// ecosystem, nginx site). Returns a static error message or null
-/// (deploy.Step errors are static text by contract).
-fn deployWriteFile(self: *Context, server_id: []const u8, path: []const u8, data: []const u8) ?[]const u8 {
-    const outcome = self.allocator.create(sessions.SftpOutcome) catch return "out of memory";
-    outcome.* = .{ .allocator = self.allocator };
-    self.manager.sftpSave(server_id, path, data, null, outcome) catch |err| {
-        self.allocator.destroy(outcome);
-        return switch (err) {
-            error.NoSession => "not connected",
-            error.NotReady => "session not ready",
-            else => "failed to write the file",
-        };
+/// Queues the file write that a step needs. The bytes travel over stdin and
+/// are cleared by the worker; secret values never enter command text or block
+/// the bridge thread. Nginx is staged under the app folder for the reviewed
+/// privileged transaction in `buildPlan`.
+fn deployStartStepFile(self: *Context, run: *deploy.Run, step: *deploy.Step) ?[]const u8 {
+    var path: ?[]u8 = null;
+    var content: ?[]u8 = null;
+    var secret_bearing = false;
+    defer if (path) |p| self.allocator.free(p);
+    defer if (content) |bytes| {
+        if (secret_bearing) std.crypto.secureZero(u8, bytes);
+        self.allocator.free(bytes);
     };
-    const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + deploy_file_wait_ns;
-    outcome.wait(self.io, deadline);
-    var owned = true;
-    defer if (owned) self.allocator.destroy(outcome);
-    if (!outcome.isDone() and !outcome.abandon()) {
-        owned = false; // the op owns the outcome now; its set frees it
-        return "timed out writing the file";
+
+    switch (step.id) {
+        .install, .build => {
+            if (run.env_written) {
+                step.prepared = true;
+                return null;
+            }
+            path = deploy.envFilePath(self.allocator, run.app.folder) catch return "out of memory";
+            content = deploy.envFile(self.allocator, &run.app, run.secrets.items) catch return "out of memory";
+            secret_bearing = true;
+        },
+        .pm2 => {
+            if (run.app.runtime.type != .node and run.app.runtime.type != .next) {
+                step.prepared = true;
+                return null;
+            }
+            path = deploy.pm2EcosystemPath(self.allocator, run.app.folder) catch return "out of memory";
+            content = deploy.ecosystemFileForInterpreter(self.allocator, &run.app, run.secrets.items, run.node_interpreter) catch return "out of memory";
+            secret_bearing = true;
+        },
+        .nginx => {
+            path = std.fmt.allocPrint(self.allocator, "{s}/.oars-nginx.{s}", .{ run.app.folder, run.app.id }) catch return "out of memory";
+            content = deploy.nginxConfig(self.allocator, &run.app) catch return "out of memory";
+        },
+        else => {
+            step.prepared = true;
+            return null;
+        },
     }
-    defer if (outcome.json) |j| self.allocator.free(j);
-    if (!outcome.ok) return "failed to write the file";
+    const quoted = shellquote.quote(self.allocator, path.?) catch return "out of memory";
+    defer self.allocator.free(quoted);
+    const mode = if (step.id == .nginx) "0600" else "0600";
+    const command = std.fmt.allocPrint(self.allocator, "DEST={s}; DIR=$(dirname -- \"$DEST\"); umask 077; mkdir -p \"$DIR\" || exit 1; TMP=\"$DEST.oars.$$\"; trap 'rm -f \"$TMP\"' EXIT HUP INT TERM; cat > \"$TMP\" && chmod {s} \"$TMP\" && mv -f \"$TMP\" \"$DEST\"", .{ quoted, mode }) catch return "out of memory";
+    defer self.allocator.free(command);
+    step.prepare_channel = self.manager.execWithInput(run.server_id, command, content.?) catch return "failed to queue the configuration write";
     return null;
 }
 
-/// Writes the config file the next step depends on: `.env` before install
-/// (or build, when install is skipped), the PM2 ecosystem file before
-/// pm2, the nginx site config before nginx (spec 07 §6). Returns a
-/// static error message or null.
-fn deployWriteStepFiles(self: *Context, run: *deploy.Run, step: *const deploy.Step) ?[]const u8 {
-    switch (step.id) {
-        .install, .build => {
-            if (run.env_written) return null;
-            const path = deploy.envFilePath(self.allocator, run.app.folder) catch return "out of memory";
-            defer self.allocator.free(path);
-            const content = deploy.envFile(self.allocator, &run.app, run.secrets.items) catch return "out of memory";
-            defer self.allocator.free(content);
-            if (deployWriteFile(self, run.server_id, path, content)) |msg| return msg;
-            run.env_written = true;
-            return null;
-        },
-        .pm2 => {
-            const path = deploy.pm2EcosystemPath(self.allocator, run.app.folder) catch return "out of memory";
-            defer self.allocator.free(path);
-            const content = deploy.ecosystemFile(self.allocator, &run.app, run.secrets.items) catch return "out of memory";
-            defer self.allocator.free(content);
-            return deployWriteFile(self, run.server_id, path, content);
-        },
-        .nginx => {
-            // The site config needs its directory to exist first; `mkdir
-            // -p` is idempotent so the step's own mkdir is harmless.
-            const q_avail = shellquote.quote(self.allocator, deploy.nginxAvailableDir()) catch return "out of memory";
-            defer self.allocator.free(q_avail);
-            const q_enabled = shellquote.quote(self.allocator, deploy.nginxEnabledDir()) catch return "out of memory";
-            defer self.allocator.free(q_enabled);
-            const mk = std.fmt.allocPrint(self.allocator, "mkdir -p {s} {s}", .{ q_avail, q_enabled }) catch return "out of memory";
-            defer self.allocator.free(mk);
-            var check = self.manager.execWait(run.server_id, mk, deploy_mkdir_cap, deploy_file_wait_ns) catch return "session lost";
-            defer check.output.deinit(self.allocator);
-            if (check.exit != 0) return "failed to create the nginx config directory";
-            const path = deploy.nginxAvailablePath(self.allocator, run.app.id) catch return "out of memory";
-            defer self.allocator.free(path);
-            const content = deploy.nginxConfig(self.allocator, &run.app) catch return "out of memory";
-            defer self.allocator.free(content);
-            return deployWriteFile(self, run.server_id, path, content);
-        },
-        else => return null,
-    }
+fn deployCaptureChannel(run: *deploy.Run, step: *deploy.Step, allocator: std.mem.Allocator, poll: *const sessions.ChannelPoll) void {
+    const start = poll.cursor -| poll.data.len;
+    const eof = poll.eof and poll.pending <= poll.data.len;
+    run.captureOutput(allocator, step, poll.data, start, poll.cursor, eof);
+    step.capture_cursor = poll.cursor;
+    if (step.output_chunks.items.len == 0) step.output_floor = poll.cursor;
+    step.stream_eof = eof;
 }
 
 /// Poll-driven step engine: starts the next step on each call, advances
 /// on channel EOF, writes each step's config file first, and marks the
 /// run done/failed/canceled/interrupted exactly once (appending the
 /// history record).
-fn deployPollStep(self: *Context, run: *deploy.Run, now_ns: i128) void {
+fn deployPollStep(self: *Context, run: *deploy.Run, now_ms: i64) void {
     while (run.currentStep()) |step| {
+        if (run.status == .cancel_requested) {
+            if (step.prepare_channel) |prepare_ch| {
+                const writes = self.manager.pollChannels(run.server_id, &.{.{ .id = prepare_ch, .pos = 0 }}, false, 8 * 1024, 8 * 1024) catch return;
+                defer {
+                    for (writes) |*poll| poll.deinit(self.allocator);
+                    self.allocator.free(writes);
+                }
+                for (writes) |*write| {
+                    if (write.id != prepare_ch or !write.eof) continue;
+                    self.manager.closeChannel(run.server_id, prepare_ch) catch {};
+                    step.prepare_channel = null;
+                    run.canceled = true;
+                    step.state = .canceled;
+                    run.status = .canceled;
+                    run.finished_at_ms = now_ms;
+                    self.deploy_history.append(self.io, run, now_ms);
+                    return;
+                }
+                return;
+            }
+            if (step.cancel_channel) |cancel_ch| {
+                const checks = self.manager.pollChannels(run.server_id, &.{.{ .id = cancel_ch, .pos = 0 }}, false, 8 * 1024, 8 * 1024) catch return;
+                defer {
+                    for (checks) |*poll| poll.deinit(self.allocator);
+                    self.allocator.free(checks);
+                }
+                for (checks) |*check| {
+                    if (check.id != cancel_ch or !check.eof) continue;
+                    self.manager.closeChannel(run.server_id, cancel_ch) catch {};
+                    step.cancel_channel = null;
+                    if (check.exit_status == 0 and std.mem.indexOf(u8, check.data, "ok") != null) {
+                        run.canceled = true;
+                        step.termination_verified = true;
+                    } else {
+                        step.state = .cancel_requested;
+                        step.@"error" = "termination could not be verified; the process may still be running";
+                    }
+                    return;
+                }
+            }
+            // Keep the original channel observable. If it reaches EOF after
+            // the request, the process-group wrapper itself has exited.
+            if (step.channel) |ch| {
+                const polls = self.manager.pollChannels(run.server_id, &.{.{ .id = ch, .pos = step.capture_cursor }}, false, 64 * 1024, 64 * 1024) catch return;
+                defer {
+                    for (polls) |*poll| poll.deinit(self.allocator);
+                    self.allocator.free(polls);
+                }
+                for (polls) |*poll| {
+                    if (poll.id != ch) continue;
+                    deployCaptureChannel(run, step, self.allocator, poll);
+                    if (!step.stream_eof and !(step.termination_verified and poll.pending <= poll.data.len)) continue;
+                    self.manager.closeChannel(run.server_id, ch) catch {};
+                    run.canceled = true;
+                    step.state = .canceled;
+                    run.status = .canceled;
+                    run.finished_at_ms = now_ms;
+                    self.deploy_history.append(self.io, run, now_ms);
+                    return;
+                }
+            }
+            return;
+        }
         if (run.canceled) {
             step.state = .canceled;
             run.status = .canceled;
-            run.finished_at = @intCast(now_ns);
-            self.deploy_history.append(self.io, run);
+            run.finished_at_ms = now_ms;
+            self.deploy_history.append(self.io, run, now_ms);
             return;
         }
         if (step.channel) |ch| {
-            const polls = self.manager.pollChannels(run.server_id, &.{.{ .id = ch, .pos = 0 }}, false, 64 * 1024, 64 * 1024) catch {
+            const polls = self.manager.pollChannels(run.server_id, &.{.{ .id = ch, .pos = step.capture_cursor }}, false, 64 * 1024, 64 * 1024) catch {
                 step.@"error" = "session lost";
                 step.state = .failed;
                 run.status = .interrupted;
-                run.finished_at = @intCast(now_ns);
-                self.deploy_history.append(self.io, run);
+                run.finished_at_ms = now_ms;
+                self.deploy_history.append(self.io, run, now_ms);
                 return;
             };
             defer {
@@ -3527,43 +4175,82 @@ fn deployPollStep(self: *Context, run: *deploy.Run, now_ns: i128) void {
             var exit: ?i32 = null;
             for (polls) |*poll| {
                 if (poll.id != ch) continue;
-                eof = poll.eof;
+                deployCaptureChannel(run, step, self.allocator, poll);
+                eof = step.stream_eof;
                 exit = poll.exit_status;
-                run.captureOutput(self.allocator, poll.data);
             }
             if (!eof) return;
+            self.manager.closeChannel(run.server_id, ch) catch {};
             step.exit = exit;
             if (exit != 0) {
                 step.state = .failed;
                 step.@"error" = "command failed";
                 run.status = .failed;
-                run.finished_at = @intCast(now_ns);
-                self.deploy_history.append(self.io, run);
+                run.finished_at_ms = now_ms;
+                self.deploy_history.append(self.io, run, now_ms);
                 return;
             }
             step.state = .success;
             run.step_index += 1;
             continue;
         }
+        if (!step.prepared) {
+            if (step.prepare_channel) |prepare_ch| {
+                const writes = self.manager.pollChannels(run.server_id, &.{.{ .id = prepare_ch, .pos = 0 }}, false, 16 * 1024, 16 * 1024) catch return;
+                defer {
+                    for (writes) |*poll| poll.deinit(self.allocator);
+                    self.allocator.free(writes);
+                }
+                for (writes) |*write| {
+                    if (write.id != prepare_ch or !write.eof) continue;
+                    self.manager.closeChannel(run.server_id, prepare_ch) catch {};
+                    step.prepare_channel = null;
+                    if (write.exit_status != 0) {
+                        step.state = .failed;
+                        step.@"error" = "configuration write failed";
+                        run.status = .failed;
+                        run.finished_at_ms = now_ms;
+                        self.deploy_history.append(self.io, run, now_ms);
+                        return;
+                    }
+                    step.prepared = true;
+                    if (step.id == .install or step.id == .build) {
+                        run.env_written = true;
+                        if (run.app.runtime.type != .node and run.app.runtime.type != .next) run.zeroSecrets();
+                    } else if (step.id == .pm2) {
+                        run.zeroSecrets();
+                    }
+                    break;
+                }
+                if (!step.prepared) return;
+            } else {
+                if (deployStartStepFile(self, run, step)) |msg| {
+                    step.state = .failed;
+                    step.@"error" = msg;
+                    run.status = .failed;
+                    run.finished_at_ms = now_ms;
+                    self.deploy_history.append(self.io, run, now_ms);
+                    return;
+                }
+                if (!step.prepared) return;
+            }
+        }
         if (step.command.len == 0) {
-            step.state = .success; // skipped step (no command configured)
+            step.state = .skipped;
             run.step_index += 1;
             continue;
         }
-        if (deployWriteStepFiles(self, run, step)) |msg| {
-            step.state = .failed;
-            step.@"error" = msg;
-            run.status = .failed;
-            run.finished_at = @intCast(now_ns);
-            self.deploy_history.append(self.io, run);
-            return;
-        }
-        const channel = self.manager.execTracked(run.server_id, step.command, "deploy", null, &.{}) catch {
+        const wrapped = if (step.cancel_token != null and step.cancel_ctrl != null)
+            deploy.wrapWithProcessGroup(self.allocator, step.command, step.cancel_token.?, step.cancel_ctrl.?) catch step.command
+        else
+            step.command;
+        defer if (wrapped.ptr != step.command.ptr) self.allocator.free(wrapped);
+        const channel = self.manager.execTracked(run.server_id, wrapped, "deploy", null, &.{}) catch {
             step.@"error" = "session lost";
             step.state = .failed;
             run.status = .interrupted;
-            run.finished_at = @intCast(now_ns);
-            self.deploy_history.append(self.io, run);
+            run.finished_at_ms = now_ms;
+            self.deploy_history.append(self.io, run, now_ms);
             return;
         };
         if (run.status == .queued) run.status = .running;
@@ -3573,9 +4260,57 @@ fn deployPollStep(self: *Context, run: *deploy.Run, now_ns: i128) void {
     }
     if (run.status != .done) {
         run.status = .done;
-        run.finished_at = @intCast(now_ns);
-        self.deploy_history.append(self.io, run);
+        run.finished_at_ms = now_ms;
+        self.deploy_history.append(self.io, run, now_ms);
     }
+}
+
+const DeployStepDelta = struct {
+    data: []u8,
+    cursor: u64,
+    gap: u64,
+    eof: bool,
+
+    fn deinit(self: *DeployStepDelta, allocator: std.mem.Allocator) void {
+        allocator.free(self.data);
+    }
+};
+
+/// Reads masked retained chunks for one view. The cursor stays in the raw
+/// SSH byte space, while each stored chunk is already masked. If a caller
+/// supplies a cursor inside a masked chunk, that partial chunk is reported as
+/// a gap because raw byte offsets cannot be mapped into the shorter redacted
+/// text safely.
+fn deployStepDelta(allocator: std.mem.Allocator, step: *const deploy.Step, cursor: u64, budget: usize) !DeployStepDelta {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var next = cursor;
+    var gap: u64 = 0;
+    if (next < step.output_floor) {
+        gap += step.output_floor - next;
+        next = step.output_floor;
+    }
+    for (step.output_chunks.items) |chunk| {
+        if (chunk.end <= next) continue;
+        if (next > chunk.start) {
+            gap += chunk.end - next;
+            next = chunk.end;
+            continue;
+        }
+        if (next < chunk.start) {
+            gap += chunk.start - next;
+            next = chunk.start;
+        }
+        if (chunk.data.len > budget -| out.items.len) break;
+        try out.appendSlice(allocator, chunk.data);
+        next = chunk.end;
+    }
+    return .{
+        .data = try out.toOwnedSlice(allocator),
+        .cursor = next,
+        .gap = gap,
+        .eof = step.stream_eof and next >= step.capture_cursor,
+    };
 }
 
 /// One poll pass: starts/advances steps, then serializes every step with
@@ -3594,9 +4329,9 @@ fn handleDeployPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
         self.manager.deploys.unlock();
         return respondError(output, "unknown run");
     };
-    self.manager.deploys.unlock();
+    defer self.manager.deploys.unlock();
 
-    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+    const now_ms = deployNowMs(self.io);
     if (!deployTerminal(run.status)) {
         const session = self.manager.get(run.server_id);
         if (session == null or session.?.status.load(.acquire) != .ready) {
@@ -3609,10 +4344,10 @@ fn handleDeployPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
                 }
             }
             run.status = .interrupted;
-            run.finished_at = @intCast(now);
-            self.deploy_history.append(self.io, run);
+            run.finished_at_ms = now_ms;
+            self.deploy_history.append(self.io, run, now_ms);
         } else {
-            deployPollStep(self, run, now);
+            deployPollStep(self, run, now_ms);
         }
     }
 
@@ -3621,6 +4356,8 @@ fn handleDeployPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
     writer.print("{d}", .{run.id}) catch return output[0..0];
     writer.writeAll(",\"status\":") catch return output[0..0];
     json.writeJsonString(&writer, run.status.jsonName()) catch return output[0..0];
+    writer.print(",\"started_at_ms\":{d},\"finished_at_ms\":", .{run.started_at_ms}) catch return output[0..0];
+    if (run.finished_at_ms) |finished| writer.print("{d}", .{finished}) catch return output[0..0] else writer.writeAll("null") catch return output[0..0];
     writer.print(",\"canceled\":{s}", .{if (run.canceled) "true" else "false"}) catch return output[0..0];
     writer.writeAll(",\"steps\":[") catch return output[0..0];
 
@@ -3647,44 +4384,23 @@ fn handleDeployPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
         }
         if (step.channel) |ch| {
             const cursor = deployCursor(payload.cursors, ch);
-            const polls = self.manager.pollChannels(run.server_id, &.{.{ .id = ch, .pos = cursor }}, false, budget, 128 * 1024) catch {
-                // Session lost mid-serialize: report the step as-is; the
-                // next poll marks the run interrupted.
-                writer.print(",\"cursor\":{d},\"gap\":0,\"eof\":false,\"data\":\"\"", .{cursor}) catch return output[0..0];
-                continue;
-            };
-            var data: []u8 = &.{};
-            var new_cursor = cursor;
-            var gap: u64 = 0;
-            var eof = false;
-            for (polls) |*poll| {
-                if (poll.id != ch) continue;
-                data = poll.data;
-                new_cursor = poll.cursor;
-                gap = poll.gap;
-                eof = poll.eof;
-            }
-            // Secret values never appear in step output (spec 07 §8).
-            const masked = deploy.maskSecrets(self.allocator, data, run.secrets.items) catch data;
-            defer if (masked.ptr != data.ptr) self.allocator.free(masked);
-            budget = budget -| data.len;
-            writer.print(",\"cursor\":{d},\"gap\":{d},\"eof\":{s},\"data\":", .{ new_cursor, gap, if (eof) "true" else "false" }) catch return output[0..0];
-            json.writeJsonString(&writer, masked) catch return output[0..0];
-            // The data must be serialized before the polls are freed.
-            for (polls) |*poll| poll.deinit(self.allocator);
-            self.allocator.free(polls);
+            var delta = deployStepDelta(self.allocator, step, cursor, budget) catch return output[0..0];
+            defer delta.deinit(self.allocator);
+            budget = budget -| delta.data.len;
+            writer.print(",\"cursor\":{d},\"gap\":{d},\"eof\":{s},\"data\":", .{ delta.cursor, delta.gap, if (delta.eof) "true" else "false" }) catch return output[0..0];
+            json.writeJsonString(&writer, delta.data) catch return output[0..0];
         }
         writer.writeAll("}") catch return output[0..0];
     }
     writer.writeAll("]") catch return output[0..0];
     writer.print(",\"done\":{s}}}", .{if (deployTerminal(run.status)) "true" else "false"}) catch return output[0..0];
+    if (deployTerminal(run.status)) run.zeroSecrets();
     self.manager.deploys.evictFinished();
     return writer.buffered();
 }
 
-/// Cancels a run: the current channel is closed and the run is reported
-/// `canceled` on the next poll ("cancel requested" — closing a channel
-/// does not prove the remote process died; spec 07 §4.2).
+/// Requests cancellation and queues a token-bound process-group verifier.
+/// The run stays `cancel_requested` until remote termination is proven.
 fn handleDeployCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
     var parsed = parsePayload(DeployCancelPayload, self.allocator, invocation.request.payload) catch {
@@ -3696,13 +4412,62 @@ fn handleDeployCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocat
         self.manager.deploys.unlock();
         return respondError(output, "unknown run");
     };
-    run.canceled = true;
-    const server_id = run.server_id;
+    if (run.status == .done or run.status == .failed or run.status == .canceled or run.status == .interrupted) {
+        self.manager.deploys.unlock();
+        return ok_json;
+    }
+    run.status = .cancel_requested;
+    const server_id = try self.allocator.dupe(u8, run.server_id);
+    defer self.allocator.free(server_id);
+    var tok: ?[]u8 = null;
+    defer if (tok) |value| self.allocator.free(value);
+    var ctrl: ?[]u8 = null;
+    defer if (ctrl) |value| self.allocator.free(value);
+    var ch: ?u32 = null;
+    var preparing = false;
     if (run.currentStep()) |step| {
-        if (step.channel) |ch| self.manager.closeChannel(server_id, ch) catch {};
+        step.state = .cancel_requested;
+        if (step.cancel_token) |value| tok = self.allocator.dupe(u8, value) catch null;
+        if (step.cancel_ctrl) |value| ctrl = self.allocator.dupe(u8, value) catch null;
+        ch = step.channel;
+        preparing = step.prepare_channel != null;
+        if (ch == null and !preparing) {
+            run.canceled = true;
+            run.status = .canceled;
+            step.state = .canceled;
+            run.finished_at_ms = deployNowMs(self.io);
+            run.zeroSecrets();
+            self.deploy_history.append(self.io, run, run.finished_at_ms.?);
+        }
     }
     self.manager.deploys.unlock();
-    self.audit.append(self.io, "deploy.cancel", server_id, "run canceled by the user") catch {};
+    if (ch == null and !preparing) {
+        self.audit.append(self.io, "deploy.cancel", server_id, "run canceled before the next step started") catch {};
+        return ok_json;
+    }
+    if (preparing) {
+        self.audit.append(self.io, "deploy.cancel", server_id, "cancel requested; waiting for the in-flight configuration write to close") catch {};
+        return ok_json;
+    }
+    // Queue verified termination on the session worker. The poll path keeps
+    // `cancel_requested` until this channel proves the exact process group is
+    // gone; this handler never waits on the network.
+    if (tok != null and ctrl != null) {
+        const cmd = deploy.cancelCommand(self.allocator, ctrl.?, tok.?) catch null;
+        if (cmd) |c| {
+            defer self.allocator.free(c);
+            if (self.manager.execTracked(server_id, c, "deploy", null, &.{})) |cancel_ch| {
+                self.manager.deploys.lock();
+                if (self.manager.deploys.get(parsed.value.run_id)) |rr| {
+                    if (rr.currentStep()) |step| step.cancel_channel = cancel_ch;
+                }
+                self.manager.deploys.unlock();
+                self.audit.append(self.io, "deploy.cancel", server_id, "cancel requested; process verification is running") catch {};
+                return ok_json;
+            } else |_| {}
+        }
+    }
+    self.audit.append(self.io, "deploy.cancel", server_id, "cancel requested; termination could not be started") catch {};
     return ok_json;
 }
 

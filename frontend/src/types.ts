@@ -363,3 +363,45 @@ export interface BroadcastPreview {
   /** Integer milliseconds since epoch, converted by the backend before JSON serialization. */
   expires_at: number;
 }
+
+// --- deploy (spec 07, NEXT-SPEC bridge contract) -----------------------------
+export type DeployEnvironment = "development" | "staging" | "production";
+export type DeployTransport = "https" | "ssh";
+export type DeployAppType = "node" | "react" | "next" | "static";
+export type DeployPackageManager = "auto" | "npm" | "pnpm" | "yarn";
+export interface DeployRepo { url: string; transport: DeployTransport; branch: string; }
+export interface DeployRuntime {
+  node_version: string; type: DeployAppType; package_manager: DeployPackageManager;
+  install: string; build: string; entry: string; args: string; start_command: string; build_folder: string;
+}
+export interface DeployEnvVar { name: string; secret: boolean; value: string; has_value: boolean; }
+export interface DeployApp {
+  id: string; server_id: string; name: string; environment: DeployEnvironment;
+  folder: string; repo: DeployRepo; runtime: DeployRuntime; env_vars: DeployEnvVar[];
+  domains: string[]; ssl: boolean; email: string; app_port: number;
+  revision: number; created_at_ms: number; updated_at_ms: number;
+}
+export interface DeployAppInput {
+  id?: string; server_id: string; name: string; environment: DeployEnvironment;
+  folder: string; repo: DeployRepo; runtime: DeployRuntime; env_vars: DeployEnvVar[];
+  domains: string[]; ssl: boolean; email: string; app_port: number;
+}
+export type DeployStepState = "pending" | "running" | "cancel_requested" | "canceled" | "success" | "failed" | "skipped";
+export type DeployRunStatus = "queued" | "running" | "cancel_requested" | "canceled" | "done" | "failed" | "interrupted";
+export interface DeployIssue { id: string; message: string; }
+export interface DeployApproval { id: string; label: string; detail: string; }
+export interface DeployPreflightFacts {
+  os: string; arch: string; libc: string; user: string; home: string; privilege: string;
+  repository_commit: string; lockfiles: string; git_host_fingerprints: string; ports: string;
+}
+export interface DeployPreflightStep { id: string; label: string; mutation: string; command: string; skipped: boolean; files: Array<{ path: string; mode: number }>; guards: string[]; rollback: string; }
+export interface DeployPreflight {
+  id: number; app_id: string; server_id: string; created_at_ms: number; expires_at_ms: number;
+  app_revision: number; target_fingerprint: number;
+  status: "gathering" | "ready" | "blocked" | "failed";
+  error?: string; facts: DeployPreflightFacts; blockers: DeployIssue[]; warnings: DeployIssue[]; approvals: DeployApproval[];
+  configs: { env: string; pm2: string; nginx: string }; steps: DeployPreflightStep[]; commit?: string;
+}
+export interface DeployStep { id: string; label: string; state: DeployStepState; channel?: number; exit?: number | null; error?: string; cursor?: number; gap?: number; eof?: boolean; data?: string; }
+export interface DeployPollResult { ok: boolean; run_id: number; status: DeployRunStatus; started_at_ms: number; finished_at_ms: number | null; canceled: boolean; done: boolean; steps: DeployStep[]; }
+export interface DeployHistoryRecord { id: number; server_id: string; app_id: string; status: DeployRunStatus; action: string; commit: string; started_at_ms: number; finished_at_ms: number | null; output: string; truncated: boolean; steps: Array<{ id: string; state: DeployStepState; exit: number | null; error: string }>; }

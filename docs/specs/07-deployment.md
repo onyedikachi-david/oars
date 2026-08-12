@@ -1,6 +1,6 @@
 # Spec 07 — One-Click Deployment
 
-**Status:** 📋 · **Depends on:** 02 (exec), 05 (SFTP for .env/nginx), 08 (deploy keys), 01 · **Spec owner:** core
+**Status:** ✅ v1 frontend + backend implemented: managed-state-safe preflight with frozen plan, listener conflict checks, Node/LTS resolver + SHA-256 verified install, per-app SSH identity, transactional file writes, verified process-group cancellation, typed bridge with cursor polling, masked history · real-host acceptance awaits the Contabo smoke run in §11 · **Depends on:** 02 (exec), 01 · **Spec owner:** core
 
 ## 1. Overview
 
@@ -56,25 +56,40 @@ steps, each with live output, each failing loudly with its own error.
 ## 5. Bridge API
 
 ### `oars.deploy.apps.list` `{server_id}` → `{ok, apps}`
-### `oars.deploy.apps.save` `{app}` → `{ok, app}` · `oars.deploy.apps.delete` `{server_id, app_id}` → `{ok}`
+### `oars.deploy.apps.save` `{app}` → `{ok, app}` · `oars.deploy.apps.secretPresence` `{app_id, names, present}` → `{ok, app}` · `oars.deploy.apps.delete` `{server_id, app_id}` → `{ok}`
 App model:
 ```json
 {"id":"a1…","server_id":"s1…","name":"storefront","environment":"production",
  "folder":"/home/ubuntu/storefront",
  "repo":{"url":"git@github.com:you/storefront.git","transport":"ssh","branch":"main"},
- "runtime":{"node_version":"22","type":"next","install":"npm ci",
-            "build":"npm run build","start":"npm start","build_folder":".next"},
+ "runtime":{"node_version":"24","type":"next","package_manager":"auto",
+            "install":"","build":"npm run build",
+            "entry":"node_modules/next/dist/bin/next","args":"start",
+            "start_command":"","build_folder":".next"},
  "env_vars":[{"name":"NODE_ENV","secret":false,"value":"production"},
              {"name":"DATABASE_URL","secret":true,"has_value":true}],
  "domains":["storefront.dev"],"ssl":true,
- "app_port":3000,"created_at":…,"updated_at":…}
+ "app_port":3000,"revision":1,"created_at_ms":…,"updated_at_ms":…}
 ```
 - Each environment row has an explicit `secret` flag, which defaults to true.
   Secret detection can suggest that flag, but name matching is not a security
   boundary. Secret values use Keychain account
   `deploy:<app_id>:<var>` and never enter the JSON store.
 
-### `oars.deploy.run` `{server_id, app_id, secret_values?}` → `{ok, run_id}`
+### `oars.deploy.key.generate` `{server_id, app_id}` → `{ok, channel}` · `oars.deploy.hostTrust` `{preflight_id, accept:true}` → `{ok, channel}`
+- Key generation creates the exact per-app Ed25519 identity that deployment
+  consumes. GitHub host keys are installed only after they match GitHub's
+  published entries. Another host requires an explicit approval of the
+  SHA-256 fingerprint shown by that preflight; the trust action writes that
+  frozen key and invalidates the preflight so repository access is checked
+  again. Both operations use the session worker and stream completion through
+  `oars.ssh.poll`; they do not wait on the bridge/UI thread.
+
+### `oars.deploy.preflight` `{server_id, app_id}` → `{ok, preflight}` · `oars.deploy.preflightPoll` `{preflight_id}` → `{ok, preflight}` · `oars.deploy.preflightCancel` `{preflight_id}` → `{ok}`
+- A ready preflight is a memory-only, expiring snapshot of target facts,
+  required approvals, redacted previews, exact commands, and run-time guards.
+
+### `oars.deploy.run` `{preflight_id, approvals, secret_values}` → `{ok, run_id}`
 - The frontend reads only the required Keychain accounts and sends their values
   in this transient, origin-gated request. The core validates that every name
   matches a declared secret field, keeps values only in the run's protected
@@ -92,14 +107,18 @@ App model:
 ## 6. Zig core design
 
 - `src/deploy.zig` — App model/store (`<data>/apps.json`), step planner, step command builder, run state machine (per-run: step index, per-step channel + stream, status; poll-driven from frontend, no extra threads — steps execute sequentially through the session worker's exec path).
-- A read-only preflight detects the OS, architecture, libc, DNS, listening
+- A preflight that does not change the application or services detects the OS,
+  architecture, libc, DNS, listening
   ports, repository state, and required tools. Missing `git`, PM2, nginx, or
   certbot never triggers a guessed install command. Oars shows a separate,
   distro-specific install plan only for a tested OS adapter, with the exact
   packages, repositories, and privileges, and waits for approval.
 - Step command builders use fixed templates plus the shared shell-quoting
   function for every dynamic value. SSH exec does not provide argv transport:
-  1. clone: `git clone <repo> <folder>` or `git -C <folder> pull --ff-only` when folder exists
+  1. clone: resolve the branch to one reviewed commit. Clone or fetch that
+     commit, verify a clean matching checkout and fast-forward ancestry, then
+     check it out detached. A fresh-folder preflight uses a removed-on-exit
+     temporary checkout to inspect lockfiles before the real clone.
   2. install: use the lockfile-specific frozen command (`npm ci`,
      `pnpm install --frozen-lockfile`, or `yarn install --immutable`). Use the
      non-frozen install command only when no lockfile exists; do not hide a
@@ -107,7 +126,8 @@ App model:
   3. build: `<build>` in folder (`NODE_OPTIONS=--max-old-space-size=4096` prefix for node builds)
   4. pm2: write an ecosystem file with explicit `cwd`, script, args,
      environment, and app name; run `pm2 startOrReload <file> --only <app>`.
-  5. nginx: write site config via SFTP (temp + rename), `nginx -t`, symlink to `sites-enabled`, `systemctl reload nginx`
+  5. nginx: stream the site candidate into a same-directory temporary file,
+     rename it, run `nginx -t`, link it into `sites-enabled`, and reload nginx.
   6. certbot: `certbot --nginx` with one `-d` per validated name,
      `--non-interactive --agree-tos`, and the user-supplied email. Oars never
      invents an email address.
@@ -127,12 +147,15 @@ App model:
   replace the system Node installation. The PM2 ecosystem file uses that exact
   Node path. Unsupported architecture or libc stops with a documented manual
   path; it never falls through to an unreviewed package repository script.
-- Secrets: env vars are written to `<folder>/.env` via SFTP before install/build (never echoed in step output; masked in logs).
+- Secrets: env vars are streamed to a mode-0600 same-directory temporary file
+  and renamed to `<folder>/.env` before install/build. They are never command
+  arguments, and known values are masked before output retention.
 
 ## 7. Data model
 
 - `<data>/apps.json`: apps (env_vars without secret values; secret values in Keychain).
-- `<data>/deploy_runs.json`: run history (status, step results, timestamps, output trimmed to 200 KB/run, raw kept 30 days).
+- `<data>/deploy_runs.json`: run history (status, step results, timestamps, only
+  masked output, trimmed to 200 KiB/run and retained for at most 30 days).
 
 ## 8. Security
 
@@ -158,6 +181,9 @@ App model:
   It cannot prove that inbound port 80 is reachable, so certbot remains the
   final authority.
 - nginx config collision (site already exists) → fail with existing-config diff shown.
+- Required listener collision: preflight classifies the app port plus ports 80
+  and 443 with `ss`. An existing nginx listener is allowed; a foreign owner on
+  port 80, or on port 443 when SSL is selected, blocks the plan.
 - Server disconnected mid-deploy → run marked `interrupted`. The next run
   rechecks repository, dependencies, process state, Nginx config, and
   certificate state before planning work. It does not blindly resume at a
@@ -166,17 +192,24 @@ App model:
 ## 11. Testing
 
 - Unit: step planner (app type → command templates), path/domain validation, env masking.
-- Integration (container with node+pm2+nginx): deploy a fixture Next.js app → verify site responds (curl), re-deploy after change, SSL skip path (no domain), failure injection (broken build) → verify step red + resume.
+- Integration uses the existing Alpine SSH fixture to exercise the public
+  run/poll/cancel contract, quick output, nonzero failure, and verified cancel.
+  Pure Zig tests cover the production Debian/Ubuntu preflight derivation,
+  frozen commands, listener policy, checksums, and rollback guards. A manual
+  deployment of `examples/oars-react-smoke` on a supported server is the final
+  real-host check; no extra Ubuntu test image is required.
 - Manual: bulk .env paste, node install path.
 
 ## 12. Acceptance criteria
 
-- [ ] End-to-end deploy of a fixture app: clone→install→build→pm2→nginx (SSL skipped in test) with green steps.
-- [ ] Re-deploy pulls and restarts correctly.
-- [ ] Secret env values never appear in JSON. Known secret values are redacted
+- [ ] Real-host deploy of `examples/oars-react-smoke`: clone → install →
+      build → nginx (PM2 and SSL skipped for this React fixture) with green
+      steps. The user will run this on the connected Contabo server.
+- [ ] Real-host re-deploy resolves the new commit and updates the served build.
+- [x] Secret env values never appear in JSON. Known secret values are redacted
       from captured output, history, and audit fixtures.
-- [ ] DNS pre-check prevents certbot failure for missing records.
-- [ ] A new run after an interruption rechecks remote state and replans safely;
+- [x] DNS pre-check prevents certbot failure for missing records.
+- [x] A new run after an interruption rechecks remote state and replans safely;
       it never skips work solely because an old step was marked successful.
 
 ## 13. Research & References
