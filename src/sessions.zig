@@ -220,6 +220,11 @@ pub const ChannelEntry = struct {
     preflight_probe: ?*preflight.ProbeOutcome = null,
     preflight_timeout_ns: i128 = 0,
     preflight_id: ?[]const u8 = null,
+    /// Spec 09: fleet scan inline exec. One internal `exec` per
+    /// scan-phase command; outcome is consumed in the next poll.
+    access_exec_outcome: ?*AccessExecOutcome = null,
+    access_exec_timeout_ns: i128 = 0,
+    access_exec_cap: usize = 0,
 
     /// Frees the command text and the optional history strings. Every
     /// path that drops an entry (eviction, close, teardown) must call
@@ -355,6 +360,16 @@ const Op = union(enum) {
         command: []const u8,
         timeout_ns: i128,
         outcome: *preflight.ProbeOutcome,
+    },
+    /// Spec 09: fleet scan inline exec (bounded output + deadline).
+    /// The probe pattern is reused: the command runs as an internal
+    /// channel, the worker drains at EOF/timeout, and the poll thread
+    /// consumes the result to advance scan state.
+    access_exec: struct {
+        command: []const u8,
+        timeout_ns: i128,
+        cap: usize,
+        outcome: *AccessExecOutcome,
     },
 };
 
@@ -515,6 +530,53 @@ pub const ClearOutcome = struct {
             if (std.Io.Timestamp.now(io, .real).nanoseconds >= deadline_ns) return;
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch return;
         }
+    }
+};
+
+/// Spec 09: inline exec for fleet scans — one internal `exec` per phase
+/// step. Mirrors `syntax_check` / `preflight_probe`: owning handler
+/// enqueues the command, worker opens an internal channel, and the
+/// bridge consumes the outcome on the next poll. Outcome heap +
+/// `abandon()` protocol matches every other worker outcome (session 30).
+pub const AccessExecOutcome = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+    done: bool = false,
+    abandoned: bool = false,
+    exit: ?i32 = null,
+    msg_buf: [256]u8 = undefined,
+    msg_len: usize = 0,
+    data: std.ArrayList(u8) = .empty,
+    pub fn set(self: *AccessExecOutcome, exit: ?i32, data: []const u8, msg: []const u8) void {
+        lockSpin(&self.mutex);
+        if (data.len > 0) self.data.appendSlice(self.allocator, data) catch {};
+        const n = @min(msg.len, self.msg_buf.len - 1);
+        @memcpy(self.msg_buf[0..n], msg[0..n]);
+        self.msg_len = n;
+        self.exit = exit;
+        self.done = true;
+        const free = self.abandoned;
+        self.mutex.unlock();
+        if (free) {
+            self.data.deinit(self.allocator);
+            self.allocator.destroy(self);
+        }
+    }
+    pub fn abandon(self: *AccessExecOutcome) bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        self.abandoned = true;
+        return self.done;
+    }
+    pub fn isDone(self: *AccessExecOutcome) bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.done;
+    }
+    pub fn message(self: *AccessExecOutcome) []const u8 {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.msg_buf[0..self.msg_len];
     }
 };
 
@@ -1839,6 +1901,19 @@ pub const Manager = struct {
         return false;
     }
 
+    /// Spec 09: queues an internal exec for a fleet-scan phase step.
+    /// Bounded output+deadline; drained by the worker. Do not block.
+    pub fn enqueueAccessExec(self: *Manager, server_id: []const u8, command: []const u8, timeout_ns: i128, cap: usize, outcome: *AccessExecOutcome) !void {
+        const session = self.get(server_id) orelse return error.NoSession;
+        if (session.status.load(.acquire) != .ready) return error.NotReady;
+        const owned = try self.allocator.dupe(u8, command);
+        errdefer self.allocator.free(owned);
+        lockSpin(&session.ops_mutex);
+        defer session.ops_mutex.unlock();
+        if (session.worker_done.load(.acquire)) return error.NotReady;
+        try session.ops.append(self.allocator, .{ .access_exec = .{ .command = owned, .timeout_ns = timeout_ns, .cap = cap, .outcome = outcome } });
+    }
+
     /// Spec 07: queues a read-only preflight probe on the session worker.
     /// Each probe is a single exec whose exit/output land in the outcome.
     pub fn enqueuePreflightProbe(self: *Manager, server_id: []const u8, id: []const u8, command: []const u8, timeout_ns: i128, outcome: *preflight.ProbeOutcome) !void {
@@ -2326,6 +2401,23 @@ fn workerMain(session: *Session) void {
             }
             // Spec 07: a preflight probe that outlives its deadline is closed
             // and completed honestly (read-only — no rollback needed).
+            if (entry.access_exec_outcome != null and entry.access_exec_timeout_ns > 0 and
+                std.Io.Timestamp.now(io, .real).nanoseconds - entry.started_ns >= entry.access_exec_timeout_ns)
+            {
+                entry.raw.sendEof();
+                entry.raw.close(session.io);
+                entry.raw_closed = true;
+                entry.access_exec_outcome.?.set(null, "", "access exec timed out");
+                entry.access_exec_outcome = null;
+                entry.access_exec_timeout_ns = 0;
+                lockSpin(&entry.stream.mutex);
+                entry.stream.eof = true;
+                entry.stream.exit_status = null;
+                entry.stream.mutex.unlock();
+                recordExecHistory(session, entry);
+                if (!dropEntryAt(session, i, entry)) i += 1;
+                continue;
+            }
             if (entry.preflight_probe != null and entry.preflight_timeout_ns > 0 and
                 std.Io.Timestamp.now(io, .real).nanoseconds - entry.started_ns >= entry.preflight_timeout_ns)
             {
@@ -2364,6 +2456,11 @@ fn workerMain(session: *Session) void {
                                 }
                                 entry.preflight_probe = null;
                                 entry.preflight_timeout_ns = 0;
+                            } else if (entry.access_exec_outcome != null) {
+                                drainAccessExec(session, entry);
+                                entry.access_exec_outcome = null;
+                                entry.access_exec_timeout_ns = 0;
+                                recordExecHistory(session, entry);
                             } else {
                                 drainProbe(session, entry);
                                 session.monitor_probe_active.store(false, .release);
@@ -2750,6 +2847,103 @@ fn drainPreflightProbe(session: *Session, entry: *ChannelEntry) void {
     out.set(exit, tail, msg);
 }
 
+fn drainAccessExec(session: *Session, entry: *ChannelEntry) void {
+    const out = entry.access_exec_outcome orelse return;
+    const cap = entry.access_exec_cap;
+    var total: std.ArrayList(u8) = .empty;
+    defer total.deinit(session.allocator);
+    var buf: [4096]u8 = undefined;
+    var cursor = entry.stream.start();
+    while (true) {
+        const n = entry.stream.readAt(cursor, &buf);
+        if (n == 0) break;
+        var tail = buf[0..n];
+        // cap bytes before handing to outcome; over-cap -> limited + truncated
+        if (total.items.len >= cap) break;
+        if (total.items.len + tail.len > cap) tail = tail[0 .. cap - total.items.len];
+        total.appendSlice(session.allocator, tail) catch break;
+        cursor += n;
+    }
+    // strip trailing whitespace to match bridge expectation (trimmed compare elsewhere)
+    var tail = total.items;
+    while (tail.len > 0 and (tail[tail.len - 1] == '\n' or tail[tail.len - 1] == '\r' or tail[tail.len - 1] == ' ' or tail[tail.len - 1] == '\t')) tail = tail[0 .. tail.len - 1];
+    const exit = entry.stream.exit_status;
+    const msg = if (tail.len > 0) tail else if (exit != null and exit.? == 0) "ok" else "failed";
+    out.set(exit, total.items, msg);
+}
+
+fn accessExecOp(session: *Session, ae: anytype) void {
+    const allocator = session.allocator;
+    const raw = session.transport.openChannel(session.io) catch {
+        allocator.free(ae.command);
+        ae.outcome.set(null, "", "could not open a channel for the access exec");
+        return;
+    };
+    raw.exec(session.io, ae.command) catch {
+        raw.close(session.io);
+        allocator.free(ae.command);
+        ae.outcome.set(null, "", "access exec could not start");
+        return;
+    };
+    const stream = allocator.create(Stream) catch {
+        raw.close(session.io);
+        allocator.free(ae.command);
+        ae.outcome.set(null, "", "out of memory");
+        return;
+    };
+    stream.* = Stream.init(allocator);
+    stream.max_bytes = @max(ae.cap, 16 * 1024);
+    const entry = allocator.create(ChannelEntry) catch {
+        allocator.destroy(stream);
+        raw.close(session.io);
+        allocator.free(ae.command);
+        ae.outcome.set(null, "", "out of memory");
+        return;
+    };
+    const history_kind = allocator.dupe(u8, "access.scan") catch {
+        allocator.destroy(entry);
+        allocator.destroy(stream);
+        raw.close(session.io);
+        allocator.free(ae.command);
+        ae.outcome.set(null, "", "out of memory");
+        return;
+    };
+    const history_command = allocator.dupe(u8, ae.command) catch {
+        allocator.free(history_kind);
+        allocator.destroy(entry);
+        allocator.destroy(stream);
+        raw.close(session.io);
+        allocator.free(ae.command);
+        ae.outcome.set(null, "", "out of memory");
+        return;
+    };
+    entry.* = .{
+        .id = session.next_channel_id.fetchAdd(1, .monotonic),
+        .kind = .exec,
+        .command = ae.command,
+        .history_kind = history_kind,
+        .history_command = history_command,
+        .stream = stream,
+        .raw = raw,
+        .internal = true,
+        .access_exec_outcome = ae.outcome,
+        .access_exec_timeout_ns = ae.timeout_ns,
+        .access_exec_cap = ae.cap,
+        .started_ns = std.Io.Timestamp.now(session.io, .real).nanoseconds,
+    };
+    lockSpin(&session.channels_mutex);
+    session.channels.append(allocator, entry) catch {
+        session.channels_mutex.unlock();
+        entry.freeCommandText(allocator);
+        allocator.destroy(entry);
+        allocator.destroy(stream);
+        raw.close(session.io);
+        ae.outcome.set(null, "", "out of memory");
+        return;
+    };
+    session.channels_mutex.unlock();
+}
+
 fn preflightProbeOp(session: *Session, pp: anytype) void {
     const allocator = session.allocator;
     const raw = session.transport.openChannel(session.io) catch {
@@ -2881,6 +3075,7 @@ fn processOps(session: *Session) void {
             .forward_set => |f| forwardSetOp(session, f),
             .syntax_check => |sc| syntaxCheckOp(session, sc),
             .preflight_probe => |pp| preflightProbeOp(session, pp),
+            .access_exec => |ae| accessExecOp(session, ae),
         }
     }
 }
@@ -4255,11 +4450,17 @@ fn sftpOpRead(session: *Session, path: []const u8, offset: u64, max: usize, outc
         outcome.set(false, sftpFail(session, "read failed", &msg_buf));
         return;
     };
+    var attrs: ssh.c.LIBSSH2_SFTP_ATTRIBUTES = undefined;
+    const has_stat = sftpFstat(session, handle, &attrs, deadline);
+    const eof = if (has_stat and attrs.flags & ssh.c.LIBSSH2_SFTP_ATTR_SIZE != 0)
+        offset + n >= attrs.filesize
+    else
+        n == 0;
     const b64 = sftpmod.base64Encode(allocator, buf[0..n]) catch return outcome.set(false, "out of memory");
     // The JSON payload copies the bytes; the worker owns and frees the
     // base64 buffer itself (the handler frees the serialized json).
     defer allocator.free(b64);
-    sftpSetJson(session, outcome, .{ .ok = true, .base64 = b64, .eof = n < max });
+    sftpSetJson(session, outcome, .{ .ok = true, .base64 = b64, .eof = eof });
 }
 
 fn sftpOpWriteChunk(
@@ -5492,6 +5693,12 @@ fn sessionDone(session: *Session) void {
         if (entry.check_outcome) |oc| {
             oc.set(null, "session disconnected");
         }
+        if (entry.access_exec_outcome) |oc| {
+            oc.set(null, "", "session disconnected");
+        }
+        if (entry.preflight_probe) |pp| {
+            pp.set(null, "", "session disconnected");
+        }
         entry.clearStdin(session.allocator);
         entry.freeCommandText(session.allocator);
         entry.stream.deinit(session.allocator);
@@ -5580,6 +5787,10 @@ fn sessionDone(session: *Session) void {
             .syntax_check => |sc| {
                 session.allocator.free(sc.command);
                 sc.outcome.set(null, "session disconnected");
+            },
+            .access_exec => |ae| {
+                session.allocator.free(ae.command);
+                ae.outcome.set(null, "", "session disconnected");
             },
             .clear => |cl| {
                 session.allocator.free(cl.path);
@@ -5860,6 +6071,20 @@ test "op outcomes survive handler abandonment: late set frees exactly once" {
     o4.* = .{ .allocator = allocator };
     try std.testing.expect(!o4.abandon());
     o4.setJson(try allocator.dupe(u8, "{\"ok\":true}"));
+
+    // Access scan execs use the same ownership transfer. The worker must
+    // unlock the outcome before it frees an object abandoned by a handler.
+    const o5 = try allocator.create(AccessExecOutcome);
+    o5.* = .{ .allocator = allocator };
+    try std.testing.expect(!o5.abandon());
+    o5.set(0, "late data", "ok");
+
+    const o6 = try allocator.create(AccessExecOutcome);
+    o6.* = .{ .allocator = allocator };
+    o6.set(0, "ready", "ok");
+    try std.testing.expect(o6.abandon());
+    o6.data.deinit(allocator);
+    allocator.destroy(o6);
 }
 
 test "sessionDone completes queued op outcomes honestly" {

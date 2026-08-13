@@ -32,7 +32,7 @@ const ssh = @import("ssh.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 109;
+const handler_count = 112;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -125,7 +125,9 @@ pub const Context = struct {
             .{ .name = "oars.sshkeys.roles.delete", .context = self, .invoke_fn = handleSshKeysRolesDelete },
             .{ .name = "oars.sshkeys.deployKey.generate", .context = self, .invoke_fn = handleSshKeysDeployKeyGenerate },
             .{ .name = "oars.access.scan", .context = self, .invoke_fn = handleAccessScan },
+            .{ .name = "oars.access.scanCancel", .context = self, .invoke_fn = handleAccessScanCancel },
             .{ .name = "oars.access.poll", .context = self, .invoke_fn = handleAccessPoll },
+            .{ .name = "oars.access.key.inspect", .context = self, .invoke_fn = handleAccessKeyInspect },
             .{ .name = "oars.access.identities.list", .context = self, .invoke_fn = handleAccessIdentitiesList },
             .{ .name = "oars.access.identities.save", .context = self, .invoke_fn = handleAccessIdentitiesSave },
             .{ .name = "oars.access.identities.delete", .context = self, .invoke_fn = handleAccessIdentitiesDelete },
@@ -133,6 +135,7 @@ pub const Context = struct {
             .{ .name = "oars.access.onboard", .context = self, .invoke_fn = handleAccessOnboard },
             .{ .name = "oars.access.rotate", .context = self, .invoke_fn = handleAccessRotate },
             .{ .name = "oars.access.jobPoll", .context = self, .invoke_fn = handleAccessJobPoll },
+            .{ .name = "oars.access.jobCancel", .context = self, .invoke_fn = handleAccessJobCancel },
             .{ .name = "oars.access.export", .context = self, .invoke_fn = handleAccessExport },
             .{ .name = "oars.backup.jobs.list", .context = self, .invoke_fn = handleBackupJobsList },
             .{ .name = "oars.backup.jobs.save", .context = self, .invoke_fn = handleBackupJobsSave },
@@ -236,7 +239,9 @@ pub const Context = struct {
             .{ .name = "oars.sshkeys.roles.delete", .origins = &allowed_origins },
             .{ .name = "oars.sshkeys.deployKey.generate", .origins = &allowed_origins },
             .{ .name = "oars.access.scan", .origins = &allowed_origins },
+            .{ .name = "oars.access.scanCancel", .origins = &allowed_origins },
             .{ .name = "oars.access.poll", .origins = &allowed_origins },
+            .{ .name = "oars.access.key.inspect", .origins = &allowed_origins },
             .{ .name = "oars.access.identities.list", .origins = &allowed_origins },
             .{ .name = "oars.access.identities.save", .origins = &allowed_origins },
             .{ .name = "oars.access.identities.delete", .origins = &allowed_origins },
@@ -244,6 +249,7 @@ pub const Context = struct {
             .{ .name = "oars.access.onboard", .origins = &allowed_origins },
             .{ .name = "oars.access.rotate", .origins = &allowed_origins },
             .{ .name = "oars.access.jobPoll", .origins = &allowed_origins },
+            .{ .name = "oars.access.jobCancel", .origins = &allowed_origins },
             .{ .name = "oars.access.export", .origins = &allowed_origins },
             .{ .name = "oars.backup.jobs.list", .origins = &allowed_origins },
             .{ .name = "oars.backup.jobs.save", .origins = &allowed_origins },
@@ -5543,51 +5549,60 @@ fn handleSshKeysDeployKeyGenerate(context: *anyopaque, invocation: native_sdk.br
 
 const access_exec_cap: usize = 256 * 1024;
 const access_exec_timeout_ns = 10 * std.time.ns_per_s;
-/// Row budget for poll/export serialization (the dispatcher gives handlers
-/// a 1 MB result buffer; rows beyond the budget are dropped, counts stay
-/// honest — the frontend windows large tables).
-const access_poll_budget: usize = 512 * 1024;
-
 const AccessScanPayload = struct {
     server_ids: ?[]const []const u8 = null,
-    full: bool = false,
+    scope: []const u8 = "connected_accounts",
+    approved_sensitive_read: bool = false,
 };
-const AccessPollPayload = struct { scan_id: []const u8 };
+const AccessPollPayload = struct { scan_id: []const u8, people_offset: usize = 0, unassigned_offset: usize = 0, limit: usize = 50 };
+const AccessScanCancelPayload = struct { scan_id: []const u8 };
+const AccessKeyInspectPayload = struct { public_key: []const u8 };
 const AccessIdentitySavePayload = struct { identity: access.IdentityInput };
-const AccessIdentityDeletePayload = struct { id: []const u8 };
+const AccessIdentityDeletePayload = struct { id: []const u8, expected_revision: ?u64 = null, confirm_name: []const u8 = "" };
 const AccessOffboardGrant = struct {
     fingerprint: []const u8,
     server_id: []const u8,
     user: []const u8,
-    expected_line_hash: []const u8,
+    line_hash: []const u8,
+    source_path: []const u8 = "",
+    file_sha256: []const u8 = "",
 };
 const AccessOffboardPayload = struct {
     identity_id: []const u8,
     grants: []const AccessOffboardGrant,
+    operation_id: []const u8 = "",
+    scan_id: []const u8 = "",
+    identity_revision: ?u64 = null,
+    confirm_name: []const u8 = "",
 };
-const AccessOnboardGrant = struct {
-    server_id: []const u8,
-    user: []const u8,
-    read_only: bool = false,
-};
+const AccessOnboardTarget = struct { kind: []const u8, name: []const u8 };
+const AccessOnboardGrant = struct { server_id: []const u8, target: AccessOnboardTarget };
 const AccessOnboardPayload = struct {
     identity_id: []const u8,
     public_key: []const u8,
     grants: []const AccessOnboardGrant,
+    operation_id: []const u8 = "",
+    identity_revision: ?u64 = null,
 };
 const AccessRotateGrant = struct {
     server_id: []const u8,
     user: []const u8,
-    expected_line_hash: []const u8,
+    line_hash: []const u8,
+    source_path: []const u8 = "",
+    file_sha256: []const u8 = "",
 };
 const AccessRotatePayload = struct {
     identity_id: []const u8,
     old_fingerprint: []const u8,
     new_public_key: []const u8,
     grants: []const AccessRotateGrant,
+    operation_id: []const u8 = "",
+    scan_id: []const u8 = "",
+    identity_revision: ?u64 = null,
 };
 const AccessJobPollPayload = struct { job_id: []const u8 };
-const AccessExportPayload = struct { format: []const u8 = "csv" };
+const AccessJobCancelPayload = struct { job_id: []const u8 };
+const AccessExportPayload = struct { format: []const u8 = "csv", cursor: usize = 0, limit: usize = 0, path: []const u8 = "", scan_id: []const u8 = "" };
 
 fn accessAudit(self: *Context, action: []const u8, server_id: []const u8, detail: []const u8) void {
     sshkeysAudit(self, action, server_id, detail);
@@ -5599,8 +5614,126 @@ fn accessFail(server: *access.ServerScan, self: *Context, msg: []const u8) void 
     server.@"error" = self.allocator.dupe(u8, msg) catch null;
 }
 
-fn accessExec(self: *Context, server_id: []const u8, cmd: []const u8) ?sessions.ExecOutcome {
-    return self.manager.execWait(server_id, cmd, access_exec_cap, access_exec_timeout_ns) catch null;
+fn accessQueueExec(self: *Context, server: *access.ServerScan, cmd: []const u8, kind: access.PendingKind, account_index: usize) bool {
+    const outcome = self.allocator.create(sessions.AccessExecOutcome) catch return false;
+    outcome.* = .{ .allocator = self.allocator };
+    self.manager.enqueueAccessExec(server.server_id, cmd, access_exec_timeout_ns, access_exec_cap, outcome) catch {
+        self.allocator.destroy(outcome);
+        return false;
+    };
+    if (server.pending) |*p| {
+        if (p.sudo_user.len > 0) self.allocator.free(p.sudo_user);
+        if (p.sftp_path.len > 0) self.allocator.free(p.sftp_path);
+    }
+    server.pending = .{ .kind = kind, .account_index = account_index, .outcome = outcome };
+    return true;
+}
+
+fn accessClearPending(self: *Context, server: *access.ServerScan, exit: ?i32, data: []const u8) void {
+    _ = exit;
+    _ = data;
+    if (server.pending) |pend| {
+        switch (pend.kind) {
+            .read_sftp, .read_sftp_data => {
+                const raw: *sessions.SftpOutcome = @ptrCast(@alignCast(pend.outcome.?));
+                if (raw.abandon()) {
+                    if (raw.json) |j| self.allocator.free(j);
+                    self.allocator.destroy(raw);
+                }
+            },
+            else => {
+                const raw: *sessions.AccessExecOutcome = @ptrCast(@alignCast(pend.outcome.?));
+                if (raw.abandon()) {
+                    raw.data.deinit(self.allocator);
+                    self.allocator.destroy(raw);
+                }
+            },
+        }
+        if (pend.sudo_user.len > 0) self.allocator.free(pend.sudo_user);
+        if (pend.sftp_path.len > 0) self.allocator.free(pend.sftp_path);
+        server.pending = null;
+    }
+}
+
+fn accessQueueSftpRead(self: *Context, server: *access.ServerScan, acc_index: usize, path: []const u8) bool {
+    const out = self.allocator.create(sessions.SftpOutcome) catch return false;
+    out.* = .{ .allocator = self.allocator };
+    // Stat first so the consumer can distinguish a missing file from denied,
+    // timeout, and transport failures before it queues content reads.
+    self.manager.sftpStat(server.server_id, path, out) catch {
+        self.allocator.destroy(out);
+        return false;
+    };
+    if (server.pending) |*p| {
+        if (p.sudo_user.len > 0) self.allocator.free(p.sudo_user);
+        if (p.sftp_path.len > 0) self.allocator.free(p.sftp_path);
+    }
+    const owned_path = self.allocator.dupe(u8, path) catch {
+        if (out.abandon()) self.allocator.destroy(out);
+        return false;
+    };
+    server.pending = .{ .kind = .read_sftp, .account_index = acc_index, .sftp_path = owned_path, .outcome = out };
+    return true;
+}
+
+fn accessQueueSftpData(self: *Context, server: *access.ServerScan, acc_index: usize, path: []const u8) bool {
+    const out = self.allocator.create(sessions.SftpOutcome) catch return false;
+    out.* = .{ .allocator = self.allocator };
+    self.manager.sftpRead(server.server_id, path, @intCast(server.read_buffer.items.len), 64 * 1024, out) catch {
+        self.allocator.destroy(out);
+        return false;
+    };
+    const owned_path = self.allocator.dupe(u8, path) catch {
+        if (out.abandon()) self.allocator.destroy(out);
+        return false;
+    };
+    server.pending = .{ .kind = .read_sftp_data, .account_index = acc_index, .sftp_path = owned_path, .outcome = out };
+    return true;
+}
+
+/// Reads a static key source through approved non-interactive sudo. SFTP uses
+/// the connected account's permissions, so it cannot inspect another user's
+/// mode-0600 authorized_keys file even after a full-account scan was approved.
+fn accessQueuePrivilegedRead(self: *Context, server: *access.ServerScan, acc_index: usize, path: []const u8) bool {
+    const quoted_path = shellquote.quote(self.allocator, path) catch return false;
+    defer self.allocator.free(quoted_path);
+    const command = std.fmt.allocPrint(self.allocator, "LC_ALL=C sudo -n cat -- {s} 2>&1", .{quoted_path}) catch return false;
+    defer self.allocator.free(command);
+    const out = self.allocator.create(sessions.AccessExecOutcome) catch return false;
+    out.* = .{ .allocator = self.allocator };
+    self.manager.enqueueAccessExec(server.server_id, command, access_exec_timeout_ns, sshkeys.max_keys_file_bytes + 1, out) catch {
+        self.allocator.destroy(out);
+        return false;
+    };
+    const owned_path = self.allocator.dupe(u8, path) catch {
+        if (out.abandon()) self.allocator.destroy(out);
+        return false;
+    };
+    server.pending = .{ .kind = .read_privileged, .account_index = acc_index, .sftp_path = owned_path, .outcome = out };
+    return true;
+}
+
+fn accessQueueSudoProbeU(self: *Context, server: *access.ServerScan, acc_index: usize, user: []const u8) bool {
+    const quoted_user = shellquote.quote(self.allocator, user) catch return false;
+    defer self.allocator.free(quoted_user);
+    var cmd_buf: [192]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&cmd_buf, "LC_ALL=C sudo -n -ll -U {s} 2>&1", .{quoted_user}) catch return false;
+    const out = self.allocator.create(sessions.AccessExecOutcome) catch return false;
+    out.* = .{ .allocator = self.allocator };
+    self.manager.enqueueAccessExec(server.server_id, cmd, access_exec_timeout_ns, access_exec_cap, out) catch {
+        self.allocator.destroy(out);
+        return false;
+    };
+    if (server.pending) |*p| {
+        if (p.sudo_user.len > 0) self.allocator.free(p.sudo_user);
+        if (p.sftp_path.len > 0) self.allocator.free(p.sftp_path);
+    }
+    const owned_user = self.allocator.dupe(u8, user) catch {
+        if (out.abandon()) self.allocator.destroy(out);
+        return false;
+    };
+    server.pending = .{ .kind = .sudo_probe_u, .account_index = acc_index, .sudo_user = owned_user, .outcome = out };
+    return true;
 }
 
 fn accessSetOptional(self: *Context, slot: *?[]const u8, value: []const u8) void {
@@ -5608,24 +5741,523 @@ fn accessSetOptional(self: *Context, slot: *?[]const u8, value: []const u8) void
     slot.* = self.allocator.dupe(u8, value) catch null;
 }
 
-/// Seeds the connected account into `accounts` (its home via `echo ~`),
-/// for connected-only scans and full scans without root.
-fn accessSeedConnected(self: *Context, server: *access.ServerScan) bool {
-    const user = server.connected_user orelse return false;
-    var home_check = accessExec(self, server.server_id, "echo ~") orelse return false;
-    defer home_check.output.deinit(self.allocator);
-    const home = std.mem.trim(u8, home_check.output.items, " \t\r\n");
-    if (home.len == 0 or home[0] != '/') return false;
-    server.accounts.append(self.allocator, .{
-        .user = self.allocator.dupe(u8, user) catch return false,
-        .home = self.allocator.dupe(u8, home) catch return false,
-    }) catch return false;
-    return true;
+fn accessMarkPartial(self: *Context, server: *access.ServerScan, reason: []const u8) void {
+    if (server.coverage_reason) |old| {
+        if (std.mem.indexOf(u8, old, reason) != null) return;
+        const combined = std.fmt.allocPrint(self.allocator, "{s}; {s}", .{ old, reason }) catch return;
+        self.allocator.free(old);
+        server.coverage_reason = combined;
+        return;
+    }
+    accessSetOptional(self, &server.coverage_reason, reason);
 }
 
-/// Advances one server one phase. Each phase runs the execs it needs
-/// (bounded, synchronous) so a poll never blocks for long.
+fn accessAppendSourceFact(self: *Context, server: *access.ServerScan, user: []const u8, fact: []const u8) void {
+    const owned = std.fmt.allocPrint(self.allocator, "{s}: {s}", .{ user, fact }) catch return;
+    server.sources.append(self.allocator, owned) catch self.allocator.free(owned);
+}
+
+fn accessQueueEffectivePolicy(self: *Context, server: *access.ServerScan, acc_index: usize) bool {
+    if (acc_index >= server.accounts.items.len) return false;
+    const account = &server.accounts.items[acc_index];
+    const client_addr = server.client_addr orelse "127.0.0.1";
+    const local_addr = server.local_addr orelse "127.0.0.1";
+    const local_port = server.local_port orelse "22";
+    const connection_host = server.connection_host orelse "localhost";
+    if (!server.connection_context_valid) accessMarkPartial(self, server, "the live SSH connection tuple was unavailable");
+    const criteria = std.fmt.allocPrint(
+        self.allocator,
+        "user={s},addr={s},laddr={s},lport={s},host={s}",
+        .{ account.user, client_addr, local_addr, local_port, connection_host },
+    ) catch return false;
+    defer self.allocator.free(criteria);
+    const quoted = shellquote.quote(self.allocator, criteria) catch return false;
+    defer self.allocator.free(quoted);
+    const elevate = !server.privileged and std.mem.eql(u8, server.sudo orelse access.sudo_unknown, access.sudo_yes);
+    const command = std.fmt.allocPrint(
+        self.allocator,
+        "LC_ALL=C {s}sshd -T -C {s} 2>&1",
+        .{ if (elevate) "sudo -n " else "", quoted },
+    ) catch return false;
+    defer self.allocator.free(command);
+    return accessQueueExec(self, server, command, .sshd_config, acc_index);
+}
+
+fn accessContinueAccountSources(self: *Context, server: *access.ServerScan, acc_index: usize) void {
+    if (acc_index >= server.accounts.items.len) return;
+    const account = &server.accounts.items[acc_index];
+    if (account.pubkey_authentication == false) {
+        account.read = true;
+        accessFinishAccountPolicy(self, server, acc_index);
+        server.next_account = acc_index + 1;
+        server.phase = .read_accounts;
+        return;
+    }
+    if (account.next_source < account.static_sources.items.len) {
+        const path = account.static_sources.items[account.next_source];
+        account.next_source += 1;
+        const elevate = !server.privileged and std.mem.eql(u8, server.sudo orelse access.sudo_unknown, access.sudo_yes);
+        const queued = if (elevate)
+            accessQueuePrivilegedRead(self, server, acc_index, path)
+        else
+            accessQueueSftpRead(self, server, acc_index, path);
+        if (!queued) {
+            accessSetOptional(self, &account.@"error", "static key source could not be queued");
+            accessContinueAccountSources(self, server, acc_index);
+        }
+        return;
+    }
+    account.read = account.@"error" == null;
+    accessFinishAccountPolicy(self, server, acc_index);
+    server.next_account = acc_index + 1;
+    server.phase = .read_accounts;
+}
+
+fn accessFinishAccountPolicy(self: *Context, server: *access.ServerScan, acc_index: usize) void {
+    if (acc_index >= server.accounts.items.len) return;
+    const account = &server.accounts.items[acc_index];
+    if (std.mem.eql(u8, account.user, server.connected_user orelse "")) {
+        accessSetOptional(self, &account.sudo, server.sudo orelse access.sudo_unknown);
+    } else if ((server.privileged or std.mem.eql(u8, server.sudo orelse access.sudo_unknown, access.sudo_yes)) and access.safeUserName(account.user)) {
+        if (accessQueueSudoProbeU(self, server, acc_index, account.user)) return;
+        accessSetOptional(self, &account.sudo, access.sudo_unknown);
+    } else {
+        accessSetOptional(self, &account.sudo, access.sudo_unknown);
+    }
+    for (server.grants.items) |*grant| {
+        if (!std.mem.eql(u8, grant.user, account.user) or grant.sudo.len != 0) continue;
+        self.allocator.free(grant.sudo);
+        grant.sudo = self.allocator.dupe(u8, account.sudo orelse access.sudo_unknown) catch continue;
+    }
+}
+
+fn accessFinishAccountRead(self: *Context, server: *access.ServerScan, acc_index: usize, path: []const u8) void {
+    if (acc_index >= server.accounts.items.len) return;
+    const account = &server.accounts.items[acc_index];
+    var file = sshkeys.parse(self.allocator, server.read_buffer.items) catch {
+        accessSetOptional(self, &account.@"error", "authorized_keys could not be parsed");
+        accessFinishAccountPolicy(self, server, acc_index);
+        return;
+    };
+    defer file.deinit(self.allocator);
+    account.key_count += file.keys.len;
+    account.read = true;
+    var file_sha: [32]u8 = undefined;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(server.read_buffer.items);
+    hasher.final(&file_sha);
+    const sha_hex = std.fmt.bytesToHex(file_sha, .lower);
+    for (file.keys) |*key| {
+        if (!key.parsed) continue;
+        if (access.hasCertificateAuthorityOption(key.options)) {
+            accessAppendSourceFact(self, server, account.user, "cert-authority line requires certificate evaluation");
+            accessMarkPartial(self, server, "certificate-authority grants were not evaluated as direct person grants");
+            continue;
+        }
+        var seen = false;
+        for (server.grants.items) |*grant| {
+            if (std.mem.eql(u8, grant.fingerprint, key.fingerprint_sha256) and
+                std.mem.eql(u8, grant.user, account.user) and
+                std.mem.eql(u8, grant.source_path, path))
+            {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        server.grants.append(self.allocator, .{
+            .fingerprint = self.allocator.dupe(u8, key.fingerprint_sha256) catch continue,
+            .user = self.allocator.dupe(u8, account.user) catch continue,
+            .sudo = self.allocator.dupe(u8, "") catch continue,
+            .comment = self.allocator.dupe(u8, key.comment) catch continue,
+            .line_hash = self.allocator.dupe(u8, key.line_hash) catch continue,
+            .source_path = self.allocator.dupe(u8, path) catch continue,
+            .file_sha256 = self.allocator.dupe(u8, &sha_hex) catch continue,
+            .options = self.allocator.dupe(u8, key.options) catch continue,
+        }) catch continue;
+    }
+    accessContinueAccountSources(self, server, acc_index);
+}
+
+fn accessFinishServerScan(self: *Context, server: *access.ServerScan) void {
+    for (server.accounts.items) |*account| {
+        if (account.skipped) continue;
+        if (!account.policy_evaluated) accessMarkPartial(self, server, "some accounts did not receive effective SSH policy evaluation");
+        if (!account.read or account.@"error" != null) accessMarkPartial(self, server, "some account key sources could not be read");
+    }
+    accessSetOptional(self, &server.coverage, if (server.coverage_reason == null) access.coverage_complete else access.coverage_partial);
+    server.done = true;
+    server.phase = .done;
+}
+
+/// Advances one server one phase. Worker-owned execs are queued and
+/// consumed on the next poll so the bridge thread never blocks on the
+/// network (spec 09 § worker ownership). Each poll either queues one
+/// exec or consumes one completed outcome.
 fn accessAdvance(self: *Context, scan: *access.Scan, server: *access.ServerScan) void {
+    // Consume any in-flight worker exec before advancing.
+    if (server.pending) |pend| {
+        // SFTP kinds use SftpOutcome; everything else uses AccessExecOutcome.
+        if (pend.kind == .read_sftp or pend.kind == .read_sftp_data) {
+            const sraw: *sessions.SftpOutcome = @ptrCast(@alignCast(pend.outcome.?));
+            if (!sraw.isDone()) return;
+            // handled in the big switch below; fall through without snapshotting exec data.
+        } else {
+            const raw: *sessions.AccessExecOutcome = @ptrCast(@alignCast(pend.outcome.?));
+            if (!raw.isDone()) return;
+        }
+        // Snapshot exec output for the exec kinds (SFTP handler below re-reads its own outcome).
+        var exit: ?i32 = null;
+        var data_buf: [256 * 1024]u8 = undefined;
+        var cap: usize = 0;
+        var data: []const u8 = &.{};
+        if (pend.kind != .read_sftp and pend.kind != .read_sftp_data and pend.kind != .read_privileged) {
+            const raw2: *sessions.AccessExecOutcome = @ptrCast(@alignCast(pend.outcome.?));
+            exit = raw2.exit;
+            const data_len = raw2.data.items.len;
+            cap = @min(data_len, data_buf.len);
+            if (cap > 0) @memcpy(data_buf[0..cap], raw2.data.items[0..cap]);
+            data = data_buf[0..cap];
+        }
+
+        switch (pend.kind) {
+            .identity_whoami => {
+                const user_trim = std.mem.trim(u8, data, " \t\r\n");
+                var user_copy: [64]u8 = undefined;
+                const ulen = @min(user_trim.len, user_copy.len);
+                if (ulen > 0) @memcpy(user_copy[0..ulen], user_trim[0..ulen]);
+                const user = user_copy[0..ulen];
+                accessClearPending(self, server, exit, data);
+                if (exit == null or exit.? != 0) return accessFail(server, self, "whoami failed");
+                if (user.len == 0 or !access.safeUserName(user)) return accessFail(server, self, "cannot determine the connected user");
+                accessSetOptional(self, &server.connected_user, user);
+                if (!accessQueueExec(self, server, "id -u", .identity_id_u, 0)) return accessFail(server, self, "not connected");
+                return;
+            },
+            .identity_id_u => {
+                const uid_trim = std.mem.trim(u8, data, " \t\r\n");
+                const uid = if (exit != null and exit.? == 0) std.fmt.parseInt(u32, uid_trim, 10) catch null else null;
+                server.connected_uid = uid;
+                server.privileged = uid != null and uid.? == 0;
+                accessClearPending(self, server, exit, data);
+                if (!accessQueueExec(self, server, "printf '%s\\n%s\\n' \"$SSH_CONNECTION\" \"$(hostname -f 2>/dev/null || hostname)\"", .connection_tuple, 0)) return accessFail(server, self, "the live SSH connection tuple could not be requested");
+                return;
+            },
+            .connection_tuple => {
+                var lines = std.mem.splitScalar(u8, data, '\n');
+                const tuple = std.mem.trim(u8, lines.next() orelse "", " \t\r");
+                const connection_host = std.mem.trim(u8, lines.next() orelse "", " \t\r");
+                var fields = std.mem.tokenizeAny(u8, tuple, " \t");
+                const client_addr = fields.next();
+                _ = fields.next(); // client port is not an sshd -C criterion.
+                const local_addr = fields.next();
+                const local_port = fields.next();
+                if (client_addr != null and local_addr != null and local_port != null and connection_host.len > 0) {
+                    accessSetOptional(self, &server.client_addr, client_addr.?);
+                    accessSetOptional(self, &server.local_addr, local_addr.?);
+                    accessSetOptional(self, &server.local_port, local_port.?);
+                    accessSetOptional(self, &server.connection_host, connection_host);
+                    server.connection_context_valid = true;
+                } else {
+                    accessMarkPartial(self, server, "the live SSH connection tuple was unavailable");
+                }
+                accessClearPending(self, server, exit, data);
+                if (server.privileged) {
+                    accessSetOptional(self, &server.sudo, access.sudo_yes);
+                    server.phase = if (scan.full) .enumerate else .read_accounts;
+                } else {
+                    server.phase = .sudo_probe;
+                }
+                return;
+            },
+            .sudo_probe => {
+                const sudo = access.parseSudoList(exit orelse 1, data);
+                accessClearPending(self, server, exit, data);
+                accessSetOptional(self, &server.sudo, sudo);
+                if (scan.full) {
+                    if (!server.privileged and !std.mem.eql(u8, sudo, access.sudo_yes)) accessSetOptional(self, &server.coverage_reason, "cannot enumerate accounts without root or full non-interactive sudo");
+                    server.phase = .enumerate;
+                } else {
+                    server.phase = .read_accounts;
+                }
+                return;
+            },
+            .enumerate => {
+                // getent passwd output is in `data`.
+                var out = struct { exit: i32, output: std.ArrayList(u8) }{ .exit = exit orelse 1, .output = .empty };
+                out.output.appendSlice(self.allocator, data) catch {};
+                // Clear the completed worker outcome before the next phase is queued.
+                const pending_exit = exit;
+                accessClearPending(self, server, exit, data);
+                if (pending_exit == null or pending_exit.? != 0) return accessFail(server, self, "cannot enumerate accounts");
+                const entries = access.parsePasswd(self.allocator, out.output.items) catch null;
+                defer if (entries) |list| {
+                    for (list) |*e| e.deinit(self.allocator);
+                    self.allocator.free(list);
+                };
+                const skipped = access.skippedAccounts(self.allocator, out.output.items) catch null;
+                defer if (skipped) |list| {
+                    for (list) |n| self.allocator.free(n);
+                    self.allocator.free(list);
+                };
+                out.output.deinit(self.allocator);
+                if (entries == null and skipped == null) accessSetOptional(self, &server.coverage_reason, "cannot enumerate accounts");
+                const connected_user = server.connected_user orelse return accessFail(server, self, "cannot determine the connected user");
+                const had_seed = blk: {
+                    for (server.accounts.items) |a| if (std.mem.eql(u8, a.user, connected_user)) break :blk true;
+                    break :blk false;
+                };
+                if (!had_seed) {
+                    // Keep passwd entries; seed the connected account via echo ~ next tick.
+                    if (entries) |list| {
+                        for (list) |*e| {
+                            if (std.mem.eql(u8, e.name, connected_user)) continue;
+                            server.accounts.append(self.allocator, .{ .user = self.allocator.dupe(u8, e.name) catch continue, .home = self.allocator.dupe(u8, e.home) catch continue, .uid = e.uid }) catch continue;
+                        }
+                    }
+                    if (skipped) |list| {
+                        for (list) |name| {
+                            if (std.mem.eql(u8, name, connected_user)) continue;
+                            server.accounts.append(self.allocator, .{ .user = self.allocator.dupe(u8, name) catch continue, .home = self.allocator.dupe(u8, "") catch continue, .skipped = true }) catch continue;
+                        }
+                    }
+                    if (!accessQueueExec(self, server, "echo ~", .seed_home, 0)) accessSetOptional(self, &server.coverage_reason, "cannot resolve the connected account's home");
+                    return;
+                }
+                if (entries) |list| {
+                    for (list) |*e| {
+                        if (std.mem.eql(u8, e.name, connected_user)) continue;
+                        server.accounts.append(self.allocator, .{ .user = self.allocator.dupe(u8, e.name) catch continue, .home = self.allocator.dupe(u8, e.home) catch continue, .uid = e.uid }) catch continue;
+                    }
+                }
+                if (skipped) |list| {
+                    for (list) |name| {
+                        if (std.mem.eql(u8, name, connected_user)) continue;
+                        server.accounts.append(self.allocator, .{ .user = self.allocator.dupe(u8, name) catch continue, .home = self.allocator.dupe(u8, "") catch continue, .skipped = true }) catch continue;
+                    }
+                }
+                server.next_account = 0;
+                server.phase = .read_accounts;
+                return;
+            },
+            .sshd_config => {
+                const acc_idx = pend.account_index;
+                accessClearPending(self, server, exit, data);
+                if (acc_idx >= server.accounts.items.len) return;
+                const account = &server.accounts.items[acc_idx];
+                account.policy_evaluated = true;
+                if (exit != null and exit.? == 0) {
+                    var policy = access.parseEffectiveSshdPolicy(self.allocator, data, account.user, account.uid, account.home) catch {
+                        accessSetOptional(self, &account.@"error", "effective SSH key policy could not be parsed");
+                        accessMarkPartial(self, server, "effective SSH key policy could not be parsed");
+                        return accessContinueAccountSources(self, server, acc_idx);
+                    };
+                    defer policy.deinit(self.allocator);
+                    account.pubkey_authentication = policy.pubkey_authentication;
+                    for (policy.static_sources) |source| {
+                        account.static_sources.append(self.allocator, self.allocator.dupe(u8, source) catch continue) catch continue;
+                        accessAppendSourceFact(self, server, account.user, source);
+                    }
+                    for (policy.warnings) |warning| {
+                        accessAppendSourceFact(self, server, account.user, warning);
+                        accessMarkPartial(self, server, warning);
+                    }
+                    if (policy.pubkey_authentication == null) accessMarkPartial(self, server, "PubkeyAuthentication was not reported for an account");
+                } else {
+                    accessSetOptional(self, &account.@"error", "effective SSH key policy could not be evaluated");
+                    accessMarkPartial(self, server, "effective SSH key policy could not be evaluated");
+                    const fallback = std.fmt.allocPrint(self.allocator, "{s}/.ssh/authorized_keys", .{account.home}) catch null;
+                    if (fallback) |path| {
+                        account.static_sources.append(self.allocator, path) catch self.allocator.free(path);
+                        accessAppendSourceFact(self, server, account.user, path);
+                    }
+                }
+                server.phase = .read_accounts;
+                accessContinueAccountSources(self, server, acc_idx);
+                return;
+            },
+            .read_privileged => {
+                const raw: *sessions.AccessExecOutcome = @ptrCast(@alignCast(pend.outcome.?));
+                const acc_idx = pend.account_index;
+                var path_copy: [512]u8 = undefined;
+                const plen = @min(pend.sftp_path.len, path_copy.len);
+                if (plen > 0) @memcpy(path_copy[0..plen], pend.sftp_path[0..plen]);
+                const read_exit = raw.exit;
+                const read_data = raw.data.items;
+                var read_copy: ?[]u8 = null;
+                if (read_exit != null and read_exit.? == 0 and read_data.len <= sshkeys.max_keys_file_bytes) {
+                    read_copy = self.allocator.dupe(u8, read_data) catch null;
+                }
+                var message_copy: [256]u8 = undefined;
+                const message = raw.message();
+                const mlen = @min(message.len, message_copy.len);
+                if (mlen > 0) @memcpy(message_copy[0..mlen], message[0..mlen]);
+                const too_large = read_data.len > sshkeys.max_keys_file_bytes;
+                accessClearPending(self, server, read_exit, &.{});
+                defer if (read_copy) |bytes| self.allocator.free(bytes);
+                if (acc_idx >= server.accounts.items.len) return;
+                const account = &server.accounts.items[acc_idx];
+                if (read_exit == null or read_exit.? != 0) {
+                    const read_message = message_copy[0..mlen];
+                    const missing = std.ascii.indexOfIgnoreCase(read_message, "no such file") != null or
+                        std.ascii.indexOfIgnoreCase(read_message, "not found") != null;
+                    if (!missing) accessSetOptional(self, &account.@"error", if (read_message.len > 0) read_message else "static key source could not be read with approved sudo");
+                    accessContinueAccountSources(self, server, acc_idx);
+                    return;
+                }
+                if (too_large or read_copy == null) {
+                    accessSetOptional(self, &account.@"error", if (too_large) "static key source is too large" else "out of memory while reading the static key source");
+                    accessContinueAccountSources(self, server, acc_idx);
+                    return;
+                }
+                server.read_buffer.clearRetainingCapacity();
+                server.read_buffer.appendSlice(self.allocator, read_copy.?) catch {
+                    accessSetOptional(self, &account.@"error", "out of memory while reading the static key source");
+                    accessContinueAccountSources(self, server, acc_idx);
+                    return;
+                };
+                accessFinishAccountRead(self, server, acc_idx, path_copy[0..plen]);
+                return;
+            },
+            .read_sftp => {
+                const sftp_out: *sessions.SftpOutcome = @ptrCast(@alignCast(pend.outcome.?));
+                const sftp_ok = sftp_out.ok;
+                const sftp_path = pend.sftp_path;
+                const acc_idx = pend.account_index;
+                var path_copy: [512]u8 = undefined;
+                const plen = @min(sftp_path.len, path_copy.len);
+                if (plen > 0) @memcpy(path_copy[0..plen], sftp_path[0..plen]);
+                var msg_copy: [256]u8 = undefined;
+                const raw_msg = sftp_out.message();
+                const mlen = @min(raw_msg.len, msg_copy.len);
+                if (mlen > 0) @memcpy(msg_copy[0..mlen], raw_msg[0..mlen]);
+                accessClearPending(self, server, exit, data);
+                if (acc_idx >= server.accounts.items.len) return;
+                const acc2 = &server.accounts.items[acc_idx];
+                if (!sftp_ok) {
+                    const msg = msg_copy[0..mlen];
+                    const missing = std.ascii.indexOfIgnoreCase(msg, "no such file") != null or
+                        std.ascii.indexOfIgnoreCase(msg, "not found") != null;
+                    if (missing) {
+                        accessContinueAccountSources(self, server, acc_idx);
+                    } else {
+                        accessSetOptional(self, &acc2.@"error", if (msg.len > 0) msg else "static key source could not be inspected");
+                        accessContinueAccountSources(self, server, acc_idx);
+                    }
+                    return;
+                }
+                const remaining_path = path_copy[0..plen];
+                server.read_buffer.clearRetainingCapacity();
+                if (!accessQueueSftpData(self, server, acc_idx, remaining_path)) {
+                    accessSetOptional(self, &acc2.@"error", "static key source could not be read");
+                    accessContinueAccountSources(self, server, acc_idx);
+                }
+                return;
+            },
+            .read_sftp_data => {
+                const sftp_out: *sessions.SftpOutcome = @ptrCast(@alignCast(pend.outcome.?));
+                const sftp_path = pend.sftp_path;
+                const acc_idx = pend.account_index;
+                var path_copy: [512]u8 = undefined;
+                const plen = @min(sftp_path.len, path_copy.len);
+                if (plen > 0) @memcpy(path_copy[0..plen], sftp_path[0..plen]);
+                var chunk: ?[]u8 = null;
+                var eof = false;
+                var read_error: ?[]const u8 = null;
+                if (!sftp_out.ok or sftp_out.json == null) {
+                    read_error = sftp_out.message();
+                } else {
+                    const parsed = std.json.parseFromSlice(struct { ok: bool, base64: []const u8 = "", eof: bool = false }, self.allocator, sftp_out.json.?, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch null;
+                    if (parsed) |result| {
+                        defer result.deinit();
+                        const size = std.base64.standard.Decoder.calcSizeForSlice(result.value.base64) catch 0;
+                        if (server.read_buffer.items.len + size > sshkeys.max_keys_file_bytes) {
+                            read_error = "static key source is too large";
+                        } else {
+                            chunk = self.allocator.alloc(u8, size) catch null;
+                            var decoded = chunk != null;
+                            if (chunk) |bytes| std.base64.standard.Decoder.decode(bytes, result.value.base64) catch {
+                                decoded = false;
+                            };
+                            if (!decoded) {
+                                if (chunk) |bytes| self.allocator.free(bytes);
+                                chunk = null;
+                                read_error = "static key source could not be decoded";
+                            } else {
+                                eof = result.value.eof;
+                            }
+                        }
+                    } else read_error = "static key source returned an invalid response";
+                }
+                var error_copy: [256]u8 = undefined;
+                const err_len = if (read_error) |message| @min(message.len, error_copy.len) else 0;
+                if (read_error) |message| if (err_len > 0) @memcpy(error_copy[0..err_len], message[0..err_len]);
+                accessClearPending(self, server, exit, data);
+                defer if (chunk) |bytes| self.allocator.free(bytes);
+                if (acc_idx >= server.accounts.items.len) return;
+                const acc2 = &server.accounts.items[acc_idx];
+                if (err_len > 0) {
+                    accessSetOptional(self, &acc2.@"error", error_copy[0..err_len]);
+                    accessContinueAccountSources(self, server, acc_idx);
+                    return;
+                }
+                server.read_buffer.appendSlice(self.allocator, chunk orelse &.{}) catch {
+                    accessSetOptional(self, &acc2.@"error", "out of memory while reading the static key source");
+                    accessContinueAccountSources(self, server, acc_idx);
+                    return;
+                };
+                const remaining_path = path_copy[0..plen];
+                if (!eof) {
+                    if (!accessQueueSftpData(self, server, acc_idx, remaining_path)) {
+                        accessSetOptional(self, &acc2.@"error", "static key source could not be read");
+                        accessContinueAccountSources(self, server, acc_idx);
+                    }
+                    return;
+                }
+                accessFinishAccountRead(self, server, acc_idx, remaining_path);
+                return;
+            },
+            .sudo_probe_u => {
+                const u_trim = std.mem.trim(u8, data, " \t\r\n");
+                _ = u_trim;
+                const sudo = access.parseSudoList(exit orelse 1, data);
+                const acc_idx = pend.account_index;
+                accessClearPending(self, server, exit, data);
+                if (acc_idx < server.accounts.items.len) {
+                    const acc2 = &server.accounts.items[acc_idx];
+                    accessSetOptional(self, &acc2.sudo, sudo);
+                    for (server.grants.items) |*g| if (std.mem.eql(u8, g.user, acc2.user) and g.sudo.len == 0) {
+                        self.allocator.free(g.sudo);
+                        g.sudo = self.allocator.dupe(u8, sudo) catch continue;
+                    };
+                }
+                return;
+            },
+            .seed_home => {
+                const home = std.mem.trim(u8, data, " \t\r\n");
+                const home_pending_exit = exit;
+                accessClearPending(self, server, exit, data);
+                if (home_pending_exit == null or home_pending_exit.? != 0 or home.len == 0 or home[0] != '/') return accessFail(server, self, "cannot resolve the connected account's home");
+                const user2 = server.connected_user orelse return accessFail(server, self, "cannot determine the connected user");
+                var already = false;
+                for (server.accounts.items) |a| if (std.mem.eql(u8, a.user, user2)) {
+                    already = true;
+                    break;
+                };
+                if (!already) server.accounts.append(self.allocator, .{ .user = self.allocator.dupe(u8, user2) catch return accessFail(server, self, "out of memory"), .home = self.allocator.dupe(u8, home) catch return accessFail(server, self, "out of memory"), .uid = server.connected_uid }) catch return accessFail(server, self, "out of memory");
+                if (server.phase == .enumerate) {
+                    server.next_account = 0;
+                    server.phase = .read_accounts;
+                }
+                // read_accounts with empty list will resume on the next tick.
+                return;
+            },
+            else => {
+                accessClearPending(self, server, exit, data);
+                return;
+            },
+        }
+    }
     switch (server.phase) {
         .queued => {
             const session = self.manager.get(server.server_id);
@@ -5639,200 +6271,63 @@ fn accessAdvance(self: *Context, scan: *access.Scan, server: *access.ServerScan)
         },
         .connecting => {}, // not produced by the current plan; reserved
         .identity => {
-            var who = accessExec(self, server.server_id, "whoami") orelse return accessFail(server, self, "not connected");
-            defer who.output.deinit(self.allocator);
-            if (who.exit != 0) return accessFail(server, self, "whoami failed");
-            const user = std.mem.trim(u8, who.output.items, " \t\r\n");
-            if (user.len == 0 or !access.safeUserName(user)) return accessFail(server, self, "cannot determine the connected user");
-            accessSetOptional(self, &server.connected_user, user);
-            var idc = accessExec(self, server.server_id, "id -u") orelse return accessFail(server, self, "not connected");
-            defer idc.output.deinit(self.allocator);
-            const uid = std.mem.trim(u8, idc.output.items, " \t\r\n");
-            server.privileged = idc.exit == 0 and std.mem.eql(u8, uid, "0");
-            if (server.privileged) {
-                // Root is its own sudo authority; no probe needed.
-                accessSetOptional(self, &server.sudo, access.sudo_yes);
-                server.phase = if (scan.full) .enumerate else .read_accounts;
-            } else {
-                server.phase = .sudo_probe;
-            }
+            if (!accessQueueExec(self, server, "whoami", .identity_whoami, 0)) return accessFail(server, self, "not connected");
+            return;
         },
         .sudo_probe => {
-            var probe = accessExec(self, server.server_id, "sudo -n -l 2>&1") orelse return accessFail(server, self, "not connected");
-            defer probe.output.deinit(self.allocator);
-            accessSetOptional(self, &server.sudo, access.parseSudoList(probe.exit, probe.output.items));
-            if (scan.full) {
-                if (!server.privileged) {
-                    accessSetOptional(self, &server.coverage_reason, "cannot enumerate accounts without root");
-                }
-                server.phase = .enumerate;
-            } else {
-                server.phase = .read_accounts;
-            }
+            if (!accessQueueExec(self, server, "sudo -n -l 2>&1", .sudo_probe, 0)) return accessFail(server, self, "not connected");
+            return;
         },
         .enumerate => {
-            if (!server.privileged) {
-                // Full scan without authority: the connected account only.
-                if (!accessSeedConnected(self, server)) return accessFail(server, self, "cannot resolve the connected account's home");
-                server.phase = .read_accounts;
+            const can_enumerate = server.privileged or std.mem.eql(u8, server.sudo orelse access.sudo_unknown, access.sudo_yes);
+            if (!can_enumerate) {
+                if (server.connected_user == null) return accessFail(server, self, "cannot determine the connected user");
+                // Non-privileged full scan: only the connected account.
+                // Queue echo ~; result arrives next tick as .seed_home (see consume switch).
+                // We leave .enumerate -> .read_accounts transition to the .seed_home handler or direct append below.
+                // If already seeded, jump straight to read_accounts.
+                for (server.accounts.items) |a| if (std.mem.eql(u8, a.user, server.connected_user.?)) {
+                    server.phase = .read_accounts;
+                    return;
+                };
+                if (!accessQueueExec(self, server, "echo ~", .seed_home, 0)) return accessFail(server, self, "not connected");
                 return;
             }
-            const connected_user = server.connected_user orelse return accessFail(server, self, "cannot determine the connected user");
-            var out = accessExec(self, server.server_id, "getent passwd") orelse return accessFail(server, self, "not connected");
-            defer out.output.deinit(self.allocator);
-            if (out.exit != 0) return accessFail(server, self, "cannot enumerate accounts");
-            const entries = access.parsePasswd(self.allocator, out.output.items) catch null;
-            defer if (entries) |list| {
-                for (list) |*e| e.deinit(self.allocator);
-                self.allocator.free(list);
-            };
-            const skipped = access.skippedAccounts(self.allocator, out.output.items) catch null;
-            defer if (skipped) |list| {
-                for (list) |n| self.allocator.free(n);
-                self.allocator.free(list);
-            };
-            if (entries == null and skipped == null) {
-                accessSetOptional(self, &server.coverage_reason, "cannot enumerate accounts");
-            }
-            // The connected account always leads the list (root is uid 0
-            // and would be filtered out by the uid >= 1000 rule).
-            if (!accessSeedConnected(self, server)) {
-                accessSetOptional(self, &server.coverage_reason, "cannot resolve the connected account's home");
-            }
-            if (entries) |list| {
-                for (list) |*e| {
-                    if (std.mem.eql(u8, e.name, connected_user)) continue; // already seeded
-                    server.accounts.append(self.allocator, .{
-                        .user = self.allocator.dupe(u8, e.name) catch continue,
-                        .home = self.allocator.dupe(u8, e.home) catch continue,
-                    }) catch continue;
-                }
-            }
-            if (skipped) |list| {
-                for (list) |name| {
-                    if (std.mem.eql(u8, name, connected_user)) continue;
-                    server.accounts.append(self.allocator, .{
-                        .user = self.allocator.dupe(u8, name) catch continue,
-                        .home = self.allocator.dupe(u8, "") catch continue,
-                        .skipped = true,
-                    }) catch continue;
-                }
-            }
-            server.next_account = 0;
-            server.phase = .read_accounts;
+            if (!accessQueueExec(self, server, if (server.privileged) "getent passwd" else "sudo -n getent passwd", .enumerate, 0)) return accessFail(server, self, "not connected");
+            return;
         },
         .read_accounts => {
             if (server.accounts.items.len == 0) {
-                // Connected-only scan: seed before reading.
-                if (!accessSeedConnected(self, server)) return accessFail(server, self, "cannot resolve the connected account's home");
-                return; // the next poll reads the seeded account
+                const user2 = server.connected_user orelse return accessFail(server, self, "cannot determine the connected user");
+                _ = user2;
+                if (!accessQueueExec(self, server, "echo ~", .seed_home, 0)) return accessFail(server, self, "not connected");
+                return;
             }
             const i = server.next_account;
             if (i >= server.accounts.items.len) {
-                server.phase = .sshd_config;
-                return;
+                return accessFinishServerScan(self, server);
             }
             const acc = &server.accounts.items[i];
-            server.next_account += 1;
-            if (acc.skipped) return;
+            if (acc.skipped) {
+                server.next_account += 1;
+                return;
+            }
             if (acc.home.len == 0 or acc.home[0] != '/') {
                 accessSetOptional(self, &acc.@"error", "cannot resolve the account's home");
+                accessMarkPartial(self, server, "an account home could not be resolved");
+                server.next_account += 1;
                 return;
             }
-            var path_buf: [512]u8 = undefined;
-            const path = std.fmt.bufPrint(&path_buf, "{s}/.ssh/authorized_keys", .{acc.home}) catch {
-                accessSetOptional(self, &acc.@"error", "cannot resolve the authorized_keys path");
-                return;
-            };
-            const content = sshkeysRead(self, server.server_id, path);
-            if (content) |c| {
-                defer self.allocator.free(c);
-                var file = sshkeys.parse(self.allocator, c) catch {
-                    accessSetOptional(self, &acc.@"error", "authorized_keys could not be parsed");
-                    return;
-                };
-                defer file.deinit(self.allocator);
-                acc.key_count = file.keys.len;
-                for (file.keys) |*k| {
-                    if (!k.parsed) continue;
-                    // One grant per (user, fingerprint); the first line's
-                    // comment and hash are the stable snapshot.
-                    var seen = false;
-                    for (server.grants.items) |*g| {
-                        if (std.mem.eql(u8, g.fingerprint, k.fingerprint_sha256) and std.mem.eql(u8, g.user, acc.user)) {
-                            seen = true;
-                            break;
-                        }
-                    }
-                    if (seen) continue;
-                    server.grants.append(self.allocator, .{
-                        .fingerprint = self.allocator.dupe(u8, k.fingerprint_sha256) catch continue,
-                        .user = self.allocator.dupe(u8, acc.user) catch continue,
-                        .sudo = self.allocator.dupe(u8, "") catch continue,
-                        .comment = self.allocator.dupe(u8, k.comment) catch continue,
-                        .line_hash = self.allocator.dupe(u8, k.line_hash) catch continue,
-                    }) catch continue;
-                }
-                acc.read = true;
-            } else {
-                // Missing file = an inspected, empty inventory.
-                acc.read = true;
+            if (!acc.policy_evaluated and !accessQueueEffectivePolicy(self, server, i)) {
+                accessSetOptional(self, &acc.@"error", "effective SSH key policy could not be queued");
+                accessMarkPartial(self, server, "effective SSH key policy could not be queued");
+                server.next_account += 1;
             }
-            // Sudo status per account (spec 09 §5): the connected account
-            // reuses the probe; others need a root-run policy query.
-            if (std.mem.eql(u8, acc.user, server.connected_user orelse "")) {
-                accessSetOptional(self, &acc.sudo, server.sudo orelse access.sudo_unknown);
-            } else if (server.privileged and access.safeUserName(acc.user)) {
-                var cmd_buf: [128]u8 = undefined;
-                const cmd = std.fmt.bufPrint(&cmd_buf, "sudo -n -l -U {s} 2>&1", .{acc.user}) catch {
-                    accessSetOptional(self, &acc.sudo, access.sudo_unknown);
-                    return;
-                };
-                var sudo_out = accessExec(self, server.server_id, cmd) orelse {
-                    accessSetOptional(self, &acc.sudo, access.sudo_unknown);
-                    return;
-                };
-                defer sudo_out.output.deinit(self.allocator);
-                accessSetOptional(self, &acc.sudo, access.parseSudoList(sudo_out.exit, sudo_out.output.items));
-            } else {
-                accessSetOptional(self, &acc.sudo, access.sudo_unknown);
-            }
-            // Grants pick up the account's resolved sudo status.
-            for (server.grants.items) |*g| {
-                if (std.mem.eql(u8, g.user, acc.user) and g.sudo.len == 0) {
-                    self.allocator.free(g.sudo);
-                    g.sudo = self.allocator.dupe(u8, acc.sudo orelse access.sudo_unknown) catch continue;
-                }
-            }
+            return;
         },
         .sshd_config => {
-            var out = accessExec(self, server.server_id, "grep -hE '^(AuthorizedKeysFile|AuthorizedKeysCommand|AuthorizedKeysCommandUser|AuthorizedKeysUserCA)' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null") orelse return accessFail(server, self, "not connected");
-            defer out.output.deinit(self.allocator);
-            if (out.exit == 0) {
-                var lines = std.mem.splitScalar(u8, out.output.items, '\n');
-                while (lines.next()) |raw| {
-                    const line = std.mem.trim(u8, raw, " \t\r");
-                    if (line.len == 0) continue;
-                    server.sources.append(self.allocator, self.allocator.dupe(u8, line) catch continue) catch continue;
-                }
-            }
-            if (access.sshdSourcesForcePartial(server.sources.items)) {
-                accessSetOptional(self, &server.coverage_reason, "dynamic or alternate AuthorizedKeys sources");
-            }
-            for (server.accounts.items) |*acc| {
-                if (acc.skipped) continue;
-                if (!acc.read) {
-                    accessSetOptional(self, &server.coverage_reason, "some accounts could not be read");
-                    break;
-                }
-            }
-            if (server.coverage_reason == null) {
-                accessSetOptional(self, &server.coverage, access.coverage_complete);
-            } else {
-                accessSetOptional(self, &server.coverage, access.coverage_partial);
-            }
-            server.done = true;
-            server.phase = .done;
+            server.phase = .read_accounts;
+            return;
         },
         .done, .@"error" => {},
     }
@@ -5847,6 +6342,165 @@ fn accessServerExists(self: *Context, server_id: []const u8) bool {
     return false;
 }
 
+fn accessRegistryLock(registry: *access.Registry) void {
+    while (!registry.mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn accessCloneJobItem(self: *Context, item: *const access.JobItem) !access.JobItem {
+    const server_id = try self.allocator.dupe(u8, item.server_id);
+    errdefer self.allocator.free(server_id);
+    const user = try self.allocator.dupe(u8, item.user);
+    errdefer self.allocator.free(user);
+    const fingerprint = try self.allocator.dupe(u8, item.fingerprint);
+    errdefer self.allocator.free(fingerprint);
+    const expected_line_hash = try self.allocator.dupe(u8, item.expected_line_hash);
+    errdefer self.allocator.free(expected_line_hash);
+    const public_key_line = try self.allocator.dupe(u8, item.public_key_line);
+    errdefer self.allocator.free(public_key_line);
+    const new_fingerprint = try self.allocator.dupe(u8, item.new_fingerprint);
+    errdefer self.allocator.free(new_fingerprint);
+    const source_path = try self.allocator.dupe(u8, item.source_path);
+    errdefer self.allocator.free(source_path);
+    const file_sha256 = try self.allocator.dupe(u8, item.file_sha256);
+    errdefer self.allocator.free(file_sha256);
+    const operation_id = try self.allocator.dupe(u8, item.operation_id);
+    errdefer self.allocator.free(operation_id);
+    return .{
+        .server_id = server_id,
+        .user = user,
+        .fingerprint = fingerprint,
+        .expected_line_hash = expected_line_hash,
+        .public_key_line = public_key_line,
+        .new_fingerprint = new_fingerprint,
+        .source_path = source_path,
+        .file_sha256 = file_sha256,
+        .operation_id = operation_id,
+        .read_only = item.read_only,
+        .state = .running,
+    };
+}
+
+/// Called with the access registry lock held. Idle unfinished work is first
+/// canceled so worker outcomes can be abandoned safely. Terminal records stay
+/// pollable for thirty minutes, then leave the bounded registry.
+fn accessExpireRegistryLocked(self: *Context, now_ns: i64) void {
+    var scan_index: usize = 0;
+    while (scan_index < self.access.scans.items.len) {
+        const scan = self.access.scans.items[scan_index];
+        const last_access = if (scan.last_access_ns > 0) scan.last_access_ns else scan.created_at_ns;
+        if (!scan.canceled and scan.finished_at_ns == 0 and access.registryDeadlineReached(now_ns, last_access, access.registry_idle_expiry_ns)) {
+            scan.canceled = true;
+            scan.finished_at_ns = now_ns;
+            for (scan.servers) |*server| {
+                if (server.pending != null) accessClearPending(self, server, null, &.{});
+                if (server.done or server.phase == .@"error") continue;
+                server.phase = .@"error";
+                accessSetOptional(self, &server.@"error", "scan expired after ten idle minutes");
+                accessSetOptional(self, &server.coverage, access.coverage_partial);
+                accessSetOptional(self, &server.coverage_reason, "scan expired before this server completed");
+            }
+        }
+        if (access.registryDeadlineReached(now_ns, scan.finished_at_ns, access.registry_terminal_retention_ns)) {
+            const expired = self.access.scans.orderedRemove(scan_index);
+            expired.deinit(self.allocator);
+            self.allocator.destroy(expired);
+            continue;
+        }
+        scan_index += 1;
+    }
+
+    var job_index: usize = 0;
+    while (job_index < self.access.jobs.items.len) {
+        const job = self.access.jobs.items[job_index];
+        const last_access = if (job.last_access_ns > 0) job.last_access_ns else job.created_at_ns;
+        if (!job.finished() and access.registryDeadlineReached(now_ns, last_access, access.registry_idle_expiry_ns)) {
+            for (job.items.items) |*item| {
+                if (item.state == .queued) item.state = .canceled;
+            }
+        }
+        if (job.finished() and job.finished_at_ns == 0) job.finished_at_ns = now_ns;
+        if (access.registryDeadlineReached(now_ns, job.finished_at_ns, access.registry_terminal_retention_ns)) {
+            const expired = self.access.jobs.orderedRemove(job_index);
+            expired.deinit(self.allocator);
+            self.allocator.destroy(expired);
+            continue;
+        }
+        job_index += 1;
+    }
+}
+
+fn accessCoordinatorMain(context: *anyopaque) void {
+    const self: *Context = @ptrCast(@alignCast(context));
+    while (!self.access.worker_stop.load(.acquire)) {
+        var work: ?struct { job_id: []u8, item_index: usize, kind: access.JobKind, item: access.JobItem } = null;
+        accessRegistryLock(self.access);
+        const now_ns: i64 = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds);
+        accessExpireRegistryLocked(self, now_ns);
+        for (self.access.scans.items) |scan| {
+            if (scan.canceled) continue;
+            var terminal = true;
+            for (scan.servers) |*server| {
+                if (server.done or server.phase == .@"error") continue;
+                terminal = false;
+                accessAdvance(self, scan, server);
+            }
+            if (terminal and scan.finished_at_ns == 0) scan.finished_at_ns = now_ns;
+        }
+        outer: for (self.access.jobs.items) |job| {
+            for (job.items.items, 0..) |*item, index| {
+                if (item.state != .queued) continue;
+                const cloned = accessCloneJobItem(self, item) catch {
+                    accessItemError(self, item, "out of memory");
+                    continue;
+                };
+                item.state = .running;
+                work = .{
+                    .job_id = self.allocator.dupe(u8, job.id) catch {
+                        var owned = cloned;
+                        owned.deinit(self.allocator);
+                        accessItemError(self, item, "out of memory");
+                        continue;
+                    },
+                    .item_index = index,
+                    .kind = job.kind,
+                    .item = cloned,
+                };
+                break :outer;
+            }
+        }
+        self.access.mutex.unlock();
+
+        if (work) |*pending| {
+            var shadow = access.Job{ .id = "", .kind = pending.kind, .identity_id = "" };
+            accessRunItem(self, &shadow, &pending.item);
+            accessRegistryLock(self.access);
+            if (self.access.jobById(pending.job_id)) |job| {
+                if (pending.item_index < job.items.items.len) {
+                    const target = &job.items.items[pending.item_index];
+                    target.state = pending.item.state;
+                    if (target.@"error") |old| self.allocator.free(old);
+                    target.@"error" = if (pending.item.@"error") |message| self.allocator.dupe(u8, message) catch null else null;
+                }
+                if (job.finished() and job.finished_at_ns == 0) job.finished_at_ns = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds);
+            }
+            self.access.mutex.unlock();
+            self.allocator.free(pending.job_id);
+            pending.item.deinit(self.allocator);
+        } else {
+            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(25), .awake) catch {};
+        }
+    }
+}
+
+fn accessEnsureCoordinator(self: *Context) !void {
+    accessRegistryLock(self.access);
+    defer self.access.mutex.unlock();
+    if (self.access.worker != null) return;
+    self.access.worker_stop.store(false, .release);
+    self.access.worker_context = self;
+    self.access.worker = try std.Thread.spawn(.{}, accessCoordinatorMain, .{self});
+}
+
 fn handleAccessScan(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
     var parsed = parsePayload(AccessScanPayload, self.allocator, invocation.request.payload) catch {
@@ -5854,6 +6508,10 @@ fn handleAccessScan(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
     };
     defer parsed.deinit();
     const payload = parsed.value;
+    const full = std.mem.eql(u8, payload.scope, "all_login_accounts");
+    if (!std.mem.eql(u8, payload.scope, "connected_accounts") and
+        !std.mem.eql(u8, payload.scope, "all_login_accounts")) return respondError(output, "invalid access scan scope");
+    if (full and !payload.approved_sensitive_read) return respondError(output, "full-account scans require sensitive-read approval");
 
     var loaded = self.store.loadParsed(self.io) catch return respondError(output, "server registry is unreadable");
     defer loaded.deinit(self.allocator);
@@ -5867,6 +6525,12 @@ fn handleAccessScan(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
     }
     if (payload.server_ids) |list| {
         for (list) |id| {
+            var duplicate = false;
+            for (ids.items) |existing| if (std.mem.eql(u8, existing, id)) {
+                duplicate = true;
+                break;
+            };
+            if (duplicate) continue;
             var found = false;
             for (servers_all) |s| {
                 if (std.mem.eql(u8, s.id, id)) {
@@ -5876,22 +6540,28 @@ fn handleAccessScan(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
             }
             if (!found) return respondError(output, "unknown server");
             try ids.append(self.allocator, try self.allocator.dupe(u8, id));
+            if (ids.items.len > 256) return respondError(output, "an access scan supports at most 256 servers");
         }
     } else {
         for (servers_all) |s| {
             try ids.append(self.allocator, try self.allocator.dupe(u8, s.id));
         }
     }
+    if (ids.items.len == 0 and payload.server_ids != null) return respondError(output, "select at least one server");
 
     var scan = self.allocator.create(access.Scan) catch return respondError(output, "out of memory");
-    errdefer {
+    var registered = false;
+    errdefer if (!registered) {
         scan.deinit(self.allocator);
         self.allocator.destroy(scan);
-    }
+    };
+    const scan_now_ns: i64 = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds);
     scan.* = .{
         .id = std.fmt.allocPrint(self.allocator, "scan-{d}", .{self.access.next_scan_id}) catch return respondError(output, "out of memory"),
-        .full = payload.full,
-        .created_at_ns = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds),
+        .full = full,
+        .scope = if (full) "all_login_accounts" else "connected_accounts",
+        .created_at_ns = scan_now_ns,
+        .last_access_ns = scan_now_ns,
         .servers = self.allocator.alloc(access.ServerScan, ids.items.len) catch return respondError(output, "out of memory"),
     };
     self.access.next_scan_id +%= 1;
@@ -5911,11 +6581,58 @@ fn handleAccessScan(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
             .host = self.allocator.dupe(u8, host) catch return respondError(output, "out of memory"),
         };
     }
-    self.access.registerScan(scan);
+    try accessEnsureCoordinator(self);
+    self.access.registerScan(scan) catch |err| return respondError(output, switch (err) {
+        error.ScanCapacity => "too many active access scans; finish or cancel one before starting another",
+        else => "out of memory",
+    });
+    registered = true;
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":true,\"scan_id\":") catch return output[0..0];
     json.writeJsonString(&writer, scan.id) catch return output[0..0];
     writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleAccessScanCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AccessScanCancelPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    accessRegistryLock(self.access);
+    defer self.access.mutex.unlock();
+    const scan = self.access.scanById(parsed.value.scan_id) orelse return respondError(output, "unknown scan");
+    scan.canceled = true;
+    scan.finished_at_ns = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds);
+    scan.last_access_ns = scan.finished_at_ns;
+    for (scan.servers) |*server| {
+        if (server.done or server.phase == .@"error") continue;
+        if (server.pending != null) accessClearPending(self, server, null, &.{});
+        server.phase = .@"error";
+        accessSetOptional(self, &server.@"error", "scan canceled");
+    }
+    return ok_json;
+}
+
+fn handleAccessKeyInspect(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AccessKeyInspectPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    const normalized = sshkeys.normalizePublicKey(self.allocator, parsed.value.public_key, "") catch return respondError(output, "invalid public key");
+    defer {
+        self.allocator.free(normalized.line);
+        self.allocator.free(normalized.fingerprint_sha256);
+    }
+    var key_type: []const u8 = "unknown";
+    var tokens = std.mem.tokenizeAny(u8, normalized.line, " \t");
+    if (tokens.next()) |value| key_type = value;
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"normalized_public_key\":") catch return output[0..0];
+    json.writeJsonString(&writer, normalized.line) catch return output[0..0];
+    writer.writeAll(",\"fingerprint\":") catch return output[0..0];
+    json.writeJsonString(&writer, normalized.fingerprint_sha256) catch return output[0..0];
+    writer.writeAll(",\"key_type\":") catch return output[0..0];
+    json.writeJsonString(&writer, key_type) catch return output[0..0];
+    writer.writeAll(",\"comment\":\"\"}") catch return output[0..0];
     return writer.buffered();
 }
 
@@ -5930,10 +6647,14 @@ fn accessWriteGrantView(writer: anytype, g: *const access.GrantView) !void {
     try json.writeJsonString(writer, g.comment);
     try writer.writeAll(",\"line_hash\":");
     try json.writeJsonString(writer, g.line_hash);
+    try writer.writeAll(",\"source_path\":");
+    try json.writeJsonString(writer, g.source_path);
+    try writer.writeAll(",\"file_sha256\":");
+    try json.writeJsonString(writer, g.file_sha256);
     try writer.writeAll("}");
 }
 
-fn accessWriteServerView(writer: anytype, v: *const access.ServerView, budget: *usize) !void {
+fn accessWriteServerView(writer: anytype, v: *const access.ServerView) !void {
     try writer.writeAll("{\"server_id\":");
     try json.writeJsonString(writer, v.server_id);
     try writer.writeAll(",\"name\":");
@@ -5961,8 +6682,6 @@ fn accessWriteServerView(writer: anytype, v: *const access.ServerView, budget: *
     try writer.writeAll(",\"accounts\":[");
     var first = true;
     for (v.accounts) |*a| {
-        if (budget.* < 64) break;
-        budget.* -= 64;
         if (!first) try writer.writeAll(",");
         first = false;
         try writer.writeAll("{\"user\":");
@@ -5981,15 +6700,6 @@ fn accessWriteServerView(writer: anytype, v: *const access.ServerView, budget: *
         try json.writeJsonString(writer, a.sudo);
         try writer.print(",\"key_count\":{d}", .{a.key_count});
         try writer.writeAll("}");
-    }
-    try writer.writeAll("],\"grants\":[");
-    first = true;
-    for (v.grants) |*g| {
-        if (budget.* < 128) break;
-        budget.* -= 128;
-        if (!first) try writer.writeAll(",");
-        first = false;
-        try accessWriteGrantView(writer, g);
     }
     try writer.writeAll("],\"sources\":[");
     first = true;
@@ -6032,6 +6742,10 @@ fn accessWritePerson(writer: anytype, p: *const access.Person) !void {
         try json.writeJsonString(writer, g.comment);
         try writer.writeAll(",\"line_hash\":");
         try json.writeJsonString(writer, g.line_hash);
+        try writer.writeAll(",\"source_path\":");
+        try json.writeJsonString(writer, g.source_path);
+        try writer.writeAll(",\"file_sha256\":");
+        try json.writeJsonString(writer, g.file_sha256);
         try writer.writeAll("}");
     }
     try writer.writeAll("]}");
@@ -6043,14 +6757,13 @@ fn handleAccessPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
         return respondError(output, "invalid payload");
     };
     defer parsed.deinit();
+    accessRegistryLock(self.access);
+    defer self.access.mutex.unlock();
     const scan = self.access.scanById(parsed.value.scan_id) orelse return respondError(output, "unknown scan");
+    scan.last_access_ns = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds);
 
-    for (scan.servers) |*server| {
-        if (server.done or server.phase == .@"error") continue;
-        accessAdvance(self, scan, server);
-    }
-
-    var all_done = true;
+    var all_done = scan.canceled;
+    if (!scan.canceled) all_done = true;
     var views: std.ArrayList(access.ServerView) = .empty;
     defer {
         for (views.items) |*v| v.deinit(self.allocator);
@@ -6062,20 +6775,26 @@ fn handleAccessPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
     }
 
     var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,\"state\":") catch return output[0..0];
-    json.writeJsonString(&writer, if (all_done) "done" else "scanning") catch return output[0..0];
+    writer.writeAll("{\"ok\":true,\"scan_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, scan.id) catch return output[0..0];
+    writer.writeAll(",\"state\":") catch return output[0..0];
+    json.writeJsonString(&writer, if (scan.canceled) "canceled" else if (all_done) "done" else "scanning") catch return output[0..0];
+    writer.writeAll(",\"scope\":") catch return output[0..0];
+    json.writeJsonString(&writer, scan.scope) catch return output[0..0];
+    writer.print(",\"created_at_ms\":{d}", .{@divTrunc(scan.created_at_ns, std.time.ns_per_ms)}) catch return output[0..0];
+    if (scan.finished_at_ns > 0) writer.print(",\"finished_at_ms\":{d}", .{@divTrunc(scan.finished_at_ns, std.time.ns_per_ms)}) catch return output[0..0];
     writer.writeAll(",\"servers\":[") catch return output[0..0];
-    var budget: usize = access_poll_budget;
     var first = true;
     for (views.items) |*v| {
         if (!first) writer.writeAll(",") catch return output[0..0];
         first = false;
-        accessWriteServerView(&writer, v, &budget) catch return output[0..0];
+        accessWriteServerView(&writer, v) catch return output[0..0];
     }
-    writer.writeAll("],\"people\":[") catch return output[0..0];
+    writer.writeAll("],\"people_page\":{") catch return output[0..0];
     var server_count: usize = 0;
     var grant_count: usize = 0;
     var coverage: []const u8 = access.coverage_partial;
+    const limit = @max(@as(usize, 1), @min(parsed.value.limit, 100));
     if (all_done) {
         const identities = self.access.identities.list(self.io) catch {
             return respondError(output, "identity registry is unreadable");
@@ -6087,19 +6806,23 @@ fn handleAccessPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
         const scans = [_]*access.Scan{scan};
         var map = access.buildMap(self.allocator, &scans, identities) catch return respondError(output, "out of memory");
         defer map.deinit(self.allocator);
+        const people_start = @min(parsed.value.people_offset, map.people.len);
+        const people_end = @min(people_start + limit, map.people.len);
+        writer.print("\"offset\":{d},\"limit\":{d},\"total\":{d},\"rows\":[", .{ people_start, limit, map.people.len }) catch return output[0..0];
         first = true;
-        for (map.people) |*p| {
-            if (budget < 128) break;
-            budget -= 128;
+        for (map.people[people_start..people_end]) |*p| {
             if (!first) writer.writeAll(",") catch return output[0..0];
             first = false;
             accessWritePerson(&writer, p) catch return output[0..0];
         }
-        writer.writeAll("],\"unassigned\":[") catch return output[0..0];
+        writer.writeAll("],\"has_more\":") catch return output[0..0];
+        writer.writeAll(if (people_end < map.people.len) "true" else "false") catch return output[0..0];
+        writer.writeAll("},\"unassigned_page\":{") catch return output[0..0];
+        const unassigned_start = @min(parsed.value.unassigned_offset, map.unassigned.len);
+        const unassigned_end = @min(unassigned_start + limit, map.unassigned.len);
+        writer.print("\"offset\":{d},\"limit\":{d},\"total\":{d},\"rows\":[", .{ unassigned_start, limit, map.unassigned.len }) catch return output[0..0];
         first = true;
-        for (map.unassigned) |*u| {
-            if (budget < 96) break;
-            budget -= 96;
+        for (map.unassigned[unassigned_start..unassigned_end]) |*u| {
             if (!first) writer.writeAll(",") catch return output[0..0];
             first = false;
             writer.writeAll("{\"fingerprint\":") catch return output[0..0];
@@ -6113,11 +6836,16 @@ fn handleAccessPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
             }
             writer.writeAll("]}") catch return output[0..0];
         }
+        writer.writeAll("],\"has_more\":") catch return output[0..0];
+        writer.writeAll(if (unassigned_end < map.unassigned.len) "true" else "false") catch return output[0..0];
         server_count = map.server_count;
         grant_count = map.grant_count;
         coverage = map.coverage;
-        writer.writeAll("],\"servers_count\":") catch return output[0..0];
-        writer.print("{d},\"grants_count\":{d},\"coverage\":", .{ server_count, grant_count }) catch return output[0..0];
+        var key_count: usize = map.unassigned.len;
+        for (map.people) |person| key_count += person.fingerprints.len;
+        writer.writeAll("},\"metrics\":{") catch return output[0..0];
+        writer.print("\"people\":{d},\"distinct_fingerprints\":{d},\"completed_servers\":{d},\"target_servers\":{d},\"observed_grants\":{d}", .{ map.people.len, key_count, server_count, scan.servers.len, grant_count }) catch return output[0..0];
+        writer.writeAll("},\"coverage\":") catch return output[0..0];
         json.writeJsonString(&writer, coverage) catch return output[0..0];
         writer.writeAll(",\"sync_errors\":[") catch return output[0..0];
         first = true;
@@ -6130,11 +6858,24 @@ fn handleAccessPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
             json.writeJsonString(&writer, e.reason) catch return output[0..0];
             writer.writeAll("}") catch return output[0..0];
         }
+        writer.writeAll("],\"source_warnings\":[") catch return output[0..0];
+        first = true;
+        for (scan.servers) |server| {
+            if (server.coverage_reason) |reason| {
+                if (!first) writer.writeAll(",") catch return output[0..0];
+                first = false;
+                writer.writeAll("{\"server_id\":") catch return output[0..0];
+                json.writeJsonString(&writer, server.server_id) catch return output[0..0];
+                writer.writeAll(",\"reason\":") catch return output[0..0];
+                json.writeJsonString(&writer, reason) catch return output[0..0];
+                writer.writeAll("}") catch return output[0..0];
+            }
+        }
         writer.writeAll("]}") catch return output[0..0];
     } else {
-        writer.writeAll("],\"unassigned\":[],\"servers_count\":0,\"grants_count\":0,\"coverage\":") catch return output[0..0];
+        writer.print("\"offset\":0,\"limit\":{d},\"total\":0,\"rows\":[],\"has_more\":false}},\"unassigned_page\":{{\"offset\":0,\"limit\":{d},\"total\":0,\"rows\":[],\"has_more\":false}},\"metrics\":{{\"people\":0,\"distinct_fingerprints\":0,\"completed_servers\":0,\"target_servers\":{d},\"observed_grants\":0}},\"coverage\":", .{ limit, limit, scan.servers.len }) catch return output[0..0];
         json.writeJsonString(&writer, coverage) catch return output[0..0];
-        writer.writeAll(",\"sync_errors\":[]}") catch return output[0..0];
+        writer.writeAll(",\"sync_errors\":[],\"source_warnings\":[]}") catch return output[0..0];
     }
     return writer.buffered();
 }
@@ -6154,40 +6895,65 @@ fn accessWritePersonGrant(writer: anytype, g: *const access.PersonGrant) !void {
     try json.writeJsonString(writer, g.comment);
     try writer.writeAll(",\"line_hash\":");
     try json.writeJsonString(writer, g.line_hash);
+    try writer.writeAll(",\"source_path\":");
+    try json.writeJsonString(writer, g.source_path);
+    try writer.writeAll(",\"file_sha256\":");
+    try json.writeJsonString(writer, g.file_sha256);
     try writer.writeAll("}");
 }
 
 fn handleAccessIdentitiesList(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     _ = invocation;
     const self = contextOf(context);
-    const identities = self.access.identities.list(self.io) catch {
+    const loaded = self.access.identities.listWithRecovery(self.io) catch {
         return respondError(output, "identity registry is unreadable");
     };
     defer {
-        for (identities) |*i| i.deinit(self.allocator);
-        self.allocator.free(identities);
+        for (loaded.identities) |*it| it.deinit(self.allocator);
+        self.allocator.free(loaded.identities);
+        if (loaded.recovery_error) |e| self.allocator.free(e);
+        if (loaded.quarantined) |q| self.allocator.free(q);
     }
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":true,\"identities\":[") catch return output[0..0];
     var first = true;
-    for (identities) |*i| {
+    for (loaded.identities) |*it| {
         if (!first) writer.writeAll(",") catch return output[0..0];
         first = false;
         writer.writeAll("{\"id\":") catch return output[0..0];
-        json.writeJsonString(&writer, i.id) catch return output[0..0];
+        json.writeJsonString(&writer, it.id) catch return output[0..0];
         writer.writeAll(",\"name\":") catch return output[0..0];
-        json.writeJsonString(&writer, i.name) catch return output[0..0];
+        json.writeJsonString(&writer, it.name) catch return output[0..0];
         writer.writeAll(",\"fingerprints\":[") catch return output[0..0];
         var ffirst = true;
-        for (i.fingerprints) |fp| {
+        for (it.fingerprints) |fp| {
             if (!ffirst) writer.writeAll(",") catch return output[0..0];
             ffirst = false;
             json.writeJsonString(&writer, fp) catch return output[0..0];
         }
-        writer.print("],\"shared\":{s},\"created_at_ns\":{d}", .{ if (i.shared) "true" else "false", i.created_at_ns }) catch return output[0..0];
+        writer.writeAll("],\"bindings\":[") catch return output[0..0];
+        var bfirst = true;
+        for (it.bindings) |bd| {
+            if (!bfirst) writer.writeAll(",") catch return output[0..0];
+            bfirst = false;
+            writer.writeAll("{\"fingerprint\":") catch return output[0..0];
+            json.writeJsonString(&writer, bd.fingerprint) catch return output[0..0];
+            writer.print(",\"shared\":{s}", .{if (bd.shared) "true" else "false"}) catch return output[0..0];
+            writer.writeAll("}") catch return output[0..0];
+        }
+        writer.print("],\"shared\":{s},\"created_at_ms\":{d},\"revision\":{d}", .{ if (it.shared) "true" else "false", it.created_at_ms, it.revision }) catch return output[0..0];
         writer.writeAll("}") catch return output[0..0];
     }
-    writer.writeAll("]}") catch return output[0..0];
+    writer.writeAll("]") catch return output[0..0];
+    if (loaded.recovery_error) |e| {
+        writer.writeAll(",\"recovery_error\":") catch return output[0..0];
+        json.writeJsonString(&writer, e) catch return output[0..0];
+    }
+    if (loaded.quarantined) |q| {
+        writer.writeAll(",\"quarantined\":") catch return output[0..0];
+        json.writeJsonString(&writer, q) catch return output[0..0];
+    }
+    writer.writeAll("}") catch return output[0..0];
     return writer.buffered();
 }
 
@@ -6197,7 +6963,8 @@ fn handleAccessIdentitiesSave(context: *anyopaque, invocation: native_sdk.bridge
         return respondError(output, "invalid payload");
     };
     defer parsed.deinit();
-    var saved = self.access.identities.save(self.io, parsed.value.identity, @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds)) catch |err| {
+    const now_ms: i64 = @divTrunc(@as(i64, @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds)), std.time.ns_per_ms);
+    var saved = self.access.identities.save(self.io, parsed.value.identity, now_ms) catch |err| {
         return respondError(output, switch (err) {
             error.MissingName, error.InvalidName => "invalid identity name",
             error.NoFingerprints => "at least one fingerprint is required",
@@ -6206,6 +6973,7 @@ fn handleAccessIdentitiesSave(context: *anyopaque, invocation: native_sdk.bridge
             error.DuplicateFingerprint => "duplicate fingerprint",
             error.FingerprintOwned => "a fingerprint can belong to at most one person unless it is marked shared",
             error.UnknownId => "unknown identity",
+            error.RevisionConflict => "identity was modified by another save; reload and retry",
             else => "identity registry is unreadable",
         });
     };
@@ -6222,7 +6990,17 @@ fn handleAccessIdentitiesSave(context: *anyopaque, invocation: native_sdk.bridge
         first = false;
         json.writeJsonString(&writer, fp) catch return output[0..0];
     }
-    writer.print("],\"shared\":{s}", .{if (saved.shared) "true" else "false"}) catch return output[0..0];
+    writer.writeAll("],\"bindings\":[") catch return output[0..0];
+    var bfirst = true;
+    for (saved.bindings) |bd| {
+        if (!bfirst) writer.writeAll(",") catch return output[0..0];
+        bfirst = false;
+        writer.writeAll("{\"fingerprint\":") catch return output[0..0];
+        json.writeJsonString(&writer, bd.fingerprint) catch return output[0..0];
+        writer.print(",\"shared\":{s}", .{if (bd.shared) "true" else "false"}) catch return output[0..0];
+        writer.writeAll("}") catch return output[0..0];
+    }
+    writer.print("],\"shared\":{s},\"created_at_ms\":{d},\"revision\":{d}", .{ if (saved.shared) "true" else "false", saved.created_at_ms, saved.revision }) catch return output[0..0];
     writer.writeAll("}}") catch return output[0..0];
     return writer.buffered();
 }
@@ -6233,7 +7011,20 @@ fn handleAccessIdentitiesDelete(context: *anyopaque, invocation: native_sdk.brid
         return respondError(output, "invalid payload");
     };
     defer parsed.deinit();
-    if (!(self.access.identities.delete(self.io, parsed.value.id) catch return respondError(output, "identity registry is unreadable"))) {
+    const expected_revision = parsed.value.expected_revision orelse return respondError(output, "identity revision is required");
+    if (parsed.value.confirm_name.len == 0) return respondError(output, "confirmation name is required");
+    var identity = self.access.identities.find(self.io, parsed.value.id) catch return respondError(output, "identity registry is unreadable");
+    defer if (identity) |*item| item.deinit(self.allocator);
+    const current = identity orelse return respondError(output, "unknown identity");
+    if (!std.mem.eql(u8, parsed.value.confirm_name, current.name)) return respondError(output, "confirmation name does not match");
+    const del_rev: ?u64 = expected_revision;
+    const deleted = self.access.identities.delete(self.io, parsed.value.id, del_rev) catch |err| {
+        return respondError(output, switch (err) {
+            error.RevisionConflict => "identity was modified by another save; reload and retry",
+            else => "identity registry is unreadable",
+        });
+    };
+    if (!deleted) {
         return respondError(output, "unknown identity");
     }
     var detail_buf: [128]u8 = undefined;
@@ -6245,11 +7036,20 @@ fn handleAccessIdentitiesDelete(context: *anyopaque, invocation: native_sdk.brid
 fn accessNewJob(self: *Context, kind: access.JobKind, identity_id: []const u8) !*access.Job {
     const job = try self.allocator.create(access.Job);
     errdefer self.allocator.destroy(job);
+    const id = try std.fmt.allocPrint(self.allocator, "job-{d}", .{self.access.next_job_id});
+    errdefer self.allocator.free(id);
+    const owned_identity_id = try self.allocator.dupe(u8, identity_id);
+    errdefer self.allocator.free(owned_identity_id);
+    const operation_id = try self.allocator.dupe(u8, "");
+    errdefer self.allocator.free(operation_id);
+    const job_now_ns: i64 = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds);
     job.* = .{
-        .id = try std.fmt.allocPrint(self.allocator, "job-{d}", .{self.access.next_job_id}),
+        .id = id,
         .kind = kind,
-        .identity_id = try self.allocator.dupe(u8, identity_id),
-        .created_at_ns = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds),
+        .identity_id = owned_identity_id,
+        .operation_id = operation_id,
+        .created_at_ns = job_now_ns,
+        .last_access_ns = job_now_ns,
     };
     self.access.next_job_id +%= 1;
     return job;
@@ -6262,6 +7062,74 @@ fn accessIdentityHasFingerprint(identity: *const access.Identity, fingerprint: [
     return false;
 }
 
+fn accessExistingOperationId(self: *Context, operation_id: []const u8) ?[]u8 {
+    if (operation_id.len == 0) return null;
+    accessRegistryLock(self.access);
+    defer self.access.mutex.unlock();
+    for (self.access.jobs.items) |job| {
+        if (std.mem.eql(u8, job.operation_id, operation_id)) {
+            return self.allocator.dupe(u8, job.id) catch null;
+        }
+    }
+    return null;
+}
+
+fn accessRespondExistingJob(output: []u8, job_id: []const u8) []const u8 {
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"job_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, job_id) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn accessFrozenGrantExists(
+    self: *Context,
+    scan_id: []const u8,
+    server_id: []const u8,
+    user: []const u8,
+    fingerprint: []const u8,
+    source_path: []const u8,
+    line_hash: []const u8,
+    file_sha256: []const u8,
+) bool {
+    if (scan_id.len == 0 or source_path.len == 0 or line_hash.len == 0 or file_sha256.len == 0) return false;
+    accessRegistryLock(self.access);
+    defer self.access.mutex.unlock();
+    const scan = self.access.scanById(scan_id) orelse return false;
+    scan.last_access_ns = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds);
+    if (scan.canceled or scan.finished_at_ns == 0) return false;
+    for (scan.servers) |server| {
+        if (!std.mem.eql(u8, server.server_id, server_id)) continue;
+        for (server.grants.items) |grant| {
+            if (std.mem.eql(u8, grant.user, user) and
+                std.mem.eql(u8, grant.fingerprint, fingerprint) and
+                std.mem.eql(u8, grant.source_path, source_path) and
+                std.mem.eql(u8, grant.line_hash, line_hash) and
+                std.mem.eql(u8, grant.file_sha256, file_sha256)) return true;
+        }
+    }
+    return false;
+}
+
+fn accessBindFingerprint(self: *Context, identity: *const access.Identity, fingerprint: []const u8) !void {
+    if (accessIdentityHasFingerprint(identity, fingerprint)) return;
+    if (identity.bindings.len >= access.max_identity_fingerprints) return error.TooManyFingerprints;
+    var bindings = try self.allocator.alloc(access.IdentityBindingInput, identity.fingerprints.len + 1);
+    defer self.allocator.free(bindings);
+    for (identity.fingerprints, 0..) |existing, i| {
+        bindings[i] = .{ .fingerprint = existing, .shared = identity.bindingShared(existing) };
+    }
+    bindings[identity.fingerprints.len] = .{ .fingerprint = fingerprint };
+    const now_ms: i64 = @divTrunc(@as(i64, @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds)), std.time.ns_per_ms);
+    var saved = try self.access.identities.save(self.io, .{
+        .id = identity.id,
+        .name = identity.name,
+        .bindings = bindings,
+        .expected_revision = identity.revision,
+    }, now_ms);
+    saved.deinit(self.allocator);
+}
+
 fn handleAccessOffboard(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
     var parsed = parsePayload(AccessOffboardPayload, self.allocator, invocation.request.payload) catch {
@@ -6270,30 +7138,53 @@ fn handleAccessOffboard(context: *anyopaque, invocation: native_sdk.bridge.Invoc
     defer parsed.deinit();
     const payload = parsed.value;
     if (payload.grants.len == 0) return respondError(output, "no grants selected");
+    if (payload.grants.len > 256) return respondError(output, "an access job supports at most 256 items");
+    if (payload.operation_id.len == 0) return respondError(output, "operation_id is required");
+    if (payload.scan_id.len == 0) return respondError(output, "scan_id is required");
+    const identity_revision = payload.identity_revision orelse return respondError(output, "identity revision is required");
+    if (payload.confirm_name.len == 0) return respondError(output, "confirmation name is required");
+    if (accessExistingOperationId(self, payload.operation_id)) |existing_job_id| {
+        defer self.allocator.free(existing_job_id);
+        return accessRespondExistingJob(output, existing_job_id);
+    }
     var identity = self.access.identities.find(self.io, payload.identity_id) catch {
         return respondError(output, "identity registry is unreadable");
     };
     defer if (identity) |*i| i.deinit(self.allocator);
     const id = identity orelse return respondError(output, "unknown identity");
-
+    if (identity_revision != id.revision) return respondError(output, "identity changed since the preview; refresh and retry");
+    if (!std.mem.eql(u8, payload.confirm_name, id.name)) return respondError(output, "confirmation name does not match");
     var job = accessNewJob(self, .offboard, payload.identity_id) catch return respondError(output, "out of memory");
     errdefer {
         job.deinit(self.allocator);
         self.allocator.destroy(job);
     }
+    const owned_operation_id = self.allocator.dupe(u8, payload.operation_id) catch return respondError(output, "out of memory");
+    self.allocator.free(job.operation_id);
+    job.operation_id = owned_operation_id;
     for (payload.grants) |g| {
         if (!accessIdentityHasFingerprint(&id, g.fingerprint)) return respondError(output, "fingerprint is not part of this identity");
         if (!access.safeUserName(g.user)) return respondError(output, "invalid user name");
-        if (g.expected_line_hash.len == 0) return respondError(output, "missing line hash");
+        if (g.line_hash.len == 0 or g.source_path.len == 0 or g.file_sha256.len == 0) return respondError(output, "the frozen source, line hash, and file hash are required");
         if (!accessServerExists(self, g.server_id)) return respondError(output, "unknown server");
+        if (!accessFrozenGrantExists(self, payload.scan_id, g.server_id, g.user, g.fingerprint, g.source_path, g.line_hash, g.file_sha256)) return respondError(output, "a selected grant no longer matches the completed scan; refresh and retry");
         job.items.append(self.allocator, .{
             .server_id = self.allocator.dupe(u8, g.server_id) catch return respondError(output, "out of memory"),
             .user = self.allocator.dupe(u8, g.user) catch return respondError(output, "out of memory"),
             .fingerprint = self.allocator.dupe(u8, g.fingerprint) catch return respondError(output, "out of memory"),
-            .expected_line_hash = self.allocator.dupe(u8, g.expected_line_hash) catch return respondError(output, "out of memory"),
+            .expected_line_hash = self.allocator.dupe(u8, g.line_hash) catch return respondError(output, "out of memory"),
+            .public_key_line = self.allocator.dupe(u8, "") catch return respondError(output, "out of memory"),
+            .new_fingerprint = self.allocator.dupe(u8, "") catch return respondError(output, "out of memory"),
+            .source_path = self.allocator.dupe(u8, g.source_path) catch return respondError(output, "out of memory"),
+            .file_sha256 = self.allocator.dupe(u8, g.file_sha256) catch return respondError(output, "out of memory"),
+            .operation_id = self.allocator.dupe(u8, payload.operation_id) catch return respondError(output, "out of memory"),
         }) catch return respondError(output, "out of memory");
     }
-    self.access.registerJob(job);
+    try accessEnsureCoordinator(self);
+    self.access.registerJob(job) catch |err| return respondError(output, switch (err) {
+        error.JobCapacity => "too many active access jobs; finish or cancel one before starting another",
+        else => "out of memory",
+    });
     var detail_buf: [128]u8 = undefined;
     const detail = std.fmt.bufPrint(&detail_buf, "identity={s} items={d}", .{ payload.identity_id, payload.grants.len }) catch "access.offboard";
     sshkeysAudit(self, "access.offboard", "", detail);
@@ -6312,13 +7203,26 @@ fn handleAccessOnboard(context: *anyopaque, invocation: native_sdk.bridge.Invoca
     defer parsed.deinit();
     const payload = parsed.value;
     if (payload.grants.len == 0) return respondError(output, "no grants selected");
+    if (payload.grants.len > 256) return respondError(output, "an access job supports at most 256 items");
+    if (payload.operation_id.len == 0) return respondError(output, "operation_id is required");
+    const identity_revision = payload.identity_revision orelse return respondError(output, "identity revision is required");
+    if (accessExistingOperationId(self, payload.operation_id)) |existing_job_id| {
+        defer self.allocator.free(existing_job_id);
+        return accessRespondExistingJob(output, existing_job_id);
+    }
     var identity = self.access.identities.find(self.io, payload.identity_id) catch {
         return respondError(output, "identity registry is unreadable");
     };
     defer if (identity) |*i| i.deinit(self.allocator);
     const id = identity orelse return respondError(output, "unknown identity");
-    for (payload.grants) |g| {
-        if (g.read_only and std.mem.eql(u8, g.user, "root")) return respondError(output, "read-only access to root is not supported");
+    if (identity_revision != id.revision) return respondError(output, "identity changed since the preview; refresh and retry");
+    for (payload.grants, 0..) |g, index| {
+        if (!std.mem.eql(u8, g.target.kind, "account") and !std.mem.eql(u8, g.target.kind, "read_only_role")) return respondError(output, "invalid onboard target kind");
+        if (!access.safeUserName(g.target.name)) return respondError(output, "invalid user name");
+        if (std.mem.eql(u8, g.target.kind, "read_only_role") and std.mem.eql(u8, g.target.name, "root")) return respondError(output, "read-only access to root is not supported");
+        for (payload.grants[index + 1 ..]) |other| {
+            if (std.mem.eql(u8, g.server_id, other.server_id) and std.mem.eql(u8, g.target.kind, other.target.kind) and std.mem.eql(u8, g.target.name, other.target.name)) return respondError(output, "duplicate onboard target");
+        }
     }
 
     const normalized = sshkeys.normalizePublicKey(self.allocator, payload.public_key, id.name) catch |err| {
@@ -6331,30 +7235,52 @@ fn handleAccessOnboard(context: *anyopaque, invocation: native_sdk.bridge.Invoca
         self.allocator.free(normalized.line);
         self.allocator.free(normalized.fingerprint_sha256);
     }
+    for (payload.grants) |g| {
+        if (!accessServerExists(self, g.server_id)) return respondError(output, "unknown server");
+    }
+
+    accessBindFingerprint(self, &id, normalized.fingerprint_sha256) catch |err| return respondError(output, switch (err) {
+        error.RevisionConflict => "identity changed since the preview; refresh and retry",
+        error.FingerprintOwned => "the inspected fingerprint belongs to another identity",
+        error.TooManyFingerprints => "the identity has too many fingerprints",
+        else => "identity registry is unreadable",
+    });
 
     var job = accessNewJob(self, .onboard, payload.identity_id) catch return respondError(output, "out of memory");
     errdefer {
         job.deinit(self.allocator);
         self.allocator.destroy(job);
     }
+    const owned_operation_id = self.allocator.dupe(u8, payload.operation_id) catch return respondError(output, "out of memory");
+    self.allocator.free(job.operation_id);
+    job.operation_id = owned_operation_id;
     for (payload.grants) |g| {
-        if (!access.safeUserName(g.user)) return respondError(output, "invalid user name");
-        if (!accessServerExists(self, g.server_id)) return respondError(output, "unknown server");
         job.items.append(self.allocator, .{
             .server_id = self.allocator.dupe(u8, g.server_id) catch return respondError(output, "out of memory"),
-            .user = self.allocator.dupe(u8, g.user) catch return respondError(output, "out of memory"),
+            .user = self.allocator.dupe(u8, g.target.name) catch return respondError(output, "out of memory"),
             .fingerprint = self.allocator.dupe(u8, normalized.fingerprint_sha256) catch return respondError(output, "out of memory"),
+            .expected_line_hash = self.allocator.dupe(u8, "") catch return respondError(output, "out of memory"),
             .public_key_line = self.allocator.dupe(u8, normalized.line) catch return respondError(output, "out of memory"),
-            .read_only = g.read_only,
+            .new_fingerprint = self.allocator.dupe(u8, "") catch return respondError(output, "out of memory"),
+            .read_only = std.mem.eql(u8, g.target.kind, "read_only_role"),
+            .source_path = self.allocator.dupe(u8, "") catch return respondError(output, "out of memory"),
+            .file_sha256 = self.allocator.dupe(u8, "") catch return respondError(output, "out of memory"),
+            .operation_id = self.allocator.dupe(u8, payload.operation_id) catch return respondError(output, "out of memory"),
         }) catch return respondError(output, "out of memory");
     }
-    self.access.registerJob(job);
+    try accessEnsureCoordinator(self);
+    self.access.registerJob(job) catch |err| return respondError(output, switch (err) {
+        error.JobCapacity => "too many active access jobs; finish or cancel one before starting another",
+        else => "out of memory",
+    });
     var detail_buf: [192]u8 = undefined;
     const detail = std.fmt.bufPrint(&detail_buf, "identity={s} fingerprint={s} items={d}", .{ payload.identity_id, normalized.fingerprint_sha256, payload.grants.len }) catch "access.onboard";
     sshkeysAudit(self, "access.onboard", "", detail);
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":true,\"job_id\":") catch return output[0..0];
     json.writeJsonString(&writer, job.id) catch return output[0..0];
+    writer.writeAll(",\"fingerprint\":") catch return output[0..0];
+    json.writeJsonString(&writer, normalized.fingerprint_sha256) catch return output[0..0];
     writer.writeAll("}") catch return output[0..0];
     return writer.buffered();
 }
@@ -6367,14 +7293,21 @@ fn handleAccessRotate(context: *anyopaque, invocation: native_sdk.bridge.Invocat
     defer parsed.deinit();
     const payload = parsed.value;
     if (payload.grants.len == 0) return respondError(output, "no grants selected");
+    if (payload.grants.len > 256) return respondError(output, "an access job supports at most 256 items");
+    if (payload.operation_id.len == 0) return respondError(output, "operation_id is required");
+    if (payload.scan_id.len == 0) return respondError(output, "scan_id is required");
+    const identity_revision = payload.identity_revision orelse return respondError(output, "identity revision is required");
+    if (accessExistingOperationId(self, payload.operation_id)) |existing_job_id| {
+        defer self.allocator.free(existing_job_id);
+        return accessRespondExistingJob(output, existing_job_id);
+    }
     var identity = self.access.identities.find(self.io, payload.identity_id) catch {
         return respondError(output, "identity registry is unreadable");
     };
     defer if (identity) |*i| i.deinit(self.allocator);
     const id = identity orelse return respondError(output, "unknown identity");
-    if (!accessIdentityHasFingerprint(&id, payload.old_fingerprint)) {
-        return respondError(output, "the old fingerprint is not part of this identity");
-    }
+    if (identity_revision != id.revision) return respondError(output, "identity changed since the preview; refresh and retry");
+    if (!accessIdentityHasFingerprint(&id, payload.old_fingerprint)) return respondError(output, "the old fingerprint is not part of this identity");
     const normalized = sshkeys.normalizePublicKey(self.allocator, payload.new_public_key, id.name) catch |err| {
         return respondError(output, switch (err) {
             error.Multiline => "public key must be a single line",
@@ -6385,31 +7318,54 @@ fn handleAccessRotate(context: *anyopaque, invocation: native_sdk.bridge.Invocat
         self.allocator.free(normalized.line);
         self.allocator.free(normalized.fingerprint_sha256);
     }
+    if (std.mem.eql(u8, payload.old_fingerprint, normalized.fingerprint_sha256)) return respondError(output, "the new key must differ from the old key");
+    for (payload.grants) |g| {
+        if (!access.safeUserName(g.user)) return respondError(output, "invalid user name");
+        if (g.line_hash.len == 0 or g.source_path.len == 0 or g.file_sha256.len == 0) return respondError(output, "the frozen source, line hash, and file hash are required");
+        if (!accessServerExists(self, g.server_id)) return respondError(output, "unknown server");
+        if (!accessFrozenGrantExists(self, payload.scan_id, g.server_id, g.user, payload.old_fingerprint, g.source_path, g.line_hash, g.file_sha256)) return respondError(output, "a selected grant no longer matches the completed scan; refresh and retry");
+    }
+    accessBindFingerprint(self, &id, normalized.fingerprint_sha256) catch |err| return respondError(output, switch (err) {
+        error.RevisionConflict => "identity changed since the preview; refresh and retry",
+        error.FingerprintOwned => "the inspected fingerprint belongs to another identity",
+        error.TooManyFingerprints => "the identity has too many fingerprints",
+        else => "identity registry is unreadable",
+    });
 
     var job = accessNewJob(self, .rotate, payload.identity_id) catch return respondError(output, "out of memory");
     errdefer {
         job.deinit(self.allocator);
         self.allocator.destroy(job);
     }
+    const owned_operation_id = self.allocator.dupe(u8, payload.operation_id) catch return respondError(output, "out of memory");
+    self.allocator.free(job.operation_id);
+    job.operation_id = owned_operation_id;
     for (payload.grants) |g| {
-        if (!access.safeUserName(g.user)) return respondError(output, "invalid user name");
-        if (g.expected_line_hash.len == 0) return respondError(output, "missing line hash");
-        if (!accessServerExists(self, g.server_id)) return respondError(output, "unknown server");
         job.items.append(self.allocator, .{
             .server_id = self.allocator.dupe(u8, g.server_id) catch return respondError(output, "out of memory"),
             .user = self.allocator.dupe(u8, g.user) catch return respondError(output, "out of memory"),
             .fingerprint = self.allocator.dupe(u8, payload.old_fingerprint) catch return respondError(output, "out of memory"),
-            .expected_line_hash = self.allocator.dupe(u8, g.expected_line_hash) catch return respondError(output, "out of memory"),
+            .expected_line_hash = self.allocator.dupe(u8, g.line_hash) catch return respondError(output, "out of memory"),
             .public_key_line = self.allocator.dupe(u8, normalized.line) catch return respondError(output, "out of memory"),
+            .new_fingerprint = self.allocator.dupe(u8, normalized.fingerprint_sha256) catch return respondError(output, "out of memory"),
+            .source_path = self.allocator.dupe(u8, g.source_path) catch return respondError(output, "out of memory"),
+            .file_sha256 = self.allocator.dupe(u8, g.file_sha256) catch return respondError(output, "out of memory"),
+            .operation_id = self.allocator.dupe(u8, payload.operation_id) catch return respondError(output, "out of memory"),
         }) catch return respondError(output, "out of memory");
     }
-    self.access.registerJob(job);
+    try accessEnsureCoordinator(self);
+    self.access.registerJob(job) catch |err| return respondError(output, switch (err) {
+        error.JobCapacity => "too many active access jobs; finish or cancel one before starting another",
+        else => "out of memory",
+    });
     var detail_buf: [192]u8 = undefined;
     const detail = std.fmt.bufPrint(&detail_buf, "identity={s} old={s} items={d}", .{ payload.identity_id, payload.old_fingerprint, payload.grants.len }) catch "access.rotate";
     sshkeysAudit(self, "access.rotate", "", detail);
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":true,\"job_id\":") catch return output[0..0];
     json.writeJsonString(&writer, job.id) catch return output[0..0];
+    writer.writeAll(",\"new_fingerprint\":") catch return output[0..0];
+    json.writeJsonString(&writer, normalized.fingerprint_sha256) catch return output[0..0];
     writer.writeAll("}") catch return output[0..0];
     return writer.buffered();
 }
@@ -6420,26 +7376,99 @@ fn accessItemError(self: *Context, item: *access.JobItem, msg: []const u8) void 
     item.@"error" = self.allocator.dupe(u8, msg) catch null;
 }
 
+fn accessItemConflict(self: *Context, item: *access.JobItem, msg: []const u8) void {
+    item.state = .conflict;
+    if (item.@"error") |e| self.allocator.free(e);
+    item.@"error" = self.allocator.dupe(u8, msg) catch null;
+}
+
 fn accessAuditItem(self: *Context, action: []const u8, item: *const access.JobItem) void {
     var detail_buf: [256]u8 = undefined;
     const detail = std.fmt.bufPrint(&detail_buf, "server={s} user={s} fingerprint={s}", .{ item.server_id, item.user, item.fingerprint }) catch action;
     sshkeysAudit(self, action, item.server_id, detail);
 }
 
-/// Executes one job item (one authorized_keys mutation). Idempotent by
-/// fingerprint: offboard/rotate remove or replace only the matched line;
-/// onboard skips a key that is already present.
+/// Executes one job item. Rotation is add -> verify -> remove, so a failure
+/// never removes the old key before the replacement is proven present.
 fn accessRunItem(self: *Context, job: *access.Job, item: *access.JobItem) void {
     var msg: []const u8 = "";
     switch (job.kind) {
-        .offboard, .rotate => {
-            const path = sshkeysPathMsg(self, item.server_id, item.user, &msg) orelse return accessItemError(self, item, msg);
-            defer self.allocator.free(path);
-            const replacement: ?[]const u8 = if (job.kind == .rotate) item.public_key_line else null;
+        .offboard => {
+            if (item.source_path.len == 0 or item.source_path[0] != '/' or std.mem.indexOf(u8, item.source_path, "..") != null) return accessItemError(self, item, "source path is not the expected static source");
+            const current = sshkeysRead(self, item.server_id, item.source_path) orelse return accessItemError(self, item, "key source could not be read");
+            defer self.allocator.free(current);
+            var current_sha: [32]u8 = undefined;
+            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+            hasher.update(current);
+            hasher.final(&current_sha);
+            const current_hex = std.fmt.bytesToHex(current_sha, .lower);
+            if (!std.mem.eql(u8, current_hex[0..], item.file_sha256)) return accessItemConflict(self, item, "authorized_keys changed since the preview; refresh and retry");
             var write_err_buf: [256]u8 = undefined;
-            const rewritten = sshkeysRewriteCore(self, item.server_id, path, item.fingerprint, item.expected_line_hash, replacement, item.user, &msg, &write_err_buf) orelse return accessItemError(self, item, msg);
+            const rewritten = sshkeysRewriteCore(self, item.server_id, item.source_path, item.fingerprint, item.expected_line_hash, null, item.user, &msg, &write_err_buf) orelse {
+                if (std.mem.indexOf(u8, msg, "changed since") != null) return accessItemConflict(self, item, msg);
+                return accessItemError(self, item, msg);
+            };
             defer self.allocator.free(rewritten);
-            accessAuditItem(self, if (job.kind == .offboard) "access.offboard" else "access.rotate", item);
+            accessAuditItem(self, "access.offboard", item);
+            item.state = .done;
+        },
+        .rotate => {
+            if (item.source_path.len == 0 or item.source_path[0] != '/' or std.mem.indexOf(u8, item.source_path, "..") != null) return accessItemError(self, item, "source path is not the expected static source");
+            const current = sshkeysRead(self, item.server_id, item.source_path) orelse return accessItemError(self, item, "key source could not be read");
+            defer self.allocator.free(current);
+            var current_sha: [32]u8 = undefined;
+            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+            hasher.update(current);
+            hasher.final(&current_sha);
+            const current_hex = std.fmt.bytesToHex(current_sha, .lower);
+            if (!std.mem.eql(u8, current_hex[0..], item.file_sha256)) return accessItemConflict(self, item, "authorized_keys changed since the preview; refresh and retry");
+
+            var parsed_current = sshkeys.parse(self.allocator, current) catch return accessItemError(self, item, "failed to parse authorized_keys");
+            defer parsed_current.deinit(self.allocator);
+            const old_target = sshkeysFindTarget(&parsed_current, item.fingerprint, item.expected_line_hash) orelse return accessItemConflict(self, item, "the old key changed since the preview; refresh and retry");
+            var replacement_present = false;
+            for (parsed_current.keys) |*key| {
+                if (key.parsed and std.mem.eql(u8, key.fingerprint_sha256, item.new_fingerprint)) {
+                    replacement_present = true;
+                    break;
+                }
+            }
+            if (!replacement_present) {
+                var staged: std.ArrayList(u8) = .empty;
+                defer staged.deinit(self.allocator);
+                staged.appendSlice(self.allocator, current) catch return accessItemError(self, item, "out of memory");
+                if (current.len > 0 and current[current.len - 1] != '\n') staged.append(self.allocator, '\n') catch return accessItemError(self, item, "out of memory");
+                if (old_target.options.len > 0) {
+                    staged.appendSlice(self.allocator, old_target.options) catch return accessItemError(self, item, "out of memory");
+                    staged.append(self.allocator, ' ') catch return accessItemError(self, item, "out of memory");
+                }
+                staged.appendSlice(self.allocator, item.public_key_line) catch return accessItemError(self, item, "out of memory");
+                staged.append(self.allocator, '\n') catch return accessItemError(self, item, "out of memory");
+                const mode = sshkeysMode(self, item.server_id, item.source_path);
+                var add_error_buf: [256]u8 = undefined;
+                if (sshkeysWrite(self, item.server_id, item.source_path, staged.items, mode, item.user, &add_error_buf)) |write_message| return accessItemError(self, item, write_message);
+            }
+
+            const verified = sshkeysRead(self, item.server_id, item.source_path) orelse return accessItemError(self, item, "the replacement key could not be verified");
+            defer self.allocator.free(verified);
+            var parsed_verified = sshkeys.parse(self.allocator, verified) catch return accessItemError(self, item, "the replacement key could not be verified");
+            defer parsed_verified.deinit(self.allocator);
+            var verified_present = false;
+            for (parsed_verified.keys) |*key| {
+                if (key.parsed and std.mem.eql(u8, key.fingerprint_sha256, item.new_fingerprint)) {
+                    verified_present = true;
+                    break;
+                }
+            }
+            if (!verified_present) return accessItemError(self, item, "the replacement key could not be verified");
+
+            var remove_error_buf: [256]u8 = undefined;
+            const rewritten = sshkeysRewriteCore(self, item.server_id, item.source_path, item.fingerprint, item.expected_line_hash, null, item.user, &msg, &remove_error_buf) orelse {
+                if (std.mem.indexOf(u8, msg, "changed since") != null) return accessItemConflict(self, item, msg);
+                return accessItemError(self, item, msg);
+            };
+            defer self.allocator.free(rewritten);
+            accessAuditItem(self, "access.rotate", item);
             item.state = .done;
         },
         .onboard => {
@@ -6494,18 +7523,24 @@ fn handleAccessJobPoll(context: *anyopaque, invocation: native_sdk.bridge.Invoca
         return respondError(output, "invalid payload");
     };
     defer parsed.deinit();
+    accessRegistryLock(self.access);
+    defer self.access.mutex.unlock();
     const job = self.access.jobById(parsed.value.job_id) orelse return respondError(output, "unknown job");
-
-    // One mutation per poll keeps every handler invocation bounded.
-    for (job.items.items) |*item| {
-        if (item.state != .queued) continue;
-        accessRunItem(self, job, item);
-        break;
-    }
+    job.last_access_ns = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds);
 
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":true,\"state\":") catch return output[0..0];
-    json.writeJsonString(&writer, if (job.finished()) "done" else "running") catch return output[0..0];
+    var has_error = false;
+    var all_canceled = job.items.items.len > 0;
+    var all_queued = job.items.items.len > 0;
+    var any_canceled = false;
+    for (job.items.items) |item| {
+        if (item.state == .@"error" or item.state == .conflict) has_error = true;
+        if (item.state != .canceled) all_canceled = false;
+        if (item.state == .canceled) any_canceled = true;
+        if (item.state != .queued) all_queued = false;
+    }
+    json.writeJsonString(&writer, if (all_canceled) "canceled" else if (all_queued) "queued" else if (job.finished() and (has_error or any_canceled)) "partial" else if (job.finished()) "done" else "running") catch return output[0..0];
     writer.writeAll(",\"results\":[") catch return output[0..0];
     var first = true;
     for (job.items.items) |*item| {
@@ -6515,6 +7550,8 @@ fn handleAccessJobPoll(context: *anyopaque, invocation: native_sdk.bridge.Invoca
         json.writeJsonString(&writer, item.server_id) catch return output[0..0];
         writer.writeAll(",\"user\":") catch return output[0..0];
         json.writeJsonString(&writer, item.user) catch return output[0..0];
+        writer.writeAll(",\"source_path\":") catch return output[0..0];
+        json.writeJsonString(&writer, item.source_path) catch return output[0..0];
         writer.writeAll(",\"state\":") catch return output[0..0];
         json.writeJsonString(&writer, item.state.jsonName()) catch return output[0..0];
         if (item.@"error") |e| {
@@ -6527,20 +7564,38 @@ fn handleAccessJobPoll(context: *anyopaque, invocation: native_sdk.bridge.Invoca
     return writer.buffered();
 }
 
+fn handleAccessJobCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AccessJobCancelPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    accessRegistryLock(self.access);
+    defer self.access.mutex.unlock();
+    const job = self.access.jobById(parsed.value.job_id) orelse return respondError(output, "unknown job");
+    job.last_access_ns = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds);
+    for (job.items.items) |*item| {
+        if (item.state == .queued) item.state = .canceled;
+    }
+    if (job.finished() and job.finished_at_ns == 0) job.finished_at_ns = job.last_access_ns;
+    return ok_json;
+}
+
 fn handleAccessExport(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
     var parsed = parsePayload(AccessExportPayload, self.allocator, invocation.request.payload) catch {
         return respondError(output, "invalid payload");
     };
     defer parsed.deinit();
+    accessRegistryLock(self.access);
+    defer self.access.mutex.unlock();
     const format = parsed.value.format;
-    if (!std.mem.eql(u8, format, "csv") and !std.mem.eql(u8, format, "json")) {
-        return respondError(output, "invalid format");
-    }
-    const scan = self.access.lastFinishedScan() orelse return respondError(output, "no completed scan yet");
-    const identities = self.access.identities.list(self.io) catch {
-        return respondError(output, "identity registry is unreadable");
-    };
+    if (!std.mem.eql(u8, format, "csv") and !std.mem.eql(u8, format, "json")) return respondError(output, "invalid format");
+    if (parsed.value.scan_id.len == 0) return respondError(output, "scan_id is required");
+    if (parsed.value.path.len == 0) return respondError(output, "an export path is required");
+    const want_scan: ?*access.Scan = self.access.scanById(parsed.value.scan_id);
+    const scan = want_scan orelse return respondError(output, "no completed scan yet");
+    scan.last_access_ns = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds);
+    if (scan.canceled or scan.finished_at_ns == 0) return respondError(output, "the selected scan is not complete");
+    const identities = self.access.identities.list(self.io) catch return respondError(output, "identity registry is unreadable");
     defer {
         for (identities) |*i| i.deinit(self.allocator);
         self.allocator.free(identities);
@@ -6548,18 +7603,49 @@ fn handleAccessExport(context: *anyopaque, invocation: native_sdk.bridge.Invocat
     const scans = [_]*access.Scan{scan};
     var map = access.buildMap(self.allocator, &scans, identities) catch return respondError(output, "out of memory");
     defer map.deinit(self.allocator);
+    // Pagination: cursor/limit slice by rows (csv lines excluding header, json items).
+    const total_csv_rows = blk: {
+        var n: usize = 0;
+        for (map.people) |*p| n += p.grants.len;
+        for (map.unassigned) |*u| n += u.grants.len;
+        n += map.sync_errors.len;
+        n += map.source_warnings.len;
+        break :blk n;
+    };
+    // For json we export the full document; pagination only applies to csv file writes.
     const content = if (std.mem.eql(u8, format, "json"))
         access.exportJson(self.allocator, &map) catch return respondError(output, "out of memory")
     else
         access.exportCsv(self.allocator, &map) catch return respondError(output, "out of memory");
     defer self.allocator.free(content);
-    var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,\"format\":") catch return output[0..0];
-    json.writeJsonString(&writer, format) catch return output[0..0];
-    writer.writeAll(",\"content\":") catch return output[0..0];
-    json.writeJsonString(&writer, content) catch return respondError(output, "export too large for one response; narrow the fleet");
-    writer.writeAll("}") catch return output[0..0];
-    return writer.buffered();
+    // Atomic file write via the native save-dialog path.
+    if (parsed.value.path.len > 0) {
+        if (std.mem.indexOf(u8, parsed.value.path, "\x00") != null) return respondError(output, "invalid path");
+        const dir = std.fs.path.dirname(parsed.value.path) orelse return respondError(output, "invalid path");
+        // Use sibling temp + fsync + rename. Never fall back to truncating the
+        // destination because that would make a failed audit export destructive.
+        {
+            var dir_io = std.Io.Dir.openDirAbsolute(self.io, dir, .{}) catch return respondError(output, "cannot open the export folder");
+            defer dir_io.close(self.io);
+            const tmp_name = std.fmt.allocPrint(self.allocator, ".{s}.oars-tmp", .{std.fs.path.basename(parsed.value.path)}) catch return respondError(output, "out of memory");
+            defer self.allocator.free(tmp_name);
+            {
+                var f = dir_io.createFile(self.io, tmp_name, .{ .truncate = true, .read = false }) catch return respondError(output, "cannot write file");
+                defer f.close(self.io);
+                f.writeStreamingAll(self.io, content) catch return respondError(output, "cannot write file");
+                f.sync(self.io) catch {};
+            }
+            dir_io.rename(tmp_name, dir_io, std.fs.path.basename(parsed.value.path), self.io) catch return respondError(output, "cannot write file");
+        }
+        var writer = std.Io.Writer.fixed(output);
+        writer.writeAll("{\"ok\":true,\"format\":") catch return output[0..0];
+        json.writeJsonString(&writer, format) catch return output[0..0];
+        writer.writeAll(",\"path\":") catch return output[0..0];
+        json.writeJsonString(&writer, parsed.value.path) catch return output[0..0];
+        writer.print(",\"rows\":{d},\"formula_safe\":{s}}}", .{ total_csv_rows, if (std.mem.eql(u8, format, "csv")) "true" else "false" }) catch return output[0..0];
+        return writer.buffered();
+    }
+    unreachable;
 }
 
 test "logs scan command is marker-escaped for busybox and GNU printf" {

@@ -19,7 +19,7 @@ already exists.
 | 06 | [Scripts + Safe Broadcast](06-scripts.md) | ✅ v1 frontend + backend implemented: library/editor, two-phase prepare→confirm broadcast, worker-driven syntax checks, per-server streams and results |
 | 07 | [One-Click Deployment](07-deployment.md) | ✅ v1 frontend + backend implemented: managed-state-safe preflight with frozen plan and port checks, exact Node/PM2 releases, per-app SSH identity, verified cancellation, cursor polling, masked history |
 | 08 | [SSH Management](08-ssh-management.md) | 📋 |
-| 09 | [Access Management](09-access.md) | 📋 |
+| 09 | [Access Management](09-access.md) | Partial: typed app-level UI, worker-driven jobs, strict mutations, and atomic exports exist; effective per-account OpenSSH sources, expiry, independent per-server target/role selection, and complete two-server integration evidence remain |
 | 10 | [Backups](10-backups.md) | 📋 |
 | 11 | [AI Terminal](11-ai-terminal.md) | 📋 |
 | 12 | [Remote Desktop (VNC)](12-vnc.md) | ✅ v1 frontend + backend implemented |

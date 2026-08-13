@@ -314,7 +314,7 @@ test "integration: access scan, identities, offboard/onboard/rotate, export" {
         try std.testing.expectEqualStrings("done", s.phase);
         try std.testing.expectEqualStrings("complete", s.coverage);
         try std.testing.expectEqualStrings("root", s.connected_user);
-        try std.testing.expectEqualStrings("yes", s.sudo);
+        try std.testing.expectEqualStrings("full", s.sudo);
         try std.testing.expectEqual(@as(usize, 1), s.accounts.len);
         try std.testing.expectEqualStrings("root", s.accounts[0].user);
         // Root's file carries fp_ada + fp_un.
@@ -363,17 +363,17 @@ test "integration: access scan, identities, offboard/onboard/rotate, export" {
             if (std.mem.eql(u8, a.user, "alice")) {
                 saw_alice = true;
                 try std.testing.expect(a.read);
-                try std.testing.expectEqualStrings("no", a.sudo);
+                try std.testing.expectEqualStrings("none", a.sudo);
                 try std.testing.expectEqual(@as(usize, 2), a.key_count); // bob + un
             }
             if (std.mem.eql(u8, a.user, "carol")) {
                 saw_carol = true;
                 try std.testing.expect(a.read);
-                try std.testing.expectEqualStrings("yes", a.sudo);
+                try std.testing.expectEqualStrings("full", a.sudo);
                 try std.testing.expectEqual(@as(usize, 1), a.key_count);
             }
             if (std.mem.eql(u8, a.user, "root")) {
-                try std.testing.expectEqualStrings("yes", a.sudo);
+                try std.testing.expectEqualStrings("full", a.sudo);
             }
         }
         try std.testing.expect(saw_alice and saw_carol and saw_nobody);
@@ -394,17 +394,17 @@ test "integration: access scan, identities, offboard/onboard/rotate, export" {
         if (std.mem.eql(u8, p.name, "Ada")) {
             ada_seen = true;
             try std.testing.expectEqual(@as(usize, 2), p.grants.len);
-            try std.testing.expectEqualStrings("yes", p.grants[0].sudo);
+            try std.testing.expectEqualStrings("full", p.grants[0].sudo);
         }
         if (std.mem.eql(u8, p.name, "Bob")) {
             bob_seen = true;
             try std.testing.expectEqual(@as(usize, 2), p.grants.len);
-            try std.testing.expectEqualStrings("no", p.grants[0].sudo);
+            try std.testing.expectEqualStrings("none", p.grants[0].sudo);
         }
         if (std.mem.eql(u8, p.name, "Carol")) {
             carol_seen = true;
             try std.testing.expectEqual(@as(usize, 2), p.grants.len);
-            try std.testing.expectEqualStrings("yes", p.grants[0].sudo);
+            try std.testing.expectEqualStrings("full", p.grants[0].sudo);
         }
     }
     try std.testing.expect(ada_seen and bob_seen and carol_seen);

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Oars UI preview</title>
     <script>
-	      (() => {
+      (() => {
         const now = Date.now();
         const monitorMode = new URLSearchParams(window.location.search).get("monitor") || "healthy";
         const logsMode = new URLSearchParams(window.location.search).get("logs") || "default";
@@ -20,6 +20,7 @@
         const filesMode = new URLSearchParams(window.location.search).get("files") || "default";
         const scriptsMode = new URLSearchParams(window.location.search).get("scripts") || "populated";
         const deployMode = new URLSearchParams(window.location.search).get("deploy") || "populated";
+        const accessMode = new URLSearchParams(window.location.search).get("access") || "populated";
         let nextDiagnosticChannel = 900;
         // Logs fixtures (spec 04): deterministic sources, lines with
         // repeatable search matches, one very long line, a follow channel
@@ -189,6 +190,29 @@
         const deployPreflights = new Map();
         const deployRuns = new Map();
         const deployHistory = [{ id: 88, server_id: "prod-api", app_id: "app-storefront", status: "done", action: "update", commit: "52cc437d927a7c9126f22c7fe218ab7dac4c4af0", started_at_ms: now - 45 * 60e3, finished_at_ms: now - 43 * 60e3, steps: [], output: "Deployment completed successfully.\n", truncated: false }];
+        const accessFingerprint = "SHA256:IIiiMx8dWbmaEVhH8Oc9GEt16E2UPRuGtQ3itmbNZxs";
+        const accessNewFingerprint = "SHA256:el3RAdX7MPz8bGotR4kPQ4XBQTl42+OD1WbuC4jrRtg";
+        let accessIdentities = [{ id: "identity-ada", name: "Ada Lovelace", fingerprints: [accessFingerprint], bindings: [{ fingerprint: accessFingerprint, shared: false }], shared: false, created_at_ms: now - 86400e3, revision: 1 }];
+        let accessScanPolls = 0;
+        let accessScanScope = "connected_accounts";
+        let accessJobPolls = 0;
+        let previewSshKeys = [
+          { line_index: 0, parsed: true, options: "", type: "ssh-ed25519", key: "AAAAC3NzaC1lZDI1NTE5AAAAIFleetPreviewAda", comment: "ada@workstation", fingerprint_sha256: accessFingerprint, bits: 256, line_hash: "line-preview-1" },
+          { line_index: 1, parsed: true, options: "restrict,command=\"/usr/local/bin/read-reports\"", type: "ssh-ed25519", key: "AAAAC3NzaC1lZDI1NTE5AAAAIReportsPreview", comment: "reports-automation", fingerprint_sha256: "SHA256:7cE9mPVmJm7V2HKjp9iY0zBkYi47SuGGq8YVxbDT2pM", bits: 256, line_hash: "line-preview-2" },
+        ];
+        let previewSshRoles = [
+          { name: "reports", shell: "/usr/sbin/nologin", read_only: true, policy: "read-only-sftp", users: ["reports-automation"] },
+        ];
+        const accessGrant = { fingerprint: accessFingerprint, server_id: "prod-api", server_name: "Production API", user: "deploy", sudo: "limited", comment: "ada@workstation", line_hash: "line-preview-1", source_path: "/home/deploy/.ssh/authorized_keys", file_sha256: "4f4a43f2c8b1f973b9dd65a7a0c486353449086d0b4b734339cfe2565112f4aa" };
+        function accessPollPayload() {
+          accessScanPolls += 1;
+          const scanning = accessMode === "scanning" && accessScanPolls < 4;
+          const empty = accessMode === "empty";
+          const partial = accessMode === "partial";
+          const server = { server_id: "prod-api", name: "Production API", host: "api.internal.example", phase: scanning ? "read_accounts" : "done", connected_user: "deploy", sudo: "limited", coverage: partial ? "partial" : "complete", coverage_reason: partial ? "AuthorizedKeysCommand is dynamic and cannot be inventoried" : "", error: "", accounts: [{ user: "deploy", home: "/home/deploy", skipped: false, read: true, error: "", sudo: "limited", key_count: empty ? 0 : 1 }], sources: ["authorizedkeysfile .ssh/authorized_keys"] };
+          const rows = empty || scanning ? [] : [{ identity_id: "identity-ada", name: "Ada Lovelace", fingerprints: [accessFingerprint], grants: [accessGrant] }];
+          return { ok: true, scan_id: "scan-preview", state: scanning ? "scanning" : "done", scope: accessScanScope, created_at_ms: now - 1200, ...(scanning ? {} : { finished_at_ms: now }), servers: [server], people_page: { offset: 0, limit: 100, total: rows.length, rows, has_more: false }, unassigned_page: { offset: 0, limit: 100, total: 0, rows: [], has_more: false }, metrics: { people: rows.length, distinct_fingerprints: rows.length, completed_servers: scanning ? 0 : 1, target_servers: 1, observed_grants: rows.length }, coverage: partial ? "partial" : "complete", sync_errors: partial ? [{ server_id: "staging-web", reason: "not connected" }] : [], source_warnings: partial ? [{ server_id: "prod-api", reason: "AuthorizedKeysCommand is dynamic and cannot be inventoried" }] : [] };
+        }
         function recordCall(command, payload) {
           let recorded = payload;
           if (command === "native-sdk.credentials.set" && payload && "secret" in payload) recorded = { ...payload, secret: "<redacted>" };
@@ -441,6 +465,32 @@
               polls.set(payload.server_id + ":mon", (polls.get(payload.server_id + ":mon")||0)+1);
               return { ok: true };
             }
+            // ── Server key and role fixtures (spec 08) ──────────────
+            if (command === "oars.sshkeys.list") return { ok: true, keys: previewSshKeys };
+            if (command === "oars.sshkeys.add") {
+              const fingerprint = accessNewFingerprint;
+              previewSshKeys.push({ line_index: previewSshKeys.length, parsed: true, options: "", type: "ssh-ed25519", key: String(payload.public_key || "").split(/\s+/)[1] || "preview-key", comment: payload.comment || "new key", fingerprint_sha256: fingerprint, bits: 256, line_hash: `line-preview-${previewSshKeys.length + 1}` });
+              return { ok: true, fingerprint, line_hash: previewSshKeys.at(-1).line_hash };
+            }
+            if (command === "oars.sshkeys.revoke") {
+              previewSshKeys = previewSshKeys.filter((entry) => entry.fingerprint_sha256 !== payload.fingerprint || entry.line_hash !== payload.expected_line_hash);
+              return { ok: true };
+            }
+            if (command === "oars.sshkeys.rotate") {
+              previewSshKeys = previewSshKeys.map((entry) => entry.fingerprint_sha256 === payload.fingerprint && entry.line_hash === payload.expected_line_hash ? { ...entry, key: String(payload.new_public_key || "").split(/\s+/)[1] || "rotated-key", fingerprint_sha256: accessNewFingerprint, line_hash: `${entry.line_hash}-rotated` } : entry);
+              return { ok: true };
+            }
+            if (command === "oars.sshkeys.generate") return { ok: true, public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPreviewGenerated oars-generated", private_path: payload.destination, keychain_account: "oars-preview-key" };
+            if (command === "oars.sshkeys.roles.list") return { ok: true, roles: previewSshRoles };
+            if (command === "oars.sshkeys.roles.create") {
+              previewSshRoles.push({ name: payload.name, shell: payload.read_only ? "/usr/sbin/nologin" : "/bin/bash", read_only: Boolean(payload.read_only), policy: payload.read_only ? "read-only-sftp" : "standard", users: [] });
+              return { ok: true };
+            }
+            if (command === "oars.sshkeys.roles.delete") {
+              previewSshRoles = previewSshRoles.filter((role) => role.name !== payload.name);
+              return { ok: true };
+            }
+            if (command === "oars.sshkeys.deployKey.generate") return { ok: true, public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDeployPreview oars-deploy", path: "~/.ssh/oars_deploy" };
             if (command === "oars.monitor.cleanDiskEstimate" || command === "oars.monitor.cleanDisk" || command === "oars.monitor.dropCaches") {
               const ch = nextDiagnosticChannel++;
               if (!window.__oarsMock.diagChannels) window.__oarsMock.diagChannels = new Map();
@@ -456,6 +506,36 @@
               window.__oarsMock.diagChannels.set(ch, { label, done: false });
               return { ok: true, channel: ch };
             }
+            // ── Fleet access fixtures (spec 09) ────────────────────
+            if (command === "oars.access.identities.list") return { ok: true, identities: accessIdentities };
+            if (command === "oars.access.identities.save") {
+              const input = payload.identity;
+              const existing = accessIdentities.find((item) => item.id === input.id);
+              const bindings = input.bindings || [];
+              const saved = { id: input.id || "identity-preview-" + (accessIdentities.length + 1), name: input.name, fingerprints: bindings.map((item) => item.fingerprint), bindings, shared: bindings.some((item) => item.shared), created_at_ms: existing?.created_at_ms || now, revision: (existing?.revision || 0) + 1 };
+              if (existing) Object.assign(existing, saved); else accessIdentities.push(saved);
+              return { ok: true, identity: saved };
+            }
+            if (command === "oars.access.identities.delete") {
+              accessIdentities = accessIdentities.filter((item) => item.id !== payload.id);
+              return { ok: true };
+            }
+            if (command === "oars.access.key.inspect") return { ok: true, normalized_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBs5Tnge2MIGi6Zcyo04aosYAQ+iwk4hKYUNpIHkyMQt preview", fingerprint: accessNewFingerprint, key_type: "ssh-ed25519", comment: "preview" };
+            if (command === "oars.access.scan") { accessScanPolls = 0; accessScanScope = payload.scope || "connected_accounts"; return { ok: true, scan_id: "scan-preview" }; }
+            if (command === "oars.access.scanCancel") return { ok: true };
+            if (command === "oars.access.poll") return accessPollPayload();
+            if (command === "oars.access.offboard" || command === "oars.access.onboard" || command === "oars.access.rotate") {
+              accessJobPolls = 0;
+              return { ok: true, job_id: "job-preview", ...(command === "oars.access.onboard" ? { fingerprint: accessNewFingerprint } : {}), ...(command === "oars.access.rotate" ? { new_fingerprint: accessNewFingerprint } : {}) };
+            }
+            if (command === "oars.access.jobPoll") {
+              accessJobPolls += 1;
+              const terminal = accessJobPolls > 2;
+              const failed = accessMode === "job-error" && terminal;
+              return { ok: true, state: terminal ? (failed ? "partial" : "done") : "running", results: [{ server_id: "prod-api", user: "deploy", source_path: accessGrant.source_path, state: terminal ? (failed ? "conflict" : "done") : "running", ...(failed ? { error: "authorized_keys changed since the preview; refresh and retry" } : {}) }] };
+            }
+            if (command === "oars.access.jobCancel") return { ok: true };
+            if (command === "oars.access.export") return { ok: true, format: payload.format, path: payload.path, rows: accessMode === "empty" ? 0 : 1, formula_safe: payload.format === "csv" };
             // ── Deployment fixtures (spec 07) ───────────────────────
             if (command === "oars.deploy.apps.list") return { ok: true, apps: deployApps.filter((app) => app.server_id === payload.server_id) };
             if (command === "oars.deploy.apps.save") {

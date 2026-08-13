@@ -27,6 +27,18 @@ import type {
   ScriptRunVars,
   BroadcastPreview,
   BroadcastPollResult,
+  AccessGrant,
+  AccessScanResponse,
+  AccessPollResponse,
+  AccessIdentitiesListResponse,
+  AccessIdentity,
+  AccessJobPollResponse,
+  AccessExportResponse,
+  AccessKeyInspectResponse,
+  AccessScope,
+  GeneratedSshKey,
+  SshKeyEntry,
+  SshRole,
 } from "./types";
 
 // Typed bridge client over window.zero.
@@ -269,27 +281,61 @@ export const api = {
     history: (serverId: string, appId: string, limit?: number) => invoke<{ ok: boolean; runs: import("./types").DeployHistoryRecord[] }>("oars.deploy.history", { server_id: serverId, app_id: appId, limit }),
   },
   sshkeys: {
-    list: (serverId: string) => invoke<{ ok: boolean; keys: any[] }>("oars.sshkeys.list", { server_id: serverId }),
-    add: (serverId: string, public_key: string, comment?: string) => invoke<any>("oars.sshkeys.add", { server_id: serverId, public_key, comment }),
-    revoke: (serverId: string, fingerprint: string, expected_line_hash: string) => invoke<any>("oars.sshkeys.revoke", { server_id: serverId, fingerprint, expected_line_hash }),
-    rotate: (serverId: string, fingerprint: string, expected_line_hash: string, new_public_key: string) => invoke<any>("oars.sshkeys.rotate", { server_id: serverId, fingerprint, expected_line_hash, new_public_key }),
-    generate: (destination: string, comment?: string, passphrase?: string, remember_passphrase?: boolean) => invoke<any>("oars.sshkeys.generate", { destination, comment, passphrase, remember_passphrase }),
-    rolesList: (serverId: string) => invoke<any>("oars.sshkeys.roles.list", { server_id: serverId }),
-    rolesCreate: (serverId: string, name: string, read_only: boolean) => invoke<any>("oars.sshkeys.roles.create", { server_id: serverId, name, read_only }),
-    rolesDelete: (serverId: string, name: string) => invoke<any>("oars.sshkeys.roles.delete", { server_id: serverId, name }),
-    deployKey: (serverId: string) => invoke<any>("oars.sshkeys.deployKey.generate", { server_id: serverId }),
+    list: (serverId: string) => invoke<{ ok: boolean; keys: SshKeyEntry[] }>("oars.sshkeys.list", { server_id: serverId }),
+    add: (serverId: string, public_key: string, comment?: string) => invoke<{ ok: boolean; fingerprint: string; line_hash: string }>("oars.sshkeys.add", { server_id: serverId, public_key, comment }),
+    revoke: (serverId: string, fingerprint: string, expected_line_hash: string) => invoke<{ ok: boolean }>("oars.sshkeys.revoke", { server_id: serverId, fingerprint, expected_line_hash }),
+    rotate: (serverId: string, fingerprint: string, expected_line_hash: string, new_public_key: string) => invoke<{ ok: boolean }>("oars.sshkeys.rotate", { server_id: serverId, fingerprint, expected_line_hash, new_public_key }),
+    generate: (destination: string, comment?: string, passphrase?: string, remember_passphrase?: boolean) => invoke<GeneratedSshKey>("oars.sshkeys.generate", { destination, comment, passphrase, remember_passphrase }),
+    rolesList: (serverId: string) => invoke<{ ok: boolean; roles: SshRole[] }>("oars.sshkeys.roles.list", { server_id: serverId }),
+    rolesCreate: (serverId: string, name: string, read_only: boolean) => invoke<{ ok: boolean }>("oars.sshkeys.roles.create", { server_id: serverId, name, read_only }),
+    rolesDelete: (serverId: string, name: string) => invoke<{ ok: boolean }>("oars.sshkeys.roles.delete", { server_id: serverId, name }),
+    deployKey: (serverId: string) => invoke<{ ok: boolean; public_key: string; path: string }>("oars.sshkeys.deployKey.generate", { server_id: serverId }),
   },
   access: {
-    scan: (serverIds?: string[]) => invoke<any>("oars.access.scan", serverIds ? { server_ids: serverIds } : {}),
-    poll: (scanId: number) => invoke<any>("oars.access.poll", { scan_id: scanId }),
-    identitiesList: () => invoke<any>("oars.access.identities.list", {}),
-    identitiesSave: (p: { id?: string; name: string; fingerprints: string[] }) => invoke<any>("oars.access.identities.save", p),
-    identitiesDelete: (id: string) => invoke<any>("oars.access.identities.delete", { id }),
-    offboard: (identityId: string, grants: any[]) => invoke<any>("oars.access.offboard", { identity_id: identityId, grants }),
-    onboard: (identityId: string, public_key: string, grants: any[]) => invoke<any>("oars.access.onboard", { identity_id: identityId, public_key, grants }),
-    rotate: (identityId: string, old_fingerprint: string, grants: any[], new_public_key: string) => invoke<any>("oars.access.rotate", { identity_id: identityId, old_fingerprint, grants, new_public_key }),
-    jobPoll: (jobId: number) => invoke<any>("oars.access.jobPoll", { job_id: jobId }),
-    export: (format: "csv" | "json") => invoke<any>("oars.access.export", { format }),
+    scan: (params?: { serverIds?: string[]; scope?: AccessScope; approvedSensitiveRead?: boolean }) =>
+      invoke<AccessScanResponse>("oars.access.scan", {
+        ...(params?.serverIds ? { server_ids: params.serverIds } : {}),
+        scope: params?.scope ?? "connected_accounts",
+        ...(params?.approvedSensitiveRead ? { approved_sensitive_read: true } : {}),
+      }),
+    scanCancel: (scanId: string) => invoke<{ ok: boolean }>("oars.access.scanCancel", { scan_id: scanId }),
+    poll: (scanId: string, opts?: { peopleOffset?: number; unassignedOffset?: number; limit?: number }) =>
+      invoke<AccessPollResponse>("oars.access.poll", { scan_id: scanId, people_offset: opts?.peopleOffset ?? 0, unassigned_offset: opts?.unassignedOffset ?? 0, limit: opts?.limit ?? 100 }),
+    keyInspect: (publicKey: string) => invoke<AccessKeyInspectResponse>("oars.access.key.inspect", { public_key: publicKey }),
+    identitiesList: () => invoke<AccessIdentitiesListResponse>("oars.access.identities.list", {}),
+    identitiesSave: (p: { id?: string; name: string; fingerprints: string[]; revision?: number; bindings?: Array<{ fingerprint: string; shared?: boolean }> }) =>
+      invoke<{ ok: boolean; identity: AccessIdentity }>("oars.access.identities.save", {
+        identity: {
+          ...(p.id != null ? { id: p.id } : {}),
+          name: p.name,
+          fingerprints: p.fingerprints,
+          ...(p.revision != null ? { expected_revision: p.revision } : {}),
+          ...(p.bindings ? { bindings: p.bindings } : {}),
+        },
+      }),
+    identitiesDelete: (id: string, expectedRevision: number, confirmName: string) =>
+      invoke<{ ok: boolean }>("oars.access.identities.delete", { id, expected_revision: expectedRevision, confirm_name: confirmName }),
+    offboard: (identityId: string, grants: AccessGrant[], opts: { operationId: string; scanId: string; identityRevision: number; confirmName: string }) =>
+      invoke<{ ok: boolean; job_id: string }>("oars.access.offboard", {
+        identity_id: identityId,
+        grants: grants.map((grant) => ({ server_id: grant.server_id, user: grant.user, fingerprint: grant.fingerprint, line_hash: grant.line_hash, source_path: grant.source_path, file_sha256: grant.file_sha256 })),
+        operation_id: opts.operationId,
+        scan_id: opts.scanId,
+        identity_revision: opts.identityRevision,
+        confirm_name: opts.confirmName,
+      }),
+    onboard: (identityId: string, public_key: string, grants: Array<{ server_id: string; target: { kind: "account" | "read_only_role"; name: string } }>, opts: { operationId: string; identityRevision: number }) =>
+      invoke<{ ok: boolean; job_id: string; fingerprint?: string }>("oars.access.onboard", { identity_id: identityId, public_key, grants, operation_id: opts.operationId, identity_revision: opts.identityRevision }),
+    rotate: (identityId: string, old_fingerprint: string, grants: AccessGrant[], new_public_key: string, opts: { operationId: string; scanId: string; identityRevision: number }) =>
+      invoke<{ ok: boolean; job_id: string; new_fingerprint?: string }>("oars.access.rotate", { identity_id: identityId, old_fingerprint, grants: grants.map((grant) => ({ server_id: grant.server_id, user: grant.user, line_hash: grant.line_hash, source_path: grant.source_path, file_sha256: grant.file_sha256 })), new_public_key, operation_id: opts.operationId, scan_id: opts.scanId, identity_revision: opts.identityRevision }),
+    jobPoll: (jobId: string) => invoke<AccessJobPollResponse>("oars.access.jobPoll", { job_id: jobId }),
+    jobCancel: (jobId: string) => invoke<{ ok: boolean }>("oars.access.jobCancel", { job_id: jobId }),
+    export: (params: { format: "csv" | "json"; scanId: string; path: string }) =>
+      invoke<AccessExportResponse>("oars.access.export", {
+        format: params.format,
+        scan_id: params.scanId,
+        path: params.path,
+      }),
   },
   backup: {
     list: (serverId?: string) => invoke<any>("oars.backup.jobs.list", serverId ? { server_id: serverId } : {}),

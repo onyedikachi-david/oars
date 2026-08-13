@@ -131,6 +131,75 @@ export interface LogClearResult {
   after_size: number;
 }
 
+// --- access (spec 09, NEXT-SPEC bridge contract §8) -------------------------
+export interface AccessAccount {
+  user: string;
+  home: string;
+  skipped: boolean;
+  read: boolean;
+  error?: string;
+  sudo: AccessSudoPolicy;
+  key_count: number;
+}
+export type AccessScope = "connected_accounts" | "all_login_accounts";
+export type AccessCoverage = "complete" | "partial";
+export type AccessSudoPolicy = "none" | "limited" | "full" | "unknown";
+export interface AccessGrant { fingerprint: string; server_id: string; server_name: string; user: string; sudo: AccessSudoPolicy; comment: string; line_hash: string; source_path: string; file_sha256: string; }
+export interface AccessServerView {
+  server_id: string; name: string; host: string; phase: string; error?: string;
+  connected_user?: string; sudo: AccessSudoPolicy; coverage: AccessCoverage; coverage_reason?: string;
+  accounts: AccessAccount[]; sources: string[];
+}
+export interface AccessScanResponse { ok: boolean; scan_id: string; }
+export interface AccessPage<T> { offset: number; limit: number; total: number; rows: T[]; has_more: boolean; }
+export interface AccessPollResponse {
+  ok: boolean; scan_id: string; state: "scanning" | "done" | "canceled"; scope: AccessScope;
+  created_at_ms: number; finished_at_ms?: number; servers: AccessServerView[];
+  people_page: AccessPage<AccessPerson>; unassigned_page: AccessPage<AccessUnassigned>;
+  metrics: { people: number; distinct_fingerprints: number; completed_servers: number; target_servers: number; observed_grants: number };
+  coverage: AccessCoverage; sync_errors: Array<{ server_id: string; reason: string }>;
+  source_warnings: Array<{ server_id: string; reason: string }>;
+}
+export interface AccessPerson { identity_id: string; name: string; fingerprints: string[]; grants: AccessGrant[]; }
+export interface AccessUnassigned { fingerprint: string; grants: AccessGrant[]; }
+export interface AccessIdentity { id: string; name: string; fingerprints: string[]; bindings: Array<{ fingerprint: string; shared: boolean }>; revision: number; created_at_ms: number; shared: boolean; }
+export interface AccessIdentitiesListResponse { ok: boolean; identities: AccessIdentity[]; revision?: number; recovery_error?: string; quarantined?: string; }
+export interface AccessJobPollResponse {
+  ok: boolean; state: "queued" | "running" | "done" | "partial" | "canceled"; results: Array<{ server_id: string; user: string; source_path: string; state: "queued" | "running" | "done" | "conflict" | "error" | "canceled"; error?: string }>;
+}
+export interface AccessExportResponse { ok: boolean; format: "csv" | "json"; path: string; rows: number; formula_safe: boolean; }
+export interface AccessKeyInspectResponse { ok: boolean; normalized_public_key: string; fingerprint: string; key_type: string; comment: string; }
+
+export interface SshKeyEntry {
+  line_index: number;
+  parsed: boolean;
+  options?: string;
+  type?: string;
+  key?: string;
+  comment?: string;
+  fingerprint_sha256?: string;
+  bits?: number | null;
+  line_hash: string;
+  raw?: string;
+  error?: string;
+}
+
+export interface SshRole {
+  name: string;
+  shell: string;
+  read_only: boolean;
+  policy: "read-only-sftp" | "standard";
+  users: string[];
+}
+
+export interface GeneratedSshKey {
+  ok: boolean;
+  public_key: string;
+  private_path: string;
+  keychain_account?: string;
+}
+
+
 export type SftpTransferStatus = "queued" | "running" | "done" | "failed" | "canceled";
 export type SftpTransferKind = "upload" | "download" | "rm" | "unzip" | "zip_download";
 

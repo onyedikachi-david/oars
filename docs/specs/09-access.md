@@ -1,14 +1,20 @@
 # Spec 09 — Access Management (fleet)
 
-**Status:** 📋 · **Depends on:** 01, 02, 08 (parser) · **Spec owner:** core
+**Status:** Partial: the typed app-level workspace, worker-driven scan/job
+lifecycle, strict mutation admission, recovery-safe rotation, and atomic audit
+exports exist; complete two-server integration evidence remains · **Depends on:**
+01, 02, 08 (parser/writer) · **Spec owner:** core
 
 ## 1. Overview
 
-The people map scans authorized keys and shows who can log in where and with
-which account. A local identity record maps a person to one or more exact key
+The people map scans observed SSH key grants and shows which account each grant
+targets. A grant is not proof that a login succeeds unless Oars also evaluated
+the effective authentication policy. A local identity record maps a person to one or more exact key
 fingerprints. Authorized-key comments can suggest labels, but they never define
-identity or authorize a mutation. Coverage and sudo status stay `unknown` when
-Oars cannot read the required files or sudo policy.
+identity or authorize a mutation. Every snapshot names its
+`connected_accounts` or `all_login_accounts` scope. Coverage is complete only
+for that named scope, and privilege stays `unknown` when Oars cannot read the
+required files or policy.
 
 ## 2. Goals / non-goals
 
@@ -36,10 +42,15 @@ Oars cannot read the required files or sudo policy.
 ### 4.1 Access view (app-level, not per-server)
 - Header: counts (People · Keys · Servers · Grants) + coverage + Last scanned +
   Re-scan + Export Audit + Add person.
-- People table: identity · fingerprints · login accounts · servers reachable ·
-  sudo status · coverage · actions. Unassigned fingerprints appear in a
+- Scope is always visible. A connected-account scan must not look like a
+  complete server audit. Full-account scan shows the target list and requires
+  explicit approval because it reads other users' access files and policy.
+- People table: identity · fingerprints · login accounts · observed servers ·
+  sudo policy (`none|limited|full|unknown`) · coverage · actions. Root is an
+  account property, not a sudo level. Unassigned fingerprints appear in a
   separate review section and can be attached to a person.
-- Person detail: per-server rows `login@host` + sudo flag + Revoke on this server.
+- Person detail: per-server rows `login@host` + observed source + sudo policy +
+  Revoke on this server.
 - Sync errors: banner "1 Sync Error — legacy-box could not be read, skipped".
 - **Offboard dialog:** "contractor will lose access to 6 servers, 4 with sudo. Type the name to confirm." → progress list per server (revoked/error).
 - **Add person dialog:** name · public key · server checkboxes (groups
@@ -49,80 +60,117 @@ Oars cannot read the required files or sudo policy.
 
 ### 4.2 Roles per server in onboard flow
 - Root and standard targets append to that account's authorized-keys file.
-  Read-only access creates or reuses the forced-command role from spec 08 and
-  installs the key with its restrictive options.
+  Read-only access creates or reuses the forced-command SFTP role from spec 08
+  and installs the key with its restrictive options. It is not a read-only shell.
 
 ## 5. Bridge API
 
-### `oars.access.scan` `{server_ids?}` → `{ok, scan_id}`
-- If `server_ids` omitted → all saved servers. Runs per-server workers (read-only execs), aggregates into a scan result. Poll for completion.
-### `oars.access.poll` `{scan_id}` → `{ok, state: scanning|done, people: PersonAccess[], unassigned: KeyAccess[], servers, grants, coverage, sync_errors:[{server_id, account?, reason}]}`
+### `oars.access.scan` `{server_ids, scope, approved_sensitive_read}` → `{ok, scan_id}`
+- Target IDs are exact, deduplicated, and capped. `all_login_accounts` requires
+  `approved_sensitive_read:true`. Runs through per-session workers and
+  aggregates into a scan result. Poll only observes progress.
+- `oars.access.scanCancel {scan_id}` stops queued work and marks unfinished
+  targets explicitly.
+### `oars.access.poll` `{scan_id, people_offset?, unassigned_offset?, limit?}` → `{ok, state: scanning|done|canceled, scope, people_page, unassigned_page, servers, metrics, coverage, sync_errors, source_warnings}`
 ```json
 {"identity_id":"p1","name":"Hiren","fingerprints":["SHA256:…"],
  "grants":[{"fingerprint":"SHA256:…","server_id":"s1","user":"root",
-             "sudo":true,"comment":"hiren@macmini"}]}
+             "account_is_root":true,"sudo_policy":"full",
+             "comment":"hiren@macmini"}]}
 ```
 - Canonical grouping key is the key fingerprint. Comments remain exact display
   labels and can differ across servers. `PersonAccess` is produced by joining
   scanned fingerprints with the explicit local identity registry. Never delete
   or rotate by comment.
-- Default scan covers the connected login account only. Full-account scan
+- Connected-account scope covers the connected login account only. Full-account scan
   enumerates local accounts and reads each `authorized_keys` file only when the
   session is root or has approved non-interactive sudo. The result includes
-  `coverage: complete|partial` plus per-account errors.
-- Read the effective `AuthorizedKeysFile` locations when authority and server
-  tooling permit it. If Oars can only inspect the conventional path, mark
-  coverage partial instead of claiming a complete server inventory.
+  `coverage: complete|partial` plus per-account errors. `complete` always means
+  complete for the response's explicit scope.
+- Read the effective `AuthorizedKeysFile` locations with `sshd -T -C` when
+  authority and server tooling permit it. Resolve every documented path and
+  token. If Oars can only inspect the conventional path, mark coverage partial
+  instead of claiming a complete server inventory.
 - `AuthorizedKeysCommand`, conditional `Match` rules, directory services, and
   other dynamic key sources can make a static file scan incomplete. Report
   those sources and keep coverage partial unless Oars can evaluate the
   effective sshd configuration for each account and inspect every resulting
   source.
-- Sudo status for a target login comes from an authoritative sudo policy query
+- Sudo policy for a target login comes from an authoritative sudo policy query
   such as `sudo -n -l -U <quoted-user>` run with enough authority. `id -Gn` is
   only context because group membership does not include all sudoers rules.
-### `oars.access.identities.save` `{id?, name, fingerprints[]}` → `{ok, identity}`
-- Fingerprints are exact decoded-key fingerprints. A fingerprint can belong to
-  at most one person unless the user explicitly marks it as shared.
-### `oars.access.offboard` `{identity_id, grants:[{fingerprint,server_id,user,expected_line_hash}]}` → `{ok, job_id}` + `oars.access.jobPoll` `{job_id}` → per-server results
+  Return `none`, `limited`, `full`, or `unknown`; record root separately.
+### `oars.access.key.inspect` `{public_key}` → normalized key and SHA-256 fingerprint
+### `oars.access.identities.save` `{identity:{id?, name, bindings[], expected_revision?}}` → `{ok, identity}`
+- Bindings contain an exact decoded-key fingerprint and per-fingerprint
+  `shared` flag. A fingerprint can belong to at most one person unless that
+  exact binding is explicitly shared.
+### `oars.access.offboard` `{operation_id, scan_id, identity_id, identity_revision, confirm_name, grants:[{fingerprint,server_id,user,source_path,line_hash,file_sha256}]}` → `{ok, job_id}` + `oars.access.jobPoll` `{job_id}` → per-item results
 - The confirmation preview resolves the identity to an exact fingerprint and
   grant snapshot. The writer removes only those matching lines. Comment matches
   never authorize deletion.
-### `oars.access.onboard` `{identity_id, public_key, grants:[{server_id, user_role}]}` → `{ok, job_id}`
-- Role resolution per server; appends the key (dedupe by fingerprint across the target server).
-### `oars.access.rotate` `{identity_id, old_fingerprint, grants[], new_public_key}` → `{ok, job_id}`
-### `oars.access.export` `{format: csv|json}` → `{ok, path}` (via save dialog; written client-side from the last scan — no server round trip)
+### `oars.access.onboard` `{operation_id, identity_id, identity_revision, public_key, grants:[{server_id,target}]}` → `{ok, job_id}`
+- Role resolution is per server. Append idempotently within the exact target
+  account; the same fingerprint can intentionally grant two accounts.
+### `oars.access.rotate` `{operation_id, scan_id, identity_id, identity_revision, old_fingerprint, grants[], new_public_key}` → `{ok, job_id}`
+- Add and verify the new key on every target first. Remove the old key only from
+  targets where that verification succeeded. Keep old and new identity bindings
+  after a partial rotation. Remove the old binding only after complete coverage
+  and complete replacement.
+### `oars.access.export` `{scan_id, format: csv|json, path}` → `{ok, path, rows}`
+- The frontend obtains `path` from the native save dialog. The core atomically
+  writes the selected completed snapshot; it does not return a large sensitive
+  map through the bridge.
 
 ## 6. Zig core design
 
 - `src/access.zig` — identity registry, scan coordinator, fingerprint-keyed
-  grant matching, and a job runner with per-server results. Each saved server
-  needs a live session or an explicit connection attempt; unreachable and
-  unauthorized accounts remain visible in coverage errors.
+  grant matching, and a job runner with per-server results. Bridge handlers
+  only queue work, consume ready outcomes, and serialize snapshots. Every
+  SSH/SFTP operation runs on the owning session worker.
+- Full scope enumerates NSS accounts without a fixed UID threshold. It applies
+  effective OpenSSH configuration per account, reads all static key-file
+  sources, and surfaces dynamic key commands and certificate/principal sources
+  as partial coverage.
+- Each saved server needs a live session or an explicit connection attempt;
+  unreachable and unauthorized accounts remain visible in coverage errors.
 - Reuses `sshkeys.AuthorizedKeys` parser/writer (spec 08) — the writer is the only mutating path and it's atomic.
 - Scan planning records the connected account, which account files were read,
   and why any account was skipped. Sudo policy checks are per login account and
   remain unknown when Oars lacks authority to query them.
+- SFTP reads return typed outcomes. Only a missing file is inspected-empty;
+  denied, timeout, too-large, transport, and parse failures make coverage partial.
+- Preserve authorized-key options. Classify direct key grants separately from
+  certificate-authority lines; a CA line is not a direct person grant.
 
 ## 7. Data model
 
-- `<data>/access_identities.json`: user-confirmed identity names and
-  fingerprint membership. It contains public-key fingerprints, not private
-  keys. Scan results remain in memory and exports are written only on demand.
+- `<data>/access_identities.json`: versioned, atomic, mode-0600 records with a
+  random ID, revision, millisecond timestamps, user-confirmed identity names,
+  and fingerprint bindings. It contains public-key fingerprints, not private
+  keys. Scan results remain in bounded memory and exports are written only on
+  demand.
 
 ## 8. Security
 
 - Scans are read-only. A privileged scan still needs approval because it reads
   other users' sensitive access files and sudo policy.
-- Mutations (offboard/onboard/rotate) are job-based, idempotent, approval-gated (type-to-confirm for offboard), and fully audited (spec 15).
+- Mutations are job-based and idempotent by `operation_id`. They validate the
+  frozen scan, identity revision, source path, line hash, and whole-file hash.
+  They are approval-gated and fully audited. Offboard requires type-to-confirm.
 - The access map is sensitive. It stays local unless the user exports it to a
   chosen path.
+- CSV follows RFC 4180 and escapes spreadsheet formula prefixes with a documented
+  transformation. JSON keeps the exact unmodified audit values.
 
 ## 9. Performance
 
-- Scan N servers in parallel (per-server workers), ≤ 2 s per server typical; progress shown per server.
+- Scan servers concurrently through their existing per-server workers;
+  progress is shown per server. No fixed completion-time claim is made because
+  account count, NSS, sudo policy, and remote latency vary.
 - Scan and job polls return current snapshots; large fleet tables are windowed.
-  Polling one view does not consume results from another.
+  Polling one view does not consume results from another. Pagination must not
+  silently drop rows.
 
 ## 10. Edge cases
 
@@ -135,25 +183,32 @@ Oars cannot read the required files or sudo policy.
   and grant; the user can remove all or select a subset.
 - Read-only role already exists → validate its forced-command policy
   before appending the key.
+- Multiple static `AuthorizedKeysFile` paths → show the exact source on each
+  grant and bind a mutation to it.
+- `AuthorizedKeysCommand`, `TrustedUserCAKeys`, or authorized-principal
+  sources → show the source and keep coverage partial unless it can be
+  completely evaluated.
 
 ## 11. Testing
 
 - Unit: identity/fingerprint joins, shared-key rules, expected-line conflicts,
   coverage, sudo policy parsing, and export formatting.
-- Integration: 2 servers × 2 users → partial and privileged scans → offboard a
+- Integration: two isolated Alpine SSH fixtures × two users → partial and privileged scans → offboard a
   selected fingerprint grant set → verify authorized keys on both; onboard,
   rotate, and stop one server to verify the sync error.
-- Manual: type-to-confirm flow, export CSV opens in Numbers/Excel.
+- Manual: type-to-confirm flow, save-path selection, formula-safe CSV opens in
+  Numbers/Excel, and exact JSON retains original values.
 
 ## 12. Acceptance criteria
 
-- [x] Scan builds an accurate people/fingerprint/login/server map, separates
+- [ ] Scan builds an accurate people/fingerprint/login/server map, separates
       unassigned keys, and states whether coverage is complete or partial.
-- [x] Offboard removes only the selected fingerprint grants and detects
+- [ ] Offboard removes only the selected fingerprint grants and detects
       concurrent line changes.
-- [x] Onboard installs keys with per-server roles.
-- [x] Unreachable servers are flagged, never silent.
-- [x] Export produces correct CSV/JSON; all mutations audited.
+- [ ] Onboard installs keys with per-server roles.
+- [ ] Unreachable servers are flagged, never silent.
+- [ ] Export writes correct CSV/JSON to a user-selected path; all mutations
+      are audited.
 
 ## 13. Research & References
 
@@ -164,7 +219,7 @@ Oars cannot read the required files or sudo policy.
   earlier spec used that comment as an identity and mutation key. The People
   feature remains, but it now uses explicit local identity records joined to
   decoded key fingerprints; comments are suggestions and display labels only.
-- **Sudo probe** — `sudo -n true` verified against sudo(8)
+- **Sudo policy** — `sudo -n true` verified against sudo(8)
   (`https://man7.org/linux/man-pages/man8/sudo.8.html`): `-n`,
   `--non-interactive` — "Avoid prompting the user for input of any
   kind. If a password is required for the command to run, sudo will
@@ -173,8 +228,9 @@ Oars cannot read the required files or sudo policy.
   never guessed). Note sudo's credential cache (5 min per terminal,
   sudoers default) means a cached credential could make the probe pass
   even when a password would otherwise be needed — the spec's
-  `sudo: true|false|unknown` vocabulary with `unknown` on failure is
-  the honest presentation of that ambiguity. **Correction:** this probe only
+  boolean vocabulary is insufficient because a policy can allow a command
+  subset. Use `none|limited|full|unknown`, with root recorded separately.
+  **Correction:** this probe only
   describes the connected account. It cannot prove sudo access for every user
   whose key Oars finds. The contract now uses a privileged per-user policy
   listing when available and returns `unknown` otherwise.
@@ -183,6 +239,11 @@ Oars cannot read the required files or sudo policy.
   (`https://www.gnu.org/software/coreutils/manual/html_node/id-invocation.html`).
   Group membership is context only; sudoers can grant or deny access without
   matching a conventional group.
+- **Effective SSH policy and account enumeration** — OpenBSD `sshd(8)` documents
+  `-T` and `-C` for effective configuration with `Match` parameters. OpenBSD
+  `sshd_config(5)` documents multiple `AuthorizedKeysFile` paths, dynamic key
+  commands, trusted CAs, and principal sources. `getent(1)` documents NSS
+  database enumeration and exit status 3 when enumeration is unsupported.
 - **Offboard/onboard/rotate mechanics** — all three are
   read-modify-write of `authorized_keys` via the atomic writer from
   spec 08 (temp + rename, 0600); idempotency is guaranteed by
@@ -190,10 +251,12 @@ Oars cannot read the required files or sudo policy.
   the writer is line-preserving except matches).
 - **CSV export** — RFC 4180 comma-separated values (fields with
   commas/quotes/newlines quoted) — cite RFC 4180
-  (`https://www.rfc-editor.org/rfc/rfc4180`); JSON export is
-  std.json-serialized.
+  (`https://www.rfc-editor.org/rfc/rfc4180`). Microsoft documents formula and
+  CSV import behavior; spreadsheet CSV escapes formula prefixes and the dialog
+  states that transformation. JSON export is exact and std.json-serialized.
 - **Snapshot semantics** — scanning is by design point-in-time (per
   §2 non-goals); no continuous monitoring claim is made.
 
-Sources: OpenBSD sshd(8), sudo(8) man7, GNU coreutils id(1), RFC 4180,
-spec 08 §13.
+Sources: OpenBSD sshd(8) and sshd_config(5), getent(1), nsswitch.conf(5),
+sudo(8), GNU coreutils id(1), RFC 4180, Microsoft Excel formula/CSV import
+documentation, and spec 08 §13.

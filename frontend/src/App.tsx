@@ -58,7 +58,7 @@ const VncTab = lazy(() => import("./VncTab").then((module) => ({ default: module
 // Shell nav
 // ---------------------------------------------------------------------------
 type Section = "Overview" | "Servers" | "Activity" | "Automation" | "Security" | "Backups" | "AI Context";
-type View = "monitor" | "terminal" | "logs" | "files" | "scripts" | "deploy" | "keys" | "access" | "backups" | "ai" | "vnc" | "history" | "vault" | "agent";
+type View = "monitor" | "terminal" | "logs" | "files" | "scripts" | "deploy" | "keys" | "backups" | "ai" | "vnc" | "history" | "vault" | "agent";
 
 interface Tab {
   server: OarsServer;
@@ -74,7 +74,6 @@ const VIEWS: { id: View; label: string }[] = [
   { id: "scripts", label: "Scripts" },
   { id: "deploy", label: "Deploy" },
   { id: "keys", label: "Keys" },
-  { id: "access", label: "Access" },
   { id: "backups", label: "Backups" },
   { id: "ai", label: "AI" },
   { id: "vnc", label: "VNC" },
@@ -1031,7 +1030,6 @@ export default function App() {
                   : activeTab.view === "scripts" ? <ScriptsTab key={activeTab.key} serverId={activeTab.server.id} servers={servers} statuses={statuses} connected={statuses.get(activeTab.server.id) === "ready"} initialScriptId={pendingScriptId} />
                   : activeTab.view === "deploy" ? <DeployTab key={activeTab.key} serverId={activeTab.server.id} />
                   : activeTab.view === "keys" ? <KeysTab key={activeTab.key} serverId={activeTab.server.id} />
-                  : activeTab.view === "access" ? <AccessTab key={activeTab.key} />
                   : activeTab.view === "backups" ? <BackupsTab key={activeTab.key} serverId={activeTab.server.id} />
                   : activeTab.view === "ai" ? <AiTab key={activeTab.key} serverId={activeTab.server.id} />
                   : activeTab.view === "vnc" ? (

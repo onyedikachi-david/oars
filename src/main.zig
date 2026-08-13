@@ -1362,7 +1362,7 @@ test "access identities save/list/delete round trip through the dispatcher" {
     try std.testing.expect(std.mem.indexOf(u8, created, "\"ok\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, created, "\"name\":\"Ada\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, created, fp1) != null);
-    const id_start = std.mem.indexOf(u8, created, "\"id\":\"id-") orelse return error.TestUnexpectedResult;
+    const id_start = std.mem.indexOf(u8, created, "\"id\":\"") orelse return error.TestUnexpectedResult;
     var id_buf: [64]u8 = undefined;
     var id_len: usize = 0;
     for (created[id_start + 6 ..]) |ch| {
@@ -1397,11 +1397,11 @@ test "access identities save/list/delete round trip through the dispatcher" {
     try std.testing.expect(std.mem.indexOf(u8, listed, "Ada") != null);
     try std.testing.expect(std.mem.indexOf(u8, listed, "Oncall") != null);
     var del_buf: [256]u8 = undefined;
-    const del_req = try std.fmt.bufPrint(&del_buf, "{{\"id\":\"7\",\"command\":\"oars.access.identities.delete\",\"payload\":{{\"id\":\"{s}\"}}}}", .{id});
+    const del_req = try std.fmt.bufPrint(&del_buf, "{{\"id\":\"7\",\"command\":\"oars.access.identities.delete\",\"payload\":{{\"id\":\"{s}\",\"expected_revision\":1,\"confirm_name\":\"Ada\"}}}}", .{id});
     const deleted = app.dispatch(del_req);
     try std.testing.expect(std.mem.indexOf(u8, deleted, "\"ok\":true") != null);
     const del_unknown = app.dispatch(
-        \\{"id":"8","command":"oars.access.identities.delete","payload":{"id":"id-nope"}}
+        \\{"id":"8","command":"oars.access.identities.delete","payload":{"id":"id-nope","expected_revision":1,"confirm_name":"Nobody"}}
     );
     try std.testing.expect(std.mem.indexOf(u8, del_unknown, "unknown identity") != null);
 }
@@ -1419,7 +1419,7 @@ test "access scan and job handlers validate payloads without sessions" {
 
     // An empty fleet scans fine (nothing to do).
     const scan = app.dispatch(
-        \\{"id":"2","command":"oars.access.scan","payload":{"full":true}}
+        \\{"id":"2","command":"oars.access.scan","payload":{"scope":"all_login_accounts","approved_sensitive_read":true}}
     );
     try std.testing.expect(std.mem.indexOf(u8, scan, "\"ok\":true") != null);
     const scan_id_start = std.mem.indexOf(u8, scan, "\"scan_id\":\"scan-") orelse return error.TestUnexpectedResult;
@@ -1443,9 +1443,9 @@ test "access scan and job handlers validate payloads without sessions" {
     try std.testing.expect(std.mem.indexOf(u8, unknown_scan, "unknown scan") != null);
 
     // Offboard requires a real identity and its own fingerprints.
-    const offboard_unknown = app.dispatch(
-        \\{"id":"5","command":"oars.access.offboard","payload":{"identity_id":"id-nope","grants":[{"fingerprint":"SHA256:IIiiMx8dWbmaEVhH8Oc9GEt16E2UPRuGtQ3itmbNZxs","server_id":"s1","user":"root","expected_line_hash":"h"}]}}
-    );
+    var unknown_offboard_buf: [768]u8 = undefined;
+    const unknown_offboard_req = try std.fmt.bufPrint(&unknown_offboard_buf, "{{\"id\":\"5\",\"command\":\"oars.access.offboard\",\"payload\":{{\"operation_id\":\"op-unknown\",\"scan_id\":\"{s}\",\"identity_id\":\"id-nope\",\"identity_revision\":1,\"confirm_name\":\"Nobody\",\"grants\":[{{\"fingerprint\":\"SHA256:IIiiMx8dWbmaEVhH8Oc9GEt16E2UPRuGtQ3itmbNZxs\",\"server_id\":\"s1\",\"user\":\"root\",\"source_path\":\"/root/.ssh/authorized_keys\",\"line_hash\":\"h\",\"file_sha256\":\"f\"}}]}}}}", .{scan_id});
+    const offboard_unknown = app.dispatch(unknown_offboard_req);
     try std.testing.expect(std.mem.indexOf(u8, offboard_unknown, "unknown identity") != null);
 
     // The fingerprint must belong to the identity.
@@ -1453,30 +1453,28 @@ test "access scan and job handlers validate payloads without sessions" {
         \\{"id":"6","command":"oars.access.identities.save","payload":{"identity":{"name":"Ada","fingerprints":["SHA256:IIiiMx8dWbmaEVhH8Oc9GEt16E2UPRuGtQ3itmbNZxs"]}}}
     );
     try std.testing.expect(std.mem.indexOf(u8, identity_saved, "\"ok\":true") != null);
-    const identity_id_start = std.mem.indexOf(u8, identity_saved, "\"id\":\"id-") orelse return error.TestUnexpectedResult;
+    const IdentityIdShape = struct { result: struct { identity: struct { id: []const u8 } } };
+    var identity_id_parsed = std.json.parseFromSlice(IdentityIdShape, std.testing.allocator, identity_saved, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return error.TestUnexpectedResult;
+    defer identity_id_parsed.deinit();
     var identity_id_buf: [64]u8 = undefined;
-    var identity_id_len: usize = 0;
-    for (identity_saved[identity_id_start + 6 ..]) |ch| {
-        if (ch == '\"') break;
-        if (identity_id_len >= identity_id_buf.len) return error.TestUnexpectedResult;
-        identity_id_buf[identity_id_len] = ch;
-        identity_id_len += 1;
-    }
-    const identity_id = identity_id_buf[0..identity_id_len];
-    var off_buf: [512]u8 = undefined;
-    const off_wrong_fp = try std.fmt.bufPrint(&off_buf, "{{\"id\":\"7\",\"command\":\"oars.access.offboard\",\"payload\":{{\"identity_id\":\"{s}\",\"grants\":[{{\"fingerprint\":\"SHA256:el3RAdX7MPz8bGotR4kPQ4XBQTl42+OD1WbuC4jrRtg\",\"server_id\":\"s1\",\"user\":\"root\",\"expected_line_hash\":\"h\"}}]}}}}", .{identity_id});
+    const identity_id_raw = identity_id_parsed.value.result.identity.id;
+    if (identity_id_raw.len == 0 or identity_id_raw.len > identity_id_buf.len) return error.TestUnexpectedResult;
+    @memcpy(identity_id_buf[0..identity_id_raw.len], identity_id_raw);
+    const identity_id = identity_id_buf[0..identity_id_raw.len];
+    var off_buf: [1024]u8 = undefined;
+    const off_wrong_fp = try std.fmt.bufPrint(&off_buf, "{{\"id\":\"7\",\"command\":\"oars.access.offboard\",\"payload\":{{\"operation_id\":\"op-wrong-fp\",\"scan_id\":\"{s}\",\"identity_id\":\"{s}\",\"identity_revision\":1,\"confirm_name\":\"Ada\",\"grants\":[{{\"fingerprint\":\"SHA256:el3RAdX7MPz8bGotR4kPQ4XBQTl42+OD1WbuC4jrRtg\",\"server_id\":\"s1\",\"user\":\"root\",\"source_path\":\"/root/.ssh/authorized_keys\",\"line_hash\":\"h\",\"file_sha256\":\"f\"}}]}}}}", .{ scan_id, identity_id });
     const off_wrong = app.dispatch(off_wrong_fp);
     try std.testing.expect(std.mem.indexOf(u8, off_wrong, "not part of this identity") != null);
 
     // Onboard validates the public key before any session work.
     var onboard_buf: [512]u8 = undefined;
-    const onboard_req = try std.fmt.bufPrint(&onboard_buf, "{{\"id\":\"8\",\"command\":\"oars.access.onboard\",\"payload\":{{\"identity_id\":\"{s}\",\"public_key\":\"not-a-key\",\"grants\":[{{\"server_id\":\"s1\",\"user\":\"root\"}}]}}}}", .{identity_id});
+    const onboard_req = try std.fmt.bufPrint(&onboard_buf, "{{\"id\":\"8\",\"command\":\"oars.access.onboard\",\"payload\":{{\"operation_id\":\"op-onboard\",\"identity_id\":\"{s}\",\"identity_revision\":1,\"public_key\":\"not-a-key\",\"grants\":[{{\"server_id\":\"s1\",\"target\":{{\"kind\":\"account\",\"name\":\"root\"}}}}]}}}}", .{identity_id});
     const onboard_bad_key = app.dispatch(onboard_req);
     try std.testing.expect(std.mem.indexOf(u8, onboard_bad_key, "invalid public key") != null);
 
     // Rotate rejects a foreign old fingerprint.
-    var rot_buf: [512]u8 = undefined;
-    const rot_req = try std.fmt.bufPrint(&rot_buf, "{{\"id\":\"9\",\"command\":\"oars.access.rotate\",\"payload\":{{\"identity_id\":\"{s}\",\"old_fingerprint\":\"SHA256:el3RAdX7MPz8bGotR4kPQ4XBQTl42+OD1WbuC4jrRtg\",\"new_public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBs5Tnge2MIGi6Zcyo04aosYAQ+iwk4hKYUNpIHkyMQt z\",\"grants\":[{{\"server_id\":\"s1\",\"user\":\"root\",\"expected_line_hash\":\"h\"}}]}}}}", .{identity_id});
+    var rot_buf: [1024]u8 = undefined;
+    const rot_req = try std.fmt.bufPrint(&rot_buf, "{{\"id\":\"9\",\"command\":\"oars.access.rotate\",\"payload\":{{\"operation_id\":\"op-rotate\",\"scan_id\":\"{s}\",\"identity_id\":\"{s}\",\"identity_revision\":1,\"old_fingerprint\":\"SHA256:el3RAdX7MPz8bGotR4kPQ4XBQTl42+OD1WbuC4jrRtg\",\"new_public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBs5Tnge2MIGi6Zcyo04aosYAQ+iwk4hKYUNpIHkyMQt z\",\"grants\":[{{\"server_id\":\"s1\",\"user\":\"root\",\"source_path\":\"/root/.ssh/authorized_keys\",\"line_hash\":\"h\",\"file_sha256\":\"f\"}}]}}}}", .{ scan_id, identity_id });
     const rotated = app.dispatch(rot_req);
     try std.testing.expect(std.mem.indexOf(u8, rotated, "not part of this identity") != null);
 
@@ -1488,14 +1486,16 @@ test "access scan and job handlers validate payloads without sessions" {
     const no_export = app.dispatch(
         \\{"id":"11","command":"oars.access.export","payload":{"format":"csv"}}
     );
-    // The empty-fleet scan above completed, so the CSV export has a header.
-    try std.testing.expect(std.mem.indexOf(u8, no_export, "\"ok\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, no_export, "identity_id,name,fingerprint,server_id,user,sudo,comment") != null);
-    const json_export = app.dispatch(
-        \\{"id":"12","command":"oars.access.export","payload":{"format":"json"}}
-    );
-    try std.testing.expect(std.mem.indexOf(u8, json_export, "\\\"coverage\\\": \\\"complete\\\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json_export, "Ada") != null);
+    try std.testing.expect(std.mem.indexOf(u8, no_export, "scan_id is required") != null);
+    var export_path_buf: [512]u8 = undefined;
+    const export_path = try std.fmt.bufPrint(&export_path_buf, "/tmp/{s}/access.csv", .{app.dir_name});
+    var export_req_buf: [768]u8 = undefined;
+    const export_req = try std.fmt.bufPrint(&export_req_buf, "{{\"id\":\"12\",\"command\":\"oars.access.export\",\"payload\":{{\"scan_id\":\"{s}\",\"format\":\"csv\",\"path\":\"{s}\"}}}}", .{ scan_id, export_path });
+    const exported = app.dispatch(export_req);
+    try std.testing.expect(std.mem.indexOf(u8, exported, "\"ok\":true") != null);
+    const csv = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, export_path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(csv);
+    try std.testing.expect(std.mem.indexOf(u8, csv, "row_type,scan_id,scope,coverage,identity_id,name,fingerprint,server_id,user,sudo,comment,source_path,line_hash,file_sha256,reason") != null);
     const bad_format = app.dispatch(
         \\{"id":"13","command":"oars.access.export","payload":{"format":"xlsx"}}
     );
