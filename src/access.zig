@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const sshkeys = @import("sshkeys.zig");
+const sshd_policy = @import("sshd_policy.zig");
 
 // --- identity registry -----------------------------------------------------
 
@@ -1072,7 +1073,12 @@ pub fn parseSudoList(exit: i32, output: []const u8) []const u8 {
     if (exit == 0) {
         if (std.mem.indexOf(u8, output, "(ALL) ALL") != null or
             std.mem.indexOf(u8, output, "(ALL : ALL) ALL") != null or
-            std.mem.indexOf(u8, output, "Commands:\n    ALL") != null) return sudo_yes;
+            std.mem.indexOf(u8, output, "(ALL) NOPASSWD: ALL") != null or
+            std.mem.indexOf(u8, output, "(ALL : ALL) NOPASSWD: ALL") != null) return sudo_yes;
+        var lines = std.mem.splitScalar(u8, output, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.eql(u8, std.mem.trim(u8, line, " \t\r"), "ALL")) return sudo_yes;
+        }
         return sudo_limited;
     }
     return sudo_unknown;
@@ -1170,168 +1176,13 @@ pub fn safeUserName(name: []const u8) bool {
     return true;
 }
 
-pub const EffectiveSshdPolicy = struct {
-    pubkey_authentication: ?bool = null,
-    static_sources: [][]const u8 = &.{},
-    warnings: [][]const u8 = &.{},
-
-    pub fn deinit(self: *EffectiveSshdPolicy, allocator: std.mem.Allocator) void {
-        for (self.static_sources) |source| allocator.free(source);
-        allocator.free(self.static_sources);
-        for (self.warnings) |warning| allocator.free(warning);
-        allocator.free(self.warnings);
-    }
-};
-
-const ExpandSourceError = error{ UnsupportedToken, InvalidHome, PathTooLong } || std.mem.Allocator.Error;
-
-/// Expands the tokens documented for `AuthorizedKeysFile` and turns relative
-/// paths into exact paths below the account home. Unknown tokens stay a
-/// coverage warning; they are never guessed.
-pub fn expandAuthorizedKeysPath(
-    allocator: std.mem.Allocator,
-    raw: []const u8,
-    user: []const u8,
-    uid: ?u32,
-    home: []const u8,
-) ExpandSourceError![]u8 {
-    if (home.len == 0 or home[0] != '/') return error.InvalidHome;
-    var expanded: std.ArrayList(u8) = .empty;
-    defer expanded.deinit(allocator);
-    var i: usize = 0;
-    while (i < raw.len) {
-        if (raw[i] != '%') {
-            try expanded.append(allocator, raw[i]);
-            i += 1;
-            continue;
-        }
-        if (i + 1 >= raw.len) return error.UnsupportedToken;
-        switch (raw[i + 1]) {
-            '%' => try expanded.append(allocator, '%'),
-            'h' => try expanded.appendSlice(allocator, home),
-            'u' => try expanded.appendSlice(allocator, user),
-            'U' => {
-                const account_uid = uid orelse return error.UnsupportedToken;
-                var uid_buf: [16]u8 = undefined;
-                const text = std.fmt.bufPrint(&uid_buf, "{d}", .{account_uid}) catch return error.PathTooLong;
-                try expanded.appendSlice(allocator, text);
-            },
-            else => return error.UnsupportedToken,
-        }
-        i += 2;
-        if (expanded.items.len > 4096) return error.PathTooLong;
-    }
-    if (expanded.items.len == 0) return error.InvalidHome;
-    if (expanded.items[0] == '/') return expanded.toOwnedSlice(allocator);
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, expanded.items });
-}
-
-fn effectiveWarning(
-    allocator: std.mem.Allocator,
-    warnings: *std.ArrayList([]const u8),
-    key: []const u8,
-    value: []const u8,
-) !void {
-    try warnings.append(allocator, try std.fmt.allocPrint(allocator, "{s} {s}", .{ key, value }));
-}
-
-/// Parses the normalized, lower-case output of `sshd -T -C`. The caller
-/// supplies the account facts used by documented path-token expansion.
-pub fn parseEffectiveSshdPolicy(
-    allocator: std.mem.Allocator,
-    output: []const u8,
-    user: []const u8,
-    uid: ?u32,
-    home: []const u8,
-) !EffectiveSshdPolicy {
-    var sources: std.ArrayList([]const u8) = .empty;
-    errdefer {
-        for (sources.items) |source| allocator.free(source);
-        sources.deinit(allocator);
-    }
-    var warnings: std.ArrayList([]const u8) = .empty;
-    errdefer {
-        for (warnings.items) |warning| allocator.free(warning);
-        warnings.deinit(allocator);
-    }
-    var pubkey: ?bool = null;
-    var saw_authorized_keys_file = false;
-    var lines = std.mem.splitScalar(u8, output, '\n');
-    while (lines.next()) |raw_line| {
-        const line = std.mem.trim(u8, raw_line, " \t\r");
-        if (line.len == 0) continue;
-        const split = std.mem.indexOfAny(u8, line, " \t") orelse continue;
-        const key = line[0..split];
-        const value = std.mem.trim(u8, line[split..], " \t");
-        if (std.mem.eql(u8, key, "pubkeyauthentication")) {
-            if (std.mem.eql(u8, value, "yes")) pubkey = true else if (std.mem.eql(u8, value, "no")) pubkey = false;
-            continue;
-        }
-        if (std.mem.eql(u8, key, "authorizedkeysfile")) {
-            saw_authorized_keys_file = true;
-            if (std.mem.eql(u8, value, "none")) continue;
-            var paths = std.mem.tokenizeAny(u8, value, " \t");
-            while (paths.next()) |path| {
-                const expanded = expandAuthorizedKeysPath(allocator, path, user, uid, home) catch |err| {
-                    const reason = switch (err) {
-                        error.UnsupportedToken => "unsupported AuthorizedKeysFile token",
-                        error.InvalidHome => "invalid account home for AuthorizedKeysFile",
-                        error.PathTooLong => "AuthorizedKeysFile path is too long",
-                        error.OutOfMemory => return error.OutOfMemory,
-                    };
-                    try effectiveWarning(allocator, &warnings, reason, path);
-                    continue;
-                };
-                var duplicate = false;
-                for (sources.items) |existing| if (std.mem.eql(u8, existing, expanded)) {
-                    duplicate = true;
-                    break;
-                };
-                if (duplicate) allocator.free(expanded) else try sources.append(allocator, expanded);
-            }
-            continue;
-        }
-        const dynamic = std.mem.eql(u8, key, "authorizedkeyscommand") or
-            std.mem.eql(u8, key, "authorizedkeysuserca") or
-            std.mem.eql(u8, key, "trustedusercakeys") or
-            std.mem.eql(u8, key, "authorizedprincipalsfile") or
-            std.mem.eql(u8, key, "authorizedprincipalscommand");
-        if (dynamic and !std.mem.eql(u8, value, "none")) try effectiveWarning(allocator, &warnings, key, value);
-    }
-    if (pubkey == null) try effectiveWarning(allocator, &warnings, "pubkeyauthentication", "not reported");
-    if (!saw_authorized_keys_file) try effectiveWarning(allocator, &warnings, "authorizedkeysfile", "not reported");
-    return .{
-        .pubkey_authentication = pubkey,
-        .static_sources = try sources.toOwnedSlice(allocator),
-        .warnings = try warnings.toOwnedSlice(allocator),
-    };
-}
-
-pub fn hasCertificateAuthorityOption(options: []const u8) bool {
-    var tokens = std.mem.splitScalar(u8, options, ',');
-    while (tokens.next()) |raw| {
-        const token = std.mem.trim(u8, raw, " \t");
-        if (std.mem.eql(u8, token, "cert-authority")) return true;
-    }
-    return false;
-}
-
-/// True when matched sshd `AuthorizedKeys*` lines force partial coverage:
-/// an `AuthorizedKeysCommand`/`AuthorizedKeysUserCA` source, or an
-/// `AuthorizedKeysFile` pointing somewhere other than the conventional
-/// per-home path (spec 09 §5).
-pub fn sshdSourcesForcePartial(sources: []const []const u8) bool {
-    for (sources) |line| {
-        if (std.mem.startsWith(u8, line, "AuthorizedKeysCommand") or
-            std.mem.startsWith(u8, line, "AuthorizedKeysUserCA")) return true;
-        if (std.mem.startsWith(u8, line, "AuthorizedKeysFile")) {
-            const rest = std.mem.trim(u8, line["AuthorizedKeysFile".len..], " \t");
-            if (!std.mem.eql(u8, rest, ".ssh/authorized_keys") and
-                !std.mem.eql(u8, rest, "%h/.ssh/authorized_keys")) return true;
-        }
-    }
-    return false;
-}
+// Re-export the shared effective-policy module so Spec 09 continues to
+// evaluate the same source model as Spec 08.
+pub const EffectiveSshdPolicy = sshd_policy.EffectiveSshdPolicy;
+pub const expandAuthorizedKeysPath = sshd_policy.expandAuthorizedKeysPath;
+pub const parseEffectiveSshdPolicy = sshd_policy.parseEffectiveSshdPolicy;
+pub const hasCertificateAuthorityOption = sshd_policy.hasCertificateAuthorityOption;
+pub const sshdSourcesForcePartial = sshd_policy.sshdSourcesForcePartial;
 
 // --- people map (pure join) ------------------------------------------------
 
@@ -2021,6 +1872,7 @@ test "identity store: save, ownership conflicts, shared, list, delete" {
 
 test "parseSudoList distinguishes yes/no/unknown" {
     try std.testing.expectEqualStrings(sudo_yes, parseSudoList(0, "User root may run the following commands on this host:\n (ALL) ALL\n"));
+    try std.testing.expectEqualStrings(sudo_yes, parseSudoList(0, "User carol may run the following commands on host:\n\nSudoers entry: /etc/sudoers.d/oars-test\n    RunAsUsers: ALL\n    Options: !authenticate\n    Commands:\n\tALL\n"));
     try std.testing.expectEqualStrings(sudo_no, parseSudoList(1, "user alice is not in the sudoers file. This incident will be reported."));
     // Alpine's sudo prints the denial with exit 0 for `-l -U` queries.
     try std.testing.expectEqualStrings(sudo_no, parseSudoList(0, "User alice is not allowed to run sudo on b7ac8cc46a82."));

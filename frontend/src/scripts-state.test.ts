@@ -65,8 +65,6 @@ describe("reconcileVariables", () => {
 
   it("keeps unused saved definitions visible", () => {
     const out = reconcileVariables(["newvar"], saved);
-    // `service` and `gone` are both saved but not detected in the body:
-    // both stay visible so an edit cannot silently drop a definition.
     expect(out.map((v) => v.name)).toEqual(["newvar", "service", "gone"]);
   });
 });
@@ -96,6 +94,44 @@ describe("filterScripts", () => {
 });
 
 describe("run value memory", () => {
+  it("keeps non-secret values per script and restores them", () => {
+    const targetScript = script({
+      id: "a",
+      variables: [
+        { name: "service", label: "Service", secret_default: false },
+        { name: "env", label: "Env", secret_default: false },
+      ],
+    });
+    const cache = rememberRunValues({}, targetScript, {
+      service: { value: "nginx", secret: false },
+      env: { value: "staging", secret: false },
+    });
+    expect(prefillRunValues(cache, targetScript)).toEqual({
+      values: { service: "nginx", env: "staging" },
+      promoted: {},
+    });
+
+    // Remove missing or undefined variable
+    const partialVars = rememberRunValues(cache, targetScript, {
+      service: { value: "nginx", secret: false },
+    });
+    expect(prefillRunValues(partialVars, targetScript)).toEqual({
+      values: { service: "nginx" },
+      promoted: {},
+    });
+  });
+
+  it("clears memory when all variables become secret or empty", () => {
+    const targetScript = script({ id: "a" });
+    const cache = rememberRunValues({}, targetScript, {
+      service: { value: "nginx", secret: false },
+    });
+    expect(cache.a).toBeDefined();
+
+    const emptyVars = rememberRunValues(cache, targetScript, {});
+    expect(emptyVars.a).toBeUndefined();
+  });
+
   it("keeps non-secret values per script and never retains effective secrets", () => {
     const cache = rememberRunValues({}, script({ id: "a" }), {
       service: { value: "nginx", secret: false },
@@ -124,6 +160,7 @@ describe("formatLastRun", () => {
   it("says no runs yet without a run or stamp", () => {
     expect(formatLastRun(null, 0)).toBe("no runs yet");
     expect(formatLastRun(123, 0)).toBe("no runs yet");
+    expect(formatLastRun(null, 5)).toBe("no runs yet");
   });
 
   it("renders relative units from millisecond stamps", () => {
@@ -132,9 +169,20 @@ describe("formatLastRun", () => {
     expect(formatLastRun(Date.now() - 3 * 3600_000, 3)).toBe("3 h ago");
     expect(formatLastRun(Date.now() - 4 * 86400_000, 3)).toBe("4 d ago");
   });
+
+  it("renders toLocaleDateString when last run was >= 30 days ago", () => {
+    const past45Days = Date.now() - 45 * 86400_000;
+    const formatted = formatLastRun(past45Days, 3);
+    expect(formatted).toBe(new Date(past45Days).toLocaleDateString());
+  });
 });
 
 describe("appendOutput", () => {
+  it("handles null or empty data", () => {
+    expect(appendOutput("existing", undefined, 0, false)).toEqual({ text: "existing", gapReported: false });
+    expect(appendOutput("existing", "", 0, true)).toEqual({ text: "existing", gapReported: true });
+  });
+
   it("appends deltas cumulatively", () => {
     const a = appendOutput("hello ", "world", 0, false);
     expect(a.text).toBe("hello world");
@@ -186,6 +234,7 @@ describe("colors and destructive tags", () => {
     expect(isValidColor("")).toBe(true);
     expect(isValidColor("blue")).toBe(false);
     expect(isValidColor("#123456")).toBe(false);
+    expect(isValidColor("rgb(0,0,0)")).toBe(false);
   });
 
   it("destructive is an exact case-insensitive tag, never a color", () => {

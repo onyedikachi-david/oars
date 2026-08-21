@@ -11,6 +11,7 @@
     "allowSyntheticDefaultImports": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
+    "types": ["node", "vite/client"],
     "noEmit": true,
     "paths": { "@/*": ["./src/*"] }
   },

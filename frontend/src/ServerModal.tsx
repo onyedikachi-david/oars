@@ -3,6 +3,9 @@ import { ChevronDown, HardDrive, KeyRound, Network, ShieldCheck, Tag, Trash2, X 
 import { api, BridgeError, pickFile, vault } from "./bridge";
 import type { Server, AuthMethod, ServerDraft } from "./types";
 import { Button } from "./components/ui/button";
+import { OarsSelect } from "./components/ui/select";
+import { ApplicationOverlay } from "./components/ApplicationPortal";
+import { useModalFocus } from "./components/useModalFocus";
 
 interface Props {
   server?: Server;
@@ -45,7 +48,6 @@ function mapBridgeError(msg: string): FieldErrors {
 
 export function ServerModal({ server, servers, onClose, onSaved, onDeleted }: Props) {
   const editing = server !== undefined;
-  const dialogRef = useRef<HTMLDivElement>(null);
   const originalSecretRef = useRef<string | null>(null);
 
   const [name, setName] = useState(server?.name ?? "");
@@ -62,11 +64,14 @@ export function ServerModal({ server, servers, onClose, onSaved, onDeleted }: Pr
   const [tagInput, setTagInput] = useState("");
   const [via, setVia] = useState<string>(server?.via_server_id ?? "");
   const [busy, setBusy] = useState(false);
-  const busyRef = useRef(busy);
-  const onCloseRef = useRef(onClose);
-  busyRef.current = busy;
-  onCloseRef.current = onClose;
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
+
+  const dialogRef = useModalFocus(onClose, "#oars-name", !busy);
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
   const [secretState, setSecretState] = useState<SecretState>(editing ? "loading" : "absent");
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(() => Boolean(server?.group || (server?.tags && server.tags.length > 0) || server?.via_server_id));
@@ -83,35 +88,6 @@ export function ServerModal({ server, servers, onClose, onSaved, onDeleted }: Pr
       .catch(() => { if (!cancelled) setSecretState("error"); });
     return () => { cancelled = true; };
   }, [editing, server?.id]);
-
-  useEffect(() => {
-    const previous = document.activeElement as HTMLElement | null;
-    const dialog = dialogRef.current;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busyRef.current) {
-        event.preventDefault();
-        onCloseRef.current();
-        return;
-      }
-      if (event.key !== "Tab" || !dialog) return;
-      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'));
-      if (focusable.length === 0) return;
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown);
-      previous?.focus();
-    };
-  }, []);
 
   const storedSecret = secretState === "present";
 
@@ -280,13 +256,14 @@ export function ServerModal({ server, servers, onClose, onSaved, onDeleted }: Pr
   };
 
   return (
-    <div className="oars-modal-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
+    <ApplicationOverlay role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
       <div
         ref={dialogRef}
         className="oars-modal"
         role="dialog"
         aria-modal="true"
         aria-labelledby="oars-modal-title"
+        aria-describedby="oars-modal-desc"
         onClick={(ev) => ev.stopPropagation()}
       >
         <div className="oars-modal-header">
@@ -296,7 +273,7 @@ export function ServerModal({ server, servers, onClose, onSaved, onDeleted }: Pr
             </span>
             <div>
               <h2 id="oars-modal-title">{editing ? "Edit connection profile" : "Add connection profile"}</h2>
-              <p className="oars-modal-subtitle">
+              <p id="oars-modal-desc" className="oars-modal-subtitle">
                 {editing ? "Update how Oars connects to this server. Secrets stay in your local Keychain." : "Save a connection profile once. Oars connects over standard SSH — no agent required."}
               </p>
             </div>
@@ -524,18 +501,20 @@ export function ServerModal({ server, servers, onClose, onSaved, onDeleted }: Pr
 
                 <div className="oars-field">
                   <label htmlFor="oars-via">Jump host</label>
-                  <select
+                  <OarsSelect
                     id="oars-via"
                     value={via}
-                    onChange={(e) => setVia(e.target.value)}
+                    onValueChange={setVia}
                     aria-invalid={Boolean(fieldErrors.via)}
                     className={fieldErrors.via ? "oars-input-error" : undefined}
-                  >
-                    <option value="">Direct connection</option>
-                    {viaOptions.map((s) => (
-                      <option key={s.id} value={s.id}>{s.name} — {s.host}</option>
-                    ))}
-                  </select>
+                    options={[
+                      { value: "", label: "Direct connection" },
+                      ...viaOptions.map((option) => ({
+                        value: option.id,
+                        label: `${option.name} — ${option.host}`,
+                      })),
+                    ]}
+                  />
                   <span className="oars-hint">Connect via another profile. Chains up to three hops, no cycles.</span>
                   {fieldErrors.via && <span className="oars-field-error">{fieldErrors.via}</span>}
                 </div>
@@ -566,6 +545,6 @@ export function ServerModal({ server, servers, onClose, onSaved, onDeleted }: Pr
           </div>
         </form>
       </div>
-    </div>
+    </ApplicationOverlay>
   );
 }

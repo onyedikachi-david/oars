@@ -10,22 +10,74 @@ permissions:
   contents: read
 
 env:
-  # Where CI keeps the Native SDK framework checkout; the build
-  # override below points the app at it.
-  NATIVE_SDK_PATH: "../native-sdk"
+  ZIG_VERSION: "0.16.0"
+  NATIVE_SDK_VERSION: "0.7.1"
 
 jobs:
   test:
-    name: Logic Tests
+    name: Logic tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
-      - name: Fetch native-sdk
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install Native SDK
+        run: npm install --global @native-sdk/cli@${{ env.NATIVE_SDK_VERSION }}
+      - name: Resolve Native SDK path
+        id: native-sdk
+        shell: bash
         run: |
-          if [ ! -f "$NATIVE_SDK_PATH/build.zig" ]; then
-            git clone --depth 1 https://github.com/vercel-labs/native.git "$NATIVE_SDK_PATH"
-          fi
-      - run: zig build test -Dplatform=null -Dnative-sdk-path="$NATIVE_SDK_PATH"
+          echo "path=$(npm root --global)/@native-sdk/cli" >> "$GITHUB_OUTPUT"
+      - name: Run Zig tests
+        run: zig build test -Dplatform=null -Dnative-sdk-path="${{ steps.native-sdk.outputs.path }}"
+
+  package:
+    name: Package ${{ matrix.name }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-latest
+            target: macos
+          - name: Linux
+            os: ubuntu-latest
+            target: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes pkg-config libgtk-4-dev libwebkitgtk-6.0-dev
+      - name: Install Native SDK
+        run: npm install --global @native-sdk/cli@${{ env.NATIVE_SDK_VERSION }}
+      - name: Resolve Native SDK path
+        id: native-sdk
+        shell: bash
+        run: |
+          echo "path=$(npm root --global)/@native-sdk/cli" >> "$GITHUB_OUTPUT"
+      - name: Build package
+        run: zig build package -Dpackage-target=${{ matrix.target }} -Dnative-sdk-path="${{ steps.native-sdk.outputs.path }}"
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: oars-${{ matrix.target }}
+          path: zig-out/package/
+          if-no-files-found: error

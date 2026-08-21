@@ -80,6 +80,19 @@ export class DirCache {
     this.entries.set(`${serverId}\u0000${pathKey}`, { listing, loadedAt: now });
   }
 
+  invalidate(serverId: string, pathKey?: string): void {
+    if (pathKey !== undefined) {
+      this.entries.delete(`${serverId}\u0000${pathKey}`);
+    } else {
+      const prefix = `${serverId}\u0000`;
+      for (const key of this.entries.keys()) {
+        if (key.startsWith(prefix)) {
+          this.entries.delete(key);
+        }
+      }
+    }
+  }
+
   clear(): void {
     this.entries.clear();
   }

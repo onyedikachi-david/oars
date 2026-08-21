@@ -70,6 +70,13 @@ export const STATUS_LABEL: Record<SessionStatus, string> = {
   error: "Error",
 };
 
+export interface ProcessSample {
+  pid: number;
+  name: string;
+  cpu: number | null;
+  mem: number | null;
+}
+
 export interface MonitorSnapshot {
   ok: boolean;
   ts: number;
@@ -95,7 +102,7 @@ export interface MonitorSnapshot {
     total_bytes: number;
     available_bytes: number;
   } | null;
-  processes: Array<{ pid: number; name: string; cpu: number | null; mem: number | null }>;
+  processes: ProcessSample[];
   probe_error: string | null;
 }
 
@@ -171,33 +178,123 @@ export interface AccessExportResponse { ok: boolean; format: "csv" | "json"; pat
 export interface AccessKeyInspectResponse { ok: boolean; normalized_public_key: string; fingerprint: string; key_type: string; comment: string; }
 
 export interface SshKeyEntry {
+  source_path: string;
   line_index: number;
+  line_hash: string;
   parsed: boolean;
   options?: string;
   type?: string;
   key?: string;
   comment?: string;
   fingerprint_sha256?: string;
-  bits?: number | null;
-  line_hash: string;
+  bits?: number;
   raw?: string;
+  error?: string;
+  // Backend-typed assessment; the UI never infers safety from options alone.
+  policy_assessment?: SshPolicyAssessment;
+}
+
+export type SshPolicyLevel = "standard" | "restricted" | "role_forced" | "weak";
+export interface SshPolicyAssessment { level: SshPolicyLevel; detail: string; }
+
+export type SshAccountKind = "connected" | "managed_role";
+export interface SshAccountRef { kind: SshAccountKind; name?: string; }
+
+export type SshSourceKind = "static" | "dynamic" | "certificate";
+export type SshSourceStatus = "missing" | "readable" | "denied" | "timeout" | "too_large" | "transport_error" | "parse_error";
+export interface SshSource {
+  path: string;
+  kind: SshSourceKind;
+  status: SshSourceStatus;
+  file_sha256?: string;
+  mode?: number;
+  owner?: string;
   error?: string;
 }
 
+export type SshRoleKind = "standard_ssh" | "read_only_sftp";
+export type SshRolePolicyState = "verified" | "missing" | "corrupt" | "stale" | "unreadable" | "drifted";
 export interface SshRole {
   name: string;
-  shell: string;
-  read_only: boolean;
-  policy: "read-only-sftp" | "standard";
-  users: string[];
+  kind: SshRoleKind;
+  home?: string;
+  shell?: string;
+  policy_state: SshRolePolicyState;
+  // Exact key fingerprints installed for this role. Comments are never used
+  // as identity (the old comment-based `users` field is gone).
+  key_fingerprints: string[];
 }
 
-export interface GeneratedSshKey {
-  ok: boolean;
-  public_key: string;
-  private_path: string;
-  keychain_account?: string;
+export interface SshDeployKey {
+  deploy_key_id: string;
+  repository_label: string;
+  path: string;
+  fingerprint: string;
+  created_at_ms?: number;
 }
+
+export type SshPrivilege = "root" | "sudo_n" | "none";
+export interface SshCapabilities { privilege: SshPrivilege; sftp_read_only: boolean; }
+
+export type SshSnapshotState = "queued" | "running" | "done" | "partial" | "canceled";
+export type SshSnapshotCoverage = "complete" | "partial";
+export interface SshSnapshotStartResponse { ok: boolean; snapshot_id: string; }
+export interface SshSnapshotPollResponse {
+  ok: boolean;
+  state: SshSnapshotState;
+  server_id: string;
+  account: SshAccountRef;
+  scope: string;
+  created_at_ms: number;
+  finished_at_ms?: number;
+  coverage: SshSnapshotCoverage;
+  capabilities: SshCapabilities;
+  sources: SshSource[];
+  keys: SshKeyEntry[];
+  roles: SshRole[];
+  deploy_keys: SshDeployKey[];
+  warnings: string[];
+}
+
+export type SshJobState = "queued" | "running" | "waiting_for_verification" | "done" | "partial" | "canceled";
+export type SshJobStepState = "queued" | "running" | "waiting" | "done" | "conflict" | "error" | "canceled";
+export interface SshJobStep { id: string; state: SshJobStepState; error?: string; }
+// Job result payloads are union-typed across the mutation kinds; every field
+// is optional and the consuming flow reads only the fields its kind defines.
+export interface SshJobResult {
+  public_key?: string;
+  private_path?: string;
+  fingerprint?: string;
+  keychain_account?: string;
+  deploy_key_id?: string;
+  new_fingerprint?: string;
+  idempotent?: boolean;
+}
+export interface SshJobPollResponse { ok: boolean; state: SshJobState; steps: SshJobStep[]; result?: SshJobResult; }
+
+export interface SshInspectResponse {
+  ok: boolean;
+  normalized_public_key: string;
+  fingerprint: string;
+  key_type: string;
+  bits?: number;
+  comment: string;
+}
+
+export type SshRolePlanAction = "create" | "repair" | "delete";
+export interface SshRolePlanResponse {
+  ok: boolean;
+  plan_id: string;
+  expires_at_ms: number;
+  account: string;
+  home?: string;
+  commands: string[];
+  effects: string[];
+}
+
+export type SshRotateVerification =
+  | { kind: "local_private_key"; path: string; passphrase?: string }
+  | { kind: "external_confirmation"; confirm_fingerprint: string };
 
 
 export type SftpTransferStatus = "queued" | "running" | "done" | "failed" | "canceled";
@@ -474,3 +571,360 @@ export interface DeployPreflight {
 export interface DeployStep { id: string; label: string; state: DeployStepState; channel?: number; exit?: number | null; error?: string; cursor?: number; gap?: number; eof?: boolean; data?: string; }
 export interface DeployPollResult { ok: boolean; run_id: number; status: DeployRunStatus; started_at_ms: number; finished_at_ms: number | null; canceled: boolean; done: boolean; steps: DeployStep[]; }
 export interface DeployHistoryRecord { id: number; server_id: string; app_id: string; status: DeployRunStatus; action: string; commit: string; started_at_ms: number; finished_at_ms: number | null; output: string; truncated: boolean; steps: Array<{ id: string; state: DeployStepState; exit: number | null; error: string }>; }
+
+// ============================================================================
+// Spec 10: Backups (oars.backup.*)
+// ============================================================================
+
+export type BackupTransferKind = "sync" | "copy";
+export type BackupDestinationType = "s3" | "local";
+export type BackupProvider = "aws" | "r2" | "b2" | "wasabi" | "minio" | "spaces";
+export type BackupScheduleMode = "manual" | "interval" | "custom";
+export type BackupIntervalUnit = "hours" | "days";
+export type BackupRunStatus = "queued" | "running" | "success" | "failed" | "no_changes" | "canceled";
+
+export interface BackupDestination {
+  type: BackupDestinationType;
+  provider: BackupProvider;
+  bucket: string;
+  prefix: string;
+  endpoint: string;
+  region: string;
+  use_iam: boolean;
+  storage_class: string;
+}
+
+export interface BackupSchedule {
+  mode: BackupScheduleMode;
+  interval_unit: BackupIntervalUnit;
+  interval_every: number;
+  expr: string;
+  enabled: boolean;
+}
+
+export interface BackupJob {
+  id: string;
+  server_id: string;
+  name: string;
+  source_path: string;
+  destination: BackupDestination;
+  transfer: BackupTransferKind;
+  schedule: BackupSchedule;
+  created_at_ns: number;
+  updated_at_ns: number;
+}
+
+export interface BackupJobInput {
+  id?: string;
+  server_id: string;
+  name: string;
+  source_path: string;
+  destination: Partial<BackupDestination> & {
+    type?: BackupDestinationType;
+    provider?: BackupProvider;
+    bucket?: string;
+  };
+  transfer?: BackupTransferKind;
+  schedule?: Partial<BackupSchedule>;
+}
+
+export interface BackupCredentials {
+  access_key: string;
+  secret_key: string;
+}
+
+export interface BackupJobsListResult {
+  ok: boolean;
+  jobs: BackupJob[];
+}
+
+export interface BackupJobSaveResult {
+  ok: boolean;
+  job: BackupJob;
+}
+
+export interface BackupTestResult {
+  ok: boolean;
+  checks: {
+    list: boolean;
+    write: boolean;
+    read: boolean;
+    delete: boolean;
+  };
+}
+
+export interface BackupRunStartResult {
+  ok: boolean;
+  run_id: string;
+}
+
+export interface BackupRunRecord {
+  id: string;
+  job_id: string;
+  server_id: string;
+  source: string;
+  status: BackupRunStatus;
+  started_at_ns: number;
+  finished_at_ns: number;
+  bytes_done: number;
+  bytes_total: number;
+  files_done: number;
+  files_total: number;
+  error: string;
+  log: string;
+}
+
+export interface BackupPollResult {
+  ok: boolean;
+  status: BackupRunStatus;
+  bytes_done: number;
+  bytes_total: number;
+  files_done: number;
+  files_total: number;
+  speed_bps: number;
+  eta_sec: number;
+  log_cursor: number;
+  dropped: number;
+  log_delta: string;
+  error: string;
+}
+
+export interface BackupHistoryResult {
+  ok: boolean;
+  runs: BackupRunRecord[];
+}
+
+export interface BackupInstallResult {
+  ok: boolean;
+  action: "already_installed" | "install" | "installed";
+  plan: string;
+}
+
+export interface BackupCronStatusResult {
+  ok: boolean;
+  rclone: boolean;
+  cron_installed: boolean;
+  cron_running: boolean;
+}
+
+// ============================================================================
+// Spec 11: AI Terminal (oars.ai.*)
+// ============================================================================
+
+export type AiAdapter = "openai_compatible" | "custom";
+export type AiInstructionRole = "developer" | "system";
+
+export interface AiCapabilities {
+  instruction_role: AiInstructionRole;
+  streaming: boolean;
+  structured_output: boolean;
+}
+
+export interface AiProvider {
+  adapter: AiAdapter;
+  base_url: string;
+  model: string;
+  capabilities: AiCapabilities;
+  updated_at_ns: number;
+}
+
+export interface AiProviderInput {
+  adapter: AiAdapter;
+  base_url: string;
+  model: string;
+  capabilities?: Partial<AiCapabilities>;
+}
+
+export interface AiLogInfo {
+  path: string;
+  last_write: number;
+}
+
+export interface AiContextBundle {
+  ok: boolean;
+  os: string;
+  hostname: string;
+  uptime_sec: number;
+  load: {
+    utilization_pct: number | null;
+    load_1: number;
+    load_5: number;
+    load_15: number;
+    cores: number;
+  };
+  mem: {
+    used_bytes: number;
+    total_bytes: number;
+    available_bytes: number;
+    swap_used_bytes: number;
+    swap_total_bytes: number;
+  } | null;
+  disk: {
+    used_bytes: number;
+    total_bytes: number;
+    available_bytes: number;
+  } | null;
+  top_processes: Array<{
+    pid: number;
+    name: string;
+    cpu: number | null;
+    mem: number | null;
+  }>;
+  active_logs: AiLogInfo[];
+  probe_error: string | null;
+}
+
+export interface AiHistoryEntry {
+  ts: number;
+  action: string;
+  detail: string;
+}
+
+export interface AiHistoryResult {
+  ok: boolean;
+  runs: AiHistoryEntry[];
+}
+
+export interface AiProviderGetResult {
+  ok: boolean;
+  provider: AiProvider | null;
+}
+
+export interface AiProviderSetResult {
+  ok: boolean;
+  provider: AiProvider;
+}
+
+// ============================================================================
+// Spec 15: Command History & Audit Journal (oars.history.*, oars.audit.*)
+// ============================================================================
+
+export interface HistoryEntry {
+  id: string;
+  operation_id: string;
+  ts: number;
+  server_id: string;
+  kind: string;
+  command: string;
+  exit: number | null;
+  duration_ms: number | null;
+  output_snippet: string;
+  redacted: boolean;
+}
+
+export interface HistoryRecordInput {
+  operation_id: string;
+  server_id: string;
+  kind: string;
+  command: string;
+  exit?: number | null;
+  duration_ms?: number | null;
+  output_snippet?: string;
+}
+
+export interface HistoryListFilter {
+  server_id?: string;
+  q?: string;
+  limit?: number;
+}
+
+export interface HistoryListResult {
+  ok: boolean;
+  entries: HistoryEntry[];
+}
+
+export interface AuditEntry {
+  id: string;
+  operation_id: string;
+  ts: number;
+  type: string;
+  target: string;
+  commands: string;
+  result: string;
+  detail: string;
+}
+
+export interface AuditListFilter {
+  q?: string;
+  type?: string;
+  limit?: number;
+}
+
+export interface AuditListResult {
+  ok: boolean;
+  entries: AuditEntry[];
+}
+
+// ============================================================================
+// Spec 17: Vault Export & Import (oars.vault.*)
+// ============================================================================
+
+export interface VaultExportParams {
+  path: string;
+  password?: string;
+  sections?: string[];
+}
+
+export interface VaultExportResult {
+  ok: boolean;
+  exported: number;
+  sections: number;
+}
+
+export interface VaultConflict {
+  key: string;
+  reason: string;
+}
+
+export interface VaultSectionReport {
+  name: string;
+  incoming: number;
+  new: number;
+  updated: number;
+  conflicts: VaultConflict[];
+}
+
+export interface VaultPreview {
+  reports: VaultSectionReport[];
+  errors: VaultConflict[];
+}
+
+export interface VaultImportParams {
+  path: string;
+  password?: string;
+}
+
+export interface VaultImportResult {
+  ok: boolean;
+  preview: VaultPreview;
+}
+
+export interface VaultImportConfirmParams {
+  path: string;
+  password?: string;
+  keep_local?: string[];
+  import_as_new?: string[];
+}
+
+export interface VaultImportConfirmResult {
+  ok: boolean;
+  result: {
+    notes: string[];
+  };
+}
+
+// ============================================================================
+// Spec 18: SSH Agent (oars.agent.*)
+// ============================================================================
+
+export interface AgentIdentity {
+  kind: string;
+  fingerprint_sha256: string;
+  comment: string;
+}
+
+export interface AgentListResult {
+  ok: boolean;
+  identities: AgentIdentity[];
+  error?: string;
+}

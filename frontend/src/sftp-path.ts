@@ -1,11 +1,7 @@
 // Raw remote-path identity for the SFTP workspace (spec 05 §5).
-//
-// A `RemotePath` is either `{utf8}` (valid UTF-8 text) or `{base64}` (raw
-// server bytes that are not valid UTF-8). Every operation payload carries
-// the RemotePath; `display` text is UI-only and is NEVER used to rebuild
-// an operation path. All joins and splits happen on raw bytes.
-
+// A `RemotePath` is either `{utf8}` (valid UTF-8 text) or `{base64}` (raw server bytes).
 import type { RemotePath, SftpEntry } from "./types";
+export type { RemotePath, SftpEntry };
 
 const DOT = 0x2e; // "."
 const SLASH = 0x2f; // "/"
@@ -30,8 +26,7 @@ export function base64ToBytes(b64: string): Uint8Array {
   return bytes;
 }
 
-/** True when `bytes` is well-formed UTF-8 (the base64 form exists because
- * this is false for some raw server names). */
+/** True when `bytes` is well-formed UTF-8. */
 export function isValidUtf8(bytes: Uint8Array): boolean {
   try {
     new TextDecoder("utf-8", { fatal: true }).decode(bytes);

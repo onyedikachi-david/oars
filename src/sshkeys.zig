@@ -317,6 +317,40 @@ pub fn lineHash(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{x}", .{&digest});
 }
 
+/// Hex SHA-256 of a whole file's exact bytes (the whole-file conflict
+/// guard every mutation submits; spec 08: an unrelated external edit
+/// must not be overwritten silently).
+pub fn fileSha256(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(content, &digest, .{});
+    return std.fmt.allocPrint(allocator, "{x}", .{&digest});
+}
+
+/// The parsed key with this exact fingerprint in this exact source, or
+/// null. Duplicate detection is per source file: the same fingerprint
+/// can still be valid in a different account or source (spec 08).
+pub fn findByFingerprint(parsed: *const ParsedFile, fingerprint_sha256: []const u8) ?*const Key {
+    for (parsed.keys) |*k| {
+        if (k.parsed and std.mem.eql(u8, k.fingerprint_sha256, fingerprint_sha256)) return k;
+    }
+    return null;
+}
+
+/// Appends one normalized key line to exact file content (newline
+/// guard: a file without a trailing newline gets one first). Pure; the
+/// caller owns the atomic write.
+pub fn appendLine(allocator: std.mem.Allocator, content: []const u8, line: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    if (content.len > 0) {
+        try out.appendSlice(allocator, content);
+        if (content[content.len - 1] != '\n') try out.append(allocator, '\n');
+    }
+    try out.appendSlice(allocator, line);
+    try out.append(allocator, '\n');
+    return out.toOwnedSlice(allocator);
+}
+
 /// Decodes a public-key base64 blob (unpadded standard alphabet — the
 /// ssh-keygen output — with a padded fallback, since some tools pad).
 /// Errors on any invalid character or length. The returned slice is
@@ -574,4 +608,36 @@ test "normalizePublicKey canonicalizes and rejects multi-line input" {
 
     try testing.expectError(error.Multiline, normalizePublicKey(allocator, "ssh-ed25519 AAAA\nssh-ed25519 AAAA", null));
     try testing.expectError(error.InvalidKey, normalizePublicKey(allocator, "not a key", null));
+}
+
+test "fileSha256 matches the empty-vector and content vectors" {
+    const allocator = testing.allocator;
+    const empty = try fileSha256(allocator, "");
+    defer allocator.free(empty);
+    try testing.expectEqualStrings("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", empty);
+    const abc = try fileSha256(allocator, "abc");
+    defer allocator.free(abc);
+    try testing.expectEqualStrings("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", abc);
+}
+
+test "findByFingerprint is scoped to the exact parsed source" {
+    const allocator = testing.allocator;
+    var file = try parse(allocator, vector_ed25519 ++ "\n" ++ vector_rsa);
+    defer file.deinit(allocator);
+    try testing.expect(findByFingerprint(&file, vector_ed25519_fp) != null);
+    try testing.expect(findByFingerprint(&file, "SHA256:nope") == null);
+}
+
+test "appendLine guards the trailing newline" {
+    const allocator = testing.allocator;
+    const line = "ssh-ed25519 AAAA new";
+    const from_empty = try appendLine(allocator, "", line);
+    defer allocator.free(from_empty);
+    try testing.expectEqualStrings("ssh-ed25519 AAAA new\n", from_empty);
+    const from_no_nl = try appendLine(allocator, "# comment", line);
+    defer allocator.free(from_no_nl);
+    try testing.expectEqualStrings("# comment\nssh-ed25519 AAAA new\n", from_no_nl);
+    const from_nl = try appendLine(allocator, "# comment\n", line);
+    defer allocator.free(from_nl);
+    try testing.expectEqualStrings("# comment\nssh-ed25519 AAAA new\n", from_nl);
 }

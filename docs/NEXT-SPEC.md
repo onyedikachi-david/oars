@@ -2,487 +2,515 @@
 
 ## Target
 
-Implement **Spec 09 — Fleet Access Management**. Treat
-`docs/specs/09-access.md` as the product contract, then correct that contract
-where the current source audit and primary references below prove it wrong or
-incomplete. Do not reduce the feature to the small `AccessTab` that exists at
-commit `0e94d4c`.
+Implement **Spec 08 — per-server SSH Management**. Treat
+`docs/specs/08-ssh-management.md` as the product contract, then correct that
+contract where the current source audit below proves it incomplete. The next
+feature after this one is Spec 10 Backups.
 
 Read these files before editing:
 
-- `docs/specs/README.md`, especially the cursor, mutation, research, and
-  worker-thread rules
+- `docs/specs/README.md`, especially the worker-thread, mutation, secret, and
+  acceptance rules
 - `docs/DESIGN.md`
-- `docs/specs/09-access.md` and the parser/writer contract in
-  `docs/specs/08-ssh-management.md`
-- `docs/research/spec-09-current-state.md`
-- `src/access.zig`, the `oars.access.*` handlers in `src/bridge.zig`, and the
-  access operation paths in `src/sessions.zig`
-- `src/sshkeys.zig` and the existing SSH-key/role helpers in `src/bridge.zig`
-- `src/integration_access.zig` and the access dispatcher tests in `src/main.zig`
-- `frontend/src/AccessTab.tsx`, `frontend/src/bridge.ts`,
+- `docs/specs/08-ssh-management.md`
+- `docs/specs/09-access.md` and `docs/NEXT-SPEC.md` from commit `16b4b9e` for
+  the shared access-source and mutation contracts
+- `src/sshkeys.zig`, `src/keygen.zig`, and `src/integration_keys.zig`
+- the `oars.sshkeys.*` handlers in `src/bridge.zig`
+- access scan and mutation operations in `src/access.zig`, `src/bridge.zig`,
+  and `src/sessions.zig`; Spec 08 must reuse their effective OpenSSH source
+  model instead of creating a second one
+- `frontend/src/KeysTab.tsx`, `frontend/src/bridge.ts`,
   `frontend/src/types.ts`, `frontend/src/App.tsx`, and `frontend/src/index.css`
-- `frontend/preview.html`; every new access state needs a deterministic fixture
-
-The research note records sources and current-state evidence. This guide states
-the required implementation.
+- `frontend/preview.html`; each state in this guide needs a deterministic
+  fixture
 
 ## Verified baseline
 
-The backend is substantial. `src/access.zig` has an identity store, scan and
-job models, fingerprint joins, CSV/JSON formatting, and bounded in-memory
-registries. The bridge registers scan, poll, identity CRUD, offboard, onboard,
-rotate, job poll, and export commands. The existing Alpine integration suite
-exercises connected/full scans, partial coverage, sync errors, key mutations,
-roles, and audit rows. The focused pure suite is 9/9 at `0e94d4c`.
+Spec 08 is already substantial. `src/sshkeys.zig` parses and rewrites
+`authorized_keys` without a shell. It preserves comments, empty lines, CRLF,
+options, and malformed rows; validates the embedded SSH key type; computes the
+OpenSSH SHA-256 fingerprint; and derives key size only for understood formats.
+`src/keygen.zig` delegates Ed25519 private-key generation to the installed
+OpenSSH `ssh-keygen`, drives non-empty passphrases through a private PTY, checks
+mode 0600, refuses existing destinations, and rolls back a partial pair.
 
-That backend is **partial**, not complete. The current frontend uses `any`, raw
-buttons, inline styles, `window.confirm`, and `window.prompt`. It has no onboard
-or rotation flow, no person detail, no unassigned-key assignment, no server
-progress, and no mutation result polling. An offboard click creates a queued
-job and then stops, so no remote key is removed. Identity save also sends the
-wrong wire shape: the backend requires `{identity:{...}}`, while the frontend
-sends the identity fields at the payload root. Export returns content, but the
-frontend looks for a path and never writes a file.
+The bridge exposes list, add, revoke, rotate, local generate, role list/create/
+delete, and server deploy-key generation. The Alpine integration test covers
+add/connect/revoke, stale-line rejection, replacement, a forced read-only SFTP
+account, rejected shell/forwarding/file mutations, role deletion, deploy-key
+generation, and audit rows. `KeysTab` has typed inventory, role, generation,
+revoke, and rotate dialogs. The preview has deterministic keys and roles.
 
-The core also has hard correctness and security gaps:
+The current status is still **Partial**, not complete. Update the Spec 08 status
+before implementation starts. The checked acceptance boxes in the spec record
+an earlier backend pass; they do not cover the release blockers below.
 
-1. `accessExec` calls `execWait` from `oars.access.poll`. A single poll loops
-   over every server, and each phase can wait 10 seconds. This violates the
-   rule that the bridge/UI thread never waits on the network.
-2. A connected-account scan can report `coverage:"complete"` after inspecting
-   only that account. The response does not say that completeness is limited
-   to the connected-account scope, so the UI can overstate a security audit.
-3. Full scan uses a fixed `uid >= 1000` filter, reads only
-   `~/.ssh/authorized_keys`, and greps config files. It misses root when root is
-   not the connected account, valid login accounts below UID 1000, a second
-   `AuthorizedKeysFile`, included and conditional configuration, certificate
-   authorities, and dynamic key/principal sources.
-4. `IdentityStore.next_id` resets to 1 on every app start. A new identity can
-   therefore duplicate an existing `id-1`. Its writer truncates the live JSON
-   file instead of using the repo's temp-sync-rename pattern.
-5. Scan/job capacity silently evicts the oldest pointer, including work a view
-   can still poll. Requests have no target or item cap, no expiry, and no
-   idempotency key. A registry append failure can also free a new scan before
-   the handler serializes its ID.
-6. An errored server is terminal for poll, but `lastFinishedScan` accepts only
-   `server.done`. A useful partial snapshot with a sync error can therefore be
-   impossible to export.
-7. Poll serialization drops rows when its byte budget is exhausted but sends
-   no page cursor or truncation field. Frontend windowing cannot recover data
-   the backend omitted.
-8. Rotation changes remote lines but does not add the new fingerprint to the
-   local identity. The next scan can show the rotated key as unassigned.
-9. Mutations target a conventional per-user file, not the exact static source
-   path frozen by the scan. They have a line hash but no whole-file identity,
-   so an unrelated concurrent edit can be overwritten.
+Current verification on 2026-08-13:
 
-Do not retain a planned or complete status after these facts are known. Mark
-Spec 09 **Partial** while implementation is in progress. Mark it complete only
-after the acceptance checks at the end of this guide pass.
+- Frontend Vitest: 10 files and 93 tests pass, but there is no focused
+  `KeysTab` test.
+- Frontend production build passes. It reports the existing large-chunk
+  warning.
+- The ChatGPT in-app browser opens `frontend/preview.html`, reaches the Keys
+  tab with no console errors, and has no document-level overflow at
+  1327 × 964. The visible screen still omits the selected account, exact key
+  source, source health, role drift, and job progress.
+- `zig build test` passes when local test sockets are allowed. The restricted
+  sandbox run passed 234 of 236 tests, then blocked the two tests that open
+  local sockets with `PERM`; the permitted rerun exited successfully. Treat
+  that sandbox denial as an environment limit, not a product failure.
 
-## Research corrections that change the design
+## Release-blocking gaps
 
-OpenSSH `sshd -T` is the effective-config interface. With `-C`, it applies the
-`Match` rules for supplied connection parameters before it prints the result.
-Reading `/etc/ssh/sshd_config*` with `grep` is not equivalent. Use a privileged
-`sshd -T -C user=…,addr=…,laddr=…,lport=…` probe when available. If Oars cannot
-evaluate the effective configuration for an account, that account is partial;
-do not guess. See [OpenBSD sshd(8)](https://man.openbsd.org/sshd.8).
+### 1. Bridge handlers wait on remote work
 
-`AuthorizedKeysFile` can contain multiple whitespace-separated paths. Paths
-can be absolute or relative to the user's home and can contain `%%`, `%h`,
-`%U`, and `%u`. `AuthorizedKeysCommand` is an additional dynamic source.
-`TrustedUserCAKeys` plus `AuthorizedPrincipalsFile` or
-`AuthorizedPrincipalsCommand` can grant certificate-based access that a list
-of raw key fingerprints cannot enumerate. Surface each source and keep overall
-coverage partial when the people map cannot resolve it. See
-[OpenBSD sshd_config(5)](https://man.openbsd.org/sshd_config) and
-[OpenBSD sshd(8), authorized_keys format](https://man.openbsd.org/sshd.8#AUTHORIZED_KEYS_FILE_FORMAT).
+The `oars.sshkeys.*` handlers call `Manager.execWait`, then create SFTP
+outcomes and call `wait`. Role listing can run several serial execs. A Keys tab
+load or mutation can therefore hold the bridge/UI thread for tens of seconds.
 
-The OpenSSH comment is display text only. It does not participate in
-authentication. Fingerprints remain the canonical identity join, and every
-mutation remains bound to a decoded key fingerprint plus the scanned source
-record. Do not identify, delete, or rotate a key by comment.
+Move every SSH and SFTP step into the owning session worker. Bridge handlers
+may validate and copy a bounded request, create a snapshot or job record, queue
+work, and serialize locked local state. They must return without waiting on a
+socket. Poll calls only observe state; they never advance the operation.
 
-`getent passwd` enumerates the configured Name Service Switch database, and
-enumeration itself can be unsupported. Do not assume `/etc/passwd` is the
-complete account source and do not use UID 1000 as the login boundary. Include
-accounts with a usable login shell, then apply effective SSH policy; an
-unsupported or unreadable account source makes coverage partial. See
-[getent(1)](https://man7.org/linux/man-pages/man1/getent.1.html) and
-[nsswitch.conf(5)](https://man7.org/linux/man-pages/man5/nsswitch.conf.5.html).
+Local `ssh-keygen` can also wait for 30 seconds. Run it on a bounded local job
+worker. Cancellation and every error path after `fork` must terminate and reap
+the child before the job becomes terminal.
 
-CSV remains RFC 4180 with CRLF records, quoting for commas/quotes/line breaks,
-and doubled embedded quotes. Because server-controlled comments and identity
-names can begin with spreadsheet formula characters, make the spreadsheet CSV
-formula-safe and state that transformation in the export dialog. JSON is the
-exact, unmodified audit format. Microsoft documents that CSV columns are
-interpreted on import and that formulas begin with `=`; see
-[Microsoft CSV import](https://support.microsoft.com/en-us/excel/get-started/import-or-export-text-txt-or-csv-files),
-[Microsoft formula rules](https://support.microsoft.com/en-US/Excel/get-started/overview-of-formulas-in-excel),
-and [RFC 4180](https://www.rfc-editor.org/rfc/rfc4180).
+### 2. Read failures look like an empty file
+
+`sshkeysRead` returns `null` for missing, denied, timeout, too-large, transport,
+decode, and parse failures. `oars.sshkeys.list` then uses `""` and reports
+`keys:[]`. Add can also treat an unreadable file as empty and replace its
+meaning with a new one-line file.
+
+Return typed source outcomes: `missing`, `readable`, `denied`, `timeout`,
+`too_large`, `transport_error`, and `parse_error`. Only `missing` can produce a
+safe create plan. Every other state blocks mutation and stays visible in the
+screen.
+
+### 3. The fixed path is not the effective SSH policy
+
+The current code resolves only `<home>/.ssh/authorized_keys`. OpenSSH can use
+multiple `AuthorizedKeysFile` paths, tokens, `Match` rules, dynamic key
+commands, trusted user CAs, and principal sources. A connected account can
+therefore have a different static source or additional access outside the file
+shown by the tab.
+
+Extract the effective-policy and static-source logic used by Spec 09 into a
+shared deep module. For the selected account, evaluate `sshd -T -C` through the
+available privilege path, expand documented tokens, read each static source,
+and surface dynamic or certificate sources as warnings. If effective policy
+cannot be evaluated, label the view partial and allow mutation only against an
+exact, readable source that the user selects. Never call that source the
+account's complete SSH access.
+
+The per-server screen covers the connected login and Oars-managed role
+accounts. It does not enumerate every account on the server; the fleet Security
+workspace owns that full-account audit. State this scope in the UI and link to
+the full scan.
+
+### 4. Conflict checks do not protect the complete preview
+
+Revoke and rotate validate a fingerprint plus one line hash. An unrelated edit
+to the same file can be overwritten because the request has no whole-file
+identity. The spec text mentions expected metadata, but its old payload omits
+it.
+
+Every snapshot source needs `file_sha256`, mode, owner when observable, and an
+exact path. Add, revoke, rotate, and role-key mutations must submit
+`snapshot_id`, `source_path`, `file_sha256`, and the target `line_hash` when a
+line exists. Re-read and compare before writing. A mismatch is a conflict; the
+job must not merge an unreviewed external edit.
+
+The writer remains line-preserving and uses a sibling temporary file, fsync,
+preserved ownership/mode, and atomic rename. If the server cannot provide the
+required atomic replacement, fail safely.
+
+### 5. Mutations are not idempotent jobs
+
+Add appends the same fingerprint again. Repeating a bridge request can repeat
+remote work. Revoke, direct rotate, role changes, and deploy-key generation do
+not provide a durable per-item result to the UI.
+
+Use a frontend-generated `operation_id` for every mutation. A repeated ID
+returns the existing job. Deduplicate an added fingerprint within the exact
+account and source; the same fingerprint can still be valid in a different
+account or source. Keep bounded retained jobs with explicit expiry. Audit
+admission once and the terminal remote result once.
+
+### 6. Direct replacement can lock out the operator
+
+The current per-server rotate removes the old key in the same file rewrite that
+adds the replacement. Atomic file replacement prevents a torn file, but it
+does not prove that the new private key works.
+
+Rotate in two stages. First add the new public key while retaining the old key,
+re-read the source, and report `waiting_for_verification`. Then verify with the
+selected local private key through a fresh SSH authentication attempt, or
+require an explicit external-verification confirmation that includes the new
+fingerprint. Remove the old key only after that gate. Cancel or failure leaves
+both keys and explains the recoverable state.
+
+### 7. Read-only roles can fail open
+
+`sshkeysRoleOptions` returns `null` when the marker is missing or unreadable.
+The ordinary add path can then write an unrestricted key to the role account.
+Role listing also treats a missing marker as an empty role set, and it calls
+authorized-key comments `users`, although comments do not identify people.
+
+A role-key mutation must resolve a verified role policy first. Missing,
+corrupt, stale, or unreadable policy blocks the write. List the account's exact
+key fingerprints and policy state; treat comments only as display text. Verify
+that every Oars-managed read-only key has `restrict`, the expected forced
+read-only SFTP command, no PTY, and no forwarding. Show `drifted` when remote
+state differs.
+
+Role creation currently requires root even though the spec also allows an
+approved non-interactive sudo path. Use root or a capability-probed `sudo -n`
+plan. Preview the exact privileged actions before approval. Quote all account
+and path values with the shared shell-quote rules. If setup succeeds but marker
+write or later verification fails, keep a partial job with repair or cleanup
+actions; never report success from only `useradd` exit 0.
+
+Role deletion leaves the home directory by design. The dialog and job result
+must show that path and must state that files remain. Require the exact account
+name as confirmation.
+
+### 8. Local passphrase storage is not wired
+
+The UI always calls generate with `remember_passphrase:false`. The backend can
+return `keychain_account`, but the frontend never stores the secret. The
+current form therefore offers no working remember choice.
+
+Add an explicit `Store passphrase in Keychain` control. After successful key
+generation, store the passphrase under `localkey:<fingerprint>` only when the
+user selected it. If Keychain storage fails, keep the generated files, report
+the partial result, and give the account name for a retry. Do not cache this
+passphrase in the frontend secret map.
+
+Register the generation payload as sensitive in all bridge inspection and
+diagnostic paths. Never log, audit, retain, or echo the passphrase. Zero the
+owned Zig request buffer before release. Audit the destination and fingerprint,
+not the secret or full private-key content.
+
+### 9. Deploy-key management supports only one hidden mutation
+
+`Copy deploy key` creates `~/.ssh/oars_deploy` as a side effect and then copies
+the public half. The UI gives no approval, no fingerprint preview, no existing
+state, and no way to manage distinct repository deploy keys. GitHub deploy
+keys are repository-scoped, so a single opaque server key is not a complete
+workflow.
+
+Use an explicit Deploy keys section. List Oars-managed keys by stable ID,
+repository label, path, fingerprint, and creation state. Generate one unique
+Ed25519 identity per repository label with a no-clobber path and an owner-only
+remote manifest beside the connected account's SSH state. Return the public
+key and GitHub setup steps only after generation succeeds. Deletion must warn
+that Oars cannot remove a key already registered on GitHub and require the
+fingerprint as confirmation.
+
+No GitHub API integration is part of Spec 08.
+
+### 10. The frontend does not expose the real safety model
+
+`KeysTab` shows only the connected account's conventional file, combines all
+options into one “restricted” count, and has no source path, source status,
+account selector, role drift, job result, or conflict recovery. It cannot add a
+key to a newly created role because the typed API drops the backend's optional
+`user`. Deploy-key creation is hidden inside a copy button. There are no
+focused component tests.
+
+Replace the decorative summary with a compact operational header. Keep one
+primary action, `Add key`; put local generation and deploy-key management in
+clear secondary actions. Do not infer safety from the presence of any option.
+Show the exact parsed options and a separate policy assessment.
 
 ## Product flow
 
-Access Management is one app-level Security workspace. Remove it from the
-per-server tab strip. A server detail link can navigate to the fleet view with
-that server preselected, but it must not mount a second scan or job controller.
+SSH Management stays in the per-server **Keys** tab. It has one controller and
+one selected account/source context.
 
-The workspace has four stable states:
+1. **Loading.** Keep the last completed snapshot visible. Show the selected
+   account and source as refreshing. Do not replace the whole tab with a
+   spinner after the first load.
+2. **Ready.** Header shows account, evaluated scope, source count, snapshot
+   time, and coverage. The main table shows comment, fingerprint, type/bits,
+   exact source, options/policy, and actions. A side rail contains managed roles
+   and deploy identities.
+3. **Partial.** Keep readable sources visible. An attention section lists each
+   unreadable, dynamic, certificate, malformed, or drifted source. A partial
+   view never says “no keys” for a source that was not read.
+4. **Job active.** Keep the snapshot visible and show a compact step list with
+   queued/running/waiting/done/conflict/error/canceled states. A terminal job
+   offers Refresh. Polling does not cause the next mutation.
+5. **Disconnected.** Keep the last snapshot labeled stale. Offer the existing
+   connect flow. Do not turn connection failure into an empty inventory.
 
-1. **No snapshot.** Explain connected-account and full-account scopes. Show the
-   selected fleet, connection readiness, and a primary `Scan access` action.
-2. **Scanning.** Keep the last completed snapshot visible. Add a compact
-   per-server progress list with queued/running/done/partial/sync-error states
-   and a Cancel action. Do not replace the whole page with a spinner.
-3. **Snapshot.** Show People, distinct keys, completed/target servers, observed
-   grants, scope, coverage, and scan time. A partial banner lists every missing
-   server, account, or dynamic source. Never summarize partial as clean.
-4. **Job active or complete.** Show one result per exact server/account/source
-   item. Polling observes the job; it does not trigger the next mutation.
-   Partial failure remains visible and offers a re-scan.
+The account selector contains the connected login and verified Oars-managed
+roles. The source selector appears when effective policy yields more than one
+static file. Dynamic or certificate sources are visible but are not editable
+in v1.
 
-The target picker groups profiles by the existing server group field. Before a
-fleet scan, offer `Connect missing servers` through the existing connection and
-Keychain flow. Host-key trust and authentication errors remain per server. A
-scan can proceed with ready sessions, but every unresolved target becomes a
-sync error in that same snapshot.
+### Add key
 
-Full-account scan reads other users' key files and sudo policy. Show the exact
-server list and sensitive-read explanation in an Oars dialog. Require an
-explicit checkbox before sending the approval. A connected-account scan needs
-no privileged-read approval, but its scope label must remain visible in the
-header, table, export, and person detail.
+Paste a public key or generate a local Ed25519 pair. Inspect and normalize the
+key in Zig before confirmation. Show fingerprint, type, comment, target account,
+exact source path, and any enforced role options. If the fingerprint already
+exists in that exact source, return an idempotent result. Confirmation starts a
+job; refresh only after it finishes.
 
-### Snapshot layout
+### Revoke key
 
-- Header actions: Re-scan, Export audit, Add person.
-- Four compact metrics: People, distinct fingerprints, targets completed, and
-  observed grants. Put coverage and scope beside the scan timestamp, not in a
-  fifth decorative card.
-- People table: Person, keys, login accounts, servers, privilege, coverage, and
-  actions. Record `account_is_root` separately. Report sudo policy as `none`,
-  `limited`, `full`, or `unknown`; do not reduce policy to a guessed boolean.
-  Never rely on shield color alone.
-- Person detail: exact fingerprint, server, account, static source path,
-  privilege, key comment, and line identity. A single-grant revoke is available
-  here.
-- Unassigned keys: one row per fingerprint, all observed grants and comments,
-  and `Attach to person`. Comments are suggestions, never the selected identity.
+Show account, source, comment, and full fingerprint. State that existing SSH
+sessions can remain open. Require the full fingerprint for a role key or when
+the selected key is the connected account's last observed direct key. Submit
+the frozen file and line hashes. A conflict returns to the refreshed preview;
+it never retries against new contents automatically.
 
-### Mutation flows
+### Rotate key
 
-**Offboard** freezes the selected completed scan, identity revision, exact
-fingerprints, and exact observed grants. The dialog states how many grants and
-privileged grants are selected. The user types the identity name. If scope or
-coverage is partial, the action is named `Revoke observed grants`; Oars cannot
-claim the person is offboarded everywhere. Send the typed name to the backend
-and validate it there.
+Show old and new fingerprints together. Stage the new key, verify the rewritten
+source, then pause. Prefer a fresh authentication check with a selected local
+private key. If the user verified outside Oars, require the new fingerprint as
+confirmation. Only the commit phase removes the old line. A partial result
+keeps both keys.
 
-**Onboard** starts with name plus one normalized OpenSSH public key. Derive and
-show its SHA-256 fingerprint in the Zig core before identity save. Then choose
-an exact account or a read-only role for each target server. Deduplicate only
-within the exact target account; the same fingerprint can intentionally grant
-different accounts on one server. Create the identity binding before the job,
-and keep a recoverable partial state if some grants fail.
+### Managed roles
 
-**Rotate** selects one old fingerprint and every observed grant to replace,
-then validates and previews the new key. Run it in two stages: add and verify
-the new key on every target first, then remove the old key only from targets
-where verification succeeded. Keep both fingerprints attached to the identity
-on a partial scan or partial job. Remove the old binding only when a
-complete-scope scan proves that every known old grant was selected and every
-replacement succeeded. A re-scan is required before the UI says rotation is
-complete.
+Create flow selects Standard SSH or Read-only SFTP, shows the exact account
+name and privileged plan, and optionally installs the first public key in the
+same job. Read-only means file listing and download through forced SFTP. It does
+not mean a read-only shell. Role detail shows policy health, exact fingerprints,
+home path, shell, and repair/delete actions.
 
-Identity delete is not offboarding. The dialog must say that deleting a local
-label does not remove remote access.
+### Deploy keys
+
+Create flow asks for a repository label and optional comment, then generates a
+unique server-side key. The result shows the fingerprint, public key, private
+path, copy action, and concise GitHub steps. Oars never uploads the private key
+or claims that the public key is registered on GitHub.
 
 ## Corrected bridge contract
 
-Use string IDs consistently. Add strict shared TypeScript types for every
-request and response. No access-specific `any` remains in `AccessTab`,
-`bridge.ts`, or `types.ts`.
+Use strict TypeScript request and response types. No SSH-management `any`
+remains in `KeysTab`, `bridge.ts`, or `types.ts`. Use string IDs consistently.
 
 ```text
-oars.access.key.inspect
-  {public_key}
-  -> {ok, normalized_public_key, fingerprint, key_type, comment}
+oars.sshkeys.inspect
+  {public_key, comment?}
+  -> {ok, normalized_public_key, fingerprint, key_type, bits?, comment}
 
-oars.access.identities.list
-  {}
-  -> {ok, identities[], recovery_error?}
+oars.sshkeys.snapshot
+  {server_id, account:{kind:"connected"|"managed_role", name?}}
+  -> {ok, snapshot_id}
 
-oars.access.identities.save
-  {identity:{id?, name, bindings:[{fingerprint,shared}], expected_revision?}}
-  -> {ok, identity}
-
-oars.access.identities.delete
-  {id, expected_revision, confirm_name}
-  -> {ok}
-
-oars.access.scan
-  {server_ids[], scope:"connected_accounts"|"all_login_accounts",
-   approved_sensitive_read:boolean}
-  -> {ok, scan_id:string}
-
-oars.access.scanCancel
-  {scan_id}
-  -> {ok}
-
-oars.access.poll
-  {scan_id, people_offset?, unassigned_offset?, limit?}
-  -> {ok, scan_id, state, scope, coverage, created_at_ms,
-      finished_at_ms?, metrics, servers[], people_page,
-      unassigned_page, sync_errors[], source_warnings[]}
-
-oars.access.offboard
-  {operation_id, scan_id, identity_id, identity_revision, confirm_name,
-   grants:[{fingerprint,server_id,user,source_path,line_hash,file_sha256}]}
-  -> {ok, job_id:string}
-
-oars.access.onboard
-  {operation_id, identity_id, identity_revision, public_key,
-   grants:[{server_id,target:{kind:"account"|"read_only_role",name}}]}
-  -> {ok, job_id:string, fingerprint}
-
-oars.access.rotate
-  {operation_id, scan_id, identity_id, identity_revision, old_fingerprint,
-   new_public_key, grants:[{server_id,user,source_path,line_hash,file_sha256}]}
-  -> {ok, job_id:string, new_fingerprint}
-
-oars.access.jobPoll
-  {job_id}
+oars.sshkeys.snapshotPoll
+  {snapshot_id}
   -> {ok, state:"queued"|"running"|"done"|"partial"|"canceled",
-      results:[{server_id,user,source_path,
-                state:"queued"|"running"|"done"|"conflict"|"error"|"canceled",
-                error?}]}
+      server_id, account, scope, created_at_ms, finished_at_ms?,
+      coverage, capabilities, sources[], keys[], roles[], deploy_keys[],
+      warnings[]}
 
-oars.access.jobCancel
+oars.sshkeys.snapshotCancel
+  {snapshot_id}
+  -> {ok}
+
+oars.sshkeys.add
+  {operation_id, snapshot_id, source_path, file_sha256,
+   public_key, comment?}
+  -> {ok, job_id, fingerprint}
+
+oars.sshkeys.revoke
+  {operation_id, snapshot_id, source_path, file_sha256,
+   fingerprint, line_hash, confirm_fingerprint?}
+  -> {ok, job_id}
+
+oars.sshkeys.rotate
+  {operation_id, snapshot_id, source_path, file_sha256,
+   old_fingerprint, line_hash, new_public_key}
+  -> {ok, job_id, new_fingerprint}
+
+oars.sshkeys.rotateCommit
+  {job_id,
+   verification:{kind:"local_private_key", path, passphrase?}|
+                 {kind:"external_confirmation", confirm_fingerprint}}
+  -> {ok}
+
+oars.sshkeys.jobPoll
+  {job_id}
+  -> {ok, state:"queued"|"running"|"waiting_for_verification"|
+                 "done"|"partial"|"canceled",
+      steps:[{id,state,error?}], result?}
+
+oars.sshkeys.jobCancel
   {job_id}
   -> {ok}
 
-oars.access.export
-  {scan_id, format:"csv"|"json", path}
-  -> {ok, path, rows, formula_safe}
+oars.sshkeys.localGenerate
+  {operation_id, destination, comment?, passphrase?}
+  -> {ok, job_id}
+
+oars.sshkeys.roles.plan
+  {server_id, name, kind:"standard_ssh"|"read_only_sftp",
+   action:"create"|"repair"|"delete"}
+  -> {ok, plan_id, expires_at_ms, account, home?, commands[], effects[]}
+
+oars.sshkeys.roles.commit
+  {operation_id, plan_id, public_key?}
+  -> {ok, job_id}
+
+oars.sshkeys.deployKeys.generate
+  {operation_id, server_id, repository_label, comment?}
+  -> {ok, job_id}
+
+oars.sshkeys.deployKeys.delete
+  {operation_id, server_id, deploy_key_id, confirm_fingerprint}
+  -> {ok, job_id}
 ```
 
-The frontend obtains `path` from `native-sdk.dialog.saveFile`. The core writes
-the selected local file with temp + sync + rename and returns no fleet content
-over the bridge. Export is bound to the explicit completed `scan_id`, including
-partial snapshots with sync errors. CSV includes observed people grants,
-unassigned grants, source warnings, and sync errors through an explicit
-`row_type` column. JSON preserves the complete typed snapshot.
+Each source contains `path`, `kind`, `status`, `file_sha256?`, `mode?`,
+`owner?`, and `error?`. Each key contains `source_path`, `line_index`,
+`line_hash`, parsed fields, and `policy_assessment`; malformed rows retain raw
+text but have no mutation action. Role `key_fingerprints` replace the misleading
+comment-based `users` field.
 
-`people_page` and `unassigned_page` contain `offset`, `limit`, `total`, `rows`,
-and `has_more`. Do not silently omit rows at a byte threshold. Clamp `limit` to
-100. Keep the current 512 KiB response ceiling as a final safety bound.
-
-Each mutating request has a frontend-generated `operation_id`. Repeating an ID
-returns the existing job instead of creating a second one. Validate the frozen
-scan, identity revision, typed confirmation, source path, line hash, and whole
-file hash before admission. Audit admission once and each remote result once.
+Clamp all user text and arrays at admission. Keep the 4 MiB key-file cap and
+64 KiB line cap from `src/sshkeys.zig`. Use at most 32 retained snapshots, 64
+retained jobs, and 64 deploy-key manifest entries per server. Active work is
+never evicted. Expire unfinished records after 10 minutes idle and terminal
+records after 30 minutes.
 
 ## Core implementation
 
-### Worker ownership and registries
+### Shared policy and writer modules
 
-Remove `accessExec` and every SSH/SFTP wait from bridge handlers. Add access
-operation/outcome variants to the owning session worker. A bridge call may
-queue work, consume a ready outcome, update locked local state, and serialize a
-snapshot. It may not wait for a remote socket.
+Keep `src/sshkeys.zig` pure. Add whole-file hashing, exact duplicate detection,
+and plan helpers there. Extract effective `sshd -T -C`, path-token expansion,
+static-source classification, and typed source errors from the access bridge
+code into a shared module such as `src/sshd_policy.zig`. Both Spec 08 and Spec
+09 use that module.
 
-One scan coordinator can have one in-flight operation per target server.
-Session workers provide concurrency across servers without a thread per scan.
-Use explicit state IDs and short registry locks; never keep a pointer after
-unlock unless its lifetime is pinned.
+Move remote key operations into explicit session operations and outcomes in
+`src/sessions.zig`. A session worker owns all libssh2 calls. A coordinator can
+sequence a job, but it must communicate through bounded outcomes and never hold
+the access or SSH-key registry lock while waiting.
 
-Keep these v1 admission bounds and test them:
+Use one atomic writer for Spec 08 and Spec 09. It validates the frozen source,
+preserves lines, stages beside the destination, sets owner/mode, syncs, renames,
+re-reads, and returns the new file hash. Do not leave the old synchronous
+`sshkeysRead`, `sshkeysWrite`, or `sshkeysRewriteCore` as a second mutation path.
 
-- 256 deduplicated targets per scan
-- 8 active or retained scans, with active work never evicted
-- 256 items per mutation job
-- 32 active or retained jobs, with active work never evicted
-- 10-minute idle expiry for an unfinished scan and 30-minute retention for a
-  terminal scan/job
+### Role policy
 
-Reject at admission when a safe slot is unavailable. Cancel or disconnect
-marks unfinished server/items explicitly. Poll is a snapshot and has no
-side-effect beyond expiry cleanup.
+Store only Oars-managed role metadata in an owner-only, versioned remote
+manifest. Write it atomically and quarantine corrupt data instead of treating
+it as empty. Verify the live account, home, shell, key source, and forced policy
+on every snapshot. An existing unowned account with the requested name is a
+conflict. Repair is a separate approved plan.
 
-### Identity store
+The read-only role stays a forced read-only SFTP contract. Test the server's
+actual SFTP subsystem and `-R` support before creating the account. Every key
+installed for that role receives the exact restrictive options. A missing or
+drifted policy blocks new key installation.
 
-Migrate `access_identities.json` to a versioned record with random IDs,
-per-fingerprint shared flags, integer-millisecond timestamps, and a monotonic
-revision. Detect duplicate IDs during load. Use sibling temp, file sync,
-mode 0600, and atomic rename. Quarantine corruption and return the quarantine
-path as `recovery_error`; never silently present a corrupt registry as an empty
-one.
+### Local generation
 
-Save and delete use compare-and-swap revisions. A fingerprint belongs to one
-identity unless that exact binding is marked shared. The UI must explain shared
-bindings before it creates one.
+Keep OpenSSH as the private-key encoder. Extend `src/keygen.zig` with explicit
+child cleanup: every timeout, cancellation, prompt failure, and verification
+failure after spawn terminates and reaps the child. Clear passphrase buffers on
+all exits. Verify both output files before no-clobber install, then report the
+fingerprint and public key through the local job result.
 
-### Scan facts
+### Deploy identities
 
-For each server, record the requested scope, connection status, connected
-account, privilege path, enumerated accounts, effective SSH source policy,
-every static source read, sudo/privilege result, and exact failure reason.
-
-For full scope:
-
-1. Capture the live connection tuple from `SSH_CONNECTION`.
-2. Enumerate NSS accounts with `getent passwd`. Include root and all accounts
-   with a usable login shell; do not use a fixed UID threshold. Record
-   unsupported enumeration as partial.
-3. For each account, run effective `sshd -T -C` through the approved privilege
-   path and parse `pubkeyauthentication`, every `authorizedkeysfile`,
-   `authorizedkeyscommand`, `trustedusercakeys`, and authorized-principal
-   sources. If effective evaluation is unavailable, mark that account partial.
-4. Expand only documented tokens in static key-file paths. Read every resolved
-   static file. Distinguish `missing`, `denied`, `timeout`, `too_large`,
-   `transport_error`, and `parse_error`; only `missing` is inspected-empty.
-   Unsupported tokens, dynamic commands, certificate authorities, and
-   unreadable sources are explicit partial reasons.
-5. Preserve authorized-key options and classify direct keys separately from
-   certificate-authority grants. Store each observed direct grant with its
-   server, account, source path, decoded fingerprint, exact comment, options,
-   line hash, and whole-file SHA-256. Never turn a CA line into a direct person
-   grant.
-6. Query target-account sudo policy only with enough authority and `LC_ALL=C`.
-   Return `none`, `limited`, `full`, or `unknown`, and record root accounts
-   separately. An arbitrary group name is context, not proof.
-
-Connected-account scope evaluates only the connected login and says so in
-every response. `coverage:"complete"` means complete **for that scope**.
-Exports and UI must retain the scope label.
-
-### Mutation jobs
-
-Reuse the spec-08 parser, but bind every mutation to the exact static source
-file found by the scan. Stage the rewritten file beside the destination,
-preserve unrelated lines and authorized-key options, recheck the whole-file
-hash immediately before rename, set the required owner/mode, then rename.
-Return `conflict` when either the line or file identity changed. State clearly
-that an external writer that ignores Oars' lock can still race after the last
-check; never describe SFTP as a true remote compare-and-swap primitive.
-
-Jobs start after the approved request is accepted. `jobPoll` only observes.
-Cancel stops queued items; an already-running single-file operation completes
-and reports its result. Disconnect makes the affected item an error and does
-not convert it to success.
-
-Rotation first adds and verifies the new key on every target. It removes the
-old key only from targets that passed the first stage, then updates the identity
-revision according to the complete/partial rule in the product flow. After
-onboard, make sure the inspected fingerprint is bound to the selected identity
-before remote mutation. Offboard does not delete the identity automatically.
+Generate unique server-side Ed25519 pairs with no passphrase for unattended Git
+use. Paths are derived from a random stable deploy-key ID, not raw repository
+text. The remote manifest maps ID to label, public fingerprint, and paths. File
+modes are 0600 for the private key and owner-readable for the public key. Never
+touch `authorized_keys`.
 
 ## Frontend implementation
 
-Rebuild `AccessTab` as a typed app-level workspace that uses the current Oars
-surface, button, status, loading, and modal primitives. Reuse
-`useModalFocus`; every dialog has `role="dialog"`, a labelled title and
-description, initial focus, focus trap, Escape, and focus restore. Remove every
-native prompt/confirm and inline style.
+Refactor `KeysTab` into small typed state modules or hooks instead of expanding
+one component with every flow. Keep one snapshot poller and one active-job
+poller. Cancel timers on server/tab change and unmount. Do not start a second
+controller from the Security workspace.
 
-Keep the page calm: one bordered workspace surface inside the rounded app
-shell, a compact metric row, one primary people table, and progressive detail.
-Avoid nested card grids. Use the existing responsive gutter system. At narrow
-widths, metrics wrap, table rows become labelled records, and dialogs fit the
-viewport without horizontal scrolling.
+Use the established Oars primitives and `docs/DESIGN.md`:
 
-Implement these dialogs and panels:
+- one obvious primary action
+- four or fewer useful metrics; omit metrics when status text is clearer
+- operational tables with no more than seven visible columns
+- text and icon labels for every status; color is supplemental
+- dialogs with title, one-sentence consequence, affected account/source, and
+  primary/cancel actions
+- responsive rows that stack without hiding fingerprints or destructive
+  consequences
 
-- scan scope/targets/privileged-read confirmation
-- add or edit person, including public-key inspection and shared-binding review
-- attach an unassigned fingerprint
-- person detail and single-grant revoke
-- offboard with exact typed name and partial-coverage warning
-- onboard target/role matrix and per-item results
-- rotate key preview and partial-result recovery
-- identity delete with the local-only warning
-- export format/path dialog with formula-safe CSV explanation
+Add deterministic preview modes for populated, empty, partial source, malformed
+row, role drift, rotate waiting, conflict, disconnected, and deploy-key result.
+Use the **ChatGPT in-app browser MCP** to inspect `frontend/preview.html` at
+desktop and narrow widths. Do not add Playwright dependencies, loaders, config,
+scripts, or tests to the repository.
 
-Retain timer IDs and generation tokens for scan/job polling. Cancel them on
-unmount, scan replacement, and job replacement. Poll until a real terminal
-state; never stop after a fixed attempt count and pretend the snapshot is done.
-Surface transport errors and preserve the last good snapshot.
+Add focused frontend tests for:
 
-Extend `preview.html` with `access=empty`, `scanning`, `populated`, `partial`,
-`offboard`, and `job-error`. Mock the final typed wire shapes, pagination,
-dialog actions, and save-path cancellation. Add no fake backend state that the
-real bridge cannot return.
+- snapshot polling and stale-snapshot preservation
+- unreadable source versus genuinely empty source
+- account/source selection
+- key inspection and duplicate result
+- add, revoke conflict, staged rotate, cancel, and refresh
+- remembered-passphrase success and Keychain failure
+- role plan/commit, drift, repair, and typed delete confirmation
+- deploy-key generation and deletion warnings
+- timer cleanup on server change and unmount
 
-## Required tests
+## Required verification
 
-### Pure and dispatcher
+Implementation is complete only when all of these checks pass in the current
+checkout:
 
-- identity migration, restart-safe IDs, duplicate-ID rejection, atomic save,
-  recovery error, revision conflict, and per-binding sharing
-- OpenSSH public-key inspection and canonical SHA-256 fingerprints
-- NSS enumeration without a UID cutoff, nologin classification, and
-  enumeration-unsupported coverage
-- effective-sshd parsing with `Match`, multiple `AuthorizedKeysFile` paths,
-  documented token expansion, dynamic keys, CA/principal sources, and partial
-  reasons
-- privilege parser for none/limited/full/unknown with `LC_ALL=C`, with root
-  recorded as an account property
-- people/unassigned joins, repeated keys across accounts, scope-aware coverage,
-  distinct counts, pagination, and sync-error exports
-- RFC 4180 output, formula-safe spreadsheet fields, exact JSON, and atomic
-  chosen-path writes
-- active registry admission, expiry, cancel, disconnect, operation-id
-  idempotency, and partial jobs
-- exact line/file conflict guards, unrelated-line preservation, role options,
-  rotate identity update, and audit cardinality
-- dispatcher payloads match the TypeScript contract; string IDs and
-  millisecond timestamps round-trip exactly
-- a poll with slow/unreachable workers returns promptly because it does not
-  execute a network wait on the bridge thread
+1. `zig fmt` on every modified Zig file.
+2. `zig build test` with leak checks. A sandbox-local socket denial must be
+   rerun with permission before interpreting the result.
+3. `scripts/integration-test.sh`, including the Spec 08 Alpine path.
+4. `npm --prefix frontend test -- --run`.
+5. `npm --prefix frontend run build`.
+6. `frontend/node_modules/.bin/tsc -p frontend/tsconfig.json --noEmit`.
+7. ChatGPT in-app browser review of every Keys preview state at desktop and
+   narrow widths: no uncaught console errors, clipped dialogs, hidden actions,
+   document overflow, or status that relies only on color.
+8. `git diff --check`.
 
-### Integration
+The integration suite must prove:
 
-Use two isolated instances of the existing Alpine SSH fixture, not an Ubuntu
-image. Give each two login accounts, different static key-file layouts, and
-different sudo policy. Cover connected scope, approved full scope, multiple
-`AuthorizedKeysFile` paths, a dynamic/CA partial source, one unreachable
-profile, offboard, onboard to an existing account and read-only role, rotate,
-whole-file conflict, idempotent duplicate operation IDs, cancellation, export,
-and audit rows. Verify the final authorized-key files and identity registry,
-not only bridge status strings.
-
-### Frontend and visual
-
-- typed scan lifecycle, indefinite polling, replacement/unmount cleanup, and
-  preservation of the last snapshot
-- scope and partial-coverage labels cannot disappear in table/detail/export
-- add/edit/attach, onboard, offboard, revoke, rotate, delete, and export flows
-- type-to-confirm and privileged-read checkbox gates
-- job progress and partial recovery; polling actually drives to terminal UI
-- keyboard/focus behavior and no `window.prompt`/`window.confirm`
-- empty, scanning, populated, partial, and error previews at desktop and narrow
-  widths with no console errors or horizontal overflow
+- effective multiple static key sources are listed with exact paths
+- missing is empty, while denied/timeout/too-large/transport are partial and
+  block mutation
+- add is idempotent for one exact source
+- an unrelated external file edit causes a whole-file conflict
+- staged rotation keeps the old key until verification and keeps both on
+  cancel/failure
+- revoke removes only the reviewed fingerprint line and a new connection with
+  that key fails
+- root and approved `sudo -n` role plans work; unavailable privilege changes
+  nothing
+- read-only role SFTP reads work while shell, PTY, forwarding, and every tested
+  file mutation fail
+- corrupt or missing role policy cannot produce an unrestricted role key
+- local key generation covers empty and non-empty passphrases, no-clobber,
+  cancellation, timeout child cleanup, mode 0600, OpenSSH readability, and
+  passphrase absence from argv, environment, response, audit, history, and logs
+- two repository labels produce distinct deploy identities; deletion removes
+  only the selected pair and never changes `authorized_keys`
+- every admitted mutation and terminal result is audited once
 
 ## Definition of done
 
-- A full approved scan accurately inventories every resolvable static SSH key
-  source on two independent servers and reports dynamic, certificate,
-  unreadable, unconnected, and unsupported sources as partial.
-- Connected-account scope is never presented or exported as a full-server
-  audit.
-- People and unassigned rows join only by decoded fingerprint. Comments remain
-  display labels.
-- Offboard/revoke, onboard, and rotate run after one approval, show every
-  result, preserve unrelated key lines/options, detect stale files, and keep
-  identity bindings correct after partial failure.
-- No access handler waits on SSH/SFTP. Slow and unreachable servers do not
-  freeze the window.
-- CSV and JSON are written to the path selected by the user; partial coverage,
-  sync errors, and unassigned grants are retained in the export.
-- The Access UI is app-level, typed, keyboard-safe, responsive, and uses no
-  browser-native prompt/confirm or raw unstyled buttons.
-- Focused pure, dispatcher, two-server Alpine integration, frontend, TypeScript,
-  build, preview, and `git diff --check` checks pass. Update Spec 09 status and
-  acceptance boxes only after this evidence exists.
+Mark Spec 08 complete only when the corrected contract, implementation, tests,
+preview fixtures, browser inspection, and status table agree. If any required
+runtime evidence is unavailable, leave the status Partial and name the exact
+missing check. Then replace this guide with the implementation guide for
+**Spec 10 — Backups**.

@@ -25,6 +25,7 @@ const preflight = @import("preflight.zig");
 const access = @import("access.zig");
 const backup = @import("backup.zig");
 const ai = @import("ai.zig");
+const keyjobs = @import("keyjobs.zig");
 const integration_keys = @import("integration_keys.zig");
 const integration_access = @import("integration_access.zig");
 const integration_backup = @import("integration_backup.zig");
@@ -152,11 +153,12 @@ pub const TestRig = struct {
         self.backup_registry = backup.Registry.init(std.testing.allocator, backup_jobs_path, backup_runs_path);
         self.ai_registry = ai.Registry.init(std.testing.allocator, ai_path);
         self.manager = sessions.Manager.init(std.testing.allocator, io, &self.store, &self.audit_store, &self.history_store, null);
-        self.ctx = .{ .allocator = std.testing.allocator, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .history = &self.history_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store, .access = &self.access_registry, .backup = &self.backup_registry, .ai = &self.ai_registry };
+        self.ctx = .{ .allocator = std.testing.allocator, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .history = &self.history_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store, .access = &self.access_registry, .keys = keyjobs.Registry.init(std.testing.allocator), .backup = &self.backup_registry, .ai = &self.ai_registry };
         self.dispatcher = self.ctx.dispatcher();
     }
 
     pub fn deinit(self: *TestRig) void {
+        self.ctx.keys.deinit();
         self.access_registry.deinit();
         self.backup_registry.deinit();
         self.ai_registry.deinit();

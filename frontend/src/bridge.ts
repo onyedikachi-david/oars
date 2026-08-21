@@ -36,9 +36,45 @@ import type {
   AccessExportResponse,
   AccessKeyInspectResponse,
   AccessScope,
-  GeneratedSshKey,
-  SshKeyEntry,
-  SshRole,
+  SshAccountRef,
+  SshInspectResponse,
+  SshJobPollResponse,
+  SshRoleKind,
+  SshRolePlanAction,
+  SshRolePlanResponse,
+  SshRotateVerification,
+  SshSnapshotPollResponse,
+  SshSnapshotStartResponse,
+  BackupJob,
+  BackupJobInput,
+  BackupCredentials,
+  BackupJobsListResult,
+  BackupJobSaveResult,
+  BackupTestResult,
+  BackupRunStartResult,
+  BackupHistoryResult,
+  BackupPollResult,
+  BackupInstallResult,
+  BackupCronStatusResult,
+  AiContextBundle,
+  AiProviderGetResult,
+  AiProviderSetResult,
+  AiProviderInput,
+  AiHistoryResult,
+  HistoryEntry,
+  HistoryRecordInput,
+  HistoryListFilter,
+  HistoryListResult,
+  AuditListFilter,
+  AuditListResult,
+  VaultExportParams,
+  VaultExportResult,
+  VaultImportParams,
+  VaultImportResult,
+  VaultImportConfirmParams,
+  VaultImportConfirmResult,
+  AgentIdentity,
+  AgentListResult,
 } from "./types";
 
 // Typed bridge client over window.zero.
@@ -65,16 +101,17 @@ export async function invoke<T = unknown>(
 ): Promise<T> {
   const zero = window.zero;
   if (!zero) throw new BridgeError("no_bridge", "Native bridge is not available");
-  let result: any;
+  let result: unknown;
   try {
     result = await zero.invoke(command, payload);
-  } catch (e: any) {
-    throw new BridgeError(e?.code ?? "invoke_failed", e?.message ?? String(e));
+  } catch (e: unknown) {
+    const err = e as { code?: string; message?: string } | null | undefined;
+    throw new BridgeError(err?.code ?? "invoke_failed", err?.message ?? String(e));
   }
   // Our handlers resolve with an envelope when they hit a user-facing
   // error; the framework rejects for transport-level failures.
-  if (result && typeof result === "object" && result.ok === false) {
-    throw new BridgeError("command_failed", result.error ?? "command failed");
+  if (result && typeof result === "object" && (result as { ok?: boolean }).ok === false) {
+    throw new BridgeError("command_failed", (result as { error?: string }).error ?? "command failed");
   }
   return result as T;
 }
@@ -123,6 +160,18 @@ export const vault = {
       account,
     });
     secretCache.delete(account);
+  },
+  clearCache(): void {
+    secretCache.clear();
+  },
+  evictServer(serverId: string): void {
+    const prefix1 = `server:${serverId}:`;
+    const prefix2 = `vnc:${serverId}`;
+    for (const key of Array.from(secretCache.keys())) {
+      if (key.startsWith(prefix1) || key === prefix2 || key.startsWith(prefix2 + ":")) {
+        secretCache.delete(key);
+      }
+    }
   },
 };
 
@@ -232,8 +281,12 @@ export const api = {
         ...(expected?.expected_sha256 === undefined ? {} : { expected_sha256: expected.expected_sha256 }),
       }),
     mkdir: (serverId: string, path: RemotePath) => invoke<{ ok: boolean }>("oars.sftp.mkdir", { server_id: serverId, path }),
-    rm: (serverId: string, path: RemotePath, recursive = false) =>
-      invoke<SftpOpStart | { ok: boolean }>("oars.sftp.rm", { server_id: serverId, path, recursive }),
+    rm: ((serverId: string, path: RemotePath, recursive = false) =>
+      invoke<SftpOpStart | { ok: boolean }>("oars.sftp.rm", { server_id: serverId, path, recursive })) as {
+      (serverId: string, path: RemotePath, recursive: true): Promise<SftpOpStart>;
+      (serverId: string, path: RemotePath, recursive?: false): Promise<{ ok: boolean }>;
+      (serverId: string, path: RemotePath, recursive?: boolean): Promise<SftpOpStart | { ok: boolean }>;
+    },
     rename: (serverId: string, from: RemotePath, to: RemotePath) =>
       invoke<{ ok: boolean }>("oars.sftp.rename", { server_id: serverId, from, to }),
     chmod: (serverId: string, path: RemotePath, mode: number) =>
@@ -281,15 +334,63 @@ export const api = {
     history: (serverId: string, appId: string, limit?: number) => invoke<{ ok: boolean; runs: import("./types").DeployHistoryRecord[] }>("oars.deploy.history", { server_id: serverId, app_id: appId, limit }),
   },
   sshkeys: {
-    list: (serverId: string) => invoke<{ ok: boolean; keys: SshKeyEntry[] }>("oars.sshkeys.list", { server_id: serverId }),
-    add: (serverId: string, public_key: string, comment?: string) => invoke<{ ok: boolean; fingerprint: string; line_hash: string }>("oars.sshkeys.add", { server_id: serverId, public_key, comment }),
-    revoke: (serverId: string, fingerprint: string, expected_line_hash: string) => invoke<{ ok: boolean }>("oars.sshkeys.revoke", { server_id: serverId, fingerprint, expected_line_hash }),
-    rotate: (serverId: string, fingerprint: string, expected_line_hash: string, new_public_key: string) => invoke<{ ok: boolean }>("oars.sshkeys.rotate", { server_id: serverId, fingerprint, expected_line_hash, new_public_key }),
-    generate: (destination: string, comment?: string, passphrase?: string, remember_passphrase?: boolean) => invoke<GeneratedSshKey>("oars.sshkeys.generate", { destination, comment, passphrase, remember_passphrase }),
-    rolesList: (serverId: string) => invoke<{ ok: boolean; roles: SshRole[] }>("oars.sshkeys.roles.list", { server_id: serverId }),
-    rolesCreate: (serverId: string, name: string, read_only: boolean) => invoke<{ ok: boolean }>("oars.sshkeys.roles.create", { server_id: serverId, name, read_only }),
-    rolesDelete: (serverId: string, name: string) => invoke<{ ok: boolean }>("oars.sshkeys.roles.delete", { server_id: serverId, name }),
-    deployKey: (serverId: string) => invoke<{ ok: boolean; public_key: string; path: string }>("oars.sshkeys.deployKey.generate", { server_id: serverId }),
+    inspect: (publicKey: string, comment?: string) =>
+      invoke<SshInspectResponse>("oars.sshkeys.inspect", { public_key: publicKey, ...(comment === undefined ? {} : { comment }) }),
+    snapshot: (serverId: string, account: SshAccountRef) =>
+      invoke<SshSnapshotStartResponse>("oars.sshkeys.snapshot", { server_id: serverId, account }),
+    snapshotPoll: (snapshotId: string) =>
+      invoke<SshSnapshotPollResponse>("oars.sshkeys.snapshotPoll", { snapshot_id: snapshotId }),
+    snapshotCancel: (snapshotId: string) =>
+      invoke<{ ok: boolean }>("oars.sshkeys.snapshotCancel", { snapshot_id: snapshotId }),
+    add: (p: { operationId: string; snapshotId: string; sourcePath: string; fileSha256: string; publicKey: string; comment?: string }) =>
+      invoke<{ ok: boolean; job_id: string; fingerprint: string }>("oars.sshkeys.add", {
+        operation_id: p.operationId, snapshot_id: p.snapshotId, source_path: p.sourcePath,
+        file_sha256: p.fileSha256, public_key: p.publicKey,
+        ...(p.comment === undefined ? {} : { comment: p.comment }),
+      }),
+    revoke: (p: { operationId: string; snapshotId: string; sourcePath: string; fileSha256: string; fingerprint: string; lineHash: string; confirmFingerprint?: string }) =>
+      invoke<{ ok: boolean; job_id: string }>("oars.sshkeys.revoke", {
+        operation_id: p.operationId, snapshot_id: p.snapshotId, source_path: p.sourcePath,
+        file_sha256: p.fileSha256, fingerprint: p.fingerprint, line_hash: p.lineHash,
+        ...(p.confirmFingerprint === undefined ? {} : { confirm_fingerprint: p.confirmFingerprint }),
+      }),
+    rotate: (p: { operationId: string; snapshotId: string; sourcePath: string; fileSha256: string; oldFingerprint: string; lineHash: string; newPublicKey: string }) =>
+      invoke<{ ok: boolean; job_id: string; new_fingerprint: string }>("oars.sshkeys.rotate", {
+        operation_id: p.operationId, snapshot_id: p.snapshotId, source_path: p.sourcePath,
+        file_sha256: p.fileSha256, old_fingerprint: p.oldFingerprint, line_hash: p.lineHash,
+        new_public_key: p.newPublicKey,
+      }),
+    rotateCommit: (jobId: string, verification: SshRotateVerification) =>
+      invoke<{ ok: boolean }>("oars.sshkeys.rotateCommit", { job_id: jobId, verification }),
+    jobPoll: (jobId: string) =>
+      invoke<SshJobPollResponse>("oars.sshkeys.jobPoll", { job_id: jobId }),
+    jobCancel: (jobId: string) =>
+      invoke<{ ok: boolean }>("oars.sshkeys.jobCancel", { job_id: jobId }),
+    // The passphrase is a sensitive payload: it crosses the bridge once and
+    // is never cached, logged, or echoed by the frontend.
+    localGenerate: (p: { operationId: string; destination: string; comment?: string; passphrase?: string }) =>
+      invoke<{ ok: boolean; job_id: string }>("oars.sshkeys.localGenerate", {
+        operation_id: p.operationId, destination: p.destination,
+        ...(p.comment === undefined ? {} : { comment: p.comment }),
+        ...(p.passphrase === undefined ? {} : { passphrase: p.passphrase }),
+      }),
+    rolesPlan: (serverId: string, name: string, kind: SshRoleKind, action: SshRolePlanAction) =>
+      invoke<SshRolePlanResponse>("oars.sshkeys.roles.plan", { server_id: serverId, name, kind, action }),
+    rolesCommit: (operationId: string, planId: string, publicKey?: string) =>
+      invoke<{ ok: boolean; job_id: string }>("oars.sshkeys.roles.commit", {
+        operation_id: operationId, plan_id: planId,
+        ...(publicKey === undefined ? {} : { public_key: publicKey }),
+      }),
+    deployKeysGenerate: (p: { operationId: string; serverId: string; repositoryLabel: string; comment?: string }) =>
+      invoke<{ ok: boolean; job_id: string }>("oars.sshkeys.deployKeys.generate", {
+        operation_id: p.operationId, server_id: p.serverId, repository_label: p.repositoryLabel,
+        ...(p.comment === undefined ? {} : { comment: p.comment }),
+      }),
+    deployKeysDelete: (p: { operationId: string; serverId: string; deployKeyId: string; confirmFingerprint: string }) =>
+      invoke<{ ok: boolean; job_id: string }>("oars.sshkeys.deployKeys.delete", {
+        operation_id: p.operationId, server_id: p.serverId, deploy_key_id: p.deployKeyId,
+        confirm_fingerprint: p.confirmFingerprint,
+      }),
   },
   access: {
     scan: (params?: { serverIds?: string[]; scope?: AccessScope; approvedSensitiveRead?: boolean }) =>
@@ -338,21 +439,65 @@ export const api = {
       }),
   },
   backup: {
-    list: (serverId?: string) => invoke<any>("oars.backup.jobs.list", serverId ? { server_id: serverId } : {}),
-    save: (job: any) => invoke<any>("oars.backup.jobs.save", { job }),
-    remove: (serverId: string, jobId: string) => invoke<any>("oars.backup.jobs.delete", { server_id: serverId, job_id: jobId }),
-    test: (serverId: string, jobId: string) => invoke<any>("oars.backup.test", { server_id: serverId, job_id: jobId }),
-    run: (serverId: string, jobId: string) => invoke<any>("oars.backup.run", { server_id: serverId, job_id: jobId }),
-    poll: (runId: number) => invoke<any>("oars.backup.poll", { run_id: runId }),
-    history: (serverId: string, jobId: string) => invoke<any>("oars.backup.history", { server_id: serverId, job_id: jobId }),
-    install: (serverId: string) => invoke<any>("oars.backup.install", { server_id: serverId }),
-    cronStatus: (serverId: string) => invoke<any>("oars.backup.cronStatus", { server_id: serverId }),
+    list: (serverId?: string) =>
+      invoke<BackupJobsListResult>("oars.backup.jobs.list", serverId ? { server_id: serverId } : {}),
+    save: (job: BackupJobInput, scheduleCredentials?: BackupCredentials) =>
+      invoke<BackupJobSaveResult>("oars.backup.jobs.save", {
+        job,
+        ...(scheduleCredentials ? { schedule_credentials: scheduleCredentials } : {}),
+      }),
+    remove: (serverId: string, jobId: string) =>
+      invoke<{ ok: boolean }>("oars.backup.jobs.delete", { server_id: serverId, job_id: jobId }),
+    test: (jobOrServerId: BackupJobInput | string, credentialsOrJobId?: BackupCredentials | string) => {
+      if (typeof jobOrServerId === "string") {
+        return invoke<BackupTestResult>("oars.backup.test", {
+          server_id: jobOrServerId,
+          job_id: credentialsOrJobId as string,
+        });
+      }
+      return invoke<BackupTestResult>("oars.backup.test", {
+        job: jobOrServerId,
+        ...(credentialsOrJobId ? { credentials: credentialsOrJobId as BackupCredentials } : {}),
+      });
+    },
+    run: (serverId: string, jobId: string, credentials?: BackupCredentials) =>
+      invoke<BackupRunStartResult>("oars.backup.run", {
+        server_id: serverId,
+        job_id: jobId,
+        ...(credentials ? { credentials } : {}),
+      }),
+    poll: (runId: string | number, logCursor?: number) =>
+      invoke<BackupPollResult>("oars.backup.poll", {
+        run_id: String(runId),
+        ...(logCursor !== undefined ? { log_cursor: logCursor } : {}),
+      }),
+    history: (serverId: string, jobId: string, limit?: number) =>
+      invoke<BackupHistoryResult>("oars.backup.history", {
+        server_id: serverId,
+        job_id: jobId,
+        ...(limit !== undefined ? { limit } : {}),
+      }),
+    install: (serverId: string, what: "rclone" | "cron" = "rclone", dryRun = false) =>
+      invoke<BackupInstallResult>("oars.backup.install", {
+        server_id: serverId,
+        what,
+        dry_run: dryRun,
+      }),
+    cronStatus: (serverId: string) =>
+      invoke<BackupCronStatusResult>("oars.backup.cronStatus", { server_id: serverId }),
   },
   ai: {
-    context: (serverId: string) => invoke<any>("oars.ai.context", { server_id: serverId }),
-    providerGet: () => invoke<any>("oars.ai.provider.get", {}),
-    providerSet: (provider: any) => invoke<any>("oars.ai.provider.set", { provider }),
-    history: (serverId?: string) => invoke<any>("oars.ai.history", serverId ? { server_id: serverId } : {}),
+    context: (serverId: string) =>
+      invoke<AiContextBundle>("oars.ai.context", { server_id: serverId }),
+    providerGet: () =>
+      invoke<AiProviderGetResult>("oars.ai.provider.get", {}),
+    providerSet: (provider: AiProviderInput) =>
+      invoke<AiProviderSetResult>("oars.ai.provider.set", { provider }),
+    history: (serverId?: string, limit?: number) =>
+      invoke<AiHistoryResult>("oars.ai.history", {
+        ...(serverId ? { server_id: serverId } : {}),
+        ...(limit !== undefined ? { limit } : {}),
+      }),
   },
   vnc: {
     start: (serverId: string, opts?: { host?: string; port?: number }) =>
@@ -372,19 +517,33 @@ export const api = {
       invoke<VncPollResult>("oars.vnc.poll", { server_id: serverId, tunnel_id: tunnelId }),
   },
   history: {
-    record: (entry: any) => invoke<any>("oars.history.record", entry),
-    list: (filter?: any) => invoke<any>("oars.history.list", filter ?? {}),
-    replay: (id: string) => invoke<any>("oars.history.replay", { id }),
-    auditList: () => invoke<any>("oars.audit.list", {}),
-    auditClear: () => invoke<any>("oars.audit.clear", {}),
+    record: (entry: HistoryRecordInput) =>
+      invoke<{ ok: boolean }>("oars.history.record", entry),
+    list: (filter?: HistoryListFilter) =>
+      invoke<HistoryListResult>("oars.history.list", filter ?? {}),
+    replay: (idOrEntryId: string) =>
+      invoke<{ ok: boolean; channel: number }>("oars.history.replay", { entry_id: idOrEntryId }),
+    auditList: (filter?: AuditListFilter) =>
+      invoke<AuditListResult>("oars.audit.list", filter ?? {}),
+    auditClear: () =>
+      invoke<{ ok: boolean }>("oars.audit.clear", { confirm: "CLEAR" }),
   },
   vault: {
-    export: (password: string) => invoke<any>("oars.vault.export", { password }),
-    import: (payload: any) => invoke<any>("oars.vault.import", payload),
-    importConfirm: (token: string, confirm: boolean) => invoke<any>("oars.vault.importConfirm", { token, confirm }),
+    export: (paramsOrPassword: VaultExportParams | string) => {
+      const payload = typeof paramsOrPassword === "string" ? { password: paramsOrPassword } : paramsOrPassword;
+      return invoke<VaultExportResult>("oars.vault.export", payload);
+    },
+    import: (params: VaultImportParams) =>
+      invoke<VaultImportResult>("oars.vault.import", params),
+    importConfirm: (paramsOrToken: VaultImportConfirmParams | string, confirm?: boolean) => {
+      const payload = typeof paramsOrToken === "string" ? { token: paramsOrToken, confirm: Boolean(confirm) } : paramsOrToken;
+      return invoke<VaultImportConfirmResult>("oars.vault.importConfirm", payload);
+    },
   },
   agent: {
-    list: () => invoke<any>("oars.agent.list", {}),
-    forward: (serverId: string, enable: boolean) => invoke<any>("oars.agent.forward", { server_id: serverId, enable }),
+    list: (path?: string) =>
+      invoke<AgentListResult>("oars.agent.list", { ...(path ? { path } : {}) }),
+    forward: (serverId: string, onOrEnable: boolean) =>
+      invoke<{ ok: boolean }>("oars.agent.forward", { server_id: serverId, on: onOrEnable }),
   },
 };

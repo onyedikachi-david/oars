@@ -13,6 +13,7 @@ const integration = @import("integration.zig");
 const access = @import("access.zig");
 const backup = @import("backup.zig");
 const ai = @import("ai.zig");
+const keyjobs = @import("keyjobs.zig");
 const vault = @import("vault.zig");
 const agent = @import("agent.zig");
 
@@ -178,10 +179,12 @@ const App = struct {
             .access = &self.access_registry,
             .backup = &self.backup_registry,
             .ai = &self.ai_registry,
+            .keys = keyjobs.Registry.init(self.allocator),
         };
     }
 
     fn deinit(self: *App) void {
+        self.bridge_ctx.keys.deinit();
         self.access_registry.deinit();
         self.backup_registry.deinit();
         self.ai_registry.deinit();
@@ -282,7 +285,8 @@ test "servers.save round trips through the bridge dispatcher" {
     defer ai_registry.deinit();
     var manager = sessions.Manager.init(store_alloc, io, &store, &audit_store, &history_store, null);
     defer manager.deinit();
-    var ctx = bridge.Context{ .allocator = store_alloc, .io = io, .store = &store, .manager = &manager, .audit = &audit_store, .history = &history_store, .logs = &logs_store, .scripts = &scripts_store, .apps = &deploy_apps_store, .deploy_history = &deploy_hist_store, .access = &access_registry, .backup = &backup_registry, .ai = &ai_registry };
+    var ctx = bridge.Context{ .allocator = store_alloc, .io = io, .store = &store, .manager = &manager, .audit = &audit_store, .history = &history_store, .logs = &logs_store, .scripts = &scripts_store, .apps = &deploy_apps_store, .deploy_history = &deploy_hist_store, .access = &access_registry, .keys = keyjobs.Registry.init(store_alloc), .backup = &backup_registry, .ai = &ai_registry };
+    defer ctx.keys.deinit();
     var dispatcher = ctx.dispatcher();
     var output: [64 * 1024]u8 = undefined;
 
@@ -402,11 +406,12 @@ const TestApp = struct {
         self.backup_registry = backup.Registry.init(store_alloc, backup_jobs_path, backup_runs_path);
         self.ai_registry = ai.Registry.init(store_alloc, ai_path);
         self.manager = sessions.Manager.init(store_alloc, io, &self.store, &self.audit_store, &self.history_store, null);
-        self.ctx = .{ .allocator = store_alloc, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .history = &self.history_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store, .access = &self.access_registry, .backup = &self.backup_registry, .ai = &self.ai_registry };
+        self.ctx = .{ .allocator = store_alloc, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .history = &self.history_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store, .access = &self.access_registry, .keys = keyjobs.Registry.init(store_alloc), .backup = &self.backup_registry, .ai = &self.ai_registry };
         self.dispatcher = self.ctx.dispatcher();
     }
 
     fn deinit(self: *TestApp) void {
+        self.ctx.keys.deinit();
         self.access_registry.deinit();
         self.backup_registry.deinit();
         self.ai_registry.deinit();
@@ -1234,7 +1239,7 @@ test "deploy.run requires a completed preflight" {
     try std.testing.expect(std.mem.indexOf(u8, hist_response, "\"runs\":[]") != null);
 }
 
-test "sshkeys.generate creates a key, refuses overwrites, and hides the passphrase" {
+test "sshkeys.localGenerate creates a key, is idempotent, and hides the passphrase" {
     var app: TestApp = undefined;
     try app.init();
     defer app.deinit();
@@ -1249,31 +1254,67 @@ test "sshkeys.generate creates a key, refuses overwrites, and hides the passphra
     const dest = try std.fmt.bufPrint(&dest_buf, "{s}/id_ed25519_oars", .{dir});
 
     var req_buf: [512]u8 = undefined;
-    const req = try std.fmt.bufPrint(&req_buf, "{{\"id\":\"1\",\"command\":\"oars.sshkeys.generate\",\"payload\":{{\"destination\":\"{s}\",\"comment\":\"oars-test\",\"passphrase\":\"hunter2-secret\",\"remember_passphrase\":true}}}}", .{dest});
+    const req = try std.fmt.bufPrint(&req_buf, "{{\"id\":\"1\",\"command\":\"oars.sshkeys.localGenerate\",\"payload\":{{\"operation_id\":\"op-gen-1\",\"destination\":\"{s}\",\"comment\":\"oars-test\",\"passphrase\":\"hunter2-secret\"}}}}", .{dest});
     const resp = app.dispatch(req);
     try std.testing.expect(std.mem.indexOf(u8, resp, "\"ok\":true") != null);
-    // The passphrase never appears in the response; the Keychain account
-    // name tells the frontend where to store it.
     try std.testing.expect(std.mem.indexOf(u8, resp, "hunter2-secret") == null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "keychain_account") != null);
 
-    const GenResp = struct {
+    const StartResp = struct {
         result: struct {
             ok: bool,
-            public_key: []const u8 = "",
-            private_path: []const u8 = "",
-            keychain_account: []const u8 = "",
+            job_id: []const u8 = "",
         },
     };
-    const gen_parsed = try std.json.parseFromSlice(GenResp, std.testing.allocator, resp, .{
+    const start_parsed = try std.json.parseFromSlice(StartResp, std.testing.allocator, resp, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     });
-    defer gen_parsed.deinit();
-    try std.testing.expect(gen_parsed.value.result.ok);
-    try std.testing.expect(std.mem.indexOf(u8, gen_parsed.value.result.public_key, "ssh-ed25519") != null);
-    try std.testing.expectEqualStrings(dest, gen_parsed.value.result.private_path);
-    try std.testing.expect(std.mem.startsWith(u8, gen_parsed.value.result.keychain_account, "localkey:SHA256:"));
+    defer start_parsed.deinit();
+    try std.testing.expect(start_parsed.value.result.ok);
+    const job_id = start_parsed.value.result.job_id;
+    try std.testing.expect(job_id.len > 0);
+
+    // A repeated operation_id returns the same job instead of a second run.
+    var again_buf: [512]u8 = undefined;
+    const again_req = try std.fmt.bufPrint(&again_buf, "{{\"id\":\"1b\",\"command\":\"oars.sshkeys.localGenerate\",\"payload\":{{\"operation_id\":\"op-gen-1\",\"destination\":\"{s}\",\"comment\":\"oars-test\",\"passphrase\":\"hunter2-secret\"}}}}", .{dest});
+    const again = app.dispatch(again_req);
+    try std.testing.expect(std.mem.indexOf(u8, again, job_id) != null);
+
+    // Poll until the local worker finishes (bounded).
+    var poll_buf: [256]u8 = undefined;
+    const poll_req = try std.fmt.bufPrint(&poll_buf, "{{\"id\":\"2\",\"command\":\"oars.sshkeys.jobPoll\",\"payload\":{{\"job_id\":\"{s}\"}}}}", .{job_id});
+    var poll_resp: []const u8 = "";
+    var attempts: usize = 0;
+    while (attempts < 400) : (attempts += 1) {
+        poll_resp = app.dispatch(poll_req);
+        if (std.mem.indexOf(u8, poll_resp, "\"state\":\"done\"") != null) break;
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(25), .awake) catch {};
+    }
+    try std.testing.expect(std.mem.indexOf(u8, poll_resp, "\"state\":\"done\"") != null);
+    // The passphrase never appears in the job result; the Keychain account
+    // name tells the frontend where to store it.
+    try std.testing.expect(std.mem.indexOf(u8, poll_resp, "hunter2-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, poll_resp, "keychain_account") != null);
+
+    const PollResp = struct {
+        result: struct {
+            ok: bool,
+            result: ?struct {
+                public_key: []const u8 = "",
+                private_path: []const u8 = "",
+                keychain_account: []const u8 = "",
+            } = null,
+        },
+    };
+    const poll_parsed = try std.json.parseFromSlice(PollResp, std.testing.allocator, poll_resp, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer poll_parsed.deinit();
+    const gen_result = poll_parsed.value.result.result orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, gen_result.public_key, "ssh-ed25519") != null);
+    try std.testing.expectEqualStrings(dest, gen_result.private_path);
+    try std.testing.expect(std.mem.startsWith(u8, gen_result.keychain_account, "localkey:SHA256:"));
 
     // The private file exists with mode 0600.
     var priv = std.Io.Dir.cwd().openFile(io, dest, .{}) catch return error.TestUnexpectedResult;
@@ -1281,73 +1322,132 @@ test "sshkeys.generate creates a key, refuses overwrites, and hides the passphra
     const st = try priv.stat(io);
     try std.testing.expectEqual(@as(u16, 0o600), st.permissions.toMode() & 0o777);
 
-    // The audit entry has the fingerprint but never the passphrase.
+    // The audit trail has admission and terminal rows but never the passphrase.
     const audit_content = try std.Io.Dir.cwd().readFileAlloc(io, app.audit_store.path, std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(audit_content);
-    try std.testing.expect(std.mem.indexOf(u8, audit_content, "sshkeys.generate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_content, "sshkeys.localGenerate") != null);
     try std.testing.expect(std.mem.indexOf(u8, audit_content, "hunter2-secret") == null);
 
-    // An existing destination is refused, not overwritten.
-    const dup = app.dispatch(req);
-    try std.testing.expect(std.mem.indexOf(u8, dup, "already exists") != null);
+    // A new operation against the same destination is refused, not overwritten.
+    var dup_buf: [512]u8 = undefined;
+    const dup_req = try std.fmt.bufPrint(&dup_buf, "{{\"id\":\"3\",\"command\":\"oars.sshkeys.localGenerate\",\"payload\":{{\"operation_id\":\"op-gen-2\",\"destination\":\"{s}\"}}}}", .{dest});
+    const dup_resp = app.dispatch(dup_req);
+    try std.testing.expect(std.mem.indexOf(u8, dup_resp, "\"ok\":true") != null);
+    var dup_id_buf: [128]u8 = undefined;
+    const dup_start = std.mem.indexOf(u8, dup_resp, "\"job_id\":\"") orelse return error.TestUnexpectedResult;
+    var dup_id_len: usize = 0;
+    for (dup_resp[dup_start + 10 ..]) |ch| {
+        if (ch == '\"') break;
+        if (dup_id_len >= dup_id_buf.len) return error.TestUnexpectedResult;
+        dup_id_buf[dup_id_len] = ch;
+        dup_id_len += 1;
+    }
+    var dup_poll_buf: [256]u8 = undefined;
+    const dup_poll_req = try std.fmt.bufPrint(&dup_poll_buf, "{{\"id\":\"4\",\"command\":\"oars.sshkeys.jobPoll\",\"payload\":{{\"job_id\":\"{s}\"}}}}", .{dup_id_buf[0..dup_id_len]});
+    var dup_poll: []const u8 = "";
+    attempts = 0;
+    while (attempts < 400) : (attempts += 1) {
+        dup_poll = app.dispatch(dup_poll_req);
+        if (std.mem.indexOf(u8, dup_poll, "\"state\":\"done\"") != null or std.mem.indexOf(u8, dup_poll, "\"state\":\"partial\"") != null) break;
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(25), .awake) catch {};
+    }
+    try std.testing.expect(std.mem.indexOf(u8, dup_poll, "\"state\":\"partial\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dup_poll, "already exists") != null);
 
     // A relative destination is rejected before any work.
-    var rel_buf: [320]u8 = undefined;
-    const rel_req = try std.fmt.bufPrint(&rel_buf, "{{\"id\":\"2\",\"command\":\"oars.sshkeys.generate\",\"payload\":{{\"destination\":\"relative/path\"}}}}", .{});
-    const rel = app.dispatch(rel_req);
-    try std.testing.expect(std.mem.indexOf(u8, rel, "invalid destination") != null);
+    const rel = app.dispatch(
+        \\{"id":"5","command":"oars.sshkeys.localGenerate","payload":{"operation_id":"op-gen-3","destination":"relative/path"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, rel, "an absolute destination path is required") != null);
 }
 
-test "sshkeys handlers require a session and validate payloads" {
+test "sshkeys handlers validate payloads and snapshot state" {
     var app: TestApp = undefined;
     try app.init();
     defer app.deinit();
+    const io = std.testing.io;
 
-    const list = app.dispatch(
-        \\{"id":"1","command":"oars.sshkeys.list","payload":{"server_id":"ghost"}}
+    // inspect rejects garbage and normalizes a valid key.
+    const bad_key = app.dispatch(
+        \\{"id":"1","command":"oars.sshkeys.inspect","payload":{"public_key":"not-a-key"}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, list, "not connected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bad_key, "invalid public key") != null);
+    const good_key = app.dispatch(
+        \\{"id":"2","command":"oars.sshkeys.inspect","payload":{"public_key":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBs5Tnge2MIGi6Zcyo04aosYAQ+iwk4hKYUNpIHkyMQt someone@host"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, good_key, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, good_key, "\"fingerprint\":\"SHA256:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, good_key, "\"key_type\":\"ssh-ed25519\"") != null);
 
-    const add = app.dispatch(
-        \\{"id":"2","command":"oars.sshkeys.add","payload":{"server_id":"ghost","public_key":"ssh-ed25519 AAAA x"}}
+    // A snapshot for a disconnected server is admitted and finishes
+    // partial with a warning; mutations still need its frozen sources.
+    const snap = app.dispatch(
+        \\{"id":"3","command":"oars.sshkeys.snapshot","payload":{"server_id":"ghost","account":{"kind":"connected"}}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, add, "not connected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snap, "\"ok\":true") != null);
+    var snap_id_buf: [128]u8 = undefined;
+    const snap_id_start = std.mem.indexOf(u8, snap, "\"snapshot_id\":\"") orelse return error.TestUnexpectedResult;
+    var snap_id_len: usize = 0;
+    for (snap[snap_id_start + 15 ..]) |ch| {
+        if (ch == '\"') break;
+        if (snap_id_len >= snap_id_buf.len) return error.TestUnexpectedResult;
+        snap_id_buf[snap_id_len] = ch;
+        snap_id_len += 1;
+    }
+    const snap_id = snap_id_buf[0..snap_id_len];
+    var snap_poll_buf: [256]u8 = undefined;
+    const snap_poll_req = try std.fmt.bufPrint(&snap_poll_buf, "{{\"id\":\"4\",\"command\":\"oars.sshkeys.snapshotPoll\",\"payload\":{{\"snapshot_id\":\"{s}\"}}}}", .{snap_id});
+    var snap_poll: []const u8 = "";
+    var attempts: usize = 0;
+    while (attempts < 400) : (attempts += 1) {
+        snap_poll = app.dispatch(snap_poll_req);
+        if (std.mem.indexOf(u8, snap_poll, "\"state\":\"partial\"") != null or std.mem.indexOf(u8, snap_poll, "\"state\":\"done\"") != null) break;
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(25), .awake) catch {};
+    }
+    try std.testing.expect(std.mem.indexOf(u8, snap_poll, "\"state\":\"partial\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snap_poll, "not connected") != null);
 
-    const revoke = app.dispatch(
-        \\{"id":"3","command":"oars.sshkeys.revoke","payload":{"server_id":"ghost","fingerprint":"SHA256:x","expected_line_hash":"y"}}
+    // Mutations validate their payload before touching the registry.
+    const add_unknown = app.dispatch(
+        \\{"id":"5","command":"oars.sshkeys.add","payload":{"operation_id":"op-a","snapshot_id":"snap-nope","source_path":"/home/u/.ssh/authorized_keys","file_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","public_key":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBs5Tnge2MIGi6Zcyo04aosYAQ+iwk4hKYUNpIHkyMQt x"}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, revoke, "not connected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, add_unknown, "unknown snapshot") != null);
 
-    const rotate = app.dispatch(
-        \\{"id":"4","command":"oars.sshkeys.rotate","payload":{"server_id":"ghost","fingerprint":"SHA256:x","expected_line_hash":"y","new_public_key":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBs5Tnge2MIGi6Zcyo04aosYAQ+iwk4hKYUNpIHkyMQt z"}}
+    const bad_hash = app.dispatch(
+        \\{"id":"6","command":"oars.sshkeys.revoke","payload":{"operation_id":"op-r","snapshot_id":"snap-nope","source_path":"/home/u/.ssh/authorized_keys","file_sha256":"abc","fingerprint":"SHA256:x","line_hash":"y"}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, rotate, "not connected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bad_hash, "invalid") != null);
 
-    const roles_list = app.dispatch(
-        \\{"id":"5","command":"oars.sshkeys.roles.list","payload":{"server_id":"ghost"}}
+    const commit_not_waiting = app.dispatch(
+        \\{"id":"7","command":"oars.sshkeys.rotateCommit","payload":{"job_id":"job-nope","verification":{"kind":"external_confirmation","confirm_fingerprint":"SHA256:x"}}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, roles_list, "not connected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, commit_not_waiting, "not waiting for verification") != null);
 
-    const roles_create = app.dispatch(
-        \\{"id":"6","command":"oars.sshkeys.roles.create","payload":{"server_id":"ghost","name":"ro-user","read_only":true}}
+    // Role plans need a completed snapshot and a safe account name.
+    const plan_no_snap = app.dispatch(
+        \\{"id":"8","command":"oars.sshkeys.roles.plan","payload":{"server_id":"ghost2","name":"ro-user","kind":"read_only_sftp","action":"create"}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, roles_create, "not connected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan_no_snap, "take a snapshot") != null);
 
-    const roles_delete = app.dispatch(
-        \\{"id":"7","command":"oars.sshkeys.roles.delete","payload":{"server_id":"ghost","name":"ro-user"}}
+    const bad_name = app.dispatch(
+        \\{"id":"9","command":"oars.sshkeys.roles.plan","payload":{"server_id":"ghost","name":"Bad Name!","kind":"read_only_sftp","action":"create"}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, roles_delete, "not connected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bad_name, "invalid account name") != null);
 
     const deploy_key = app.dispatch(
-        \\{"id":"8","command":"oars.sshkeys.deployKey.generate","payload":{"server_id":"ghost"}}
+        \\{"id":"10","command":"oars.sshkeys.deployKeys.delete","payload":{"operation_id":"op-d","server_id":"ghost","deploy_key_id":"bogus","confirm_fingerprint":"SHA256:x"}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, deploy_key, "not connected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, deploy_key, "invalid deploy key id") != null);
 
-    // Role names are validated before any session work.
-    const bad_name = app.dispatch(
-        \\{"id":"9","command":"oars.sshkeys.roles.create","payload":{"server_id":"ghost","name":"Bad Name!","read_only":true}}
+    const job_poll_unknown = app.dispatch(
+        \\{"id":"11","command":"oars.sshkeys.jobPoll","payload":{"job_id":"job-nope"}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, bad_name, "invalid role name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, job_poll_unknown, "unknown job") != null);
+
+    const job_cancel_unknown = app.dispatch(
+        \\{"id":"12","command":"oars.sshkeys.jobCancel","payload":{"job_id":"job-nope"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, job_cancel_unknown, "unknown job") != null);
 }
 
 test "access identities save/list/delete round trip through the dispatcher" {

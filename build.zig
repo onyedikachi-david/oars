@@ -146,7 +146,18 @@ pub fn build(b: *std.Build) void {
     const web_layer_override = b.option(WebLayerOption, "web-layer", "Override app.zon webview_layer: auto, include, exclude");
     const cef_dir_override = b.option([]const u8, "cef-dir", "Override CEF root directory for Chromium builds");
     const cef_auto_install_override = b.option(bool, "cef-auto-install", "Override app.zon CEF auto-install setting");
-    const package_target = b.option(PackageTarget, "package-target", "Package target: macos, windows, linux") orelse .macos;
+    const native_package_target: ?PackageTarget = switch (target.result.os.tag) {
+        .macos => .macos,
+        .linux => .linux,
+        .windows => .windows,
+        else => null,
+    };
+    const package_target = b.option(PackageTarget, "package-target", "Package target: macos, windows, linux") orelse native_package_target orelse .macos;
+    if (native_package_target) |expected| {
+        if (package_target != expected) {
+            @panic("-Dpackage-target must match the operating system selected by -Dtarget");
+        }
+    }
     const native_sdk_path = b.option([]const u8, "native-sdk-path", "Path to the Native SDK framework checkout") orelse default_native_sdk_path;
     const package_optimize_name = @tagName(package_optimize);
     const selected_platform: PlatformOption = switch (platform_option) {

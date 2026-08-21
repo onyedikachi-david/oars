@@ -5,6 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Oars UI preview</title>
     <script>
+      document.documentElement.dataset.previewVariant =
+        new URLSearchParams(window.location.search).get("concept") || "baseline";
+    </script>
+    <link rel="stylesheet" href="/preview-variants.css" />
+    <script>
       (() => {
         const now = Date.now();
         const monitorMode = new URLSearchParams(window.location.search).get("monitor") || "healthy";
@@ -21,6 +26,7 @@
         const scriptsMode = new URLSearchParams(window.location.search).get("scripts") || "populated";
         const deployMode = new URLSearchParams(window.location.search).get("deploy") || "populated";
         const accessMode = new URLSearchParams(window.location.search).get("access") || "populated";
+        const keysMode = new URLSearchParams(window.location.search).get("keys") || "populated";
         let nextDiagnosticChannel = 900;
         // Logs fixtures (spec 04): deterministic sources, lines with
         // repeatable search matches, one very long line, a follow channel
@@ -196,13 +202,86 @@
         let accessScanPolls = 0;
         let accessScanScope = "connected_accounts";
         let accessJobPolls = 0;
-        let previewSshKeys = [
-          { line_index: 0, parsed: true, options: "", type: "ssh-ed25519", key: "AAAAC3NzaC1lZDI1NTE5AAAAIFleetPreviewAda", comment: "ada@workstation", fingerprint_sha256: accessFingerprint, bits: 256, line_hash: "line-preview-1" },
-          { line_index: 1, parsed: true, options: "restrict,command=\"/usr/local/bin/read-reports\"", type: "ssh-ed25519", key: "AAAAC3NzaC1lZDI1NTE5AAAAIReportsPreview", comment: "reports-automation", fingerprint_sha256: "SHA256:7cE9mPVmJm7V2HKjp9iY0zBkYi47SuGGq8YVxbDT2pM", bits: 256, line_hash: "line-preview-2" },
+        // ── SSH key management fixtures (spec 08, async snapshot/job contract) ──
+        const keysSourcePath = "/home/deploy/.ssh/authorized_keys";
+        const keysFileHash = "4f4a43f2c8b1f973b9dd65a7a0c486353449086d0b4b734339cfe2565112f4aa";
+        const keysRoleFingerprint = "SHA256:7cE9mPVmJm7V2HKjp9iY0zBkYi47SuGGq8YVxbDT2pM";
+        const keysDeployFingerprint = "SHA256:3oJb8m0Zr2yXqk0f4u2mJ0Qm0Z1QwHf7oQx6Q1yU0kA";
+        const keysBaseSources = [
+          { path: keysSourcePath, kind: "static", status: "readable", file_sha256: keysFileHash, mode: 0o600, owner: "deploy" },
         ];
-        let previewSshRoles = [
-          { name: "reports", shell: "/usr/sbin/nologin", read_only: true, policy: "read-only-sftp", users: ["reports-automation"] },
+        const keysBaseKeys = [
+          { source_path: keysSourcePath, line_index: 0, line_hash: "1".repeat(64), parsed: true, options: "", type: "ssh-ed25519", key: "AAAAC3NzaC1lZDI1NTE5AAAAIFleetPreviewAda", comment: "ada@workstation", fingerprint_sha256: accessFingerprint, bits: 256, policy_assessment: { level: "standard", detail: "No key-level restrictions" } },
+          { source_path: keysSourcePath, line_index: 1, line_hash: "2".repeat(64), parsed: true, options: "restrict,command=\"internal-sftp -R\"", type: "ssh-ed25519", key: "AAAAC3NzaC1lZDI1NTE5AAAAIReportsPreview", comment: "reports-automation", fingerprint_sha256: keysRoleFingerprint, bits: 256, policy_assessment: { level: "role_forced", detail: "Forced command with all session features restricted" } },
         ];
+        let keysJobSeq = 0;
+        const keysJobs = new Map();
+        function keysSnapshotPayload() {
+          const partial = keysMode === "partial";
+          const sources = partial
+            ? [...keysBaseSources, { path: "/usr/libexec/auth-keys-command", kind: "dynamic", status: "transport_error", error: "AuthorizedKeysCommand output cannot be inventoried" }, { path: "/etc/ssh/authorized_keys", kind: "static", status: "denied", error: "Permission denied" }]
+            : keysBaseSources;
+          const keys = keysMode === "empty" ? [] : keysMode === "malformed"
+            ? [keysBaseKeys[0], { source_path: keysSourcePath, line_index: 1, line_hash: "3".repeat(64), parsed: false, raw: "ssh-ed25519 AAAA##truncated", error: "The key blob is not valid base64.", policy_assessment: { level: "weak", detail: "Malformed row: no mutation is allowed" } }]
+            : keysBaseKeys;
+          const roles = keysMode === "empty"
+            ? []
+            : [{ name: "reports", kind: "read_only_sftp", home: "/home/reports", shell: "/bin/bash", policy_state: keysMode === "role-drift" ? "drifted" : "verified", key_fingerprints: [keysRoleFingerprint] }];
+          const deployKeys = keysMode === "deploy-result"
+            ? [{ deploy_key_id: "dk-01ab23cd45ef6789", repository_label: "acme/shopfront", path: "/home/deploy/.ssh/oars_deploy_01ab23cd45ef6789", fingerprint: keysDeployFingerprint, created_at_ms: now - 3600e3 }]
+            : [];
+          return {
+            ok: true,
+            state: partial ? "partial" : "done",
+            server_id: "prod-api",
+            account: { kind: "connected" },
+            scope: partial ? "single_source_fallback" : "effective_policy",
+            created_at_ms: now - 900,
+            finished_at_ms: now,
+            coverage: partial ? "partial" : "complete",
+            capabilities: { privilege: "root", sftp_read_only: true },
+            sources,
+            keys,
+            roles,
+            deploy_keys: deployKeys,
+            warnings: partial ? ["The effective sshd policy could not be evaluated; showing the conventional source only."] : [],
+          };
+        }
+        function keysJobSteps(kind, state) {
+          const names = {
+            add: ["check_source", "write", "verify"],
+            revoke: ["check_source", "write", "verify"],
+            rotate: ["check_source", "stage", "verify_staged", "verify_access", "remove_old", "verify"],
+            roles: ["probe_privilege", "create_account", "install_key", "write_policy", "verify"],
+            deploy: ["read_manifest", "generate", "write_manifest", "verify"],
+            local: ["generate", "verify"],
+          }[kind] || ["work"];
+          return names.map((id, index) => {
+            if (state === "done") return { id, state: "done" };
+            if (state === "waiting") return { id, state: index < 3 ? "done" : index === 3 ? "waiting" : "queued" };
+            if (state === "conflict") return { id, state: index === 0 ? "conflict" : "queued", ...(index === 0 ? { error: "the source changed since the snapshot; refresh and review again" } : {}) };
+            return { id, state: index === 0 ? "done" : index === 1 ? "running" : "queued" };
+          });
+        }
+        function keysJobPayload(job) {
+          job.polls += 1;
+          if (keysMode === "conflict" && (job.kind === "add" || job.kind === "revoke")) {
+            return { ok: true, state: "partial", steps: keysJobSteps(job.kind, "conflict") };
+          }
+          if (job.kind === "rotate" && !job.committed) {
+            if (job.polls < 2) return { ok: true, state: "running", steps: keysJobSteps("rotate", "running") };
+            return { ok: true, state: "waiting_for_verification", steps: keysJobSteps("rotate", "waiting") };
+          }
+          if (job.polls < 2) return { ok: true, state: "running", steps: keysJobSteps(job.kind, "running") };
+          const result = job.kind === "local"
+            ? { public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPreviewGenerated oars-generated", private_path: job.destination || "/tmp/id_ed25519", fingerprint: accessNewFingerprint, keychain_account: "localkey:" + accessNewFingerprint }
+            : job.kind === "deploy"
+              ? { deploy_key_id: "dk-98zx76wv54ut32sr", public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDeployPreview oars-deploy", private_path: "/home/deploy/.ssh/oars_deploy_98zx76wv54ut32sr", fingerprint: keysDeployFingerprint }
+              : job.kind === "rotate"
+                ? { new_fingerprint: accessNewFingerprint }
+                : undefined;
+          return { ok: true, state: "done", steps: keysJobSteps(job.kind, "done"), ...(result ? { result } : {}) };
+        }
         const accessGrant = { fingerprint: accessFingerprint, server_id: "prod-api", server_name: "Production API", user: "deploy", sudo: "limited", comment: "ada@workstation", line_hash: "line-preview-1", source_path: "/home/deploy/.ssh/authorized_keys", file_sha256: "4f4a43f2c8b1f973b9dd65a7a0c486353449086d0b4b734339cfe2565112f4aa" };
         function accessPollPayload() {
           accessScanPolls += 1;
@@ -466,31 +545,68 @@
               return { ok: true };
             }
             // ── Server key and role fixtures (spec 08) ──────────────
-            if (command === "oars.sshkeys.list") return { ok: true, keys: previewSshKeys };
-            if (command === "oars.sshkeys.add") {
-              const fingerprint = accessNewFingerprint;
-              previewSshKeys.push({ line_index: previewSshKeys.length, parsed: true, options: "", type: "ssh-ed25519", key: String(payload.public_key || "").split(/\s+/)[1] || "preview-key", comment: payload.comment || "new key", fingerprint_sha256: fingerprint, bits: 256, line_hash: `line-preview-${previewSshKeys.length + 1}` });
-              return { ok: true, fingerprint, line_hash: previewSshKeys.at(-1).line_hash };
+            if (command === "oars.sshkeys.inspect") {
+              const text = String(payload.public_key || "").trim();
+              if (!text.startsWith("ssh-")) return { ok: false, error: "invalid public key" };
+              return { ok: true, normalized_public_key: text, fingerprint: accessNewFingerprint, key_type: "ssh-ed25519", bits: 256, comment: payload.comment || "preview" };
             }
-            if (command === "oars.sshkeys.revoke") {
-              previewSshKeys = previewSshKeys.filter((entry) => entry.fingerprint_sha256 !== payload.fingerprint || entry.line_hash !== payload.expected_line_hash);
+            if (command === "oars.sshkeys.snapshot") {
+              if (keysMode === "disconnected") return { ok: false, error: "not connected" };
+              return { ok: true, snapshot_id: "snap-preview" };
+            }
+            if (command === "oars.sshkeys.snapshotPoll") return keysSnapshotPayload();
+            if (command === "oars.sshkeys.snapshotCancel") return { ok: true };
+            if (command === "oars.sshkeys.add" || command === "oars.sshkeys.revoke" || command === "oars.sshkeys.rotate") {
+              const kind = command.split(".").pop();
+              const jobId = `job-preview-${++keysJobSeq}`;
+              keysJobs.set(jobId, { kind, polls: 0, committed: false });
+              return { ok: true, job_id: jobId, ...(kind === "add" ? { fingerprint: accessNewFingerprint } : {}), ...(kind === "rotate" ? { new_fingerprint: accessNewFingerprint } : {}) };
+            }
+            if (command === "oars.sshkeys.rotateCommit") {
+              const job = keysJobs.get(payload.job_id);
+              if (!job) return { ok: false, error: "the job is not waiting for verification" };
+              if (payload.verification?.kind === "external_confirmation" && payload.verification?.confirm_fingerprint !== accessNewFingerprint) return { ok: false, error: "the typed fingerprint does not match the staged key; both keys remain" };
+              job.committed = true;
               return { ok: true };
             }
-            if (command === "oars.sshkeys.rotate") {
-              previewSshKeys = previewSshKeys.map((entry) => entry.fingerprint_sha256 === payload.fingerprint && entry.line_hash === payload.expected_line_hash ? { ...entry, key: String(payload.new_public_key || "").split(/\s+/)[1] || "rotated-key", fingerprint_sha256: accessNewFingerprint, line_hash: `${entry.line_hash}-rotated` } : entry);
-              return { ok: true };
+            if (command === "oars.sshkeys.jobPoll") {
+              const job = keysJobs.get(payload.job_id);
+              if (!job) return { ok: false, error: "unknown job" };
+              return keysJobPayload(job);
             }
-            if (command === "oars.sshkeys.generate") return { ok: true, public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPreviewGenerated oars-generated", private_path: payload.destination, keychain_account: "oars-preview-key" };
-            if (command === "oars.sshkeys.roles.list") return { ok: true, roles: previewSshRoles };
-            if (command === "oars.sshkeys.roles.create") {
-              previewSshRoles.push({ name: payload.name, shell: payload.read_only ? "/usr/sbin/nologin" : "/bin/bash", read_only: Boolean(payload.read_only), policy: payload.read_only ? "read-only-sftp" : "standard", users: [] });
-              return { ok: true };
+            if (command === "oars.sshkeys.jobCancel") return { ok: true };
+            if (command === "oars.sshkeys.localGenerate") {
+              const jobId = `job-preview-${++keysJobSeq}`;
+              keysJobs.set(jobId, { kind: "local", polls: 0, committed: false, destination: payload.destination });
+              return { ok: true, job_id: jobId };
             }
-            if (command === "oars.sshkeys.roles.delete") {
-              previewSshRoles = previewSshRoles.filter((role) => role.name !== payload.name);
-              return { ok: true };
+            if (command === "oars.sshkeys.roles.plan") {
+              const name = String(payload.name || "role");
+              const action = payload.action || "create";
+              const commands = action === "create" ? [`useradd -m -s /bin/bash -p '' ${name}`] : action === "delete" ? [`userdel ${name}`] : [];
+              const effects = action === "create"
+                ? [`Create the account '${name}' with a home directory; password login stays disabled`, `Record '${name}' in the Oars role policy manifest`]
+                : action === "delete"
+                  ? [`Delete the account '${name}'; the home directory is left on disk`, `Remove '${name}' from the Oars role policy manifest`]
+                  : [`Re-verify the account, home, shell, and key source for '${name}'`, `Rewrite the Oars role policy entry for '${name}'`];
+              return { ok: true, plan_id: `plan-preview-${action}`, expires_at_ms: now + 300000, account: name, home: `/home/${name}`, commands, effects };
             }
-            if (command === "oars.sshkeys.deployKey.generate") return { ok: true, public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDeployPreview oars-deploy", path: "~/.ssh/oars_deploy" };
+            if (command === "oars.sshkeys.roles.commit") {
+              const jobId = `job-preview-${++keysJobSeq}`;
+              keysJobs.set(jobId, { kind: "roles", polls: 0, committed: false });
+              return { ok: true, job_id: jobId };
+            }
+            if (command === "oars.sshkeys.deployKeys.generate") {
+              const jobId = `job-preview-${++keysJobSeq}`;
+              keysJobs.set(jobId, { kind: "deploy", polls: 0, committed: false });
+              return { ok: true, job_id: jobId };
+            }
+            if (command === "oars.sshkeys.deployKeys.delete") {
+              if (payload.confirm_fingerprint !== keysDeployFingerprint) return { ok: false, error: "invalid confirmation fingerprint" };
+              const jobId = `job-preview-${++keysJobSeq}`;
+              keysJobs.set(jobId, { kind: "deploy", polls: 0, committed: false });
+              return { ok: true, job_id: jobId };
+            }
             if (command === "oars.monitor.cleanDiskEstimate" || command === "oars.monitor.cleanDisk" || command === "oars.monitor.dropCaches") {
               const ch = nextDiagnosticChannel++;
               if (!window.__oarsMock.diagChannels) window.__oarsMock.diagChannels = new Map();

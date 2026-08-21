@@ -12,8 +12,22 @@ describe("VNC input contracts", () => {
   it("validates the supported VNC port range", () => {
     expect(validateVncPort("5900")).toEqual({ ok: true, value: 5900 });
     expect(validateVncPort("5999")).toEqual({ ok: true, value: 5999 });
+    expect(validateVncPort("  5905  ")).toEqual({ ok: true, value: 5905 });
+
+    // Empty / whitespace
+    expect(validateVncPort("")).toEqual({ ok: false, message: "Enter a port between 5900 and 5999" });
+    expect(validateVncPort("   ")).toEqual({ ok: false, message: "Enter a port between 5900 and 5999" });
+
+    // Non-digits
     expect(validateVncPort("5899").ok).toBe(false);
-    expect(validateVncPort("59x0").ok).toBe(false);
+    expect(validateVncPort("59x0")).toEqual({ ok: false, message: "Port must be digits only" });
+    expect(validateVncPort("-5900")).toEqual({ ok: false, message: "Port must be digits only" });
+    expect(validateVncPort("5900.5")).toEqual({ ok: false, message: "Port must be digits only" });
+
+    // Out of range
+    expect(validateVncPort("0")).toEqual({ ok: false, message: "Port must be 5900-5999" });
+    expect(validateVncPort("6000")).toEqual({ ok: false, message: "Port must be 5900-5999" });
+    expect(validateVncPort("99999")).toEqual({ ok: false, message: "Port must be 5900-5999" });
   });
 
   it("requires matching setup passwords", () => {
@@ -25,6 +39,9 @@ describe("VNC input contracts", () => {
   it("only warns for legacy password-only authentication", () => {
     expect(legacyVncAuthWarning(["password"])).toBe(true);
     expect(legacyVncAuthWarning(["username", "password", "target"])).toBe(false);
+    expect(legacyVncAuthWarning([])).toBe(false);
+    expect(legacyVncAuthWarning(["none"])).toBe(false);
+    expect(legacyVncAuthWarning(["password", "tls"])).toBe(false);
   });
 
   it("turns a closed poll into a terminal reason", () => {
@@ -37,6 +54,10 @@ describe("VNC input contracts", () => {
     expect(desktopProbeLabel({ desktop_installed: true, window_manager_running: true, desktop_surface_running: true, desktop_panel_running: true, desktop_running: true, desktop_name: "XFCE" }, 1)).toBe("XFCE installed · display :1 running");
     expect(desktopProbeLabel({ desktop_installed: true, window_manager_running: false, desktop_surface_running: false, desktop_panel_running: false, desktop_running: false, desktop_name: "XFCE" }, 0)).toBe("XFCE installed · display :0 stopped");
     expect(desktopProbeLabel({ desktop_installed: true, window_manager_running: true, desktop_surface_running: false, desktop_panel_running: false, desktop_running: false, desktop_name: "XFCE" }, 0)).toBe("XFCE installed · display :0 incomplete (missing desktop and panel)");
+    expect(desktopProbeLabel({ desktop_installed: true, window_manager_running: true, desktop_surface_running: false, desktop_panel_running: true, desktop_running: false, desktop_name: "XFCE" }, 1)).toBe("XFCE installed · display :1 incomplete (missing desktop)");
+    expect(desktopProbeLabel({ desktop_installed: true, window_manager_running: true, desktop_surface_running: true, desktop_panel_running: false, desktop_running: false, desktop_name: "XFCE" }, 1)).toBe("XFCE installed · display :1 incomplete (missing panel)");
+    expect(desktopProbeLabel({ desktop_installed: true, window_manager_running: true, desktop_surface_running: true, desktop_panel_running: true, desktop_running: false, desktop_name: "XFCE" }, 1)).toBe("XFCE installed · display :1 incomplete");
+    expect(desktopProbeLabel({ desktop_installed: true, window_manager_running: false, desktop_surface_running: false, desktop_panel_running: false, desktop_running: false, desktop_name: "" }, 1)).toBe("Desktop installed · display :1 stopped");
     expect(desktopProbeLabel({ desktop_installed: false, window_manager_running: false, desktop_surface_running: false, desktop_panel_running: false, desktop_running: false, desktop_name: "" }, 2)).toBe("not installed · display :2 stopped");
   });
 });

@@ -373,6 +373,10 @@ const Op = union(enum) {
     },
 };
 
+/// Not an observed SFTP status: the op failed before a protocol status
+/// existed (local errors, transport loss, timeouts).
+pub const fx_unknown: i64 = -1;
+
 /// Completion record for synchronous SFTP ops (spec 05): the worker builds
 /// the full success JSON (owned), the handler copies it into its output
 /// buffer and frees it. Async ops (download/unzip/zip_download/recursive rm)
@@ -393,6 +397,11 @@ pub const SftpOutcome = struct {
     abandoned: bool = false,
     msg_buf: [256]u8 = undefined,
     msg_len: usize = 0,
+    /// The SFTP protocol status (LIBSSH2_FX_*) of a failed op, when the
+    /// worker could observe one; fx_unknown otherwise. Lets typed
+    /// consumers (spec 08 source outcomes) distinguish missing, denied,
+    /// and transport failures instead of guessing from message text.
+    fx: i64 = fx_unknown,
     /// Owned success payload (worker-built JSON). Read only after `isDone`.
     json: ?[]u8 = null,
 
@@ -406,6 +415,14 @@ pub const SftpOutcome = struct {
         const free = self.abandoned;
         self.mutex.unlock();
         if (free) self.allocator.destroy(self);
+    }
+
+    /// set() plus the observed SFTP status code (see `fx`).
+    pub fn setFx(self: *SftpOutcome, ok: bool, msg: []const u8, fx: i64) void {
+        lockSpin(&self.mutex);
+        self.fx = fx;
+        self.mutex.unlock();
+        self.set(ok, msg);
     }
 
     pub fn setJson(self: *SftpOutcome, json: []u8) void {
@@ -464,6 +481,12 @@ pub const SftpExpectedIdentity = struct {
     size: ?u64 = null,
     mtime: ?u64 = null,
     sha256: ?[]const u8 = null,
+    /// True when the reviewed source did not exist. A file appearing before
+    /// the atomic rename is a conflict, even if it is empty.
+    missing: bool = false,
+    /// Feature-specific hashing cap. Editor saves keep the 1 MiB default;
+    /// SSH authorized_keys raises it to its bounded 4 MiB source limit.
+    max_hash_bytes: u64 = sftpmod.max_inline_bytes,
 };
 
 pub const ClearExpected = struct {
@@ -1163,8 +1186,14 @@ pub const Manager = struct {
         self.allocator.free(key);
         var s = session.server;
         s.deinit(session.allocator);
-        if (session.password) |p| session.allocator.free(p);
-        if (session.passphrase) |p| session.allocator.free(p);
+        if (session.password) |p| {
+            std.crypto.secureZero(u8, @constCast(p));
+            session.allocator.free(p);
+        }
+        if (session.passphrase) |p| {
+            std.crypto.secureZero(u8, @constCast(p));
+            session.allocator.free(p);
+        }
         session.threaded.deinit();
         session.allocator.destroy(session);
     }
@@ -1284,6 +1313,55 @@ pub const Manager = struct {
         try session.ops.append(self.allocator, .{ .exec = .{
             .id = id,
             .command = owned,
+            .history_kind = owned_kind,
+            .history_command = owned_hc,
+            .history_secrets = owned_secrets,
+        } });
+        return id;
+    }
+
+    /// Queues a tracked exec with bounded stdin. The stdin bytes are never
+    /// included in command history and are securely cleared by the worker.
+    pub fn execTrackedWithInput(
+        self: *Manager,
+        server_id: []const u8,
+        command: []const u8,
+        stdin_data: []const u8,
+        history_kind: []const u8,
+        history_command: ?[]const u8,
+        history_secrets: []const []const u8,
+    ) !u32 {
+        const session = self.get(server_id) orelse return error.NoSession;
+        if (session.status.load(.acquire) != .ready) return error.NotReady;
+        const id = session.next_channel_id.fetchAdd(1, .monotonic);
+        const owned = try self.allocator.dupe(u8, command);
+        errdefer self.allocator.free(owned);
+        const owned_stdin = try self.allocator.dupe(u8, stdin_data);
+        errdefer {
+            std.crypto.secureZero(u8, owned_stdin);
+            self.allocator.free(owned_stdin);
+        }
+        const owned_kind = try self.allocator.dupe(u8, history_kind);
+        errdefer self.allocator.free(owned_kind);
+        const owned_hc: ?[]const u8 = if (history_command) |hc| try self.allocator.dupe(u8, hc) else null;
+        errdefer if (owned_hc) |hc| self.allocator.free(hc);
+        const owned_secrets: ?[][]const u8 = if (history_secrets.len > 0) blk: {
+            const arr = try self.allocator.alloc([]const u8, history_secrets.len);
+            errdefer self.allocator.free(arr);
+            for (history_secrets, 0..) |secret, i| arr[i] = try self.allocator.dupe(u8, secret);
+            break :blk arr;
+        } else null;
+        errdefer if (owned_secrets) |secrets| {
+            for (secrets) |secret| self.allocator.free(secret);
+            self.allocator.free(secrets);
+        };
+        lockSpin(&session.ops_mutex);
+        defer session.ops_mutex.unlock();
+        if (session.worker_done.load(.acquire)) return error.NotReady;
+        try session.ops.append(self.allocator, .{ .exec = .{
+            .id = id,
+            .command = owned,
+            .stdin_data = owned_stdin,
             .history_kind = owned_kind,
             .history_command = owned_hc,
             .history_secrets = owned_secrets,
@@ -1427,6 +1505,8 @@ pub const Manager = struct {
             .size = identity.size,
             .mtime = identity.mtime,
             .sha256 = owned_sha,
+            .missing = identity.missing,
+            .max_hash_bytes = identity.max_hash_bytes,
         } else null;
         try self.queueSftp(session, .{ .sftp_save = .{
             .path = owned,
@@ -1635,10 +1715,42 @@ pub const Manager = struct {
         return self.waitExec(server_id, channel, max_bytes, timeout_ns);
     }
 
+    /// Runs a tracked exec to completion from a non-UI coordinator thread.
+    pub fn execWaitTracked(
+        self: *Manager,
+        server_id: []const u8,
+        command: []const u8,
+        history_kind: []const u8,
+        history_command: ?[]const u8,
+        history_secrets: []const []const u8,
+        max_bytes: usize,
+        timeout_ns: i128,
+    ) !ExecOutcome {
+        const channel = try self.execTracked(server_id, command, history_kind, history_command, history_secrets);
+        return self.waitExec(server_id, channel, max_bytes, timeout_ns);
+    }
+
     /// Runs a bounded exec with stdin to completion. Secret input is never
     /// part of the command text or command history.
     pub fn execWaitWithInput(self: *Manager, server_id: []const u8, command: []const u8, stdin_data: []const u8, max_bytes: usize, timeout_ns: i128) !ExecOutcome {
         const channel = try self.execWithInput(server_id, command, stdin_data);
+        return self.waitExec(server_id, channel, max_bytes, timeout_ns);
+    }
+
+    /// Runs a tracked exec with stdin to completion from a non-UI coordinator
+    /// thread. Stdin is never retained in command history.
+    pub fn execWaitTrackedWithInput(
+        self: *Manager,
+        server_id: []const u8,
+        command: []const u8,
+        stdin_data: []const u8,
+        history_kind: []const u8,
+        history_command: ?[]const u8,
+        history_secrets: []const []const u8,
+        max_bytes: usize,
+        timeout_ns: i128,
+    ) !ExecOutcome {
+        const channel = try self.execTrackedWithInput(server_id, command, stdin_data, history_kind, history_command, history_secrets);
         return self.waitExec(server_id, channel, max_bytes, timeout_ns);
     }
 
@@ -4168,6 +4280,11 @@ fn sftpFail(session: *Session, prefix: []const u8, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s}: {s}", .{ prefix, msg }) catch prefix;
 }
 
+/// The last SFTP error as the FX code stored on outcomes.
+fn sftpLastFx(sftp: *ssh.c.LIBSSH2_SFTP) i64 {
+    return @intCast(ssh.c.libssh2_sftp_last_error(sftp));
+}
+
 // --- SFTP worker ops (spec 05) -------------------------------------------
 
 const sftp_timeout_ms = 15_000;
@@ -4409,7 +4526,7 @@ fn sftpOpStat(session: *Session, path: []const u8, outcome: *SftpOutcome) void {
     var attrs: ssh.c.LIBSSH2_SFTP_ATTRIBUTES = undefined;
     if (!sftpLstat(session, sftp, path_z, &attrs, deadline)) {
         var msg_buf: [256]u8 = undefined;
-        outcome.set(false, sftpFail(session, "stat failed", &msg_buf));
+        outcome.setFx(false, sftpFail(session, "stat failed", &msg_buf), sftpLastFx(sftp));
         return;
     }
     const base = std.fs.path.basename(path);
@@ -4437,7 +4554,7 @@ fn sftpOpRead(session: *Session, path: []const u8, offset: u64, max: usize, outc
 
     const handle = sftpOpen(session, sftp, path_z, ssh.c.LIBSSH2_FXF_READ, 0, ssh.c.LIBSSH2_SFTP_OPENFILE, deadline) orelse {
         var msg_buf: [256]u8 = undefined;
-        outcome.set(false, sftpFail(session, "cannot open file", &msg_buf));
+        outcome.setFx(false, sftpFail(session, "cannot open file", &msg_buf), sftpLastFx(sftp));
         return;
     };
     defer _ = ssh.c.libssh2_sftp_close_handle(handle);
@@ -4447,7 +4564,7 @@ fn sftpOpRead(session: *Session, path: []const u8, offset: u64, max: usize, outc
     defer allocator.free(buf);
     const n = sftpRead(session, handle, buf, deadline) orelse {
         var msg_buf: [256]u8 = undefined;
-        outcome.set(false, sftpFail(session, "read failed", &msg_buf));
+        outcome.setFx(false, sftpFail(session, "read failed", &msg_buf), sftpLastFx(sftp));
         return;
     };
     var attrs: ssh.c.LIBSSH2_SFTP_ATTRIBUTES = undefined;
@@ -4581,7 +4698,15 @@ fn sftpSaveConflict(
     const identity = expected orelse return null;
     var attrs: ssh.c.LIBSSH2_SFTP_ATTRIBUTES = undefined;
     if (!sftpLstat(session, sftp, path_z, &attrs, deadline)) {
-        return "conflict: the file disappeared from the server; reload and review before saving";
+        const fx = sftpLastFx(sftp);
+        if (identity.missing and fx == ssh.c.LIBSSH2_FX_NO_SUCH_FILE) return null;
+        return if (identity.missing)
+            "conflict: cannot verify that the target is still missing; reload and review before saving"
+        else
+            "conflict: the file disappeared from the server; reload and review before saving";
+    }
+    if (identity.missing) {
+        return "conflict: a file appeared at the reviewed path; reload and review before saving";
     }
     if (identity.size) |want| {
         if (attrs.filesize != want) {
@@ -4594,9 +4719,9 @@ fn sftpSaveConflict(
         }
     }
     if (identity.sha256) |want_hex| {
-        // Hash the remote file in full and compare. Bounded by the
-        // editor's 1 MiB ceiling; anything larger cannot be verified.
-        if (attrs.filesize > sftpmod.max_inline_bytes) {
+        // Hash the remote file in full and compare, bounded by the owning
+        // feature's admitted source limit.
+        if (attrs.filesize > identity.max_hash_bytes) {
             return "conflict: the file is too large to verify; reload and review before saving";
         }
         const handle = sftpOpen(session, sftp, path_z, ssh.c.LIBSSH2_FXF_READ, 0, ssh.c.LIBSSH2_SFTP_OPENFILE, deadline) orelse {

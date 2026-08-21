@@ -186,7 +186,8 @@ describe("Scripts workspace", () => {
     const user = userEvent.setup();
     renderScripts();
     await screen.findByText(/Read the current service log/);
-    await user.selectOptions(screen.getByLabelText("Filter scripts by tag"), "logs");
+    await user.click(screen.getByLabelText("Filter scripts by tag"));
+    await user.click(screen.getByRole("option", { name: "logs" }));
     await user.type(screen.getByLabelText("Search scripts"), "deploy");
     expect(await screen.findByRole("heading", { name: "No matching scripts" })).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Clear filters" }));

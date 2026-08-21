@@ -1,6 +1,10 @@
 # Spec 08 — SSH Management (per-server)
 
-**Status:** 📋 · **Depends on:** 02 (exec/SFTP), 01 · **Spec owner:** core
+**Status:** Partial: the corrected worker-driven bridge, typed effective-policy
+sources, guarded mutations, staged rotation, fail-closed roles, deploy-key
+management, operational UI, and automated Docker evidence land; the required
+desktop/narrow in-app browser review remains unavailable · **Depends on:** 02
+(exec/SFTP), 01 · **Spec owner:** core
 
 ## 1. Overview
 

@@ -13,8 +13,11 @@ import {
   Database,
   Gauge,
   HardDrive,
+  GripVertical,
   KeyRound,
   LayoutDashboard,
+  PanelLeftClose,
+  PanelLeftOpen,
   ListChecks,
   LockKeyhole,
   Menu,
@@ -33,16 +36,20 @@ import {
   X,
   Zap,
 } from "lucide-react";
+import { Mosaic, MosaicWindow, type MosaicNode, type MosaicPath } from "react-mosaic-component";
 import { Button } from "./components/ui/button";
 import { OarsLoadingState, OarsRefreshStatus } from "./components/OarsLoadingState";
+import { WorkspaceLayoutPicker } from "./components/WorkspaceLayoutPicker";
+import { ApplicationNotice } from "./components/ApplicationPortal";
 import { api, BridgeError } from "./bridge";
-import type { Server as OarsServer, SessionStatus, Script } from "./types";
+import type { Server as OarsServer, SessionStatus, Script, DeployApp } from "./types";
 import { TerminalTab } from "./TerminalTab";
 import { ServerModal } from "./ServerModal";
 import { MonitorTab } from "./MonitorTab";
 import { LogsTab } from "./LogsTab";
 import { FilesTab } from "./FilesTab";
 import { ScriptsTab } from "./ScriptsTab";
+import { CommandPalette } from "./components/CommandPalette";
 import { DeployTab } from "./DeployTab";
 import { KeysTab } from "./KeysTab";
 import { AccessTab } from "./AccessTab";
@@ -51,6 +58,12 @@ import { AiTab } from "./AiTab";
 import { HistoryTab } from "./HistoryTab";
 import { VaultTab } from "./VaultTab";
 import { AgentTab } from "./AgentTab";
+import {
+  MAX_WORKSPACE_PANES,
+  buildWorkspaceLayout,
+  workspaceLayoutKeys,
+  type WorkspaceLayoutVariant,
+} from "./workspace-layout";
 
 const VncTab = lazy(() => import("./VncTab").then((module) => ({ default: module.VncTab })));
 
@@ -475,6 +488,24 @@ export default function App() {
   const [serverMenuId, setServerMenuId] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState<Section>("Overview");
   const [mobileNav, setMobileNav] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem("oars:sidebar-collapsed") === "true";
+    } catch {
+      return false;
+    }
+  });
+  const [defaultLayoutVariant, setDefaultLayoutVariant] = useState<WorkspaceLayoutVariant>(() => {
+    try {
+      const stored = localStorage.getItem("oars:workspace-layout-default");
+      return stored === "columns" || stored === "focus" ? stored : "balanced";
+    } catch {
+      return "balanced";
+    }
+  });
+  const [layoutVariant, setLayoutVariant] = useState<WorkspaceLayoutVariant>(defaultLayoutVariant);
+  const [mosaicLayout, setMosaicLayout] = useState<MosaicNode<string> | null>(null);
+  const [compactWorkspace, setCompactWorkspace] = useState(() => window.matchMedia("(max-width: 900px)").matches);
   const [toast, setToast] = useState("");
   const [serversLoading, setServersLoading] = useState(true);
   const [serversRefreshing, setServersRefreshing] = useState(false);
@@ -545,6 +576,31 @@ export default function App() {
 
   useEffect(() => { applyTheme(theme); }, [theme, applyTheme]);
 
+  useEffect(() => {
+    try { localStorage.setItem("oars:sidebar-collapsed", String(sidebarCollapsed)); } catch {}
+  }, [sidebarCollapsed]);
+
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 900px)");
+    const update = () => setCompactWorkspace(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
+  const tabKeySignature = tabs.map((tab) => tab.key).join("\u0000");
+  useEffect(() => {
+    const keys = tabs.map((tab) => tab.key);
+    setMosaicLayout((current) => {
+      const currentKeys = workspaceLayoutKeys(current);
+      const nextKeys = [
+        ...currentKeys.filter((key) => keys.includes(key)),
+        ...keys.filter((key) => !currentKeys.includes(key)),
+      ];
+      return buildWorkspaceLayout(nextKeys, layoutVariant, compactWorkspace);
+    });
+  }, [tabKeySignature, layoutVariant, compactWorkspace]);
+
 
 
   const setStatus = useCallback((serverId: string, status: SessionStatus) => {
@@ -561,6 +617,21 @@ export default function App() {
     api.scripts.list().then((r) => setScriptsForPalette(r.scripts)).catch(() => {});
   }, []);
 
+  const [pendingDeployApp, setPendingDeployApp] = useState<{ serverId: string; appId: string } | null>(null);
+  const [deployAppsForPalette, setDeployAppsForPalette] = useState<Array<{ id: string; name: string; serverId: string }>>([]);
+
+  const handleDeployAppsLoaded = useCallback((serverId: string, apps: DeployApp[]) => {
+    setDeployAppsForPalette((prev) => [
+      ...prev.filter((a) => a.serverId !== serverId),
+      ...apps.map((a) => ({ id: a.id, name: a.name, serverId })),
+    ]);
+  }, []);
+
+  const showPaneLimit = useCallback(() => {
+    setToast(`A workspace can show up to ${MAX_WORKSPACE_PANES} server panes.`);
+    window.setTimeout(() => setToast(""), 2800);
+  }, []);
+
   const openServer = useCallback((server: OarsServer) => {
     setTabs((prev) => {
       const existing = prev.find((t) => t.server.id === server.id);
@@ -568,11 +639,15 @@ export default function App() {
         setActiveKey(existing.key);
         return prev;
       }
+      if (prev.length >= MAX_WORKSPACE_PANES) {
+        showPaneLimit();
+        return prev;
+      }
       const tab: Tab = { server, key: server.id, view: "terminal" };
       setActiveKey(tab.key);
       return [...prev, tab];
     });
-  }, []);
+  }, [showPaneLimit]);
 
   const openServerView = useCallback((server: OarsServer, view: View) => {
     setTabs((prev) => {
@@ -581,22 +656,37 @@ export default function App() {
         setActiveKey(existing.key);
         return prev.map((tab) => tab.key === existing.key ? { ...tab, view } : tab);
       }
+      if (prev.length >= MAX_WORKSPACE_PANES) {
+        showPaneLimit();
+        return prev;
+      }
       const tab: Tab = { server, key: server.id, view };
       setActiveKey(tab.key);
       return [...prev, tab];
     });
-  }, []);
+  }, [showPaneLimit]);
 
   const openMirrored = useCallback((server: OarsServer, view: View = "terminal") => {
-    fleetCountRef.current += 1;
-    const tab: Tab = { server, key: `${server.id}#${fleetCountRef.current}`, view };
-    setTabs((prev) => [...prev, tab]);
-    setActiveKey(tab.key);
+    setTabs((prev) => {
+      if (prev.length >= MAX_WORKSPACE_PANES) {
+        showPaneLimit();
+        return prev;
+      }
+      fleetCountRef.current += 1;
+      const tab: Tab = { server, key: `${server.id}#${fleetCountRef.current}`, view };
+      setActiveKey(tab.key);
+      return [...prev, tab];
+    });
+  }, [showPaneLimit]);
+
+  const setViewForKey = useCallback((key: string, view: View) => {
+    setTabs((prev) => prev.map((tab) => (tab.key === key ? { ...tab, view } : tab)));
+    setActiveKey(key);
   }, []);
 
   const setView = useCallback((view: View) => {
-    setTabs((prev) => prev.map((t) => (t.key === activeKey ? { ...t, view } : t)));
-  }, [activeKey]);
+    if (activeKey) setViewForKey(activeKey, view);
+  }, [activeKey, setViewForKey]);
 
   const closeTab = useCallback((key: string) => {
     const tab = tabs.find((item) => item.key === key);
@@ -731,6 +821,22 @@ export default function App() {
     });
   }, []);
 
+  const applyLayoutVariant = useCallback((variant: WorkspaceLayoutVariant) => {
+    setLayoutVariant(variant);
+    setMosaicLayout((current) => {
+      const currentKeys = workspaceLayoutKeys(current);
+      const keys = currentKeys.length > 0 ? currentKeys : tabs.map((tab) => tab.key);
+      return buildWorkspaceLayout(keys, variant, compactWorkspace);
+    });
+  }, [compactWorkspace, tabs]);
+
+  const saveDefaultLayout = useCallback(() => {
+    setDefaultLayoutVariant(layoutVariant);
+    try { localStorage.setItem("oars:workspace-layout-default", layoutVariant); } catch {}
+    setToast(`${layoutVariant[0].toUpperCase()}${layoutVariant.slice(1)} is now the default layout.`);
+    window.setTimeout(() => setToast(""), 2400);
+  }, [layoutVariant]);
+
   function onAction(label: string) {
     // fleet-level quick actions map to real UX
     if (label === "Open shell") {
@@ -783,20 +889,18 @@ export default function App() {
       }
     }
     // Spec 07 palette: open Deploy for a saved app on a server
-    try {
-      const deployApps: Array<{ id: string; name: string; server_id: string }> = (window as unknown as { __oarsDeployPalette?: Array<{ id: string; name: string; server_id: string }> }).__oarsDeployPalette ?? [];
-      for (const app of deployApps) {
-        const s = servers.find((x) => x.id === app.server_id);
-        if (!s) continue;
-        const openDeployApp = () => {
-          (window as unknown as { __oarsRequestedDeployApp?: { appId: string; serverId: string } }).__oarsRequestedDeployApp = { appId: app.id, serverId: app.server_id };
+    for (const app of deployAppsForPalette) {
+      const s = servers.find((x) => x.id === app.serverId);
+      if (!s) continue;
+      items.push({
+        label: `Open “${app.name}” deployments on ${s.name}`,
+        action: () => {
+          setPendingDeployApp({ serverId: s.id, appId: app.id });
           openServerView(s, "deploy");
-          window.dispatchEvent(new CustomEvent("oars:select-deploy-app", { detail: { appId: app.id, serverId: app.server_id } }));
           setPaletteOpen(false);
-        };
-        items.push({ label: `Open “${app.name}” deployments on ${s.name}`, action: openDeployApp });
-      }
-    } catch {}
+        },
+      });
+    }
     items.push({ label: "Add server…", action: () => { setModal({}); setPaletteOpen(false); } });
     items.push({ label: `Theme: switch to ${theme === "dark" ? "light" : "dark"}`, action: () => { setTheme(theme === "dark" ? "light" : "dark"); setPaletteOpen(false); } });
     if (!paletteQ) return items.slice(0, 20);
@@ -805,11 +909,6 @@ export default function App() {
   })();
 
   const activeStatus = activeTab ? statuses.get(activeTab.server.id) : undefined;
-  const activeViewConnecting = Boolean(
-    activeTab
-      && CONNECTION_VIEWS.has(activeTab.view)
-      && (!activeStatus || activeStatus === "connecting" || activeStatus === "authenticating"),
-  );
   const connectedCount = Array.from(statuses.values()).filter((status) => status === "ready").length;
   const failedCount = Array.from(statuses.values()).filter((status) => status === "error").length;
   const fleetStatus: SessionStatus | undefined = serversLoading ? "connecting" : failedCount > 0 ? "error" : connectedCount > 0 ? "ready" : undefined;
@@ -823,15 +922,138 @@ export default function App() {
         ? `${connectedCount} connected`
         : servers.length === 0 ? "No servers" : "Fleet idle";
 
+  const renderServerPane = (key: string, path: MosaicPath) => {
+    const tab = tabs.find((item) => item.key === key);
+    if (!tab) return <div />;
+    const status = statuses.get(tab.server.id);
+    const viewConnecting = CONNECTION_VIEWS.has(tab.view)
+      && (!status || status === "connecting" || status === "authenticating");
+    const isMirror = tab.key.includes("#");
+
+    return (
+      <MosaicWindow<string>
+        className={`oars-mosaic-window ${tab.key === activeKey ? "is-active" : ""}`}
+        path={path}
+        title={tab.server.name}
+        draggable
+        renderToolbar={() => (
+          <div
+            className="workspace-pane-toolbar"
+            onPointerDown={() => setActiveKey(tab.key)}
+          >
+            <div className="workspace-pane-drag" title="Drag to move this pane">
+              <GripVertical aria-hidden />
+              <span className={`dot ${sessionStatusClass(status)}`} aria-hidden />
+              <strong>{tab.server.name}{isMirror ? " · mirror" : ""}</strong>
+              <span className="workspace-pane-address">{tab.server.user}@{tab.server.host}:{tab.server.port}</span>
+            </div>
+            <div className="workspace-pane-actions">
+              <span className="workspace-pane-status">{fleetLabel(status)}</span>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label={`Edit ${tab.server.name}`}
+                title="Edit profile"
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={() => setModal({ server: tab.server })}
+              >
+                <Pencil />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label={`Close ${tab.server.name}${isMirror ? " mirror" : ""}`}
+                title="Close pane"
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={() => closeTab(tab.key)}
+              >
+                <X />
+              </Button>
+            </div>
+          </div>
+        )}
+      >
+        <section
+          className="workspace-pane"
+          aria-label={`${tab.server.name} workspace`}
+          onPointerDownCapture={() => setActiveKey(tab.key)}
+        >
+          <nav className="subnav workspace-pane-subnav" role="tablist" aria-label={`${tab.server.name} views`}>
+            {VIEWS.map((view) => (
+              <button
+                key={view.id}
+                role="tab"
+                aria-selected={tab.view === view.id}
+                className={`subnav-item ${tab.view === view.id ? "active" : ""}`}
+                onClick={() => setViewForKey(tab.key, view.id)}
+              >
+                {view.label}
+              </button>
+            ))}
+          </nav>
+
+          <div className="workspace-pane-scroll" hidden={tab.view === "terminal"}>
+            <div className="content workspace-pane-content">
+              {viewConnecting ? (
+                <OarsLoadingState
+                  title={`Connecting to ${tab.server.name}`}
+                  detail="Oars is opening a secure session before it loads this view."
+                />
+              ) : tab.view === "monitor" ? <MonitorTab key={tab.key} server={tab.server} />
+                : tab.view === "logs" ? <LogsTab key={tab.key} server={tab.server} />
+                : tab.view === "files" ? <FilesTab key={tab.key} serverId={tab.server.id} onNavigateToDeploy={() => setViewForKey(tab.key, "deploy")} />
+                : tab.view === "scripts" ? <ScriptsTab key={tab.key} serverId={tab.server.id} servers={servers} statuses={statuses} connected={status === "ready"} initialScriptId={pendingScriptId} />
+                : tab.view === "deploy" ? (
+                  <DeployTab
+                    key={tab.key}
+                    serverId={tab.server.id}
+                    initialAppId={pendingDeployApp?.serverId === tab.server.id ? pendingDeployApp.appId : null}
+                    onAppsLoaded={(apps) => handleDeployAppsLoaded(tab.server.id, apps)}
+                    onClearPendingApp={() => setPendingDeployApp(null)}
+                  />
+                )
+                : tab.view === "keys" ? <KeysTab key={tab.key} serverId={tab.server.id} />
+                : tab.view === "backups" ? <BackupsTab key={tab.key} serverId={tab.server.id} />
+                : tab.view === "ai" ? <AiTab key={tab.key} serverId={tab.server.id} />
+                : tab.view === "vnc" ? (
+                  <Suspense fallback={<OarsLoadingState title="Loading remote desktop" detail="Oars is preparing the secure VNC client." />}>
+                    <VncTab key={tab.key} serverId={tab.server.id} />
+                  </Suspense>
+                )
+                : tab.view === "history" ? <HistoryTab key={tab.key} />
+                : tab.view === "vault" ? <VaultTab key={tab.key} />
+                : tab.view === "agent" ? <AgentTab key={tab.key} />
+                : <div className="empty"><h3>{VIEWS.find((view) => view.id === tab.view)?.label}</h3><p className="muted">Coming in the next spec — backend is ready.</p></div>}
+            </div>
+          </div>
+
+          <div className="terminal-deck workspace-terminal-deck" hidden={tab.view !== "terminal"}>
+            <TerminalTab server={tab.server} onStatus={setStatus} onServerUpdated={handleServerUpdated} />
+          </div>
+        </section>
+      </MosaicWindow>
+    );
+  };
+
   return (
-    <main className="oars-app">
-      <aside className={`sidebar ${mobileNav ? "sidebar-open" : ""}`}>
+    <main className={`oars-app ${sidebarCollapsed ? "has-collapsed-sidebar" : ""}`}>
+      <aside className={`sidebar ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${mobileNav ? "sidebar-open" : ""}`}>
         <div className="brand">
           <div className="brand-mark"><Network /></div>
-          <div><strong>oars</strong><span>LOCAL OPS</span></div>
+          <div className="brand-copy"><strong>oars</strong><span>LOCAL OPS</span></div>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            className="sidebar-collapse-toggle"
+            onClick={() => setSidebarCollapsed((current) => !current)}
+            aria-label={sidebarCollapsed ? "Expand navigation" : "Collapse navigation"}
+            title={sidebarCollapsed ? "Expand navigation" : "Collapse navigation"}
+          >
+            {sidebarCollapsed ? <PanelLeftOpen /> : <PanelLeftClose />}
+          </Button>
           <Button variant="ghost" size="icon-sm" className="mobile-close" onClick={() => setMobileNav(false)} aria-label="Close navigation"><X /></Button>
         </div>
-        <div className="workspace-switcher">
+        <div className="workspace-switcher" title="Workspace: Local machine">
           <div className="workspace-icon"><Cloud /></div>
           <div><span>Workspace</span><strong>Local machine</strong></div>
           <ChevronRight />
@@ -845,9 +1067,10 @@ export default function App() {
                   key={item.label}
                   className={`nav-item ${!activeTab && activeSection === item.label ? "nav-active" : ""}`}
                   onClick={() => { setActiveSection(item.label as Section); setActiveKey(null); setMobileNav(false); }}
+                  title={item.label}
                 >
                   <item.icon />
-                  {item.label}
+                  <span className="nav-item-label">{item.label}</span>
                 </button>
               ))}
             </div>
@@ -867,7 +1090,7 @@ export default function App() {
             {fleetGroups.length === 0 ? (
               <div className="sidebar-fleet-empty">{serversLoading ? "Loading profiles…" : servers.length === 0 ? "No connection profiles yet." : "No matches."}</div>
             ) : fleetGroups.map((group) => {
-              const collapsed = collapsedFleetGroups.has(group.key);
+              const collapsed = !sidebarCollapsed && collapsedFleetGroups.has(group.key);
               return (
                 <div className="sidebar-fleet-group" key={group.key}>
                   <button
@@ -921,7 +1144,7 @@ export default function App() {
             })}
           </div>
           <div className="sidebar-fleet-add">
-            <Button size="sm" onClick={() => setModal({})}><Plus data-icon="inline-start" /> Add server</Button>
+            <Button size="sm" onClick={() => setModal({})} aria-label="Add server" title="Add server"><Plus data-icon="inline-start" /><span>Add server</span></Button>
           </div>
         </div>
         <div className="sidebar-bottom">
@@ -976,74 +1199,56 @@ export default function App() {
         </header>
 
         {tabs.length > 0 && (
-          <div className="tabbar" role="tablist" aria-label="Open server views">
-            {tabs.map((tab) => {
-              const isMirror = tab.key.includes("#");
-              return (
-                <div key={tab.key} className={`tab ${tab.key === activeKey ? "active" : ""}`}>
-                  <button
-                    type="button"
-                    className="tab-select"
-                    role="tab"
-                    aria-selected={tab.key === activeKey}
-                    onClick={() => setActiveKey(tab.key)}
-                    title={isMirror ? `${tab.server.name} — mirrored view` : tab.server.name}
-                  >
-                    <span className={`dot ${sessionStatusClass(statuses.get(tab.server.id))}`} aria-hidden />
-                    <span>{tab.server.name}{isMirror ? " · mirror" : ""}</span>
-                  </button>
-                  <button type="button" className="tab-close" aria-label={`Close ${tab.server.name}${isMirror ? " mirror" : ""}`} title="Close tab" onClick={() => closeTab(tab.key)}><X /></button>
-                </div>
-              );
-            })}
+          <div className="tabbar">
+            <div className="tabbar-tabs" role="tablist" aria-label="Open server views">
+              {tabs.map((tab) => {
+                const isMirror = tab.key.includes("#");
+                return (
+                  <div key={tab.key} className={`tab ${tab.key === activeKey ? "active" : ""}`}>
+                    <button
+                      type="button"
+                      className="tab-select"
+                      role="tab"
+                      aria-selected={tab.key === activeKey}
+                      onClick={() => setActiveKey(tab.key)}
+                      title={isMirror ? `${tab.server.name} — mirrored view` : tab.server.name}
+                    >
+                      <span className={`dot ${sessionStatusClass(statuses.get(tab.server.id))}`} aria-hidden />
+                      <span>{tab.server.name}{isMirror ? " · mirror" : ""}</span>
+                    </button>
+                    <button type="button" className="tab-close" aria-label={`Close ${tab.server.name}${isMirror ? " mirror" : ""}`} title="Close tab" onClick={() => closeTab(tab.key)}><X /></button>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="workspace-layout-controls">
+              <span>{tabs.length} of {MAX_WORKSPACE_PANES}</span>
+              <WorkspaceLayoutPicker
+                value={layoutVariant}
+                defaultValue={defaultLayoutVariant}
+                onChange={applyLayoutVariant}
+                onSaveDefault={saveDefaultLayout}
+              />
+            </div>
           </div>
         )}
 
-        <div className="workspace">
-          {activeTab ? (
-            <div className="workspace-inner">
-              <div className="workspace-header">
-                <div className="ws-title">
-                  <span className="ws-name">{activeTab.server.name}</span>
-                  <span className="ws-meta">{activeTab.server.user}@{activeTab.server.host}:{activeTab.server.port}{activeTab.server.group ? ` · ${activeTab.server.group}` : ""}</span>
-                </div>
-                <div className="ws-actions">
-                  <span className={`dot ${sessionStatusClass(statuses.get(activeTab.server.id))}`} />
-                  <span className="ws-status">{statuses.get(activeTab.server.id) ?? "closed"}</span>
-                  <Button variant="ghost" size="sm" onClick={() => setModal({ server: activeTab.server })}>Edit</Button>
-                </div>
-              </div>
-              <nav className="subnav" role="tablist">
-                {VIEWS.map((v) => (
-                  <button key={v.id} role="tab" aria-selected={activeTab.view === v.id} className={`subnav-item ${activeTab.view === v.id ? "active" : ""}`} onClick={() => setView(v.id)}>{v.label}</button>
-                ))}
-              </nav>
-              {activeTab.view !== "terminal" && <div className="content">
-                {activeViewConnecting ? (
-                  <OarsLoadingState
-                    title={`Connecting to ${activeTab.server.name}`}
-                    detail="Oars is opening a secure session before it loads this view."
-                  />
-                ) : activeTab.view === "monitor" ? <MonitorTab key={activeTab.key} server={activeTab.server} />
-                  : activeTab.view === "logs" ? <LogsTab key={activeTab.key} server={activeTab.server} />
-                  : activeTab.view === "files" ? <FilesTab key={activeTab.key} serverId={activeTab.server.id} onNavigateToDeploy={() => setView("deploy")} />
-                  : activeTab.view === "scripts" ? <ScriptsTab key={activeTab.key} serverId={activeTab.server.id} servers={servers} statuses={statuses} connected={statuses.get(activeTab.server.id) === "ready"} initialScriptId={pendingScriptId} />
-                  : activeTab.view === "deploy" ? <DeployTab key={activeTab.key} serverId={activeTab.server.id} />
-                  : activeTab.view === "keys" ? <KeysTab key={activeTab.key} serverId={activeTab.server.id} />
-                  : activeTab.view === "backups" ? <BackupsTab key={activeTab.key} serverId={activeTab.server.id} />
-                  : activeTab.view === "ai" ? <AiTab key={activeTab.key} serverId={activeTab.server.id} />
-                  : activeTab.view === "vnc" ? (
-                    <Suspense fallback={<OarsLoadingState title="Loading remote desktop" detail="Oars is preparing the secure VNC client." />}>
-                      <VncTab key={activeTab.key} serverId={activeTab.server.id} />
-                    </Suspense>
-                  )
-                  : activeTab.view === "history" ? <HistoryTab key={activeTab.key} />
-                  : activeTab.view === "vault" ? <VaultTab key={activeTab.key} />
-                  : activeTab.view === "agent" ? <AgentTab key={activeTab.key} />
-                  : <div className="empty"><h3>{VIEWS.find((x) => x.id === activeTab.view)?.label}</h3><p className="muted">Coming in the next spec — backend is ready.</p></div>}
-              </div>}
-            </div>
-          ) : serversLoading ? (
+        {tabs.length > 0 && (
+          <div className="workspace workspace-mosaic-host" hidden={!activeTab}>
+            <Mosaic<string>
+              className="oars-mosaic"
+              value={mosaicLayout}
+              onChange={setMosaicLayout}
+              renderTile={renderServerPane}
+              resize={{ minimumPaneSizePercentage: 18 }}
+              zeroStateView={<div />}
+            />
+            {loadError && <div className="form-error workspace-mosaic-error">{loadError}</div>}
+          </div>
+        )}
+
+        {!activeTab && <div className="workspace">
+          {serversLoading ? (
             <OarsLoadingState title="Loading your workspace" detail="Oars is reading local connection profiles and recent activity." />
           ) : activeSection === "Overview" ? (
             <Overview servers={servers} statuses={statuses} search={search} onAdd={() => setModal({})} onOpenServer={openServer} onAction={onAction} />
@@ -1086,36 +1291,21 @@ export default function App() {
               {servers[0] ? <div className="panel" style={{ padding: 0, overflow: "hidden" }}><AiTab serverId={servers[0].id} /></div> : <div className="panel muted" style={{ padding: 22 }}>Add a server to see AI context.</div>}
             </div>
           )}
-          <div className="terminal-deck" hidden={!activeTab || activeTab.view !== "terminal"}>
-            {tabs.map((tab) => (
-              <div key={tab.key} className="terminal-pane" hidden={tab.key !== activeKey || activeTab?.view !== "terminal"}>
-                <TerminalTab server={tab.server} onStatus={setStatus} onServerUpdated={handleServerUpdated} />
-              </div>
-            ))}
-          </div>
           {loadError && <div className="form-error" style={{ marginTop: 14 }}>{loadError}</div>}
-        </div>
+        </div>}
       </section>
 
       {modal && <ServerModal server={modal.server} servers={servers} onClose={() => setModal(null)} onSaved={handleSaved} onDeleted={handleDeleted} />}
 
-      {paletteOpen && (
-        <div className="overlay" onClick={() => setPaletteOpen(false)}>
-          <div className="dialog" onClick={(e) => e.stopPropagation()} style={{ width: 560, maxHeight: "70vh", display: "flex", flexDirection: "column" }}>
-            <div style={{ padding: 12, borderBottom: "1px solid var(--border)" }}>
-              <input autoFocus placeholder="Type a command or search…" value={paletteQ} onChange={(e) => setPaletteQ(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && paletteItems[0]) paletteItems[0].action(); }} style={{ width: "100%", background: "var(--background)", border: "1px solid var(--border)", color: "var(--foreground)", borderRadius: 8, padding: "10px 12px", fontSize: 13 }} />
-            </div>
-            <div style={{ overflow: "auto", padding: 8, display: "grid", gap: 4 }}>
-              {paletteItems.map((it, i) => (
-                <button key={i} onClick={it.action} style={{ textAlign: "left", background: i === 0 ? "var(--accent)" : "var(--background)", border: "1px solid var(--border)", color: i === 0 ? "var(--primary)" : "var(--foreground)", borderRadius: 6, padding: "8px 10px", fontSize: 12, cursor: "pointer" }}>{it.label}</button>
-              ))}
-              {paletteItems.length === 0 && <div className="muted" style={{ padding: 12, fontSize: 12 }}>No matches</div>}
-            </div>
-          </div>
-        </div>
-      )}
+      <CommandPalette
+        isOpen={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        items={paletteItems}
+        query={paletteQ}
+        onQueryChange={setPaletteQ}
+      />
 
-      {toast && <div className="toast"><Check /> {toast}</div>}
+      {toast && <ApplicationNotice><div className="toast"><Check /> {toast}</div></ApplicationNotice>}
     </main>
   );
 }

@@ -15,11 +15,25 @@ import {
 } from "lucide-react";
 import { api, BridgeError } from "./bridge";
 import { Button } from "./components/ui/button";
+import { OarsSelect } from "./components/ui/select";
 import { OarsLoadingState } from "./components/OarsLoadingState";
+import { ApplicationNotice, ApplicationOverlay } from "./components/ApplicationPortal";
+import { useModalFocus } from "./components/useModalFocus";
+import {
+  type GaugeTone,
+  type DiskPlan,
+  type MonitorHistory,
+  DISK_PLANS,
+  gaugeTone,
+  toneLabel,
+  highestTone,
+  bytesToGiB,
+  formatUptime,
+  snapshotMilliseconds,
+  formatSnapshotAge,
+} from "./monitor-state";
 import type { MonitorSnapshot, Server } from "./types";
 
-type GaugeTone = "healthy" | "watch" | "tight" | "critical" | "muted";
-type DiskPlan = "journal" | "apt";
 type RunStatus = "idle" | "running" | "success" | "error";
 
 interface RunState {
@@ -35,33 +49,9 @@ interface PlanState {
 
 type PlanStates = Record<DiskPlan, PlanState>;
 
-interface MonitorHistory {
-  cpu: number[];
-  memory: number[];
-  storage: number[];
-}
-
 type Approval =
   | { kind: "cleanup"; plan: DiskPlan }
   | { kind: "drop-caches" };
-
-const DISK_PLANS: Record<
-  DiskPlan,
-  { title: string; description: string; estimateCommand: string; cleanupCommand: string }
-> = {
-  journal: {
-    title: "System journal",
-    description: "Review current journal use, then remove archived entries older than three days.",
-    estimateCommand: "journalctl --disk-usage",
-    cleanupCommand: "journalctl --vacuum-time=3d",
-  },
-  apt: {
-    title: "APT package cache",
-    description: "Review the package download cache, then remove cached package files.",
-    estimateCommand: "du -sb /var/cache/apt",
-    cleanupCommand: "apt-get clean",
-  },
-};
 
 function emptyRun(): RunState {
   return { status: "idle", output: "", exitCode: null };
@@ -76,55 +66,6 @@ function emptyPlans(): PlanStates {
 
 function emptyHistory(): MonitorHistory {
   return { cpu: [], memory: [], storage: [] };
-}
-
-function bytesToGiB(bytes: number): string {
-  return (bytes / 1024 ** 3).toFixed(1);
-}
-
-function formatUptime(seconds: number): string {
-  const days = Math.floor(seconds / 86400);
-  if (days > 0) return `${days}d`;
-  const hours = Math.floor(seconds / 3600);
-  if (hours > 0) return `${hours}h`;
-  return `${Math.floor(seconds / 60)}m`;
-}
-
-function snapshotMilliseconds(timestamp: number): number {
-  if (timestamp > 1e15) return timestamp / 1e6;
-  if (timestamp > 1e12) return timestamp;
-  return timestamp * 1000;
-}
-
-function formatSnapshotAge(timestamp: number): string {
-  if (!timestamp) return "Waiting for first sample";
-  const ageSeconds = Math.max(0, Math.round((Date.now() - snapshotMilliseconds(timestamp)) / 1000));
-  if (ageSeconds < 5) return "Updated just now";
-  if (ageSeconds < 60) return `Updated ${ageSeconds}s ago`;
-  return `Updated ${Math.floor(ageSeconds / 60)}m ago`;
-}
-
-function gaugeTone(percent: number | null): GaugeTone {
-  if (percent === null) return "muted";
-  if (percent >= 90) return "critical";
-  if (percent >= 80) return "tight";
-  if (percent >= 60) return "watch";
-  return "healthy";
-}
-
-function toneLabel(tone: GaugeTone): string {
-  return {
-    healthy: "Healthy",
-    watch: "Watch",
-    tight: "Tight",
-    critical: "Critical",
-    muted: "Waiting",
-  }[tone];
-}
-
-function highestTone(tones: GaugeTone[]): GaugeTone {
-  const priority: GaugeTone[] = ["critical", "tight", "watch", "healthy", "muted"];
-  return priority.find((tone) => tones.includes(tone)) ?? "muted";
 }
 
 function messageOf(error: unknown): string {
@@ -292,44 +233,14 @@ function MonitorApprovalDialog({
   onCancel: () => void;
   onConfirm: () => void;
 }) {
-  const dialogRef = useRef<HTMLDivElement>(null);
   const isCleanup = approval.kind === "cleanup";
   const plan = isCleanup ? DISK_PLANS[approval.plan] : null;
   const title = isCleanup ? `Run ${plan!.title.toLowerCase()} cleanup?` : "Drop filesystem caches?";
   const command = isCleanup ? plan!.cleanupCommand : `sync; echo ${dropLevel} > /proc/sys/vm/drop_caches`;
-
-  useEffect(() => {
-    const previous = document.activeElement as HTMLElement | null;
-    const dialog = dialogRef.current;
-    dialogRef.current?.querySelector<HTMLButtonElement>("[data-monitor-confirm]")?.focus();
-    const handleKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busy) {
-        event.preventDefault();
-        onCancel();
-        return;
-      }
-      if (event.key !== "Tab" || !dialog) return;
-      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'));
-      if (focusable.length === 0) return;
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    window.addEventListener("keydown", handleKey);
-    return () => {
-      window.removeEventListener("keydown", handleKey);
-      previous?.focus();
-    };
-  }, [busy, onCancel]);
+  const dialogRef = useModalFocus(onCancel, "[data-monitor-confirm]", !busy);
 
   return (
-    <div className="oars-modal-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onCancel(); }}>
+    <ApplicationOverlay role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onCancel(); }}>
       <div ref={dialogRef} className="oars-modal oars-modal-narrow monitor-approval" role="dialog" aria-modal="true" aria-labelledby="monitor-approval-title" aria-describedby="monitor-approval-description">
         <header className="oars-modal-header">
           <div className="oars-modal-title-row">
@@ -369,7 +280,7 @@ function MonitorApprovalDialog({
           </div>
         </footer>
       </div>
-    </div>
+    </ApplicationOverlay>
   );
 }
 
@@ -666,7 +577,7 @@ export function MonitorTab({ server }: { server: Server }) {
         </div>
       )}
       {loadError && <div className="monitor-error" role="alert">{loadError}</div>}
-      {notice && <div className="monitor-toast" role="status">{notice}</div>}
+      {notice && <ApplicationNotice><div className="monitor-toast" role="status">{notice}</div></ApplicationNotice>}
 
       <div className="monitor-metrics">
         <ResourceMetric
@@ -839,11 +750,11 @@ export function MonitorTab({ server }: { server: Server }) {
                 <div><strong>Linux normally manages these caches for you.</strong><p>Dropping them can cause extra disk I/O and processor use while the data is rebuilt.</p></div>
               </div>
               <div className="monitor-drop-row">
-                <label htmlFor="drop-level"><span>Cache type</span><select id="drop-level" value={dropLevel} onChange={(event) => setDropLevel(Number(event.target.value) as 1 | 2 | 3)} disabled={dropRun.status === "running"}>
-                  <option value={1}>Page cache</option>
-                  <option value={2}>Reclaimable slab</option>
-                  <option value={3}>Both (default)</option>
-                </select></label>
+                <label htmlFor="drop-level"><span>Cache type</span><OarsSelect id="drop-level" value={String(dropLevel)} onValueChange={(value) => setDropLevel(Number(value) as 1 | 2 | 3)} disabled={dropRun.status === "running"} options={[
+                  { value: "1", label: "Page cache" },
+                  { value: "2", label: "Reclaimable slab" },
+                  { value: "3", label: "Both (default)" },
+                ]} /></label>
                 <Button variant="destructive" onClick={() => setApproval({ kind: "drop-caches" })} disabled={dropRun.status === "running"}>
                   {dropRun.status === "running" ? <><RefreshCw className="spin" /> Running…</> : "Review and run"}
                 </Button>

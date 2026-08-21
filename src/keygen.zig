@@ -36,6 +36,7 @@ pub const KeygenError = error{
     VerifyFailed,
     InstallFailed,
     Timeout,
+    Canceled,
     OutOfMemory,
 };
 
@@ -54,6 +55,10 @@ pub const GenerateOptions = struct {
     destination: []const u8,
     comment: ?[]const u8 = null,
     passphrase: ?[]const u8 = null,
+    /// Cooperative cancellation: the job worker sets this flag; the
+    /// driver checks it between reads, terminates and reaps the child,
+    /// and returns error.Canceled.
+    cancel: ?*std.atomic.Value(bool) = null,
 };
 
 // --- prompt state machine (pure, unit-tested) ------------------------------
@@ -121,6 +126,7 @@ const c = struct {
     extern "c" fn read(fd: c_int, buf: [*]u8, n: usize) isize;
     extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
     extern "c" fn waitpid(pid: c_int, status: *c_int, options: c_int) c_int;
+    extern "c" fn kill(pid: c_int, sig: c_int) c_int;
     extern "c" fn _exit(code: c_int) noreturn;
 };
 
@@ -173,6 +179,7 @@ fn runSshKeygen(
     ssh_keygen_path: [:0]const u8,
     argv_tail: []const []const u8,
     passphrase: ?[]const u8,
+    cancel: ?*std.atomic.Value(bool),
 ) KeygenError!void {
     const master = c.posix_openpt(o_flags.rdwr | o_flags.noctty);
     if (master < 0) return error.PtyFailed;
@@ -216,6 +223,18 @@ fn runSshKeygen(
         c._exit(127);
     }
 
+    // Every exit past this point terminates and reaps the child before
+    // the error propagates (spec 08: timeout, cancellation, prompt
+    // failure, and verification failure never orphan ssh-keygen).
+    var status: c_int = 0;
+    var child_reaped = false;
+    defer {
+        if (!child_reaped) {
+            _ = c.kill(pid, 9); // SIGKILL: guaranteed termination
+            while (c.waitpid(pid, &status, 0) < 0) {}
+        }
+    }
+
     // Parent: drive the prompts over the master.
     var scratch: std.ArrayList(u8) = .empty;
     defer {
@@ -228,11 +247,13 @@ fn runSshKeygen(
     const pass = passphrase orelse "";
     var feeding = passphrase != null;
     const deadline = std.Io.Timestamp.now(io, .real).nanoseconds + keygen_timeout_ns;
-    var status: c_int = 0;
     var child_done = false;
     var saw_eof = false;
 
     while (true) {
+        if (cancel) |flag| {
+            if (flag.load(.acquire)) return error.Canceled;
+        }
         if (std.Io.Timestamp.now(io, .real).nanoseconds >= deadline) return error.Timeout;
         var fds = [_]std.posix.pollfd{.{ .fd = master, .events = POLLIN, .revents = 0 }};
         const nfds = std.posix.poll(&fds, 250) catch return error.SpawnFailed;
@@ -266,6 +287,7 @@ fn runSshKeygen(
         const wpid = c.waitpid(pid, &status, WNOHANG);
         if (wpid == pid) {
             child_done = true;
+            child_reaped = true;
             break;
         }
         if (saw_eof and sent >= 2 or saw_eof and passphrase == null) break;
@@ -274,6 +296,7 @@ fn runSshKeygen(
 
     if (!child_done) {
         _ = c.waitpid(pid, &status, 0);
+        child_reaped = true;
     }
     if (!std.posix.W.IFEXITED(@intCast(status)) or std.posix.W.EXITSTATUS(@intCast(status)) != 0) return error.GenerationFailed;
 }
@@ -345,7 +368,7 @@ pub fn generate(io: std.Io, allocator: std.mem.Allocator, options: GenerateOptio
         }
     }
 
-    try runSshKeygen(io, allocator, ssh_keygen_path, argv.items, options.passphrase);
+    try runSshKeygen(io, allocator, ssh_keygen_path, argv.items, options.passphrase, options.cancel);
 
     // Verify before install: the private mode is 0600 and the public key
     // parses (spec 08 §6: verify, then no-clobber install).

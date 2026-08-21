@@ -15,6 +15,8 @@ import RFB from "@novnc/novnc";
 import { api, vault, BridgeError } from "./bridge";
 import { Button } from "./components/ui/button";
 import { OarsLoadingState } from "./components/OarsLoadingState";
+import { ApplicationOverlay } from "./components/ApplicationPortal";
+import { useModalFocus } from "./components/useModalFocus";
 import {
   closedTunnelReason,
   desktopProbeLabel,
@@ -828,209 +830,317 @@ export function VncTab({ serverId }: { serverId: string }) {
 
       {/* Credentials dialog */}
       {credDialogOpen && (
-        <div className="oars-modal-overlay" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget && !credBusy) closeCredentials(); }}>
-          <div
-            data-testid="vnc-credentials-dialog"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="vnc-creds-title"
-            className="oars-modal oars-modal-narrow"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <header className="oars-modal-header">
-              <div className="oars-modal-title-row">
-                <span className="oars-modal-icon" aria-hidden><AlertTriangle size={15} /></span>
-                <div>
-                  <h2 id="vnc-creds-title">
-                    {credDialogMode === "manage" ? "Saved VNC password" : credDialogMode === "retry" ? "Replace VNC password" : "VNC password required"}
-                  </h2>
-                  <p className="oars-modal-subtitle">
-                    {credDialogMode === "manage"
-                      ? "Replace or remove the password that Oars reads from the system Keychain."
-                      : credDialogMode === "retry"
-                        ? "The saved password was rejected and removed. Enter the current server password to reconnect."
-                        : "The remote desktop requires a password. It is never stored in app configuration or logs."}
-                  </p>
-                </div>
-                <Button variant="ghost" size="icon-sm" aria-label="Close" onClick={closeCredentials} disabled={credBusy}><X size={14} /></Button>
-              </div>
-            </header>
-            <div className="oars-modal-body" style={{ gap: 12 }}>
-              {credDialogMode !== "manage" && credTypes && legacyVncAuthWarning(credTypes) && (
-                <div data-testid="vnc-legacy-warning" style={{ padding: "10px 12px", border: "1px solid oklch(0.78 0.16 82 / 0.22)", borderRadius: 8, background: "color-mix(in oklch, oklch(0.78 0.16 82) 8%, transparent)", color: "var(--foreground)", fontSize: 11, lineHeight: 1.5 }}>
-                  Legacy VNC Authentication is in use — only the first eight password characters are used to authenticate.
-                </div>
-              )}
-              {lifecycleError && <div style={{ color: "var(--destructive)", fontSize: 11 }}>{lifecycleError}</div>}
-              <label className="oars-field">
-                <span className="oars-label">VNC password</span>
-                <input
-                  data-testid="vnc-password-input"
-                  type="password"
-                  autoFocus
-                  value={credPassword}
-                  onChange={(e) => setCredPassword(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === "Enter" && !credBusy) void submitCredentials(); }}
-                  placeholder="Enter VNC password"
-                  style={{ height: 32, padding: "0 10px", border: "1px solid var(--border)", borderRadius: 7, background: "var(--background)", color: "var(--foreground)", fontSize: 12, outline: "none" }}
-                />
-              </label>
-              {credDialogMode !== "manage" && (
-                <label className="oars-check">
-                  <input data-testid="vnc-remember" type="checkbox" checked={credRemember} onChange={(e) => setCredRemember(e.target.checked)} />
-                  Remember in Keychain
-                </label>
-              )}
-              <p style={{ margin: 0, color: "var(--muted-foreground)", fontSize: 10, lineHeight: 1.5 }}>
-                Remembered passwords are stored as <code style={{ fontFamily: "var(--font-geist-mono, ui-monospace, monospace)", fontSize: 10 }}>vnc:{serverId}</code> in the system Keychain.
-              </p>
-            </div>
-            <footer className="oars-modal-actions oars-modal-footer">
-              {credDialogMode === "manage" && (
-                <div className="oars-modal-actions-left">
-                  <Button data-testid="vnc-password-forget" variant="ghost" onClick={() => void forgetSavedPassword()} disabled={credBusy}>Remove saved</Button>
-                </div>
-              )}
-              <div className="oars-modal-actions-right">
-                <Button variant="ghost" onClick={closeCredentials} disabled={credBusy}>Cancel</Button>
-                <Button data-testid="vnc-password-submit" onClick={() => void submitCredentials()} disabled={credBusy || !credPassword}>
-                  {credBusy ? "Working…" : credDialogMode === "manage" ? "Save password" : credRemember ? "Save and connect" : "Use once"}
-                </Button>
-              </div>
-            </footer>
-          </div>
-        </div>
+        <VncCredentialsModal
+          credDialogMode={credDialogMode}
+          credBusy={credBusy}
+          credTypes={credTypes}
+          lifecycleError={lifecycleError}
+          credPassword={credPassword}
+          setCredPassword={setCredPassword}
+          submitCredentials={submitCredentials}
+          credRemember={credRemember}
+          setCredRemember={setCredRemember}
+          serverId={serverId}
+          forgetSavedPassword={forgetSavedPassword}
+          closeCredentials={closeCredentials}
+        />
       )}
 
-      {/* Setup approval modal (established Oars pattern) */}
+      {/* Setup approval modal */}
       {setupApprovalOpen && setup.kind === "plan" && (
-        <div className="oars-modal-overlay" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget && !setupBusy) setSetupApprovalOpen(false); }}>
-          <div data-testid="vnc-setup-approval" role="dialog" aria-modal="true" aria-labelledby="vnc-setup-title" className="oars-modal oars-modal-narrow" onClick={(e) => e.stopPropagation()}>
-            <header className="oars-modal-header">
-              <div className="oars-modal-title-row">
-                <span className="oars-modal-icon oars-modal-icon-danger" aria-hidden><AlertTriangle size={15} /></span>
-                <div>
-                  <h2 id="vnc-setup-title">
-                    {setup.data.action === "manual"
-                      ? "Manual remote desktop setup"
-                      : setup.data.desktop_action === "install"
-                        ? "Install XFCE desktop?"
-                        : setup.data.desktop_action === "start"
-                          ? "Start XFCE desktop?"
-                          : setup.data.action === "configure" ? "Configure VNC server?" : "Install and configure VNC?"}
-                  </h2>
-                  <p className="oars-modal-subtitle">
-                    {setup.data.action === "manual"
-                      ? "Oars could not determine an install command for this server. Follow the guidance below."
-                      : setup.data.desktop_action === "install"
-                        ? "Oars will install a lightweight XFCE desktop, configure VNC, and start both on the selected display."
-                        : setup.data.desktop_action === "start"
-                          ? "Oars will start the installed XFCE desktop and configure VNC on the selected display."
-                      : setup.data.action === "configure"
-                        ? "Oars will set the server password and restart x11vnc on remote loopback."
-                        : "Oars will install x11vnc, set its password, and start it on remote loopback. This action is audited."}
-                  </p>
-                </div>
-                <Button variant="ghost" size="icon-sm" aria-label="Close" onClick={() => setSetupApprovalOpen(false)} disabled={setupBusy}><X size={14} /></Button>
-              </div>
-            </header>
-            <div className="oars-modal-body" style={{ gap: 12 }}>
-              <label className="oars-check" style={{ alignItems: "flex-start", gap: 10 }}>
-                <input
-                  data-testid="vnc-setup-desktop"
-                  type="checkbox"
-                  checked={setupDesktop}
-                  disabled={setupBusy}
-                  onChange={(e) => void updateDesktopChoice(e.target.checked)}
-                />
-                <span style={{ display: "grid", gap: 2 }}>
-                  <span style={{ color: "var(--foreground)", fontSize: 11, fontWeight: 600 }}>Install or start XFCE desktop</span>
-                  <span style={{ color: "var(--muted-foreground)", fontSize: 10, lineHeight: 1.45 }}>
-                    Recommended for headless servers. This adds desktop packages and runs them under the connected SSH account.
-                  </span>
-                </span>
-              </label>
-              {setup.data.action === "install" && (
-                <div className="monitor-command-preview">
-                  <span>Install command</span>
-                  <code data-testid="vnc-setup-plan">{setup.data.plan}</code>
-                </div>
-              )}
-              {setup.data.hint && setup.data.action !== "manual" && (
-                <div className="monitor-command-preview">
-                  <span>Secure command preview</span>
-                  <code data-testid="vnc-setup-hint">{setup.data.hint}</code>
-                </div>
-              )}
-              {setup.data.action === "manual" && setup.data.hint && (
-                <p style={{ margin: 0, color: "var(--muted-foreground)", fontSize: 11, lineHeight: 1.6 }}>{setup.data.hint}</p>
-              )}
-              {setup.data.action !== "manual" && (
-                <>
-                  {setupPasswordError && <div className="oars-form-error" role="alert">{setupPasswordError}</div>}
-                  <div className="vnc-password-grid">
-                    <label className="oars-field">
-                      <span className="oars-label">Server password</span>
-                      <input
-                        data-testid="vnc-setup-password"
-                        type="password"
-                        autoComplete="new-password"
-                        value={setupPassword}
-                        onChange={(e) => { setSetupPassword(e.target.value); setSetupPasswordError(null); }}
-                        placeholder="Set VNC password"
-                      />
-                    </label>
-                    <label className="oars-field">
-                      <span className="oars-label">Confirm password</span>
-                      <input
-                        data-testid="vnc-setup-password-confirm"
-                        type="password"
-                        autoComplete="new-password"
-                        value={setupPasswordConfirm}
-                        onChange={(e) => { setSetupPasswordConfirm(e.target.value); setSetupPasswordError(null); }}
-                        placeholder="Repeat VNC password"
-                        onKeyDown={(e) => { if (e.key === "Enter" && !setupBusy) void executeSetup(); }}
-                      />
-                    </label>
-                  </div>
-                  <p style={{ margin: 0, color: "var(--muted-foreground)", fontSize: 10, lineHeight: 1.5 }}>
-                    Oars sends the password through command input, creates a mode-0600 authentication file, and starts x11vnc with <code>-localhost -rfbauth</code>. The password is also saved in Keychain for this server.
-                  </p>
-                  {setupExecuting && (
-                    <OarsLoadingState
-                      compact
-                      className="vnc-setup-progress"
-                      title={setup.data.desktop_action === "install" ? "Installing XFCE desktop" : "Configuring remote desktop"}
-                      detail={setup.data.desktop_action === "install" ? "Package installation can take up to 30 minutes and continues if Oars restarts." : `Oars is preparing display :${display}.`}
-                    />
-                  )}
-                </>
-              )}
-            </div>
-            <footer className="oars-modal-actions oars-modal-footer">
-              <div className="oars-modal-actions-right">
-                {setup.data.action !== "manual" && <Button variant="ghost" onClick={() => setSetupApprovalOpen(false)} disabled={setupBusy}>Cancel</Button>}
-                {(setup.data.action === "install" || setup.data.action === "configure") && (
-                  <Button data-testid="vnc-setup-run" onClick={() => void executeSetup()} disabled={setupBusy}>
-                    {setupExecuting
-                      ? setup.data.desktop_action === "install" ? "Installing desktop…" : "Configuring…"
-                      : setupBusy
-                        ? "Updating plan…"
-                      : setup.data.desktop_action === "install"
-                        ? "Install desktop"
-                        : setup.data.desktop_action === "start"
-                          ? "Start desktop"
-                          : setup.data.action === "install" ? "Install and configure" : "Configure and restart"}
-                  </Button>
-                )}
-                {setup.data.action === "manual" && (
-                  <Button variant="outline" onClick={() => setSetupApprovalOpen(false)}>Close</Button>
-                )}
-              </div>
-            </footer>
-          </div>
-        </div>
+        <VncSetupApprovalModal
+          setup={setup}
+          setupBusy={setupBusy}
+          setupDesktop={setupDesktop}
+          updateDesktopChoice={updateDesktopChoice}
+          setupPasswordError={setupPasswordError}
+          setupPassword={setupPassword}
+          setSetupPassword={setSetupPassword}
+          setSetupPasswordError={setSetupPasswordError}
+          setupPasswordConfirm={setupPasswordConfirm}
+          setSetupPasswordConfirm={setSetupPasswordConfirm}
+          executeSetup={executeSetup}
+          setupExecuting={setupExecuting}
+          display={display}
+          onClose={() => setSetupApprovalOpen(false)}
+        />
       )}
     </div>
+  );
+}
+
+function VncCredentialsModal({
+  credDialogMode,
+  credBusy,
+  credTypes,
+  lifecycleError,
+  credPassword,
+  setCredPassword,
+  submitCredentials,
+  credRemember,
+  setCredRemember,
+  serverId,
+  forgetSavedPassword,
+  closeCredentials,
+}: {
+  credDialogMode: CredentialDialogMode;
+  credBusy: boolean;
+  credTypes: string[] | null;
+  lifecycleError: string | null;
+  credPassword: string;
+  setCredPassword: (v: string) => void;
+  submitCredentials: () => Promise<void>;
+  credRemember: boolean;
+  setCredRemember: (v: boolean) => void;
+  serverId: string;
+  forgetSavedPassword: () => Promise<void>;
+  closeCredentials: () => void;
+}) {
+  const dialogRef = useModalFocus(closeCredentials, '[data-testid="vnc-password-input"]', !credBusy);
+  return (
+    <ApplicationOverlay role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget && !credBusy) closeCredentials(); }}>
+      <div
+        ref={dialogRef}
+        data-testid="vnc-credentials-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="vnc-creds-title"
+        aria-describedby="vnc-creds-desc"
+        className="oars-modal oars-modal-narrow"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <header className="oars-modal-header">
+          <div className="oars-modal-title-row">
+            <span className="oars-modal-icon" aria-hidden><AlertTriangle size={15} /></span>
+            <div>
+              <h2 id="vnc-creds-title">
+                {credDialogMode === "manage" ? "Saved VNC password" : credDialogMode === "retry" ? "Replace VNC password" : "VNC password required"}
+              </h2>
+              <p id="vnc-creds-desc" className="oars-modal-subtitle">
+                {credDialogMode === "manage"
+                  ? "Replace or remove the password that Oars reads from the system Keychain."
+                  : credDialogMode === "retry"
+                    ? "The saved password was rejected and removed. Enter the current server password to reconnect."
+                    : "The remote desktop requires a password. It is never stored in app configuration or logs."}
+              </p>
+            </div>
+            <Button variant="ghost" size="icon-sm" aria-label="Close" onClick={closeCredentials} disabled={credBusy}><X size={14} /></Button>
+          </div>
+        </header>
+        <div className="oars-modal-body" style={{ gap: 12 }}>
+          {credDialogMode !== "manage" && credTypes && legacyVncAuthWarning(credTypes) && (
+            <div data-testid="vnc-legacy-warning" style={{ padding: "10px 12px", border: "1px solid oklch(0.78 0.16 82 / 0.22)", borderRadius: 8, background: "color-mix(in oklch, oklch(0.78 0.16 82) 8%, transparent)", color: "var(--foreground)", fontSize: 11, lineHeight: 1.5 }}>
+              Legacy VNC Authentication is in use — only the first eight password characters are used to authenticate.
+            </div>
+          )}
+          {lifecycleError && <div style={{ color: "var(--destructive)", fontSize: 11 }}>{lifecycleError}</div>}
+          <label className="oars-field">
+            <span className="oars-label">VNC password</span>
+            <input
+              data-testid="vnc-password-input"
+              type="password"
+              value={credPassword}
+              onChange={(e) => setCredPassword(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && !credBusy) void submitCredentials(); }}
+              placeholder="Enter VNC password"
+              style={{ height: 32, padding: "0 10px", border: "1px solid var(--border)", borderRadius: 7, background: "var(--background)", color: "var(--foreground)", fontSize: 12, outline: "none" }}
+            />
+          </label>
+          {credDialogMode !== "manage" && (
+            <label className="oars-check">
+              <input data-testid="vnc-remember" type="checkbox" checked={credRemember} onChange={(e) => setCredRemember(e.target.checked)} />
+              Remember in Keychain
+            </label>
+          )}
+          <p style={{ margin: 0, color: "var(--muted-foreground)", fontSize: 10, lineHeight: 1.5 }}>
+            Remembered passwords are stored as <code style={{ fontFamily: "var(--font-geist-mono, ui-monospace, monospace)", fontSize: 10 }}>vnc:{serverId}</code> in the system Keychain.
+          </p>
+        </div>
+        <footer className="oars-modal-actions oars-modal-footer">
+          {credDialogMode === "manage" && (
+            <div className="oars-modal-actions-left">
+              <Button data-testid="vnc-password-forget" variant="ghost" onClick={() => void forgetSavedPassword()} disabled={credBusy}>Remove saved</Button>
+            </div>
+          )}
+          <div className="oars-modal-actions-right">
+            <Button variant="ghost" onClick={closeCredentials} disabled={credBusy}>Cancel</Button>
+            <Button data-testid="vnc-password-submit" onClick={() => void submitCredentials()} disabled={credBusy || !credPassword}>
+              {credBusy ? "Working…" : credDialogMode === "manage" ? "Save password" : credRemember ? "Save and connect" : "Use once"}
+            </Button>
+          </div>
+        </footer>
+      </div>
+    </ApplicationOverlay>
+  );
+}
+
+function VncSetupApprovalModal({
+  setup,
+  setupBusy,
+  setupDesktop,
+  updateDesktopChoice,
+  setupPasswordError,
+  setupPassword,
+  setSetupPassword,
+  setSetupPasswordError,
+  setupPasswordConfirm,
+  setSetupPasswordConfirm,
+  executeSetup,
+  setupExecuting,
+  display,
+  onClose,
+}: {
+  setup: Extract<any, { kind: "plan" }>;
+  setupBusy: boolean;
+  setupDesktop: boolean;
+  updateDesktopChoice: (v: boolean) => Promise<void>;
+  setupPasswordError: string | null;
+  setupPassword: string;
+  setSetupPassword: (v: string) => void;
+  setSetupPasswordError: (v: string | null) => void;
+  setupPasswordConfirm: string;
+  setSetupPasswordConfirm: (v: string) => void;
+  executeSetup: () => Promise<void>;
+  setupExecuting: boolean;
+  display: number;
+  onClose: () => void;
+}) {
+  const dialogRef = useModalFocus(onClose, '[data-testid="vnc-setup-run"]', !setupBusy);
+  return (
+    <ApplicationOverlay role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget && !setupBusy) onClose(); }}>
+      <div
+        ref={dialogRef}
+        data-testid="vnc-setup-approval"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="vnc-setup-title"
+        aria-describedby="vnc-setup-desc"
+        className="oars-modal oars-modal-narrow"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <header className="oars-modal-header">
+          <div className="oars-modal-title-row">
+            <span className="oars-modal-icon oars-modal-icon-danger" aria-hidden><AlertTriangle size={15} /></span>
+            <div>
+              <h2 id="vnc-setup-title">
+                {setup.data.action === "manual"
+                  ? "Manual remote desktop setup"
+                  : setup.data.desktop_action === "install"
+                    ? "Install XFCE desktop?"
+                    : setup.data.desktop_action === "start"
+                      ? "Start XFCE desktop?"
+                      : setup.data.action === "configure" ? "Configure VNC server?" : "Install and configure VNC?"}
+              </h2>
+              <p id="vnc-setup-desc" className="oars-modal-subtitle">
+                {setup.data.action === "manual"
+                  ? "Oars could not determine an install command for this server. Follow the guidance below."
+                  : setup.data.desktop_action === "install"
+                    ? "Oars will install a lightweight XFCE desktop, configure VNC, and start both on the selected display."
+                    : setup.data.desktop_action === "start"
+                      ? "Oars will start the installed XFCE desktop and configure VNC on the selected display."
+                  : setup.data.action === "configure"
+                    ? "Oars will set the server password and restart x11vnc on remote loopback."
+                    : "Oars will install x11vnc, set its password, and start it on remote loopback. This action is audited."}
+              </p>
+            </div>
+            <Button variant="ghost" size="icon-sm" aria-label="Close" onClick={onClose} disabled={setupBusy}><X size={14} /></Button>
+          </div>
+        </header>
+        <div className="oars-modal-body" style={{ gap: 12 }}>
+          <label className="oars-check" style={{ alignItems: "flex-start", gap: 10 }}>
+            <input
+              data-testid="vnc-setup-desktop"
+              type="checkbox"
+              checked={setupDesktop}
+              disabled={setupBusy}
+              onChange={(e) => void updateDesktopChoice(e.target.checked)}
+            />
+            <span style={{ display: "grid", gap: 2 }}>
+              <span style={{ color: "var(--foreground)", fontSize: 11, fontWeight: 600 }}>Install or start XFCE desktop</span>
+              <span style={{ color: "var(--muted-foreground)", fontSize: 10, lineHeight: 1.45 }}>
+                Recommended for headless servers. This adds desktop packages and runs them under the connected SSH account.
+              </span>
+            </span>
+          </label>
+          {setup.data.action === "install" && (
+            <div className="monitor-command-preview">
+              <span>Install command</span>
+              <code data-testid="vnc-setup-plan">{setup.data.plan}</code>
+            </div>
+          )}
+          {setup.data.hint && setup.data.action !== "manual" && (
+            <div className="monitor-command-preview">
+              <span>Secure command preview</span>
+              <code data-testid="vnc-setup-hint">{setup.data.hint}</code>
+            </div>
+          )}
+          {setup.data.action === "manual" && setup.data.hint && (
+            <p style={{ margin: 0, color: "var(--muted-foreground)", fontSize: 11, lineHeight: 1.6 }}>{setup.data.hint}</p>
+          )}
+          {setup.data.action !== "manual" && (
+            <>
+              {setupPasswordError && <div className="oars-form-error" role="alert">{setupPasswordError}</div>}
+              <div className="vnc-password-grid">
+                <label className="oars-field">
+                  <span className="oars-label">Server password</span>
+                  <input
+                    data-testid="vnc-setup-password"
+                    type="password"
+                    autoComplete="new-password"
+                    value={setupPassword}
+                    onChange={(e) => { setSetupPassword(e.target.value); setSetupPasswordError(null); }}
+                    placeholder="Set VNC password"
+                  />
+                </label>
+                <label className="oars-field">
+                  <span className="oars-label">Confirm password</span>
+                  <input
+                    data-testid="vnc-setup-password-confirm"
+                    type="password"
+                    autoComplete="new-password"
+                    value={setupPasswordConfirm}
+                    onChange={(e) => { setSetupPasswordConfirm(e.target.value); setSetupPasswordError(null); }}
+                    placeholder="Repeat VNC password"
+                    onKeyDown={(e) => { if (e.key === "Enter" && !setupBusy) void executeSetup(); }}
+                  />
+                </label>
+              </div>
+              <p style={{ margin: 0, color: "var(--muted-foreground)", fontSize: 10, lineHeight: 1.5 }}>
+                Oars sends the password through command input, creates a mode-0600 authentication file, and starts x11vnc with <code>-localhost -rfbauth</code>. The password is also saved in Keychain for this server.
+              </p>
+              {setupExecuting && (
+                <OarsLoadingState
+                  compact
+                  className="vnc-setup-progress"
+                  title={setup.data.desktop_action === "install" ? "Installing XFCE desktop" : "Configuring remote desktop"}
+                  detail={setup.data.desktop_action === "install" ? "Package installation can take up to 30 minutes and continues if Oars restarts." : `Oars is preparing display :${display}.`}
+                />
+              )}
+            </>
+          )}
+        </div>
+        <footer className="oars-modal-actions oars-modal-footer">
+          <div className="oars-modal-actions-right">
+            {setup.data.action !== "manual" && <Button variant="ghost" onClick={onClose} disabled={setupBusy}>Cancel</Button>}
+            {(setup.data.action === "install" || setup.data.action === "configure") && (
+              <Button data-testid="vnc-setup-run" onClick={() => void executeSetup()} disabled={setupBusy}>
+                {setupExecuting
+                  ? setup.data.desktop_action === "install" ? "Installing desktop…" : "Configuring…"
+                  : setupBusy
+                    ? "Updating plan…"
+                  : setup.data.desktop_action === "install"
+                    ? "Install desktop"
+                    : setup.data.desktop_action === "start"
+                      ? "Start desktop"
+                      : setup.data.action === "install" ? "Install and configure" : "Configure and restart"}
+              </Button>
+            )}
+            {setup.data.action === "manual" && (
+              <Button variant="outline" onClick={onClose}>Close</Button>
+            )}
+          </div>
+        </footer>
+      </div>
+    </ApplicationOverlay>
   );
 }

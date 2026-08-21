@@ -25,6 +25,8 @@ const preflight = @import("preflight.zig");
 const sshkeys = @import("sshkeys.zig");
 const keygen = @import("keygen.zig");
 const access = @import("access.zig");
+const keyjobs = @import("keyjobs.zig");
+const sshd_policy = @import("sshd_policy.zig");
 const backup = @import("backup.zig");
 const vault = @import("vault.zig");
 const agent = @import("agent.zig");
@@ -32,7 +34,7 @@ const ssh = @import("ssh.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 112;
+const handler_count = 118;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -46,6 +48,7 @@ pub const Context = struct {
     apps: *deploy.AppStore,
     deploy_history: *deploy.HistoryStore,
     access: *access.Registry,
+    keys: keyjobs.Registry,
     backup: *backup.Registry,
     ai: *ai.Registry,
     handlers: [handler_count]native_sdk.BridgeHandler = undefined,
@@ -115,15 +118,21 @@ pub const Context = struct {
             .{ .name = "oars.deploy.poll", .context = self, .invoke_fn = handleDeployPoll },
             .{ .name = "oars.deploy.cancel", .context = self, .invoke_fn = handleDeployCancel },
             .{ .name = "oars.deploy.history", .context = self, .invoke_fn = handleDeployHistory },
-            .{ .name = "oars.sshkeys.list", .context = self, .invoke_fn = handleSshKeysList },
+            .{ .name = "oars.sshkeys.inspect", .context = self, .invoke_fn = handleSshKeysInspect },
+            .{ .name = "oars.sshkeys.snapshot", .context = self, .invoke_fn = handleSshKeysSnapshot },
+            .{ .name = "oars.sshkeys.snapshotPoll", .context = self, .invoke_fn = handleSshKeysSnapshotPoll },
+            .{ .name = "oars.sshkeys.snapshotCancel", .context = self, .invoke_fn = handleSshKeysSnapshotCancel },
             .{ .name = "oars.sshkeys.add", .context = self, .invoke_fn = handleSshKeysAdd },
             .{ .name = "oars.sshkeys.revoke", .context = self, .invoke_fn = handleSshKeysRevoke },
             .{ .name = "oars.sshkeys.rotate", .context = self, .invoke_fn = handleSshKeysRotate },
-            .{ .name = "oars.sshkeys.generate", .context = self, .invoke_fn = handleSshKeysGenerate },
-            .{ .name = "oars.sshkeys.roles.list", .context = self, .invoke_fn = handleSshKeysRolesList },
-            .{ .name = "oars.sshkeys.roles.create", .context = self, .invoke_fn = handleSshKeysRolesCreate },
-            .{ .name = "oars.sshkeys.roles.delete", .context = self, .invoke_fn = handleSshKeysRolesDelete },
-            .{ .name = "oars.sshkeys.deployKey.generate", .context = self, .invoke_fn = handleSshKeysDeployKeyGenerate },
+            .{ .name = "oars.sshkeys.rotateCommit", .context = self, .invoke_fn = handleSshKeysRotateCommit },
+            .{ .name = "oars.sshkeys.jobPoll", .context = self, .invoke_fn = handleSshKeysJobPoll },
+            .{ .name = "oars.sshkeys.jobCancel", .context = self, .invoke_fn = handleSshKeysJobCancel },
+            .{ .name = "oars.sshkeys.localGenerate", .context = self, .invoke_fn = handleSshKeysLocalGenerate },
+            .{ .name = "oars.sshkeys.roles.plan", .context = self, .invoke_fn = handleSshKeysRolesPlan },
+            .{ .name = "oars.sshkeys.roles.commit", .context = self, .invoke_fn = handleSshKeysRolesCommit },
+            .{ .name = "oars.sshkeys.deployKeys.generate", .context = self, .invoke_fn = handleSshKeysDeployKeysGenerate },
+            .{ .name = "oars.sshkeys.deployKeys.delete", .context = self, .invoke_fn = handleSshKeysDeployKeysDelete },
             .{ .name = "oars.access.scan", .context = self, .invoke_fn = handleAccessScan },
             .{ .name = "oars.access.scanCancel", .context = self, .invoke_fn = handleAccessScanCancel },
             .{ .name = "oars.access.poll", .context = self, .invoke_fn = handleAccessPoll },
@@ -229,15 +238,21 @@ pub const Context = struct {
             .{ .name = "oars.deploy.poll", .origins = &allowed_origins },
             .{ .name = "oars.deploy.cancel", .origins = &allowed_origins },
             .{ .name = "oars.deploy.history", .origins = &allowed_origins },
-            .{ .name = "oars.sshkeys.list", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.inspect", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.snapshot", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.snapshotPoll", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.snapshotCancel", .origins = &allowed_origins },
             .{ .name = "oars.sshkeys.add", .origins = &allowed_origins },
             .{ .name = "oars.sshkeys.revoke", .origins = &allowed_origins },
             .{ .name = "oars.sshkeys.rotate", .origins = &allowed_origins },
-            .{ .name = "oars.sshkeys.generate", .origins = &allowed_origins },
-            .{ .name = "oars.sshkeys.roles.list", .origins = &allowed_origins },
-            .{ .name = "oars.sshkeys.roles.create", .origins = &allowed_origins },
-            .{ .name = "oars.sshkeys.roles.delete", .origins = &allowed_origins },
-            .{ .name = "oars.sshkeys.deployKey.generate", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.rotateCommit", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.jobPoll", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.jobCancel", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.localGenerate", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.roles.plan", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.roles.commit", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.deployKeys.generate", .origins = &allowed_origins },
+            .{ .name = "oars.sshkeys.deployKeys.delete", .origins = &allowed_origins },
             .{ .name = "oars.access.scan", .origins = &allowed_origins },
             .{ .name = "oars.access.scanCancel", .origins = &allowed_origins },
             .{ .name = "oars.access.poll", .origins = &allowed_origins },
@@ -4513,49 +4528,6 @@ const sshkeys_exec_cap: usize = 8 * 1024;
 const sshkeys_exec_timeout_ns = 10 * std.time.ns_per_s;
 const sshkeys_wait_ns = 20 * std.time.ns_per_s;
 const roles_marker_path = "/etc/oars-roles.json";
-const deploy_key_name = "oars_deploy";
-
-const SshKeysListPayload = struct {
-    server_id: []const u8,
-    user: ?[]const u8 = null,
-};
-const SshKeysAddPayload = struct {
-    server_id: []const u8,
-    public_key: []const u8,
-    comment: ?[]const u8 = null,
-    user: ?[]const u8 = null,
-};
-const SshKeysRevokePayload = struct {
-    server_id: []const u8,
-    fingerprint: []const u8,
-    expected_line_hash: []const u8,
-    user: ?[]const u8 = null,
-};
-const SshKeysRotatePayload = struct {
-    server_id: []const u8,
-    fingerprint: []const u8,
-    expected_line_hash: []const u8,
-    new_public_key: []const u8,
-    user: ?[]const u8 = null,
-};
-const SshKeysGeneratePayload = struct {
-    destination: []const u8,
-    comment: ?[]const u8 = null,
-    passphrase: ?[]const u8 = null,
-    remember_passphrase: bool = false,
-};
-const SshKeysRolesListPayload = struct { server_id: []const u8 };
-const SshKeysRolesCreatePayload = struct {
-    server_id: []const u8,
-    name: []const u8,
-    read_only: bool = false,
-};
-const SshKeysRolesDeletePayload = struct {
-    server_id: []const u8,
-    name: []const u8,
-};
-const SshKeysDeployKeyPayload = struct { server_id: []const u8 };
-
 fn validRoleName(name: []const u8) bool {
     if (name.len == 0 or name.len > 32) return false;
     const first = name[0];
@@ -4900,136 +4872,47 @@ fn sshkeysRoleOptions(self: *Context, server_id: []const u8, user: []const u8) ?
     return null;
 }
 
-fn handleSshKeysList(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(SshKeysListPayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
-    defer parsed.deinit();
-    var err_response: []const u8 = "";
-    const path = sshkeysPath(self, output, parsed.value.server_id, parsed.value.user, &err_response) orelse return err_response;
-    defer self.allocator.free(path);
-    const content = sshkeysRead(self, parsed.value.server_id, path) orelse "";
-    defer if (content.len > 0) self.allocator.free(content);
-    var file = sshkeys.parse(self.allocator, content) catch {
-        return respondError(output, "failed to parse authorized_keys");
-    };
-    defer file.deinit(self.allocator);
+// --- roles (spec 08 §4.2) -----------------------------------------------------
 
-    var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,\"keys\":[") catch return output[0..0];
-    var first = true;
-    for (file.keys) |*k| {
-        if (!first) writer.writeAll(",") catch return output[0..0];
-        first = false;
-        writer.writeAll("{\"line_index\":") catch return output[0..0];
-        writer.print("{d}", .{k.line_index}) catch return output[0..0];
-        writer.writeAll(",\"parsed\":") catch return output[0..0];
-        writer.writeAll(if (k.parsed) "true" else "false") catch return output[0..0];
-        if (k.parsed) {
-            writer.writeAll(",\"options\":") catch return output[0..0];
-            json.writeJsonString(&writer, k.options) catch return output[0..0];
-            writer.writeAll(",\"type\":") catch return output[0..0];
-            json.writeJsonString(&writer, k.key_type) catch return output[0..0];
-            writer.writeAll(",\"key\":") catch return output[0..0];
-            json.writeJsonString(&writer, k.key) catch return output[0..0];
-            writer.writeAll(",\"comment\":") catch return output[0..0];
-            json.writeJsonString(&writer, k.comment) catch return output[0..0];
-            writer.writeAll(",\"fingerprint_sha256\":") catch return output[0..0];
-            json.writeJsonString(&writer, k.fingerprint_sha256) catch return output[0..0];
-            writer.writeAll(",\"bits\":") catch return output[0..0];
-            if (k.bits) |b| {
-                writer.print("{d}", .{b}) catch return output[0..0];
-            } else {
-                writer.writeAll("null") catch return output[0..0];
-            }
-            writer.writeAll(",\"line_hash\":") catch return output[0..0];
-            json.writeJsonString(&writer, k.line_hash) catch return output[0..0];
-        } else {
-            // Malformed lines surface with their raw text (spec 08 §10).
-            writer.writeAll(",\"raw\":") catch return output[0..0];
-            json.writeJsonString(&writer, k.raw) catch return output[0..0];
-            writer.writeAll(",\"error\":") catch return output[0..0];
-            json.writeJsonString(&writer, k.@"error") catch return output[0..0];
-            writer.writeAll(",\"line_hash\":") catch return output[0..0];
-            json.writeJsonString(&writer, k.line_hash) catch return output[0..0];
-        }
-        writer.writeAll("}") catch return output[0..0];
+/// The roles marker (`/etc/oars-roles.json`): Oars-created role users,
+/// with the forced command recorded from the server's SFTP subsystem.
+const RolesMarkerEntry = struct {
+    name: []const u8,
+    read_only: bool,
+    forced_command: []const u8 = "",
+};
+
+fn sshkeysRolesLoad(self: *Context, server_id: []const u8, out: *std.ArrayList(RolesMarkerEntry)) bool {
+    const content = sshkeysRead(self, server_id, roles_marker_path) orelse return true;
+    defer self.allocator.free(content);
+    if (content.len == 0) return true;
+    const parsed = std.json.parseFromSlice([]RolesMarkerEntry, self.allocator, content, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return false;
+    defer parsed.deinit();
+    for (parsed.value) |r| {
+        out.append(self.allocator, .{
+            .name = self.allocator.dupe(u8, r.name) catch return false,
+            .read_only = r.read_only,
+            .forced_command = self.allocator.dupe(u8, r.forced_command) catch return false,
+        }) catch return false;
     }
-    writer.writeAll("]}") catch return output[0..0];
-    return writer.buffered();
+    return true;
 }
 
-fn handleSshKeysAdd(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(SshKeysAddPayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
-    defer parsed.deinit();
-    const payload = parsed.value;
-    var err_response: []const u8 = "";
-    const path = sshkeysPath(self, output, payload.server_id, payload.user, &err_response) orelse return err_response;
-    defer self.allocator.free(path);
-    if (sshkeysEnsureSshDir(self, payload.server_id, path)) |msg| return respondError(output, msg);
-
-    const normalized = sshkeys.normalizePublicKey(self.allocator, payload.public_key, payload.comment) catch |err| {
-        return respondError(output, switch (err) {
-            error.Multiline => "public key must be a single line",
-            else => "invalid public key",
-        });
-    };
-    defer {
-        self.allocator.free(normalized.line);
-        self.allocator.free(normalized.fingerprint_sha256);
-    }
-
-    // Read-only role keys get the forced-command options automatically.
-    var options: ?[]const u8 = null;
-    defer if (options) |o| self.allocator.free(o);
-    if (payload.user) |u| options = sshkeysRoleOptions(self, payload.server_id, u);
-
-    const content = sshkeysRead(self, payload.server_id, path) orelse "";
-    defer if (content.len > 0) self.allocator.free(content);
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(self.allocator);
-    if (content.len > 0) {
-        try out.appendSlice(self.allocator, content);
-        if (content[content.len - 1] != '\n') try out.append(self.allocator, '\n'); // newline guard
-    }
-    if (options) |o| {
-        try out.appendSlice(self.allocator, o);
-        try out.append(self.allocator, ' ');
-    }
-    try out.appendSlice(self.allocator, normalized.line);
-    try out.append(self.allocator, '\n');
-
-    const mode = sshkeysMode(self, payload.server_id, path);
-    var write_err_buf: [256]u8 = undefined;
-    if (sshkeysWrite(self, payload.server_id, path, out.items, mode, payload.user, &write_err_buf)) |msg| return respondError(output, msg);
-
-    // Report the new line's index/hash from the written state.
-    var written = sshkeys.parse(self.allocator, out.items) catch {
-        return respondError(output, "failed to parse the written file");
-    };
-    defer written.deinit(self.allocator);
-    var line_index: usize = 0;
-    if (written.keys.len > 0) line_index = written.keys[written.keys.len - 1].line_index;
-    var detail_buf: [256]u8 = undefined;
-    const detail = std.fmt.bufPrint(&detail_buf, "fingerprint={s} user={s}", .{ normalized.fingerprint_sha256, payload.user orelse "-" }) catch "sshkeys.add";
-    sshkeysAudit(self, "sshkeys.add", payload.server_id, detail);
-    var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,\"line_index\":") catch return output[0..0];
-    writer.print("{d},\"fingerprint\":", .{line_index}) catch return output[0..0];
-    json.writeJsonString(&writer, normalized.fingerprint_sha256) catch return output[0..0];
-    writer.writeAll(",\"line_hash\":") catch return output[0..0];
-    json.writeJsonString(&writer, written.keys[written.keys.len - 1].line_hash) catch return output[0..0];
-    writer.writeAll("}") catch return output[0..0];
-    return writer.buffered();
+fn sshkeysRolesSave(self: *Context, server_id: []const u8, roles: *const std.ArrayList(RolesMarkerEntry)) bool {
+    var out: std.Io.Writer.Allocating = .init(self.allocator);
+    defer out.deinit();
+    std.json.Stringify.value(roles.items, .{}, &out.writer) catch return false;
+    var err_buf: [256]u8 = undefined;
+    return sshkeysWrite(self, server_id, roles_marker_path, out.writer.buffered(), 0o600, null, &err_buf) == null;
 }
 
-/// Loads the file, finds the target key by fingerprint + line hash, and
-/// rewrites it (drop or replace). Shared by revoke and rotate. Returns
-/// null with a plain message in `msg` on any conflict.
+/// The shared read/parse/guard/rewrite/write path used by spec 09 access
+/// jobs (spec 08 mutations run through the keyjobs drivers instead).
+/// Returns the rewritten content on success; `msg` carries a static or
+/// `write_err_buf`-backed reason otherwise.
 fn sshkeysRewriteCore(
     self: *Context,
     server_id: []const u8,
@@ -5090,267 +4973,22 @@ fn sshkeysRewriteCore(
     return rewritten;
 }
 
-/// Bridge-facing wrapper: failures become JSON error responses.
-fn sshkeysRewrite(
-    self: *Context,
-    output: []u8,
-    err_response: *[]const u8,
-    server_id: []const u8,
-    path: []const u8,
-    fingerprint: []const u8,
-    expected_hash: []const u8,
-    replacement: ?[]const u8,
-    owner: ?[]const u8,
-) ?[]u8 {
-    var msg: []const u8 = "";
-    // The write error text is formatted into this frame's buffer so it
-    // stays valid until respondError copies it (the heap outcome that
-    // produced it is destroyed before sshkeysWrite returns).
-    var write_err_buf: [256]u8 = undefined;
-    const rewritten = sshkeysRewriteCore(self, server_id, path, fingerprint, expected_hash, replacement, owner, &msg, &write_err_buf) orelse {
-        err_response.* = respondError(output, msg);
-        return null;
-    };
-    return rewritten;
+const sshkeys_disabled_password_hash = "$6$oars-disabled$lpNdEPf3.DwtukqfRj4YY0/dfZbbT9NpQRWqiqapBqjNgUKbnotVRGvSJ9sJaEd7f2wrX4L.NTvtpFwcRj21ws";
+
+fn sshkeysRoleCreateCommand(buffer: []u8, name: []const u8) ![]const u8 {
+    // useradd's lock marker also blocks public-key authentication on some sshd
+    // configurations. A valid SHA-512-crypt-shaped value with no known
+    // preimage keeps the account unlocked without enabling password login.
+    return std.fmt.bufPrint(buffer, "useradd -m -s /bin/bash {s} && usermod -p '{s}' {s}", .{ name, sshkeys_disabled_password_hash, name });
 }
 
-fn handleSshKeysRevoke(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(SshKeysRevokePayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
-    defer parsed.deinit();
-    const payload = parsed.value;
-    var err_response: []const u8 = "";
-    const path = sshkeysPath(self, output, payload.server_id, payload.user, &err_response) orelse return err_response;
-    defer self.allocator.free(path);
-    const rewritten = sshkeysRewrite(self, output, &err_response, payload.server_id, path, payload.fingerprint, payload.expected_line_hash, null, payload.user) orelse return err_response;
-    self.allocator.free(rewritten);
-    var detail_buf: [256]u8 = undefined;
-    const detail = std.fmt.bufPrint(&detail_buf, "fingerprint={s} user={s}", .{ payload.fingerprint, payload.user orelse "-" }) catch "sshkeys.revoke";
-    sshkeysAudit(self, "sshkeys.revoke", payload.server_id, detail);
-    return ok_json;
-}
-
-fn handleSshKeysRotate(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(SshKeysRotatePayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
-    defer parsed.deinit();
-    const payload = parsed.value;
-    const normalized = sshkeys.normalizePublicKey(self.allocator, payload.new_public_key, null) catch |err| {
-        return respondError(output, switch (err) {
-            error.Multiline => "public key must be a single line",
-            else => "invalid public key",
-        });
-    };
-    defer {
-        self.allocator.free(normalized.line);
-        self.allocator.free(normalized.fingerprint_sha256);
-    }
-    var err_response: []const u8 = "";
-    const path = sshkeysPath(self, output, payload.server_id, payload.user, &err_response) orelse return err_response;
-    defer self.allocator.free(path);
-    const rewritten = sshkeysRewrite(self, output, &err_response, payload.server_id, path, payload.fingerprint, payload.expected_line_hash, normalized.line, payload.user) orelse return err_response;
-    self.allocator.free(rewritten);
-    var detail_buf: [256]u8 = undefined;
-    const detail = std.fmt.bufPrint(&detail_buf, "old={s} new={s} user={s}", .{ payload.fingerprint, normalized.fingerprint_sha256, payload.user orelse "-" }) catch "sshkeys.rotate";
-    sshkeysAudit(self, "sshkeys.rotate", payload.server_id, detail);
-    return ok_json;
-}
-
-/// Local key generation (spec 08 §5): ssh-keygen through a private PTY;
-/// the passphrase never enters argv, env, or audit text. When
-/// `remember_passphrase` is set, the response names the Keychain account
-/// (`localkey:<fingerprint>`) the frontend stores the passphrase under.
-fn handleSshKeysGenerate(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(SshKeysGeneratePayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
-    defer parsed.deinit();
-    const payload = parsed.value;
-    const generated = keygen.generate(self.io, self.allocator, .{
-        .destination = payload.destination,
-        .comment = payload.comment,
-        .passphrase = payload.passphrase,
-    }) catch |err| {
-        return respondError(output, switch (err) {
-            error.SshKeygenMissing => "ssh-keygen is not available on this machine",
-            error.InvalidDestination => "invalid destination path",
-            error.DestinationMissing => "the destination folder does not exist",
-            error.DestinationExists => "a key already exists at that destination",
-            error.PtyFailed, error.SpawnFailed, error.PromptFailed => "ssh-keygen failed during generation",
-            error.GenerationFailed => "ssh-keygen failed to generate the key",
-            error.VerifyFailed => "the generated key failed verification",
-            error.InstallFailed => "failed to install the key pair",
-            error.Timeout => "ssh-keygen did not finish in time",
-            error.UnexpectedOutput => "ssh-keygen produced unexpected output",
-            error.OutOfMemory => "out of memory",
-        });
-    };
-    defer {
-        self.allocator.free(generated.public_key);
-        self.allocator.free(generated.private_path);
-        self.allocator.free(generated.fingerprint_sha256);
-    }
-    var detail_buf: [512]u8 = undefined;
-    const detail = std.fmt.bufPrint(&detail_buf, "destination={s} type=ed25519 fingerprint={s}", .{ generated.private_path, generated.fingerprint_sha256 }) catch "sshkeys.generate";
-    sshkeysAudit(self, "sshkeys.generate", "-", detail);
-    var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,\"public_key\":") catch return output[0..0];
-    json.writeJsonString(&writer, generated.public_key) catch return output[0..0];
-    writer.writeAll(",\"private_path\":") catch return output[0..0];
-    json.writeJsonString(&writer, generated.private_path) catch return output[0..0];
-    if (payload.remember_passphrase and payload.passphrase != null and payload.passphrase.?.len > 0) {
-        writer.writeAll(",\"keychain_account\":") catch return output[0..0];
-        var account_buf: [128]u8 = undefined;
-        const account = std.fmt.bufPrint(&account_buf, "localkey:{s}", .{generated.fingerprint_sha256}) catch "";
-        json.writeJsonString(&writer, account) catch return output[0..0];
-    }
-    writer.writeAll("}") catch return output[0..0];
-    return writer.buffered();
-}
-
-// --- roles (spec 08 §4.2) -----------------------------------------------------
-
-/// The roles marker (`/etc/oars-roles.json`): Oars-created role users,
-/// with the forced command recorded from the server's SFTP subsystem.
-const RolesMarkerEntry = struct {
-    name: []const u8,
-    read_only: bool,
-    forced_command: []const u8 = "",
-};
-
-fn sshkeysRolesLoad(self: *Context, server_id: []const u8, out: *std.ArrayList(RolesMarkerEntry)) bool {
-    const content = sshkeysRead(self, server_id, roles_marker_path) orelse return true;
-    defer self.allocator.free(content);
-    if (content.len == 0) return true;
-    const parsed = std.json.parseFromSlice([]RolesMarkerEntry, self.allocator, content, .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_always,
-    }) catch return false;
-    defer parsed.deinit();
-    for (parsed.value) |r| {
-        out.append(self.allocator, .{
-            .name = self.allocator.dupe(u8, r.name) catch return false,
-            .read_only = r.read_only,
-            .forced_command = self.allocator.dupe(u8, r.forced_command) catch return false,
-        }) catch return false;
-    }
-    return true;
-}
-
-fn sshkeysRolesSave(self: *Context, server_id: []const u8, roles: *const std.ArrayList(RolesMarkerEntry)) bool {
-    var out: std.Io.Writer.Allocating = .init(self.allocator);
-    defer out.deinit();
-    std.json.Stringify.value(roles.items, .{}, &out.writer) catch return false;
-    var err_buf: [256]u8 = undefined;
-    return sshkeysWrite(self, server_id, roles_marker_path, out.writer.buffered(), 0o600, null, &err_buf) == null;
-}
-
-fn handleSshKeysRolesList(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(SshKeysRolesListPayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
-    defer parsed.deinit();
-    const server_id = parsed.value.server_id;
-    const session = self.manager.get(server_id) orelse return respondError(output, "not connected");
-    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
-    var roles: std.ArrayList(RolesMarkerEntry) = .empty;
-    defer {
-        for (roles.items) |*r| {
-            self.allocator.free(r.name);
-            self.allocator.free(r.forced_command);
-        }
-        roles.deinit(self.allocator);
-    }
-    if (!sshkeysRolesLoad(self, server_id, &roles)) return respondError(output, "failed to read the roles marker");
-
-    var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,\"roles\":[") catch return output[0..0];
-    var first = true;
-    for (roles.items) |*role| {
-        // Live state: the user must still exist; read the shell and home.
-        var cmd_buf: [96]u8 = undefined;
-        const cmd = std.fmt.bufPrint(&cmd_buf, "getent passwd {s}", .{role.name}) catch continue;
-        var check = self.manager.execWait(server_id, cmd, sshkeys_exec_cap, sshkeys_exec_timeout_ns) catch continue;
-        defer check.output.deinit(self.allocator);
-        if (check.exit != 0) continue; // stale marker entry
-        const passwd = std.mem.trim(u8, check.output.items, " \t\r\n");
-        var tokens = std.mem.splitScalar(u8, passwd, ':');
-        var fields: [16][]const u8 = undefined;
-        var n: usize = 0;
-        while (tokens.next()) |t| {
-            if (n >= fields.len) break;
-            fields[n] = t;
-            n += 1;
-        }
-        if (n < 7) continue;
-        const home = fields[n - 2];
-        const shell = fields[n - 1];
-
-        if (!first) writer.writeAll(",") catch return output[0..0];
-        first = false;
-        writer.writeAll("{\"name\":") catch return output[0..0];
-        json.writeJsonString(&writer, role.name) catch return output[0..0];
-        writer.writeAll(",\"shell\":") catch return output[0..0];
-        json.writeJsonString(&writer, shell) catch return output[0..0];
-        writer.print(",\"read_only\":{s},\"policy\":", .{if (role.read_only) "true" else "false"}) catch return output[0..0];
-        json.writeJsonString(&writer, if (role.read_only) "read-only-sftp" else "standard") catch return output[0..0];
-        writer.writeAll(",\"users\":[") catch return output[0..0];
-        // The people holding keys on this account (authorized_keys comments).
-        var ak_buf: [512]u8 = undefined;
-        const ak_cmd = std.fmt.bufPrint(&ak_buf, "cat {s}/.ssh/authorized_keys 2>/dev/null", .{home}) catch "";
-        if (ak_cmd.len > 0) {
-            var ak = self.manager.execWait(server_id, ak_cmd, sshkeys_exec_cap, sshkeys_exec_timeout_ns) catch null;
-            if (ak) |*a| {
-                defer a.output.deinit(self.allocator);
-                var file = sshkeys.parse(self.allocator, a.output.items) catch null;
-                if (file) |*f| {
-                    defer f.deinit(self.allocator);
-                    var k_first = true;
-                    for (f.keys) |*k| {
-                        if (!k.parsed) continue;
-                        if (!k_first) writer.writeAll(",") catch return output[0..0];
-                        k_first = false;
-                        json.writeJsonString(&writer, k.comment) catch return output[0..0];
-                    }
-                }
-            }
-        }
-        writer.writeAll("]}") catch return output[0..0];
-    }
-    writer.writeAll("]}") catch return output[0..0];
-    return writer.buffered();
-}
-
-/// Runs one privileged command; returns false on non-zero exit (the
-/// caller's error response is set).
-fn sshkeysExec(self: *Context, output: []u8, err_response: *[]const u8, server_id: []const u8, cmd: []const u8, fail_msg: []const u8) bool {
-    var check = self.manager.execWait(server_id, cmd, sshkeys_exec_cap, sshkeys_exec_timeout_ns) catch {
-        err_response.* = respondError(output, "not connected");
-        return false;
-    };
-    defer check.output.deinit(self.allocator);
-    if (check.exit != 0) {
-        err_response.* = respondError(output, fail_msg);
-        return false;
-    }
-    return true;
-}
-
-/// Creates (or verifies) a role user: root check, capability-detected
-/// forced command for read-only roles, `useradd -m -s /bin/bash -p ''`,
-/// per-user 0700/0600 ssh setup, and the roles marker update. Idempotent:
-/// an existing matching role verifies the user and returns null. Returns
-/// a plain error message on failure. Callers audit (the same role may be
-/// created from `sshkeys.roles.create` or an access onboard job).
+/// Creates (or verifies) a role user for spec 09 access onboard jobs:
+/// root check, capability-detected forced command for read-only roles,
+/// an unlocked account with password login disabled, per-user 0700/0600 SSH
+/// setup, and the roles marker update. Idempotent: an existing matching role
+/// verifies the user and returns null. Spec 08 role management runs through
+/// the plan/commit job drivers instead.
 fn sshkeysRoleEnsureCore(self: *Context, server_id: []const u8, name: []const u8, read_only: bool) ?[]const u8 {
-    // User creation requires root (spec 08 §4.2: show the exact
-    // privileged commands; stop when the authority is absent).
     var id_check = self.manager.execWait(server_id, "id -u", sshkeys_exec_cap, sshkeys_exec_timeout_ns) catch {
         return "not connected";
     };
@@ -5371,7 +5009,6 @@ fn sshkeysRoleEnsureCore(self: *Context, server_id: []const u8, name: []const u8
     for (roles.items) |r| {
         if (std.mem.eql(u8, r.name, name)) {
             if (r.read_only != read_only) return "a user with this name already exists but is not the requested role type";
-            // Idempotent: the role already exists; verify the user does too.
             var cmd_buf: [96]u8 = undefined;
             const cmd = std.fmt.bufPrint(&cmd_buf, "getent passwd {s}", .{name}) catch return "role user is missing";
             var check = self.manager.execWait(server_id, cmd, sshkeys_exec_cap, sshkeys_exec_timeout_ns) catch {
@@ -5383,8 +5020,6 @@ fn sshkeysRoleEnsureCore(self: *Context, server_id: []const u8, name: []const u8
         }
     }
 
-    // Capability-detect the SFTP subsystem for read-only roles before
-    // creating anything (spec 08 §4.2).
     var forced_command: []const u8 = "";
     var forced_owned: ?[]u8 = null;
     defer if (forced_owned) |f| self.allocator.free(f);
@@ -5402,11 +5037,8 @@ fn sshkeysRoleEnsureCore(self: *Context, server_id: []const u8, name: []const u8
         forced_command = forced_owned.?;
     }
 
-    var useradd_buf: [160]u8 = undefined;
-    // `-p ''` creates an unlocked account with an empty password field:
-    // sshd refuses key auth for locked accounts, and password auth stays
-    // refused (no PermitEmptyPasswords). Key access is the only way in.
-    const useradd_cmd = std.fmt.bufPrint(&useradd_buf, "useradd -m -s /bin/bash -p '' {s}", .{name}) catch return "invalid role name";
+    var useradd_buf: [320]u8 = undefined;
+    const useradd_cmd = sshkeysRoleCreateCommand(&useradd_buf, name) catch return "invalid role name";
     var created = self.manager.execWait(server_id, useradd_cmd, sshkeys_exec_cap, sshkeys_exec_timeout_ns) catch {
         return "not connected";
     };
@@ -5444,7 +5076,6 @@ fn sshkeysRoleEnsureCore(self: *Context, server_id: []const u8, name: []const u8
     defer setup_check.output.deinit(self.allocator);
     if (setup_check.exit != 0) return "failed to set up the role user";
 
-    // Record the role (with the forced command, for future key adds).
     roles.append(self.allocator, .{
         .name = self.allocator.dupe(u8, name) catch return "out of memory",
         .read_only = read_only,
@@ -5454,94 +5085,4083 @@ fn sshkeysRoleEnsureCore(self: *Context, server_id: []const u8, name: []const u8
     return null;
 }
 
-fn handleSshKeysRolesCreate(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(SshKeysRolesCreatePayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
-    defer parsed.deinit();
-    const payload = parsed.value;
-    if (!validRoleName(payload.name)) return respondError(output, "invalid role name");
-    if (std.mem.eql(u8, payload.name, "root")) return respondError(output, "invalid role name");
+// --- ssh key management (spec 08, worker-driven) -----------------------------
+//
+// Every SSH/SFTP step below runs on the keyjobs coordinator thread (or the
+// local job worker for ssh-keygen); bridge handlers only validate, freeze a
+// bounded request into a snapshot/job record, register it, and serialize
+// locked state. Poll calls never advance an operation (specs README).
 
-    const server_id = payload.server_id;
-    if (sshkeysRoleEnsureCore(self, server_id, payload.name, payload.read_only)) |msg| {
-        return respondError(output, msg);
-    }
-    var detail_buf: [128]u8 = undefined;
-    const detail = std.fmt.bufPrint(&detail_buf, "name={s} read_only={s}", .{ payload.name, if (payload.read_only) "yes" else "no" }) catch "sshkeys.roles.create";
-    sshkeysAudit(self, "sshkeys.roles.create", server_id, detail);
-    return ok_json;
+const keys_exec_cap: usize = 256 * 1024;
+const keys_exec_timeout_ns = 15 * std.time.ns_per_s;
+const keys_sftp_wait_ns = 25 * std.time.ns_per_s;
+const keys_verify_wait_ns = 20 * std.time.ns_per_s;
+const keys_max_id_text: usize = 128;
+const keys_max_path_text: usize = 4096;
+const keys_max_comment_text: usize = 256;
+const keys_max_key_text: usize = sshkeys.max_key_line_bytes;
+const keys_max_passphrase_text: usize = 1024;
+const deploy_manifest_file = "oars_deploy_keys.json";
+const deploy_key_prefix = "oars_deploy_";
+
+const KeysInspectPayload = struct { public_key: []const u8, comment: ?[]const u8 = null };
+const KeysAccountPayload = struct { kind: []const u8, name: ?[]const u8 = null };
+const KeysSnapshotPayload = struct { server_id: []const u8, account: KeysAccountPayload };
+const KeysSnapshotIdPayload = struct { snapshot_id: []const u8 };
+const KeysJobIdPayload = struct { job_id: []const u8 };
+const KeysAddPayload = struct {
+    operation_id: []const u8,
+    snapshot_id: []const u8,
+    source_path: []const u8,
+    file_sha256: []const u8,
+    public_key: []const u8,
+    comment: ?[]const u8 = null,
+};
+const KeysRevokePayload = struct {
+    operation_id: []const u8,
+    snapshot_id: []const u8,
+    source_path: []const u8,
+    file_sha256: []const u8,
+    fingerprint: []const u8,
+    line_hash: []const u8,
+    confirm_fingerprint: ?[]const u8 = null,
+};
+const KeysRotatePayload = struct {
+    operation_id: []const u8,
+    snapshot_id: []const u8,
+    source_path: []const u8,
+    file_sha256: []const u8,
+    old_fingerprint: []const u8,
+    line_hash: []const u8,
+    new_public_key: []const u8,
+};
+/// Flattened union (the frontend sends `{kind, ...}`): dispatch on `kind`.
+const KeysVerificationPayload = struct {
+    kind: []const u8,
+    path: ?[]const u8 = null,
+    passphrase: ?[]const u8 = null,
+    confirm_fingerprint: ?[]const u8 = null,
+};
+const KeysRotateCommitPayload = struct { job_id: []const u8, verification: KeysVerificationPayload };
+const KeysLocalGeneratePayload = struct {
+    operation_id: []const u8,
+    destination: []const u8,
+    comment: ?[]const u8 = null,
+    passphrase: ?[]const u8 = null,
+};
+const KeysRolesPlanPayload = struct {
+    server_id: []const u8,
+    name: []const u8,
+    kind: []const u8,
+    action: []const u8,
+};
+const KeysRolesCommitPayload = struct {
+    operation_id: []const u8,
+    plan_id: []const u8,
+    public_key: ?[]const u8 = null,
+};
+const KeysDeployGeneratePayload = struct {
+    operation_id: []const u8,
+    server_id: []const u8,
+    repository_label: []const u8,
+    comment: ?[]const u8 = null,
+};
+const KeysDeployDeletePayload = struct {
+    operation_id: []const u8,
+    server_id: []const u8,
+    deploy_key_id: []const u8,
+    confirm_fingerprint: []const u8,
+};
+
+fn keysValidId(text: []const u8) bool {
+    return text.len > 0 and text.len <= keys_max_id_text;
 }
 
-fn handleSshKeysRolesDelete(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(SshKeysRolesDeletePayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
-    defer parsed.deinit();
-    const payload = parsed.value;
-    const server_id = payload.server_id;
-    const session = self.manager.get(server_id) orelse return respondError(output, "not connected");
-    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
-    var roles: std.ArrayList(RolesMarkerEntry) = .empty;
-    defer {
-        for (roles.items) |*r| {
-            self.allocator.free(r.name);
-            self.allocator.free(r.forced_command);
-        }
-        roles.deinit(self.allocator);
+fn keysValidHash(text: []const u8) bool {
+    if (text.len != 64) return false;
+    for (text) |ch| {
+        if (!std.ascii.isHex(ch)) return false;
     }
-    if (!sshkeysRolesLoad(self, server_id, &roles)) return respondError(output, "failed to read the roles marker");
-    var found = false;
+    return true;
+}
+
+fn keysValidFingerprint(text: []const u8) bool {
+    return std.mem.startsWith(u8, text, "SHA256:") and text.len > 7 and text.len <= 128;
+}
+
+fn keysValidPath(text: []const u8) bool {
+    return text.len > 0 and text.len <= keys_max_path_text and
+        std.mem.indexOfAny(u8, text, "\r\n") == null;
+}
+
+fn keysEnsureStarted(self: *Context) void {
+    self.keys.ensureStarted(self.io, .{
+        .context = self,
+        .drive_snapshot = keysDriveSnapshot,
+        .drive_job = keysDriveJob,
+        .drive_local_job = keysDriveLocalJob,
+    });
+}
+
+fn keysNowMs(self: *Context) i64 {
+    return @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_ms));
+}
+
+// --- serializers (fixed writer; overflow fails the response) ---------------
+
+fn keysWriteSource(writer: *std.Io.Writer, source: *const keyjobs.Source) !void {
+    try writer.writeAll("{\"path\":");
+    try json.writeJsonString(writer, source.path);
+    try writer.writeAll(",\"kind\":");
+    try json.writeJsonString(writer, source.kind);
+    try writer.writeAll(",\"status\":");
+    try json.writeJsonString(writer, source.status.jsonName());
+    if (source.file_sha256) |hash| {
+        try writer.writeAll(",\"file_sha256\":");
+        try json.writeJsonString(writer, hash);
+    }
+    if (source.mode) |mode| {
+        try writer.print(",\"mode\":{d}", .{mode});
+    }
+    if (source.owner) |owner| {
+        try writer.writeAll(",\"owner\":");
+        try json.writeJsonString(writer, owner);
+    }
+    if (source.@"error") |err| {
+        try writer.writeAll(",\"error\":");
+        try json.writeJsonString(writer, err);
+    }
+    try writer.writeAll("}");
+}
+
+fn keysWriteKeyEntry(writer: *std.Io.Writer, key: *const keyjobs.KeyEntry) !void {
+    try writer.writeAll("{\"source_path\":");
+    try json.writeJsonString(writer, key.source_path);
+    try writer.print(",\"line_index\":{d}", .{key.line_index});
+    try writer.writeAll(",\"line_hash\":");
+    try json.writeJsonString(writer, key.line_hash);
+    try writer.print(",\"parsed\":{s}", .{if (key.parsed) "true" else "false"});
+    if (key.options.len > 0) {
+        try writer.writeAll(",\"options\":");
+        try json.writeJsonString(writer, key.options);
+    }
+    if (key.key_type.len > 0) {
+        try writer.writeAll(",\"type\":");
+        try json.writeJsonString(writer, key.key_type);
+    }
+    if (key.key.len > 0) {
+        try writer.writeAll(",\"key\":");
+        try json.writeJsonString(writer, key.key);
+    }
+    if (key.comment.len > 0) {
+        try writer.writeAll(",\"comment\":");
+        try json.writeJsonString(writer, key.comment);
+    }
+    if (key.fingerprint_sha256.len > 0) {
+        try writer.writeAll(",\"fingerprint_sha256\":");
+        try json.writeJsonString(writer, key.fingerprint_sha256);
+    }
+    if (key.bits) |bits| {
+        try writer.print(",\"bits\":{d}", .{bits});
+    }
+    if (key.raw.len > 0) {
+        try writer.writeAll(",\"raw\":");
+        try json.writeJsonString(writer, key.raw);
+    }
+    if (key.@"error".len > 0) {
+        try writer.writeAll(",\"error\":");
+        try json.writeJsonString(writer, key.@"error");
+    }
+    if (key.policy_level.len > 0) {
+        try writer.writeAll(",\"policy_assessment\":{\"level\":");
+        try json.writeJsonString(writer, key.policy_level);
+        try writer.writeAll(",\"detail\":");
+        try json.writeJsonString(writer, key.policy_detail);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("}");
+}
+
+fn keysWriteRoleEntry(writer: *std.Io.Writer, role: *const keyjobs.RoleEntry) !void {
+    try writer.writeAll("{\"name\":");
+    try json.writeJsonString(writer, role.name);
+    try writer.writeAll(",\"kind\":");
+    try json.writeJsonString(writer, role.kind);
+    if (role.home) |home| {
+        try writer.writeAll(",\"home\":");
+        try json.writeJsonString(writer, home);
+    }
+    if (role.shell) |shell| {
+        try writer.writeAll(",\"shell\":");
+        try json.writeJsonString(writer, shell);
+    }
+    try writer.writeAll(",\"policy_state\":");
+    try json.writeJsonString(writer, role.policy_state.jsonName());
+    try writer.writeAll(",\"key_fingerprints\":[");
+    for (role.key_fingerprints, 0..) |fp, i| {
+        if (i > 0) try writer.writeAll(",");
+        try json.writeJsonString(writer, fp);
+    }
+    try writer.writeAll("]}");
+}
+
+fn keysWriteDeployKeyEntry(writer: *std.Io.Writer, entry: *const keyjobs.DeployKeyEntry) !void {
+    try writer.writeAll("{\"deploy_key_id\":");
+    try json.writeJsonString(writer, entry.id);
+    try writer.writeAll(",\"repository_label\":");
+    try json.writeJsonString(writer, entry.repository_label);
+    try writer.writeAll(",\"path\":");
+    try json.writeJsonString(writer, entry.path);
+    try writer.writeAll(",\"fingerprint\":");
+    try json.writeJsonString(writer, entry.fingerprint);
+    if (entry.created_at_ms != 0) {
+        try writer.print(",\"created_at_ms\":{d}", .{entry.created_at_ms});
+    }
+    try writer.writeAll("}");
+}
+
+fn keysPrivilegeJson(privilege: []const u8) []const u8 {
+    if (std.mem.eql(u8, privilege, "root")) return "root";
+    if (std.mem.eql(u8, privilege, "sudo_n")) return "sudo_n";
+    return "none";
+}
+
+/// The snapshot poll response body. The caller holds the registry lock,
+/// so a driver never mutates a field mid-read.
+fn keysSnapshotPollWrite(self: *Context, writer: *std.Io.Writer, snap: *keyjobs.Snapshot) !void {
+    _ = self;
+    try writer.writeAll("{\"ok\":true,\"state\":");
+    try json.writeJsonString(writer, snap.state.jsonName());
+    try writer.writeAll(",\"server_id\":");
+    try json.writeJsonString(writer, snap.server_id);
+    try writer.writeAll(",\"account\":{\"kind\":");
+    try json.writeJsonString(writer, if (snap.account_kind == .managed_role) "managed_role" else "connected");
+    if (snap.account_name) |name| {
+        try writer.writeAll(",\"name\":");
+        try json.writeJsonString(writer, name);
+    }
+    try writer.writeAll("}");
+    try writer.writeAll(",\"scope\":");
+    try json.writeJsonString(writer, snap.scope);
+    try writer.print(",\"created_at_ms\":{d}", .{@divTrunc(snap.created_at_ns, std.time.ns_per_ms)});
+    if (snap.finished_at_ns) |finished| {
+        try writer.print(",\"finished_at_ms\":{d}", .{@divTrunc(finished, std.time.ns_per_ms)});
+    }
+    try writer.writeAll(",\"coverage\":");
+    try json.writeJsonString(writer, if (snap.coverage.len > 0) snap.coverage else "partial");
+    try writer.writeAll(",\"capabilities\":{\"privilege\":");
+    try json.writeJsonString(writer, keysPrivilegeJson(snap.privilege));
+    try writer.print(",\"sftp_read_only\":{s}}}", .{if (snap.sftp_read_only) "true" else "false"});
+    try writer.writeAll(",\"sources\":[");
+    for (snap.sources.items, 0..) |*source, i| {
+        if (i > 0) try writer.writeAll(",");
+        try keysWriteSource(writer, source);
+    }
+    try writer.writeAll("],\"keys\":[");
+    for (snap.keys.items, 0..) |*key, i| {
+        if (i > 0) try writer.writeAll(",");
+        try keysWriteKeyEntry(writer, key);
+    }
+    try writer.writeAll("],\"roles\":[");
+    for (snap.roles.items, 0..) |*role, i| {
+        if (i > 0) try writer.writeAll(",");
+        try keysWriteRoleEntry(writer, role);
+    }
+    try writer.writeAll("],\"deploy_keys\":[");
+    for (snap.deploy_keys.items, 0..) |*entry, i| {
+        if (i > 0) try writer.writeAll(",");
+        try keysWriteDeployKeyEntry(writer, entry);
+    }
+    try writer.writeAll("],\"warnings\":[");
+    for (snap.warnings.items, 0..) |warning, i| {
+        if (i > 0) try writer.writeAll(",");
+        try json.writeJsonString(writer, warning);
+    }
+    try writer.writeAll("]}");
+}
+
+/// The job poll response body. The caller holds the registry lock.
+fn keysJobPollWrite(self: *Context, writer: *std.Io.Writer, job: *keyjobs.Job) !void {
+    _ = self;
+    try writer.writeAll("{\"ok\":true,\"state\":");
+    try json.writeJsonString(writer, job.state.jsonName());
+    try writer.writeAll(",\"steps\":[");
+    for (job.steps, 0..) |*step, i| {
+        if (i > 0) try writer.writeAll(",");
+        try writer.writeAll("{\"id\":");
+        try json.writeJsonString(writer, step.id);
+        try writer.writeAll(",\"state\":");
+        try json.writeJsonString(writer, step.state.jsonName());
+        if (step.@"error") |err| {
+            try writer.writeAll(",\"error\":");
+            try json.writeJsonString(writer, err);
+        }
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]");
+    if (job.result_json) |result| {
+        // Built by the driver from already-escaped values; never carries
+        // secrets (passphrases are excluded at construction).
+        try writer.writeAll(",\"result\":");
+        try writer.writeAll(result);
+    }
+    try writer.writeAll("}");
+}
+
+// --- remote helpers (coordinator thread: bounded blocking is fine here) -----
+
+fn keysExec(self: *Context, server_id: []const u8, cmd: []const u8) ?sessions.ExecOutcome {
+    return self.manager.execWaitTracked(server_id, cmd, "sshkeys", null, &.{}, keys_exec_cap, keys_exec_timeout_ns) catch null;
+}
+
+fn keysSessionReady(self: *Context, server_id: []const u8) bool {
+    const session = self.manager.get(server_id) orelse return false;
+    return session.status.load(.acquire) == .ready;
+}
+
+/// Bounded wait on one SFTP outcome. Returns false when the wait timed
+/// out and the op kept the outcome (its eventual set frees it); the
+/// caller must not touch the outcome after false.
+fn keysSftpWait(self: *Context, outcome: *sessions.SftpOutcome) bool {
+    const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + keys_sftp_wait_ns;
+    outcome.wait(self.io, deadline);
+    if (outcome.isDone()) return true;
+    return outcome.abandon(); // true: completed in the race window
+}
+
+const KeysReadStatus = enum { readable, missing, denied, timeout, too_large, transport_error };
+
+const KeysReadResult = struct {
+    status: KeysReadStatus,
+    /// Owned content; set only for `.readable`.
+    content: ?[]u8 = null,
+    detail_buf: [256]u8 = undefined,
+    detail_len: usize = 0,
+
+    fn detail(self: *const KeysReadResult) []const u8 {
+        return self.detail_buf[0..self.detail_len];
+    }
+
+    fn withDetail(self: *KeysReadResult, msg: []const u8) KeysReadResult {
+        const n = @min(msg.len, self.detail_buf.len);
+        @memcpy(self.detail_buf[0..n], msg[0..n]);
+        self.detail_len = n;
+        return self.*;
+    }
+};
+
+fn keysSourceStatus(status: KeysReadStatus) keyjobs.SourceStatus {
+    return switch (status) {
+        .readable => .readable,
+        .missing => .missing,
+        .denied => .denied,
+        .timeout => .timeout,
+        .too_large => .too_large,
+        .transport_error => .transport_error,
+    };
+}
+
+/// Typed SFTP read of one source file: missing, denied, timeout,
+/// too_large, and transport failures stay distinct so a read failure can
+/// never look like an empty file (spec 08 corrected contract).
+fn keysReadTyped(self: *Context, server_id: []const u8, path: []const u8, max_bytes: usize) KeysReadResult {
+    const stat_out = self.allocator.create(sessions.SftpOutcome) catch return .{ .status = .transport_error };
+    stat_out.* = .{ .allocator = self.allocator };
+    self.manager.sftpStat(server_id, path, stat_out) catch {
+        self.allocator.destroy(stat_out);
+        var result = KeysReadResult{ .status = .transport_error };
+        return result.withDetail("not connected");
+    };
+    if (!keysSftpWait(self, stat_out)) return .{ .status = .timeout };
+    defer self.allocator.destroy(stat_out);
+    defer if (stat_out.json) |j| self.allocator.free(j);
+    if (!stat_out.ok) {
+        var result = KeysReadResult{ .status = switch (stat_out.fx) {
+            ssh.c.LIBSSH2_FX_NO_SUCH_FILE => .missing,
+            ssh.c.LIBSSH2_FX_PERMISSION_DENIED => .denied,
+            else => .transport_error,
+        } };
+        return result.withDetail(stat_out.message());
+    }
+
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(self.allocator);
+    var offset: u64 = 0;
+    while (true) {
+        const read_out = self.allocator.create(sessions.SftpOutcome) catch return .{ .status = .transport_error };
+        read_out.* = .{ .allocator = self.allocator };
+        self.manager.sftpRead(server_id, path, offset, sshkeys_read_chunk, read_out) catch {
+            self.allocator.destroy(read_out);
+            return .{ .status = .transport_error };
+        };
+        if (!keysSftpWait(self, read_out)) return .{ .status = .timeout };
+        defer self.allocator.destroy(read_out);
+        defer if (read_out.json) |j| self.allocator.free(j);
+        if (!read_out.ok) {
+            var result = KeysReadResult{ .status = switch (read_out.fx) {
+                ssh.c.LIBSSH2_FX_NO_SUCH_FILE => .missing,
+                ssh.c.LIBSSH2_FX_PERMISSION_DENIED => .denied,
+                else => .transport_error,
+            } };
+            return result.withDetail(read_out.message());
+        }
+        const payload = read_out.json orelse return .{ .status = .transport_error };
+        const parsed = std.json.parseFromSlice(struct {
+            ok: bool,
+            base64: []const u8 = "",
+            eof: bool = false,
+        }, self.allocator, payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return .{ .status = .transport_error };
+        defer parsed.deinit();
+        if (!parsed.value.ok) return .{ .status = .transport_error };
+        const size = std.base64.standard.Decoder.calcSizeForSlice(parsed.value.base64) catch return .{ .status = .transport_error };
+        if (content.items.len + size > max_bytes) return .{ .status = .too_large };
+        const decoded = self.allocator.alloc(u8, size) catch return .{ .status = .transport_error };
+        defer self.allocator.free(decoded);
+        std.base64.standard.Decoder.decode(decoded, parsed.value.base64) catch return .{ .status = .transport_error };
+        content.appendSlice(self.allocator, decoded) catch return .{ .status = .transport_error };
+        offset += decoded.len;
+        if (parsed.value.eof) break;
+    }
+    return .{ .status = .readable, .content = content.toOwnedSlice(self.allocator) catch null };
+}
+
+/// Typed read through `sudo -n` for files the connected account cannot
+/// open (role homes, the root-owned roles manifest).
+fn keysPrivilegedRead(self: *Context, server_id: []const u8, path: []const u8, max_bytes: usize) KeysReadResult {
+    const quoted = shellquote.quote(self.allocator, path) catch return .{ .status = .transport_error };
+    defer self.allocator.free(quoted);
+    const stat_cmd = std.fmt.allocPrint(self.allocator, "sudo -n stat -c '%a' {s} 2>&1", .{quoted}) catch return .{ .status = .transport_error };
+    defer self.allocator.free(stat_cmd);
+    var stat_check = self.manager.execWait(server_id, stat_cmd, keys_exec_cap, keys_exec_timeout_ns) catch {
+        return .{ .status = .transport_error, .detail_len = 0 };
+    };
+    defer stat_check.output.deinit(self.allocator);
+    if (stat_check.exit != 0) {
+        const text = stat_check.output.items;
+        if (std.mem.indexOf(u8, text, "No such file") != null) return .{ .status = .missing };
+        var result = KeysReadResult{ .status = .denied };
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        return result.withDetail(if (trimmed.len > 0) trimmed else "sudo -n stat failed");
+    }
+    const cat_cmd = std.fmt.allocPrint(self.allocator, "sudo -n cat {s}", .{quoted}) catch return .{ .status = .transport_error };
+    defer self.allocator.free(cat_cmd);
+    var read = self.manager.execWait(server_id, cat_cmd, max_bytes + 1, keys_exec_timeout_ns) catch {
+        return .{ .status = .transport_error };
+    };
+    defer read.output.deinit(self.allocator);
+    if (read.output.items.len > max_bytes or read.limited) return .{ .status = .too_large };
+    if (read.exit != 0) {
+        const text = std.mem.trim(u8, read.output.items, " \t\r\n");
+        if (std.mem.indexOf(u8, text, "No such file") != null) return .{ .status = .missing };
+        var result = KeysReadResult{ .status = .denied };
+        return result.withDetail(if (text.len > 0) text else "sudo -n cat failed");
+    }
+    return .{ .status = .readable, .content = self.allocator.dupe(u8, read.output.items) catch null };
+}
+
+const KeysStatMeta = struct {
+    mode: ?u32 = null,
+    owner: ?[]u8 = null, // owned
+};
+
+/// Mode and owner from `stat -c '%a|%U'` (busybox-compatible); null
+/// fields when the probe fails. Metadata is informational only.
+fn keysStatMeta(self: *Context, server_id: []const u8, path: []const u8, privileged: bool) KeysStatMeta {
+    const quoted = shellquote.quote(self.allocator, path) catch return .{};
+    defer self.allocator.free(quoted);
+    const cmd = std.fmt.allocPrint(self.allocator, "{s}stat -c '%a|%U' {s}", .{ if (privileged) "sudo -n " else "", quoted }) catch return .{};
+    defer self.allocator.free(cmd);
+    var check = self.manager.execWait(server_id, cmd, keys_exec_cap, keys_exec_timeout_ns) catch return .{};
+    defer check.output.deinit(self.allocator);
+    if (check.exit != 0) return .{};
+    const text = std.mem.trim(u8, check.output.items, " \t\r\n");
+    const split = std.mem.indexOfScalar(u8, text, '|') orelse return .{};
+    var meta = KeysStatMeta{};
+    meta.mode = std.fmt.parseInt(u32, text[0..split], 8) catch null;
+    if (split + 1 < text.len) meta.owner = self.allocator.dupe(u8, text[split + 1 ..]) catch null;
+    return meta;
+}
+
+/// The one atomic writer for spec 08 (and the base spec 09 helpers):
+const KeysWriteGuard = union(enum) {
+    unguarded,
+    missing,
+    sha256: []const u8,
+};
+
+/// sftpSave stages beside the destination with the frozen whole-file
+/// identity as its guard, posix-renames, then this wrapper repairs
+/// mode/owner and re-reads so the returned hash is what the server
+/// actually holds. The worker hashes up to the authorized_keys 4 MiB cap and
+/// distinguishes an absent source from an existing empty file.
+fn keysWriteAtomic(
+    self: *Context,
+    server_id: []const u8,
+    path: []const u8,
+    content: []const u8,
+    guard: KeysWriteGuard,
+    mode: ?u32,
+    owner: ?[]const u8,
+    err_buf: []u8,
+    out_hash: *?[]u8,
+) ?[]const u8 {
+    out_hash.* = null;
+    const out = self.allocator.create(sessions.SftpOutcome) catch return "out of memory";
+    out.* = .{ .allocator = self.allocator };
+    const expected: ?sessions.SftpExpectedIdentity = switch (guard) {
+        .unguarded => null,
+        .missing => .{ .missing = true, .max_hash_bytes = sshkeys.max_keys_file_bytes },
+        .sha256 => |sha| .{ .sha256 = sha, .max_hash_bytes = sshkeys.max_keys_file_bytes },
+    };
+    self.manager.sftpSave(server_id, path, content, expected, out) catch |err| {
+        self.allocator.destroy(out);
+        return switch (err) {
+            error.NoSession => "not connected",
+            error.NotReady => "session not ready",
+            else => "failed to queue the write",
+        };
+    };
+    if (!keysSftpWait(self, out)) return "timed out writing the file";
+    defer self.allocator.destroy(out);
+    defer if (out.json) |j| self.allocator.free(j);
+    if (!out.ok) return std.fmt.bufPrint(err_buf, "{s}", .{out.message()}) catch "failed to write the file";
+    if (mode) |m| {
+        const chmod_out = self.allocator.create(sessions.SftpOutcome) catch return "out of memory";
+        chmod_out.* = .{ .allocator = self.allocator };
+        self.manager.sftpChmod(server_id, path, m, chmod_out) catch {
+            self.allocator.destroy(chmod_out);
+            return "failed to set file permissions";
+        };
+        if (!keysSftpWait(self, chmod_out)) return "failed to set file permissions";
+        defer self.allocator.destroy(chmod_out);
+        defer if (chmod_out.json) |j| self.allocator.free(j);
+        if (!chmod_out.ok) return "failed to set file permissions";
+    }
+    if (owner) |o| {
+        const quoted_owner = shellquote.quote(self.allocator, o) catch return "out of memory";
+        defer self.allocator.free(quoted_owner);
+        const quoted_path = shellquote.quote(self.allocator, path) catch return "out of memory";
+        defer self.allocator.free(quoted_path);
+        const cmd = std.fmt.allocPrint(self.allocator, "chown {s} {s}", .{ quoted_owner, quoted_path }) catch return "out of memory";
+        defer self.allocator.free(cmd);
+        var check = keysExec(self, server_id, cmd) orelse return "failed to set file ownership";
+        defer check.output.deinit(self.allocator);
+        if (check.exit != 0) return "failed to set file ownership";
+    }
+    // Re-read: the returned hash describes the file the server holds.
+    const read = keysReadTyped(self, server_id, path, sshkeys.max_keys_file_bytes + 1);
+    if (read.status != .readable) return "the write could not be verified; refresh the snapshot";
+    const reread = read.content.?;
+    defer self.allocator.free(reread);
+    if (!std.mem.eql(u8, reread, content)) return "the file changed during the write; refresh and review again";
+    out_hash.* = sshkeys.fileSha256(self.allocator, reread) catch return "out of memory";
+    return null;
+}
+
+/// Atomic privileged write through `sudo -n sh -c`: stage beside the
+/// destination, set owner/mode, `mv -f` (rename is atomic on one
+/// filesystem). The content travels on stdin, never in argv.
+fn keysPrivilegedWrite(self: *Context, server_id: []const u8, path: []const u8, content: []const u8, guard: KeysWriteGuard, mode: u32, owner: ?[]const u8, err_buf: []u8) ?[]const u8 {
+    const quoted_path = shellquote.quote(self.allocator, path) catch return "out of memory";
+    defer self.allocator.free(quoted_path);
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(self.allocator);
+    script.appendSlice(self.allocator, "set -e; umask 077; d=$(dirname ") catch return "out of memory";
+    script.appendSlice(self.allocator, quoted_path) catch return "out of memory";
+    script.appendSlice(self.allocator, "); t=$(mktemp \"$d/.oars-write.XXXXXX\"); trap 'rm -f \"$t\"' EXIT HUP INT TERM; cat > \"$t\"; chmod ") catch return "out of memory";
+    var mode_buf: [8]u8 = undefined;
+    const mode_text = std.fmt.bufPrint(&mode_buf, "{o}", .{mode}) catch return "out of memory";
+    script.appendSlice(self.allocator, mode_text) catch return "out of memory";
+    script.appendSlice(self.allocator, " \"$t\"; ") catch return "out of memory";
+    if (owner) |o| {
+        const quoted_owner = shellquote.quote(self.allocator, o) catch return "out of memory";
+        defer self.allocator.free(quoted_owner);
+        script.appendSlice(self.allocator, "chown ") catch return "out of memory";
+        script.appendSlice(self.allocator, quoted_owner) catch return "out of memory";
+        script.appendSlice(self.allocator, " \"$t\"; ") catch return "out of memory";
+    }
+    switch (guard) {
+        .unguarded => {},
+        .missing => {
+            script.appendSlice(self.allocator, "if [ -e ") catch return "out of memory";
+            script.appendSlice(self.allocator, quoted_path) catch return "out of memory";
+            script.appendSlice(self.allocator, " ]; then exit 73; fi; ") catch return "out of memory";
+        },
+        .sha256 => |sha| {
+            const quoted_sha = shellquote.quote(self.allocator, sha) catch return "out of memory";
+            defer self.allocator.free(quoted_sha);
+            script.appendSlice(self.allocator, "a=$(sha256sum ") catch return "out of memory";
+            script.appendSlice(self.allocator, quoted_path) catch return "out of memory";
+            script.appendSlice(self.allocator, " 2>/dev/null) || exit 73; [ \"${a%% *}\" = ") catch return "out of memory";
+            script.appendSlice(self.allocator, quoted_sha) catch return "out of memory";
+            script.appendSlice(self.allocator, " ] || exit 73; ") catch return "out of memory";
+        },
+    }
+    script.appendSlice(self.allocator, "mv -f \"$t\" ") catch return "out of memory";
+    script.appendSlice(self.allocator, quoted_path) catch return "out of memory";
+    script.appendSlice(self.allocator, "; trap - EXIT HUP INT TERM") catch return "out of memory";
+    const quoted_script = shellquote.quote(self.allocator, script.items) catch return "out of memory";
+    defer self.allocator.free(quoted_script);
+    const cmd = std.fmt.allocPrint(self.allocator, "sudo -n sh -c {s}", .{quoted_script}) catch return "out of memory";
+    defer self.allocator.free(cmd);
+    var check = self.manager.execWaitTrackedWithInput(server_id, cmd, content, "sshkeys", null, &.{}, keys_exec_cap, keys_exec_timeout_ns) catch {
+        return "not connected";
+    };
+    defer check.output.deinit(self.allocator);
+    if (check.exit != 0) {
+        if (check.exit == 73) return "conflict: the source changed after it was reviewed; refresh and review again";
+        const text = std.mem.trim(u8, check.output.items, " \t\r\n");
+        return std.fmt.bufPrint(err_buf, "privileged write failed: {s}", .{text[0..@min(text.len, 120)]}) catch "privileged write failed";
+    }
+    return null;
+}
+
+/// Creates `<dir>` with 0700 owned by `owner` through the available
+/// privilege path (role homes).
+fn keysPrivilegedEnsureDir(self: *Context, server_id: []const u8, dir: []const u8, owner: []const u8, privilege: KeysPrivilege) ?[]const u8 {
+    const quoted_dir = shellquote.quote(self.allocator, dir) catch return "out of memory";
+    defer self.allocator.free(quoted_dir);
+    const quoted_owner = shellquote.quote(self.allocator, owner) catch return "out of memory";
+    defer self.allocator.free(quoted_owner);
+    const script = std.fmt.allocPrint(self.allocator, "mkdir -p {s} && chmod 700 {s} && chown {s} {s}", .{ quoted_dir, quoted_dir, quoted_owner, quoted_dir }) catch return "out of memory";
+    defer self.allocator.free(script);
+    const cmd = if (privilege == .sudo_n) blk: {
+        const quoted_script = shellquote.quote(self.allocator, script) catch return "out of memory";
+        defer self.allocator.free(quoted_script);
+        break :blk std.fmt.allocPrint(self.allocator, "sudo -n sh -c {s}", .{quoted_script}) catch return "out of memory";
+    } else script_blk: {
+        break :script_blk self.allocator.dupe(u8, script) catch return "out of memory";
+    };
+    defer self.allocator.free(cmd);
+    var check = keysExec(self, server_id, cmd) orelse return "not connected";
+    defer check.output.deinit(self.allocator);
+    if (check.exit != 0) return "failed to create the ssh directory";
+    return null;
+}
+
+const KeysAccountFacts = struct {
+    user: []u8,
+    uid: ?u32,
+    home: []u8,
+    shell: []u8,
+
+    fn deinit(self: *KeysAccountFacts, allocator: std.mem.Allocator) void {
+        allocator.free(self.user);
+        allocator.free(self.home);
+        allocator.free(self.shell);
+    }
+};
+
+/// passwd facts for the connected login or a named account, via
+/// `getent passwd` (busybox-compatible). Null when the account or the
+/// session is unavailable.
+fn keysAccountFacts(self: *Context, server_id: []const u8, account_name: ?[]const u8) ?KeysAccountFacts {
+    if (!keysSessionReady(self, server_id)) return null;
+    const user = if (account_name) |name|
+        self.allocator.dupe(u8, name) catch return null
+    else blk: {
+        const session = self.manager.get(server_id) orelse return null;
+        break :blk self.allocator.dupe(u8, session.server.user) catch return null;
+    };
+    var user_transferred = false;
+    defer if (!user_transferred) self.allocator.free(user);
+    const quoted = shellquote.quote(self.allocator, user) catch return null;
+    defer self.allocator.free(quoted);
+    const cmd = std.fmt.allocPrint(self.allocator, "getent passwd {s}", .{quoted}) catch return null;
+    defer self.allocator.free(cmd);
+    var check = keysExec(self, server_id, cmd) orelse return null;
+    defer check.output.deinit(self.allocator);
+    if (check.exit != 0) return null;
+    // name:x:uid:gid:gecos:home:shell — home is second-to-last even
+    // when gecos contains colons.
+    var tokens = std.mem.splitScalar(u8, std.mem.trim(u8, check.output.items, " \t\r\n"), ':');
+    var all: [16][]const u8 = undefined;
+    var n: usize = 0;
+    while (tokens.next()) |t| {
+        if (n >= all.len) return null;
+        all[n] = t;
+        n += 1;
+    }
+    if (n < 4) return null;
+    const home = all[n - 2];
+    if (home.len == 0 or home[0] != '/') return null;
+    const home_copy = self.allocator.dupe(u8, home) catch return null;
+    const shell_copy = self.allocator.dupe(u8, all[n - 1]) catch {
+        self.allocator.free(home_copy);
+        return null;
+    };
+    user_transferred = true;
+    return .{
+        .user = user,
+        .uid = std.fmt.parseInt(u32, all[2], 10) catch null,
+        .home = home_copy,
+        .shell = shell_copy,
+    };
+}
+
+const KeysPrivilege = enum { root, sudo_n, none };
+
+fn keysPrivilegeName(privilege: KeysPrivilege) []const u8 {
+    return switch (privilege) {
+        .root => "root",
+        .sudo_n => "sudo_n",
+        .none => "none",
+    };
+}
+
+fn keysProbePrivilege(self: *Context, server_id: []const u8) KeysPrivilege {
+    var id_check = keysExec(self, server_id, "id -u") orelse return .none;
+    defer id_check.output.deinit(self.allocator);
+    if (id_check.exit == 0 and std.mem.eql(u8, std.mem.trim(u8, id_check.output.items, " \t\r\n"), "0")) return .root;
+    var sudo_check = keysExec(self, server_id, "sudo -n true") orelse return .none;
+    defer sudo_check.output.deinit(self.allocator);
+    if (sudo_check.exit == 0) return .sudo_n;
+    return .none;
+}
+
+const KeysConnTuple = struct {
+    client_addr: []u8,
+    local_addr: []u8,
+    local_port: []u8,
+    host: []u8,
+    valid: bool,
+
+    fn deinit(self: *KeysConnTuple, allocator: std.mem.Allocator) void {
+        allocator.free(self.client_addr);
+        allocator.free(self.local_addr);
+        allocator.free(self.local_port);
+        allocator.free(self.host);
+    }
+};
+
+/// The live connection tuple used as `sshd -T -C` criteria (the same
+/// probe as the spec 09 scan). Invalid when SSH_CONNECTION/hostname
+/// could not be read; callers fall back to the conventional source and
+/// mark the view partial.
+fn keysConnectionTuple(self: *Context, server_id: []const u8) KeysConnTuple {
+    var check = keysExec(self, server_id, "printf '%s\\n%s\\n' \"$SSH_CONNECTION\" \"$(hostname -f 2>/dev/null || hostname)\"") orelse return keysInvalidTuple(self);
+    defer check.output.deinit(self.allocator);
+    var lines = std.mem.splitScalar(u8, check.output.items, '\n');
+    const tuple = std.mem.trim(u8, lines.next() orelse "", " \t\r");
+    const host = std.mem.trim(u8, lines.next() orelse "", " \t\r");
+    var fields = std.mem.tokenizeAny(u8, tuple, " \t");
+    const client_addr = fields.next() orelse return keysInvalidTuple(self);
+    _ = fields.next(); // client port is not an sshd -C criterion
+    const local_addr = fields.next() orelse return keysInvalidTuple(self);
+    const local_port = fields.next() orelse return keysInvalidTuple(self);
+    if (host.len == 0) return keysInvalidTuple(self);
+    var result = KeysConnTuple{
+        .client_addr = self.allocator.dupe(u8, client_addr) catch return keysInvalidTuple(self),
+        .local_addr = @constCast(""),
+        .local_port = @constCast(""),
+        .host = @constCast(""),
+        .valid = true,
+    };
+    errdefer result.deinit(self.allocator);
+    result.local_addr = self.allocator.dupe(u8, local_addr) catch return keysInvalidTuple(self);
+    result.local_port = self.allocator.dupe(u8, local_port) catch return keysInvalidTuple(self);
+    result.host = self.allocator.dupe(u8, host) catch return keysInvalidTuple(self);
+    return result;
+}
+
+fn keysInvalidTuple(self: *Context) KeysConnTuple {
+    return .{
+        .client_addr = self.allocator.dupe(u8, "127.0.0.1") catch @constCast(""),
+        .local_addr = self.allocator.dupe(u8, "127.0.0.1") catch @constCast(""),
+        .local_port = self.allocator.dupe(u8, "22") catch @constCast(""),
+        .host = self.allocator.dupe(u8, "localhost") catch @constCast(""),
+        .valid = false,
+    };
+}
+
+/// `sshd -T -C` through the available privilege path. Null when the
+/// effective policy cannot be evaluated (no privilege, no sshd binary,
+/// or a parse failure) — callers then show the conventional single
+/// source and label the view partial.
+/// The raw output is returned through `raw_out` (owned) for the SFTP
+/// subsystem scan.
+fn keysEffectivePolicy(self: *Context, server_id: []const u8, facts: *const KeysAccountFacts, privilege: KeysPrivilege, tuple: *const KeysConnTuple, raw_out: *?[]u8) ?sshd_policy.EffectiveSshdPolicy {
+    raw_out.* = null;
+    if (privilege == .none or !tuple.valid) return null;
+    const criteria = std.fmt.allocPrint(self.allocator, "user={s},addr={s},laddr={s},lport={s},host={s}", .{ facts.user, tuple.client_addr, tuple.local_addr, tuple.local_port, tuple.host }) catch return null;
+    defer self.allocator.free(criteria);
+    const quoted = shellquote.quote(self.allocator, criteria) catch return null;
+    defer self.allocator.free(quoted);
+    const cmd = std.fmt.allocPrint(self.allocator, "LC_ALL=C {s}sshd -T -C {s} 2>&1", .{ if (privilege == .sudo_n) "sudo -n " else "", quoted }) catch return null;
+    defer self.allocator.free(cmd);
+    var check = keysExec(self, server_id, cmd) orelse return null;
+    defer check.output.deinit(self.allocator);
+    if (check.exit != 0) return null;
+    var policy = sshd_policy.parseEffectiveSshdPolicy(self.allocator, check.output.items, facts.user, facts.uid, facts.home) catch return null;
+    errdefer policy.deinit(self.allocator);
+    raw_out.* = self.allocator.dupe(u8, check.output.items) catch null;
+    return policy;
+}
+
+const KeysSftpCapability = struct {
+    read_only: bool = false,
+    /// The exact forced command for read-only role keys (owned).
+    forced_command: []u8 = &.{},
+
+    fn deinit(self: *KeysSftpCapability, allocator: std.mem.Allocator) void {
+        allocator.free(self.forced_command);
+    }
+};
+
+/// The server's SFTP subsystem from the `sshd -T` output plus a live
+/// check that read-only mode (`-R`) is accepted: internal-sftp needs
+/// OpenSSH >= 8.5 (checked through `ssh -V`); a binary subsystem is
+/// probed with `-R` and rejected on an option error (spec 08 §13).
+fn keysDetectSftpCapability(self: *Context, server_id: []const u8, policy_output: ?[]const u8) KeysSftpCapability {
+    const raw = policy_output orelse return .{};
+    var subsystem: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (!std.mem.startsWith(u8, line, "subsystem ")) continue;
+        var tokens = std.mem.tokenizeAny(u8, line["subsystem ".len..], " \t");
+        const name = tokens.next() orelse continue;
+        if (!std.mem.eql(u8, name, "sftp")) continue;
+        subsystem = tokens.next();
+        break;
+    }
+    const value = subsystem orelse return .{};
+    if (std.mem.eql(u8, value, "internal-sftp")) {
+        var ver = keysExec(self, server_id, "ssh -V 2>&1") orelse return .{};
+        defer ver.output.deinit(self.allocator);
+        const text = std.mem.trim(u8, ver.output.items, " \t\r\n");
+        const prefix = "OpenSSH_";
+        const start = std.mem.indexOf(u8, text, prefix) orelse return .{};
+        const rest = text[start + prefix.len ..];
+        const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return .{};
+        const major = std.fmt.parseInt(u32, rest[0..dot], 10) catch return .{};
+        var minor_end = dot + 1;
+        while (minor_end < rest.len and std.ascii.isDigit(rest[minor_end])) minor_end += 1;
+        const minor = std.fmt.parseInt(u32, rest[dot + 1 .. minor_end], 10) catch return .{};
+        if (major < 8 or (major == 8 and minor < 5)) return .{};
+        return .{
+            .read_only = true,
+            .forced_command = self.allocator.dupe(u8, "internal-sftp -R") catch &.{},
+        };
+    }
+    // Binary subsystem: probe that -R is accepted (an option error means
+    // the build is too old for read-only mode).
+    const quoted = shellquote.quote(self.allocator, value) catch return .{};
+    defer self.allocator.free(quoted);
+    const cmd = std.fmt.allocPrint(self.allocator, "{s} -R </dev/null 2>&1 | head -c 512", .{quoted}) catch return .{};
+    defer self.allocator.free(cmd);
+    var probe = keysExec(self, server_id, cmd) orelse return .{};
+    defer probe.output.deinit(self.allocator);
+    const text = probe.output.items;
+    if (std.mem.indexOf(u8, text, "llegal option") != null or
+        std.mem.indexOf(u8, text, "nknown option") != null or
+        std.mem.indexOf(u8, text, "nvalid option") != null) return .{};
+    return .{
+        .read_only = true,
+        .forced_command = std.fmt.allocPrint(self.allocator, "{s} -R", .{value}) catch &.{},
+    };
+}
+
+// --- remote manifests (roles + deploy keys) ---------------------------------
+//
+// Both manifests are owner-only versioned JSON documents written
+// atomically. Corrupt content is quarantined (renamed aside) instead of
+// being treated as empty; a missing manifest is simply empty.
+
+const RolesManifestEntry = struct {
+    name: []u8,
+    /// "standard_ssh" | "read_only_sftp"
+    kind: []u8,
+    forced_command: []u8,
+    created_at_ms: i64 = 0,
+
+    fn deinit(self: *RolesManifestEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.kind);
+        allocator.free(self.forced_command);
+    }
+};
+
+const RolesManifestRead = union(enum) {
+    ok: []RolesManifestEntry,
+    missing,
+    corrupt,
+    unreadable,
+};
+
+fn keysRolesManifestEntriesDeinit(allocator: std.mem.Allocator, entries: []RolesManifestEntry) void {
+    for (entries) |*entry| entry.deinit(allocator);
+    allocator.free(entries);
+}
+
+/// Parses the versioned roles manifest; the legacy bare-array format
+/// (`[{name, read_only, forced_command}]`) is migrated in memory and
+/// rewritten as versioned on the next save.
+fn keysParseRolesManifest(allocator: std.mem.Allocator, content: []const u8) ?[]RolesManifestEntry {
+    const Versioned = struct {
+        version: u32 = 0,
+        roles: []struct {
+            name: []const u8,
+            kind: []const u8 = "standard_ssh",
+            forced_command: []const u8 = "",
+            created_at_ms: i64 = 0,
+        } = &.{},
+    };
+    var entries: std.ArrayList(RolesManifestEntry) = .empty;
+    errdefer {
+        for (entries.items) |*entry| entry.deinit(allocator);
+        entries.deinit(allocator);
+    }
+    if (std.json.parseFromSlice(Versioned, allocator, content, .{ .ignore_unknown_fields = true, .allocate = .alloc_always })) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.version != 1) return null;
+        for (parsed.value.roles) |role| {
+            if (!validRoleName(role.name)) return null;
+            const standard = std.mem.eql(u8, role.kind, "standard_ssh");
+            const read_only = std.mem.eql(u8, role.kind, "read_only_sftp");
+            if (!standard and !read_only) return null;
+            if (read_only and role.forced_command.len == 0) return null;
+            const kind = if (read_only) "read_only_sftp" else "standard_ssh";
+            entries.append(allocator, .{
+                .name = allocator.dupe(u8, role.name) catch return null,
+                .kind = allocator.dupe(u8, kind) catch return null,
+                .forced_command = allocator.dupe(u8, role.forced_command) catch return null,
+                .created_at_ms = role.created_at_ms,
+            }) catch return null;
+        }
+        return entries.toOwnedSlice(allocator) catch null;
+    } else |_| {}
+    // Legacy migration path.
+    const Legacy = []struct {
+        name: []const u8,
+        read_only: bool,
+        forced_command: []const u8 = "",
+    };
+    const parsed = std.json.parseFromSlice(Legacy, allocator, content, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return null;
+    defer parsed.deinit();
+    for (parsed.value) |role| {
+        if (!validRoleName(role.name)) return null;
+        entries.append(allocator, .{
+            .name = allocator.dupe(u8, role.name) catch return null,
+            .kind = allocator.dupe(u8, if (role.read_only) "read_only_sftp" else "standard_ssh") catch return null,
+            .forced_command = allocator.dupe(u8, role.forced_command) catch return null,
+        }) catch return null;
+    }
+    return entries.toOwnedSlice(allocator) catch null;
+}
+
+test "roles manifest rejects unknown or incomplete policy kinds" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(keysParseRolesManifest(allocator, "{\"version\":1,\"roles\":[{\"name\":\"reports\",\"kind\":\"future_policy\"}]}") == null);
+    try std.testing.expect(keysParseRolesManifest(allocator, "{\"version\":1,\"roles\":[{\"name\":\"reports\",\"kind\":\"read_only_sftp\",\"forced_command\":\"\"}]}") == null);
+}
+
+fn keysSerializeRolesManifest(allocator: std.mem.Allocator, entries: []const RolesManifestEntry) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"version\":1,\"roles\":[");
+    for (entries, 0..) |entry, i| {
+        if (i > 0) try out.writer.writeAll(",");
+        try out.writer.writeAll("{\"name\":");
+        try json.writeJsonString(&out.writer, entry.name);
+        try out.writer.writeAll(",\"kind\":");
+        try json.writeJsonString(&out.writer, entry.kind);
+        try out.writer.writeAll(",\"forced_command\":");
+        try json.writeJsonString(&out.writer, entry.forced_command);
+        try out.writer.print(",\"created_at_ms\":{d}}}", .{entry.created_at_ms});
+    }
+    try out.writer.writeAll("]}");
+    return out.toOwnedSlice();
+}
+
+fn keysRolesManifestRead(self: *Context, server_id: []const u8, privilege: KeysPrivilege) RolesManifestRead {
+    if (privilege == .none) return .unreadable;
+    const read = if (privilege == .root)
+        keysReadTyped(self, server_id, roles_marker_path, 256 * 1024)
+    else
+        keysPrivilegedRead(self, server_id, roles_marker_path, 256 * 1024);
+    switch (read.status) {
+        .missing => return .missing,
+        .readable => {},
+        else => return .unreadable,
+    }
+    const content = read.content orelse return .unreadable;
+    defer self.allocator.free(content);
+    if (std.mem.trim(u8, content, " \t\r\n").len == 0) return .missing;
+    const entries = keysParseRolesManifest(self.allocator, content) orelse return .corrupt;
+    return .{ .ok = entries };
+}
+
+fn keysRolesManifestWrite(self: *Context, server_id: []const u8, privilege: KeysPrivilege, entries: []const RolesManifestEntry) ?[]const u8 {
+    const content = keysSerializeRolesManifest(self.allocator, entries) catch return "out of memory";
+    defer self.allocator.free(content);
+    var err_buf: [256]u8 = undefined;
+    if (privilege == .root) {
+        var hash: ?[]u8 = null;
+        defer if (hash) |h| self.allocator.free(h);
+        // The manifest is Oars-owned: no frozen-identity guard, last
+        // writer inside a job wins, and the driver re-reads on verify.
+        return keysWriteAtomic(self, server_id, roles_marker_path, content, .unguarded, 0o600, null, &err_buf, &hash);
+    }
+    return keysPrivilegedWrite(self, server_id, roles_marker_path, content, .unguarded, 0o600, null, &err_buf);
+}
+
+/// Renames a corrupt manifest aside (best effort); the corrupt bytes are
+/// preserved for inspection instead of being treated as an empty file.
+fn keysQuarantine(self: *Context, server_id: []const u8, path: []const u8, privilege: KeysPrivilege) void {
+    if (privilege == .none) return;
+    const quoted = shellquote.quote(self.allocator, path) catch return;
+    defer self.allocator.free(quoted);
+    const dest = std.fmt.allocPrint(self.allocator, "{s}.corrupt-{d}", .{ path, @divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_s) }) catch return;
+    defer self.allocator.free(dest);
+    const quoted_dest = shellquote.quote(self.allocator, dest) catch return;
+    defer self.allocator.free(quoted_dest);
+    const cmd = std.fmt.allocPrint(self.allocator, "{s}mv -f {s} {s}", .{ if (privilege == .sudo_n) "sudo -n " else "", quoted, quoted_dest }) catch return;
+    defer self.allocator.free(cmd);
+    var check = keysExec(self, server_id, cmd) orelse return;
+    check.output.deinit(self.allocator);
+}
+
+fn keysDeployManifestPath(self: *Context, home: []const u8) ?[]u8 {
+    return std.fmt.allocPrint(self.allocator, "{s}/.ssh/{s}", .{ home, deploy_manifest_file }) catch null;
+}
+
+const DeployManifestRead = union(enum) {
+    ok: []keyjobs.DeployKeyEntry,
+    missing,
+    corrupt,
+    unreadable,
+};
+
+fn keysDeployEntriesDeinit(allocator: std.mem.Allocator, entries: []keyjobs.DeployKeyEntry) void {
+    for (entries) |*entry| entry.deinit(allocator);
+    allocator.free(entries);
+}
+
+fn keysParseDeployManifest(allocator: std.mem.Allocator, content: []const u8) ?[]keyjobs.DeployKeyEntry {
+    const Versioned = struct {
+        version: u32 = 0,
+        keys: []struct {
+            id: []const u8,
+            repository_label: []const u8,
+            path: []const u8,
+            fingerprint: []const u8,
+            comment: []const u8 = "",
+            created_at_ms: i64 = 0,
+        } = &.{},
+    };
+    const parsed = std.json.parseFromSlice(Versioned, allocator, content, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return null;
+    defer parsed.deinit();
+    if (parsed.value.version != 1) return null;
+    var entries: std.ArrayList(keyjobs.DeployKeyEntry) = .empty;
+    errdefer {
+        for (entries.items) |*entry| entry.deinit(allocator);
+        entries.deinit(allocator);
+    }
+    for (parsed.value.keys) |key| {
+        if (!std.mem.startsWith(u8, key.id, "dk-") or key.id.len > 32) return null;
+        if (!keysValidFingerprint(key.fingerprint)) return null;
+        entries.append(allocator, .{
+            .id = allocator.dupe(u8, key.id) catch return null,
+            .repository_label = allocator.dupe(u8, key.repository_label) catch return null,
+            .path = allocator.dupe(u8, key.path) catch return null,
+            .fingerprint = allocator.dupe(u8, key.fingerprint) catch return null,
+            .comment = allocator.dupe(u8, key.comment) catch return null,
+            .created_at_ms = key.created_at_ms,
+        }) catch return null;
+    }
+    return entries.toOwnedSlice(allocator) catch null;
+}
+
+fn keysSerializeDeployManifest(allocator: std.mem.Allocator, entries: []const keyjobs.DeployKeyEntry) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"version\":1,\"keys\":[");
+    for (entries, 0..) |entry, i| {
+        if (i > 0) try out.writer.writeAll(",");
+        try out.writer.writeAll("{\"id\":");
+        try json.writeJsonString(&out.writer, entry.id);
+        try out.writer.writeAll(",\"repository_label\":");
+        try json.writeJsonString(&out.writer, entry.repository_label);
+        try out.writer.writeAll(",\"path\":");
+        try json.writeJsonString(&out.writer, entry.path);
+        try out.writer.writeAll(",\"fingerprint\":");
+        try json.writeJsonString(&out.writer, entry.fingerprint);
+        try out.writer.writeAll(",\"comment\":");
+        try json.writeJsonString(&out.writer, entry.comment);
+        try out.writer.print(",\"created_at_ms\":{d}}}", .{entry.created_at_ms});
+    }
+    try out.writer.writeAll("]}");
+    return out.toOwnedSlice();
+}
+
+fn keysDeployManifestRead(self: *Context, server_id: []const u8, home: []const u8) DeployManifestRead {
+    const path = keysDeployManifestPath(self, home) orelse return .unreadable;
+    defer self.allocator.free(path);
+    const read = keysReadTyped(self, server_id, path, 256 * 1024);
+    switch (read.status) {
+        .missing => return .missing,
+        .readable => {},
+        else => return .unreadable,
+    }
+    const content = read.content orelse return .unreadable;
+    defer self.allocator.free(content);
+    if (std.mem.trim(u8, content, " \t\r\n").len == 0) return .missing;
+    const entries = keysParseDeployManifest(self.allocator, content) orelse return .corrupt;
+    return .{ .ok = entries };
+}
+
+fn keysDeployManifestWrite(self: *Context, server_id: []const u8, home: []const u8, entries: []const keyjobs.DeployKeyEntry) ?[]const u8 {
+    const path = keysDeployManifestPath(self, home) orelse return "out of memory";
+    defer self.allocator.free(path);
+    const content = keysSerializeDeployManifest(self.allocator, entries) catch return "out of memory";
+    defer self.allocator.free(content);
+    var err_buf: [256]u8 = undefined;
+    var hash: ?[]u8 = null;
+    defer if (hash) |h| self.allocator.free(h);
+    return keysWriteAtomic(self, server_id, path, content, .unguarded, 0o600, null, &err_buf, &hash);
+}
+
+// --- snapshot driver (coordinator thread) ------------------------------------
+
+/// Accumulates the lists a snapshot swaps into the registry at the end.
+/// On any abort the builder frees what it gathered; on success ownership
+/// moves to the registry through `snapshotSwap`.
+const KeysSnapshotBuilder = struct {
+    sources: std.ArrayList(keyjobs.Source) = .empty,
+    keys: std.ArrayList(keyjobs.KeyEntry) = .empty,
+    roles: std.ArrayList(keyjobs.RoleEntry) = .empty,
+    deploy_keys: std.ArrayList(keyjobs.DeployKeyEntry) = .empty,
+    warnings: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *KeysSnapshotBuilder, allocator: std.mem.Allocator) void {
+        for (self.sources.items) |*s| s.deinit(allocator);
+        self.sources.deinit(allocator);
+        for (self.keys.items) |*k| k.deinit(allocator);
+        self.keys.deinit(allocator);
+        for (self.roles.items) |*r| r.deinit(allocator);
+        self.roles.deinit(allocator);
+        for (self.deploy_keys.items) |*d| d.deinit(allocator);
+        self.deploy_keys.deinit(allocator);
+        for (self.warnings.items) |w| allocator.free(w);
+        self.warnings.deinit(allocator);
+    }
+
+    fn warn(self: *KeysSnapshotBuilder, allocator: std.mem.Allocator, text: []const u8) void {
+        if (self.warnings.items.len >= keyjobs.max_warnings) return;
+        const owned = allocator.dupe(u8, text) catch return;
+        self.warnings.append(allocator, owned) catch allocator.free(owned);
+    }
+
+    fn warnFmt(self: *KeysSnapshotBuilder, allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) void {
+        if (self.warnings.items.len >= keyjobs.max_warnings) return;
+        const owned = std.fmt.allocPrint(allocator, fmt, args) catch return;
+        self.warnings.append(allocator, owned) catch allocator.free(owned);
+    }
+};
+
+fn keysFinishSnapshot(registry: *keyjobs.Registry, snap: *keyjobs.Snapshot, state: keyjobs.SnapshotState) void {
+    registry.snapshotFinish(snap, state, "", "partial", "none", false, "", null);
+}
+
+/// Reads one static source into the builder: the typed status, the
+/// frozen whole-file hash (missing sources report the empty-file hash so
+/// clients always echo a usable identity), stat metadata, and the parsed
+/// key rows. Returns false when the status blocks mutation.
+fn keysSnapshotReadSource(self: *Context, builder: *KeysSnapshotBuilder, server_id: []const u8, path: []const u8, privileged: bool) bool {
+    const path_copy = self.allocator.dupe(u8, path) catch return false;
+    const kind_copy = self.allocator.dupe(u8, "static") catch {
+        self.allocator.free(path_copy);
+        return false;
+    };
+    var source = keyjobs.Source{ .path = path_copy, .kind = kind_copy };
+    var read = if (privileged)
+        keysPrivilegedRead(self, server_id, path, sshkeys.max_keys_file_bytes)
+    else
+        keysReadTyped(self, server_id, path, sshkeys.max_keys_file_bytes);
+    source.status = keysSourceStatus(read.status);
+    if (read.detail().len > 0 and read.status != .readable and read.status != .missing) {
+        source.@"error" = self.allocator.dupe(u8, read.detail()) catch null;
+    }
+    switch (read.status) {
+        .missing => {
+            source.file_sha256 = sshkeys.fileSha256(self.allocator, "") catch null;
+        },
+        .readable => blk: {
+            const content = read.content orelse {
+                source.status = .transport_error;
+                break :blk;
+            };
+            defer self.allocator.free(content);
+            source.file_sha256 = sshkeys.fileSha256(self.allocator, content) catch null;
+            const meta = keysStatMeta(self, server_id, path, privileged);
+            source.mode = meta.mode;
+            source.owner = meta.owner;
+            var file = sshkeys.parse(self.allocator, content) catch {
+                source.status = .parse_error;
+                source.@"error" = self.allocator.dupe(u8, "the file could not be parsed") catch null;
+                break :blk;
+            };
+            defer file.deinit(self.allocator);
+            var count: usize = 0;
+            for (file.keys) |*k| {
+                if (count >= keyjobs.max_keys_per_source) {
+                    builder.warnFmt(self.allocator, "{s}: only the first {d} keys are shown", .{ path, keyjobs.max_keys_per_source });
+                    break;
+                }
+                const entry = keyjobs.keyEntryFromParsed(self.allocator, path, k) catch continue;
+                builder.keys.append(self.allocator, entry) catch continue;
+                count += 1;
+            }
+        },
+        else => {},
+    }
+    const allows = keyjobs.statusAllowsMutation(source.status);
+    builder.sources.append(self.allocator, source) catch {
+        source.deinit(self.allocator);
+        return false;
+    };
+    return allows;
+}
+
+/// Verifies one manifest role against the live server: account, home,
+/// shell, key source, and — for read-only roles — the exact restrictive
+/// options on every installed key.
+fn keysSnapshotVerifyRole(self: *Context, builder: *KeysSnapshotBuilder, server_id: []const u8, entry: *const RolesManifestEntry, privilege: KeysPrivilege) void {
+    const name_copy = self.allocator.dupe(u8, entry.name) catch return;
+    const kind_copy = self.allocator.dupe(u8, entry.kind) catch {
+        self.allocator.free(name_copy);
+        return;
+    };
+    var role = keyjobs.RoleEntry{
+        .name = name_copy,
+        .kind = kind_copy,
+        .forced_command = self.allocator.dupe(u8, entry.forced_command) catch &.{},
+    };
+    defer builder.roles.append(self.allocator, role) catch role.deinit(self.allocator);
+
+    var facts = keysAccountFacts(self, server_id, entry.name) orelse {
+        role.policy_state = .stale; // the account behind the policy is gone
+        return;
+    };
+    defer facts.deinit(self.allocator);
+    role.home = self.allocator.dupe(u8, facts.home) catch null;
+    role.shell = self.allocator.dupe(u8, facts.shell) catch null;
+    if (privilege == .none) {
+        role.policy_state = .unreadable;
+        return;
+    }
+    const source_path = std.fmt.allocPrint(self.allocator, "{s}/.ssh/authorized_keys", .{facts.home}) catch return;
+    defer self.allocator.free(source_path);
+    const read = if (privilege == .root)
+        keysReadTyped(self, server_id, source_path, sshkeys.max_keys_file_bytes)
+    else
+        keysPrivilegedRead(self, server_id, source_path, sshkeys.max_keys_file_bytes);
+    switch (read.status) {
+        .missing => {
+            role.policy_state = .verified; // no keys installed yet
+            return;
+        },
+        .readable => {},
+        else => {
+            role.policy_state = .unreadable;
+            return;
+        },
+    }
+    const content = read.content orelse {
+        role.policy_state = .unreadable;
+        return;
+    };
+    defer self.allocator.free(content);
+    var file = sshkeys.parse(self.allocator, content) catch {
+        role.policy_state = .unreadable;
+        return;
+    };
+    defer file.deinit(self.allocator);
+    const read_only = std.mem.eql(u8, entry.kind, "read_only_sftp");
+    var fingerprints: std.ArrayList([]u8) = .empty;
+    defer {
+        for (fingerprints.items) |fp| self.allocator.free(fp);
+        fingerprints.deinit(self.allocator);
+    }
+    var drifted = false;
+    for (file.keys) |*k| {
+        if (!k.parsed) {
+            drifted = true; // a row Oars did not write and cannot reason about
+            continue;
+        }
+        const fp = self.allocator.dupe(u8, k.fingerprint_sha256) catch continue;
+        fingerprints.append(self.allocator, fp) catch {
+            self.allocator.free(fp);
+            continue;
+        };
+        if (read_only and !keyjobs.verifyReadOnlyKeyOptions(k.options, entry.forced_command)) drifted = true;
+    }
+    role.key_fingerprints = fingerprints.toOwnedSlice(self.allocator) catch &.{};
+    role.policy_state = if (drifted) .drifted else .verified;
+}
+
+fn keysDriveSnapshot(context: *anyopaque, registry: *keyjobs.Registry, snap: *keyjobs.Snapshot) void {
+    const self = contextOf(context);
+    const allocator = self.allocator;
+    const server_id = snap.server_id;
+
+    var builder = KeysSnapshotBuilder{};
+    defer builder.deinit(allocator);
+
+    if (snap.cancel_requested.load(.acquire)) {
+        keysFinishSnapshot(registry, snap, .canceled);
+        return;
+    }
+    if (!keysSessionReady(self, server_id)) {
+        builder.warn(allocator, "not connected; start an SSH session and refresh");
+        registry.snapshotSwap(snap, builder.sources, builder.keys, builder.roles, builder.deploy_keys, builder.warnings);
+        builder.sources = .empty;
+        builder.keys = .empty;
+        builder.roles = .empty;
+        builder.deploy_keys = .empty;
+        builder.warnings = .empty;
+        keysFinishSnapshot(registry, snap, .partial);
+        return;
+    }
+
+    var facts = keysAccountFacts(self, server_id, snap.account_name) orelse {
+        if (snap.account_name) |name| {
+            builder.warnFmt(allocator, "account {s} was not found on the server", .{name});
+        } else {
+            builder.warn(allocator, "the connected account could not be resolved");
+        }
+        registry.snapshotSwap(snap, builder.sources, builder.keys, builder.roles, builder.deploy_keys, builder.warnings);
+        builder.sources = .empty;
+        builder.keys = .empty;
+        builder.roles = .empty;
+        builder.deploy_keys = .empty;
+        builder.warnings = .empty;
+        keysFinishSnapshot(registry, snap, .partial);
+        return;
+    };
+    defer facts.deinit(allocator);
+
+    const privilege = keysProbePrivilege(self, server_id);
+    var tuple = keysConnectionTuple(self, server_id);
+    defer tuple.deinit(allocator);
+    if (!tuple.valid) builder.warn(allocator, "the live SSH connection tuple was unavailable; effective policy could not be matched");
+
+    if (snap.cancel_requested.load(.acquire)) {
+        keysFinishSnapshot(registry, snap, .canceled);
+        return;
+    }
+
+    var policy_raw: ?[]u8 = null;
+    defer if (policy_raw) |raw| allocator.free(raw);
+    var policy = keysEffectivePolicy(self, server_id, &facts, privilege, &tuple, &policy_raw);
+    defer if (policy) |*p| p.deinit(allocator);
+
+    const scope: []const u8 = if (policy != null) "effective_policy" else "single_source_fallback";
+    if (policy == null) {
+        if (privilege == .none) {
+            builder.warn(allocator, "effective SSH policy needs root or approved sudo -n; showing only the conventional authorized_keys source");
+        } else {
+            builder.warn(allocator, "sshd -T could not be evaluated; showing only the conventional authorized_keys source");
+        }
+    }
+
+    var capability = if (policy_raw != null) keysDetectSftpCapability(self, server_id, policy_raw) else KeysSftpCapability{};
+    defer capability.deinit(allocator);
+
+    // Static sources: effective-policy paths, or the conventional file as
+    // the labeled fallback.
+    var all_static_ok = true;
+    var source_count: usize = 0;
+    if (policy) |*p| {
+        for (p.static_sources) |path| {
+            if (source_count >= keyjobs.max_sources_per_snapshot) {
+                builder.warnFmt(allocator, "only the first {d} static sources are shown", .{keyjobs.max_sources_per_snapshot});
+                all_static_ok = false;
+                break;
+            }
+            // Role homes are 0700 role-owned: reading them needs privilege.
+            const privileged = snap.account_kind == .managed_role and privilege != .none;
+            if (snap.account_kind == .managed_role and privilege == .none) {
+                const denied_path = allocator.dupe(u8, path) catch break;
+                const denied_kind = allocator.dupe(u8, "static") catch {
+                    allocator.free(denied_path);
+                    break;
+                };
+                var source = keyjobs.Source{
+                    .path = denied_path,
+                    .kind = denied_kind,
+                    .status = .denied,
+                    .@"error" = allocator.dupe(u8, "reading a role source requires root or approved sudo -n") catch null,
+                };
+                builder.sources.append(allocator, source) catch source.deinit(allocator);
+                all_static_ok = false;
+                source_count += 1;
+                continue;
+            }
+            if (!keysSnapshotReadSource(self, &builder, server_id, path, privileged)) all_static_ok = false;
+            source_count += 1;
+        }
+        for (p.dynamic_sources) |dyn| {
+            const label = std.fmt.allocPrint(allocator, "{s} {s}", .{ dyn.key, dyn.value }) catch continue;
+            var source = keyjobs.Source{
+                .path = label,
+                .kind = allocator.dupe(u8, dyn.kind) catch {
+                    allocator.free(label);
+                    continue;
+                },
+                // Informational row: Oars cannot inventory or edit this
+                // source; the UI renders the kind, never this status.
+                .status = .readable,
+            };
+            builder.sources.append(allocator, source) catch {
+                source.deinit(allocator);
+                continue;
+            };
+        }
+        for (p.warnings) |warning| builder.warnFmt(allocator, "sshd policy: {s}", .{warning});
+        if (p.pubkey_authentication == false) builder.warn(allocator, "public-key authentication is disabled for this account in the effective sshd policy");
+    } else {
+        const fallback_path = std.fmt.allocPrint(allocator, "{s}/.ssh/authorized_keys", .{facts.home}) catch {
+            keysFinishSnapshot(registry, snap, .partial);
+            return;
+        };
+        defer allocator.free(fallback_path);
+        const privileged = snap.account_kind == .managed_role and privilege != .none;
+        if (!keysSnapshotReadSource(self, &builder, server_id, fallback_path, privileged)) all_static_ok = false;
+    }
+
+    if (snap.cancel_requested.load(.acquire)) {
+        keysFinishSnapshot(registry, snap, .canceled);
+        return;
+    }
+
+    // Server-level roles: verified against the live accounts on every
+    // snapshot (spec 08 fail-closed roles).
+    var dynamic_count: usize = 0;
+    if (policy) |*p| dynamic_count = p.dynamic_sources.len;
+    switch (keysRolesManifestRead(self, server_id, privilege)) {
+        .ok => |entries| {
+            defer keysRolesManifestEntriesDeinit(allocator, entries);
+            for (entries) |*entry| {
+                keysSnapshotVerifyRole(self, &builder, server_id, entry, privilege);
+            }
+        },
+        .missing => {},
+        .corrupt => {
+            builder.warn(allocator, "the role policy manifest is corrupt; managed roles cannot be trusted until an approved repair or cleanup moves it aside");
+        },
+        .unreadable => {
+            if (privilege == .none) {
+                builder.warn(allocator, "managed roles cannot be verified without root or approved sudo -n");
+            } else {
+                builder.warn(allocator, "the role policy manifest could not be read");
+            }
+        },
+    }
+
+    // Deploy keys live in the connected account's home; role snapshots
+    // skip them.
+    if (snap.account_kind == .connected) {
+        switch (keysDeployManifestRead(self, server_id, facts.home)) {
+            .ok => |entries| {
+                defer allocator.free(entries);
+                for (entries) |*entry| {
+                    const copy = keyjobs.DeployKeyEntry{
+                        .id = allocator.dupe(u8, entry.id) catch continue,
+                        .repository_label = allocator.dupe(u8, entry.repository_label) catch continue,
+                        .path = allocator.dupe(u8, entry.path) catch continue,
+                        .fingerprint = allocator.dupe(u8, entry.fingerprint) catch continue,
+                        .comment = allocator.dupe(u8, entry.comment) catch continue,
+                        .created_at_ms = entry.created_at_ms,
+                    };
+                    builder.deploy_keys.append(allocator, copy) catch {
+                        var mutable = copy;
+                        mutable.deinit(allocator);
+                        continue;
+                    };
+                }
+                for (entries) |*entry| entry.deinit(allocator);
+            },
+            .missing => {},
+            .corrupt => {
+                builder.warn(allocator, "the deploy-key manifest is corrupt; deploy identities cannot be managed until an approved cleanup moves it aside");
+            },
+            .unreadable => builder.warn(allocator, "the deploy-key manifest could not be read"),
+        }
+    }
+
+    const pubkey_auth: ?bool = if (policy) |*p| p.pubkey_authentication else null;
+    const complete = policy != null and all_static_ok and tuple.valid and dynamic_count == 0;
+    const state: keyjobs.SnapshotState = if (policy != null and all_static_ok) .done else .partial;
+    registry.snapshotSwap(snap, builder.sources, builder.keys, builder.roles, builder.deploy_keys, builder.warnings);
+    builder.sources = .empty;
+    builder.keys = .empty;
+    builder.roles = .empty;
+    builder.deploy_keys = .empty;
+    builder.warnings = .empty;
+    registry.snapshotFinish(
+        snap,
+        state,
+        scope,
+        if (complete) "complete" else "partial",
+        keysPrivilegeName(privilege),
+        capability.read_only,
+        capability.forced_command,
+        pubkey_auth,
+    );
+}
+
+// --- job drivers (coordinator / local worker thread) -------------------------
+
+fn keysJobKindDetail(job: *keyjobs.Job, buf: []u8) []const u8 {
+    return keyjobs.kindDetail(job, buf);
+}
+
+/// The terminal audit row for a job. Exactly one row per job: drivers
+/// transition to a terminal state only through keysJobFinish, and
+/// handler-side cancels of queued/waiting jobs audit at the call site.
+fn keysJobAuditTerminal(self: *Context, job: *keyjobs.Job, state: keyjobs.JobState) void {
+    var kind_buf: [256]u8 = undefined;
+    const kind_detail = keysJobKindDetail(job, &kind_buf);
+    var detail_buf: [384]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "state={s} {s}", .{ state.jsonName(), kind_detail }) catch state.jsonName();
+    const target = if (job.server_id.len > 0) job.server_id else "local";
+    self.audit.append(self.io, job.kind.auditName(), target, detail) catch {};
+}
+
+fn keysJobFinish(self: *Context, registry: *keyjobs.Registry, job: *keyjobs.Job, step_index: usize, step_state: keyjobs.StepState, msg: ?[]const u8, state: keyjobs.JobState) void {
+    registry.jobSetStep(job, step_index, step_state, msg);
+    registry.jobSetState(job, state);
+    keysJobAuditTerminal(self, job, state);
+}
+
+/// Cooperative cancel between steps; finishes the job and returns true.
+fn keysJobCancelDrive(self: *Context, registry: *keyjobs.Registry, job: *keyjobs.Job, step_index: usize) bool {
+    if (!job.cancel_requested.load(.acquire)) return false;
+    keysJobFinish(self, registry, job, step_index, .canceled, null, .canceled);
+    return true;
+}
+
+/// Builds `{"name":"value",...}` with every value escaped. Result
+/// fragments never carry secrets.
+fn keysBuildAddResult(self: *Context, fingerprint: []const u8, idempotent: bool) ?[]u8 {
+    var out: std.Io.Writer.Allocating = .init(self.allocator);
+    errdefer out.deinit();
+    out.writer.writeAll("{\"fingerprint\":") catch return null;
+    json.writeJsonString(&out.writer, fingerprint) catch return null;
+    out.writer.print(",\"idempotent\":{s}}}", .{if (idempotent) "true" else "false"}) catch return null;
+    return out.toOwnedSlice() catch null;
+}
+
+fn keysBuildResult(self: *Context, fields: []const [2][]const u8) ?[]u8 {
+    var out: std.Io.Writer.Allocating = .init(self.allocator);
+    errdefer out.deinit();
+    out.writer.writeAll("{") catch return null;
+    for (fields, 0..) |field, i| {
+        if (i > 0) out.writer.writeAll(",") catch return null;
+        json.writeJsonString(&out.writer, field[0]) catch return null;
+        out.writer.writeAll(":") catch return null;
+        json.writeJsonString(&out.writer, field[1]) catch return null;
+    }
+    out.writer.writeAll("}") catch return null;
+    return out.toOwnedSlice() catch null;
+}
+
+/// True when a role-account job must use the sudo write path: root uses
+/// SFTP directly (with the identity guard); sudo_n needs sudo sh.
+fn keysJobPrivileged(job: *const keyjobs.Job, privilege: KeysPrivilege) bool {
+    return job.account_name != null and privilege == .sudo_n;
+}
+
+fn keysJobReadSource(self: *Context, server_id: []const u8, path: []const u8, privileged: bool) KeysReadResult {
+    return if (privileged)
+        keysPrivilegedRead(self, server_id, path, sshkeys.max_keys_file_bytes)
+    else
+        keysReadTyped(self, server_id, path, sshkeys.max_keys_file_bytes);
+}
+
+/// Writes one authorized_keys source through the one atomic writer. Both the
+/// SFTP and sudo paths compare the frozen whole-file identity immediately
+/// before atomic replacement.
+fn keysJobWriteSource(
+    self: *Context,
+    server_id: []const u8,
+    path: []const u8,
+    content: []const u8,
+    guard: KeysWriteGuard,
+    mode: ?u32,
+    owner: ?[]const u8,
+    privileged: bool,
+    err_buf: []u8,
+    out_hash: *?[]u8,
+) ?[]const u8 {
+    if (privileged) {
+        const err = keysPrivilegedWrite(self, server_id, path, content, guard, mode orelse 0o600, owner, err_buf);
+        if (err) |e| return e;
+        out_hash.* = sshkeys.fileSha256(self.allocator, content) catch null;
+        return null;
+    }
+    return keysWriteAtomic(self, server_id, path, content, guard, mode, owner, err_buf, out_hash);
+}
+
+fn keysEnsureDirFor(self: *Context, server_id: []const u8, path: []const u8, account: ?[]const u8, privilege: KeysPrivilege) ?[]const u8 {
+    if (account == null) return sshkeysEnsureSshDir(self, server_id, path);
+    const dir = std.fs.path.dirname(path) orelse return "invalid path";
+    return keysPrivilegedEnsureDir(self, server_id, dir, account.?, privilege);
+}
+
+/// The frozen source at job start: a fresh typed read, the whole-file
+/// hash comparison against the client's frozen identity, and a parse.
+/// `parsed` borrows `content`; keep both alive together.
+const KeysSourceState = struct {
+    content: []u8,
+    parsed: sshkeys.ParsedFile,
+    /// Frozen source identity for the atomic writer. Hash slices borrow the
+    /// job payload and remain valid for the job lifetime.
+    guard: KeysWriteGuard,
+};
+
+/// check_source for add/revoke/rotate. On failure the step and job are
+/// finished inside and null is returned.
+fn keysJobCheckSource(self: *Context, registry: *keyjobs.Registry, job: *keyjobs.Job, privileged: bool) ?KeysSourceState {
+    var read = keysJobReadSource(self, job.server_id, job.source_path, privileged);
+    switch (read.status) {
+        .missing => {
+            const empty_sha = sshkeys.fileSha256(self.allocator, "") catch {
+                keysJobFinish(self, registry, job, 0, .@"error", "out of memory", .partial);
+                return null;
+            };
+            defer self.allocator.free(empty_sha);
+            if (!std.mem.eql(u8, empty_sha, job.file_sha256)) {
+                keysJobFinish(self, registry, job, 0, .conflict, "the source appeared since the snapshot; refresh and review again", .partial);
+                return null;
+            }
+            const content = self.allocator.dupe(u8, "") catch {
+                keysJobFinish(self, registry, job, 0, .@"error", "out of memory", .partial);
+                return null;
+            };
+            const parsed = sshkeys.parse(self.allocator, content) catch {
+                self.allocator.free(content);
+                keysJobFinish(self, registry, job, 0, .@"error", "out of memory", .partial);
+                return null;
+            };
+            return .{ .content = content, .parsed = parsed, .guard = .missing };
+        },
+        .readable => {},
+        .denied => {
+            keysJobFinish(self, registry, job, 0, .@"error", "permission denied reading the source; no mutation is allowed", .partial);
+            return null;
+        },
+        .timeout => {
+            keysJobFinish(self, registry, job, 0, .@"error", "the source read timed out; no mutation was made", .partial);
+            return null;
+        },
+        .too_large => {
+            keysJobFinish(self, registry, job, 0, .@"error", "the source exceeds the 4 MiB limit; no mutation is allowed", .partial);
+            return null;
+        },
+        .transport_error => {
+            const detail = if (read.detail().len > 0) read.detail() else "the source could not be read";
+            keysJobFinish(self, registry, job, 0, .@"error", detail, .partial);
+            return null;
+        },
+    }
+    const content = read.content orelse {
+        keysJobFinish(self, registry, job, 0, .@"error", "the source could not be read", .partial);
+        return null;
+    };
+    var content_transferred = false;
+    defer if (!content_transferred) self.allocator.free(content);
+    const sha = sshkeys.fileSha256(self.allocator, content) catch {
+        keysJobFinish(self, registry, job, 0, .@"error", "out of memory", .partial);
+        return null;
+    };
+    defer self.allocator.free(sha);
+    if (!std.mem.eql(u8, sha, job.file_sha256)) {
+        keysJobFinish(self, registry, job, 0, .conflict, "the file changed since the snapshot; refresh and review again", .partial);
+        return null;
+    }
+    const parsed = sshkeys.parse(self.allocator, content) catch {
+        keysJobFinish(self, registry, job, 0, .@"error", "the file could not be parsed; no mutation is allowed", .partial);
+        return null;
+    };
+    content_transferred = true;
+    return .{ .content = content, .parsed = parsed, .guard = .{ .sha256 = job.file_sha256 } };
+}
+
+/// Finds the reviewed line: fingerprint plus exact line hash (the line
+/// index is not stable after an external edit).
+fn keysJobFindTarget(parsed: *const sshkeys.ParsedFile, fingerprint: []const u8, line_hash: []const u8) ?sshkeys.Key {
+    for (parsed.keys) |*k| {
+        if (!k.parsed) continue;
+        if (std.mem.eql(u8, k.fingerprint_sha256, fingerprint) and std.mem.eql(u8, k.line_hash, line_hash)) return k.*;
+    }
+    return null;
+}
+
+/// Probes the session, privilege, and role-write authority shared by the
+/// source-mutation drivers. Returns false after finishing the job.
+fn keysJobRemotePreamble(self: *Context, registry: *keyjobs.Registry, job: *keyjobs.Job, step_index: usize, privilege_out: *KeysPrivilege) bool {
+    if (!keysSessionReady(self, job.server_id)) {
+        keysJobFinish(self, registry, job, step_index, .@"error", "not connected", .partial);
+        return false;
+    }
+    const privilege = keysProbePrivilege(self, job.server_id);
+    privilege_out.* = privilege;
+    if (job.account_name != null and privilege == .none) {
+        keysJobFinish(self, registry, job, step_index, .@"error", "writing a role source requires root or approved sudo -n", .partial);
+        return false;
+    }
+    return true;
+}
+
+fn keysDriveJobAdd(self: *Context, registry: *keyjobs.Registry, job: *keyjobs.Job) void {
+    const p = &job.payload.add;
+    registry.jobSetStep(job, 0, .running, null);
+    if (keysJobCancelDrive(self, registry, job, 0)) return;
+    var privilege: KeysPrivilege = .none;
+    if (!keysJobRemotePreamble(self, registry, job, 0, &privilege)) return;
+    const privileged = keysJobPrivileged(job, privilege);
+    var state = keysJobCheckSource(self, registry, job, privileged) orelse return;
+    defer self.allocator.free(state.content);
+    defer state.parsed.deinit(self.allocator);
+    if (sshkeys.findByFingerprint(&state.parsed, p.fingerprint) != null) {
+        registry.jobSetStep(job, 0, .done, null);
+        registry.jobSetStep(job, 1, .done, null);
+        if (keysBuildAddResult(self, p.fingerprint, true)) |fragment| {
+            registry.jobSetResult(job, fragment);
+        }
+        keysJobFinish(self, registry, job, 2, .done, null, .done);
+        return;
+    }
+    registry.jobSetStep(job, 0, .done, null);
+
+    registry.jobSetStep(job, 1, .running, null);
+    if (keysJobCancelDrive(self, registry, job, 1)) return;
+    const new_content = sshkeys.appendLine(self.allocator, state.content, p.normalized_line) catch {
+        keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+        return;
+    };
+    defer self.allocator.free(new_content);
+    if (state.content.len == 0) {
+        if (keysEnsureDirFor(self, job.server_id, job.source_path, job.account_name, privilege)) |err| {
+            keysJobFinish(self, registry, job, 1, .@"error", err, .partial);
+            return;
+        }
+    }
+    const meta = keysStatMeta(self, job.server_id, job.source_path, privileged);
+    defer if (meta.owner) |o| self.allocator.free(o);
+    const mode: u32 = meta.mode orelse 0o600;
+    var err_buf: [256]u8 = undefined;
+    var new_hash: ?[]u8 = null;
+    defer if (new_hash) |h| self.allocator.free(h);
+    if (keysJobWriteSource(self, job.server_id, job.source_path, new_content, state.guard, mode, job.account_name, privileged, &err_buf, &new_hash)) |err| {
+        keysJobFinish(self, registry, job, 1, .@"error", err, .partial);
+        return;
+    }
+    registry.jobSetStep(job, 1, .done, null);
+
+    registry.jobSetStep(job, 2, .running, null);
+    const verify = keysJobReadSource(self, job.server_id, job.source_path, privileged);
+    if (verify.status != .readable) {
+        keysJobFinish(self, registry, job, 2, .@"error", "the write could not be verified; refresh the snapshot", .partial);
+        return;
+    }
+    const verified = verify.content.?;
+    defer self.allocator.free(verified);
+    var verify_file = sshkeys.parse(self.allocator, verified) catch {
+        keysJobFinish(self, registry, job, 2, .@"error", "the written file could not be parsed; refresh the snapshot", .partial);
+        return;
+    };
+    defer verify_file.deinit(self.allocator);
+    if (sshkeys.findByFingerprint(&verify_file, p.fingerprint) == null) {
+        keysJobFinish(self, registry, job, 2, .@"error", "the new key was not found after the write; refresh the snapshot", .partial);
+        return;
+    }
+    if (keysBuildAddResult(self, p.fingerprint, false)) |fragment| {
+        registry.jobSetResult(job, fragment);
+    }
+    keysJobFinish(self, registry, job, 2, .done, null, .done);
+}
+
+fn keysDriveJobRevoke(self: *Context, registry: *keyjobs.Registry, job: *keyjobs.Job) void {
+    const p = &job.payload.revoke;
+    registry.jobSetStep(job, 0, .running, null);
+    if (keysJobCancelDrive(self, registry, job, 0)) return;
+    var privilege: KeysPrivilege = .none;
+    if (!keysJobRemotePreamble(self, registry, job, 0, &privilege)) return;
+    const privileged = keysJobPrivileged(job, privilege);
+    var state = keysJobCheckSource(self, registry, job, privileged) orelse return;
+    defer self.allocator.free(state.content);
+    defer state.parsed.deinit(self.allocator);
+    const target = keysJobFindTarget(&state.parsed, p.fingerprint, p.line_hash) orelse {
+        if (sshkeys.findByFingerprint(&state.parsed, p.fingerprint) != null) {
+            keysJobFinish(self, registry, job, 0, .conflict, "the reviewed line changed; refresh and review again", .partial);
+        } else {
+            keysJobFinish(self, registry, job, 0, .conflict, "the reviewed key is no longer in the source; refresh the snapshot", .partial);
+        }
+        return;
+    };
+    registry.jobSetStep(job, 0, .done, null);
+
+    registry.jobSetStep(job, 1, .running, null);
+    if (keysJobCancelDrive(self, registry, job, 1)) return;
+    const new_content = sshkeys.rewrite(self.allocator, &state.parsed, target.line_index, null) catch {
+        keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+        return;
+    };
+    defer self.allocator.free(new_content);
+    var err_buf: [256]u8 = undefined;
+    var new_hash: ?[]u8 = null;
+    defer if (new_hash) |h| self.allocator.free(h);
+    if (keysJobWriteSource(self, job.server_id, job.source_path, new_content, state.guard, null, job.account_name, privileged, &err_buf, &new_hash)) |err| {
+        keysJobFinish(self, registry, job, 1, .@"error", err, .partial);
+        return;
+    }
+    registry.jobSetStep(job, 1, .done, null);
+
+    registry.jobSetStep(job, 2, .running, null);
+    const verify = keysJobReadSource(self, job.server_id, job.source_path, privileged);
+    if (verify.status != .readable) {
+        keysJobFinish(self, registry, job, 2, .@"error", "the write could not be verified; refresh the snapshot", .partial);
+        return;
+    }
+    const verified = verify.content.?;
+    defer self.allocator.free(verified);
+    var verify_file = sshkeys.parse(self.allocator, verified) catch {
+        keysJobFinish(self, registry, job, 2, .@"error", "the written file could not be parsed; refresh the snapshot", .partial);
+        return;
+    };
+    defer verify_file.deinit(self.allocator);
+    if (sshkeys.findByFingerprint(&verify_file, p.fingerprint) != null) {
+        keysJobFinish(self, registry, job, 2, .@"error", "the key is still present after the write; refresh the snapshot", .partial);
+        return;
+    }
+    keysJobFinish(self, registry, job, 2, .done, null, .done);
+}
+
+/// Staged rotation: the new key is appended and verified while the old
+/// key stays usable, then the job waits for an explicit commit
+/// (rotateCommit) before the old line is removed. Cancel or failure
+/// before the commit leaves both keys in place.
+fn keysDriveJobRotate(self: *Context, registry: *keyjobs.Registry, job: *keyjobs.Job) void {
+    if (job.verification != null) {
+        keysDriveJobRotateCommit(self, registry, job);
+        return;
+    }
+    const p = &job.payload.rotate;
+    registry.jobSetStep(job, 0, .running, null);
+    if (keysJobCancelDrive(self, registry, job, 0)) return;
+    var privilege: KeysPrivilege = .none;
+    if (!keysJobRemotePreamble(self, registry, job, 0, &privilege)) return;
+    const privileged = keysJobPrivileged(job, privilege);
+    var state = keysJobCheckSource(self, registry, job, privileged) orelse return;
+    defer self.allocator.free(state.content);
+    defer state.parsed.deinit(self.allocator);
+    if (keysJobFindTarget(&state.parsed, p.old_fingerprint, p.line_hash) == null) {
+        keysJobFinish(self, registry, job, 0, .conflict, "the reviewed line changed; refresh and review again", .partial);
+        return;
+    }
+    registry.jobSetStep(job, 0, .done, null);
+
+    registry.jobSetStep(job, 1, .running, null);
+    if (keysJobCancelDrive(self, registry, job, 1)) return;
+    const staged = sshkeys.appendLine(self.allocator, state.content, p.new_line) catch {
+        keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+        return;
+    };
+    defer self.allocator.free(staged);
+    var err_buf: [256]u8 = undefined;
+    var staged_write_hash: ?[]u8 = null;
+    defer if (staged_write_hash) |h| self.allocator.free(h);
+    if (keysJobWriteSource(self, job.server_id, job.source_path, staged, state.guard, null, job.account_name, privileged, &err_buf, &staged_write_hash)) |err| {
+        keysJobFinish(self, registry, job, 1, .@"error", err, .partial);
+        return;
+    }
+    registry.jobSetStep(job, 1, .done, null);
+
+    registry.jobSetStep(job, 2, .running, null);
+    const verify = keysJobReadSource(self, job.server_id, job.source_path, privileged);
+    if (verify.status != .readable) {
+        keysJobFinish(self, registry, job, 2, .@"error", "the staged file could not be re-read; both keys may be present", .partial);
+        return;
+    }
+    const staged_content = verify.content.?;
+    defer self.allocator.free(staged_content);
+    var staged_file = sshkeys.parse(self.allocator, staged_content) catch {
+        keysJobFinish(self, registry, job, 2, .@"error", "the staged file could not be parsed; both keys may be present", .partial);
+        return;
+    };
+    defer staged_file.deinit(self.allocator);
+    if (sshkeys.findByFingerprint(&staged_file, p.new_fingerprint) == null or
+        sshkeys.findByFingerprint(&staged_file, p.old_fingerprint) == null)
+    {
+        keysJobFinish(self, registry, job, 2, .@"error", "the staged file does not hold both keys; review the source before retrying", .partial);
+        return;
+    }
+    const staged_sha = sshkeys.fileSha256(self.allocator, staged_content) catch {
+        keysJobFinish(self, registry, job, 2, .@"error", "out of memory", .partial);
+        return;
+    };
+    registry.jobSetStagedHash(job, staged_sha);
+    registry.jobSetStep(job, 2, .done, null);
+
+    // Park until rotateCommit supplies the verification. Not terminal:
+    // no audit row yet.
+    registry.jobSetStep(job, 3, .waiting, null);
+    registry.jobSetState(job, .waiting_for_verification);
+}
+
+fn keysDriveJobRotateCommit(self: *Context, registry: *keyjobs.Registry, job: *keyjobs.Job) void {
+    const p = &job.payload.rotate;
+    const verification = &job.verification.?;
+    registry.jobSetStep(job, 3, .running, null);
+    if (keysJobCancelDrive(self, registry, job, 3)) return;
+    var err_buf: [256]u8 = undefined;
+    const verification_error = keysVerifyNewKey(self, job, verification, &err_buf);
+    // The verification secret is no longer needed after the fresh auth
+    // attempt. Clear it before any subsequent remote write or retained state.
+    registry.jobClearSecrets(job);
+    if (verification_error) |err| {
+        // Both keys remain on the server.
+        keysJobFinish(self, registry, job, 3, .@"error", err, .partial);
+        return;
+    }
+    registry.jobSetStep(job, 3, .done, null);
+
+    registry.jobSetStep(job, 4, .running, null);
+    if (keysJobCancelDrive(self, registry, job, 4)) return;
+    if (!keysSessionReady(self, job.server_id)) {
+        keysJobFinish(self, registry, job, 4, .@"error", "not connected; the old key was retained", .partial);
+        return;
+    }
+    const privilege = keysProbePrivilege(self, job.server_id);
+    if (job.account_name != null and privilege == .none) {
+        keysJobFinish(self, registry, job, 4, .@"error", "writing a role source requires root or approved sudo -n; the old key was retained", .partial);
+        return;
+    }
+    const privileged = keysJobPrivileged(job, privilege);
+    const read = keysJobReadSource(self, job.server_id, job.source_path, privileged);
+    if (read.status != .readable) {
+        keysJobFinish(self, registry, job, 4, .@"error", "the source could not be re-read; the old key was retained", .partial);
+        return;
+    }
+    const content = read.content.?;
+    defer self.allocator.free(content);
+    const current_sha = sshkeys.fileSha256(self.allocator, content) catch {
+        keysJobFinish(self, registry, job, 4, .@"error", "out of memory", .partial);
+        return;
+    };
+    defer self.allocator.free(current_sha);
+    const staged_sha = job.staged_file_sha256 orelse {
+        keysJobFinish(self, registry, job, 4, .@"error", "the staged state was lost; refresh and rotate again", .partial);
+        return;
+    };
+    if (!std.mem.eql(u8, current_sha, staged_sha)) {
+        keysJobFinish(self, registry, job, 4, .conflict, "the file changed after staging; the old key was retained", .partial);
+        return;
+    }
+    var parsed = sshkeys.parse(self.allocator, content) catch {
+        keysJobFinish(self, registry, job, 4, .@"error", "the file could not be parsed; the old key was retained", .partial);
+        return;
+    };
+    defer parsed.deinit(self.allocator);
+    const target = keysJobFindTarget(&parsed, p.old_fingerprint, p.line_hash) orelse {
+        keysJobFinish(self, registry, job, 4, .conflict, "the old line changed after staging; the old key was retained", .partial);
+        return;
+    };
+    const new_content = sshkeys.rewrite(self.allocator, &parsed, target.line_index, null) catch {
+        keysJobFinish(self, registry, job, 4, .@"error", "out of memory", .partial);
+        return;
+    };
+    defer self.allocator.free(new_content);
+    const guard: KeysWriteGuard = .{ .sha256 = staged_sha };
+    var write_hash: ?[]u8 = null;
+    defer if (write_hash) |h| self.allocator.free(h);
+    if (keysJobWriteSource(self, job.server_id, job.source_path, new_content, guard, null, job.account_name, privileged, &err_buf, &write_hash)) |err| {
+        keysJobFinish(self, registry, job, 4, .@"error", err, .partial);
+        return;
+    }
+    registry.jobSetStep(job, 4, .done, null);
+
+    registry.jobSetStep(job, 5, .running, null);
+    const verify = keysJobReadSource(self, job.server_id, job.source_path, privileged);
+    if (verify.status != .readable) {
+        keysJobFinish(self, registry, job, 5, .@"error", "the final file could not be verified; refresh the snapshot", .partial);
+        return;
+    }
+    const verified = verify.content.?;
+    defer self.allocator.free(verified);
+    var verify_file = sshkeys.parse(self.allocator, verified) catch {
+        keysJobFinish(self, registry, job, 5, .@"error", "the final file could not be parsed; refresh the snapshot", .partial);
+        return;
+    };
+    defer verify_file.deinit(self.allocator);
+    if (sshkeys.findByFingerprint(&verify_file, p.new_fingerprint) == null or
+        sshkeys.findByFingerprint(&verify_file, p.old_fingerprint) != null)
+    {
+        keysJobFinish(self, registry, job, 5, .@"error", "the final file does not match the rotation; refresh the snapshot", .partial);
+        return;
+    }
+    if (keysBuildResult(self, &.{.{ "new_fingerprint", p.new_fingerprint }})) |fragment| {
+        registry.jobSetResult(job, fragment);
+    }
+    keysJobFinish(self, registry, job, 5, .done, null, .done);
+}
+
+/// The rotation verification: a temporary key-auth session as the target
+/// account with the host fingerprint copied from the main session (no
+/// new trust prompt). Reaching `ready` proves the new key signs in;
+/// forced-command accounts authenticate the same way.
+fn keysVerifyNewKey(self: *Context, job: *keyjobs.Job, verification: *const keyjobs.RotateVerification, err_buf: []u8) ?[]const u8 {
+    switch (verification.*) {
+        .external_confirmation => |*v| {
+            const p = &job.payload.rotate;
+            if (!std.mem.eql(u8, v.confirm_fingerprint, p.new_fingerprint)) {
+                return "the typed fingerprint does not match the staged key; both keys remain";
+            }
+            return null;
+        },
+        .local_private_key => |*v| {
+            const base = self.manager.get(job.server_id) orelse return "not connected";
+            if (base.status.load(.acquire) != .ready) return "session not ready";
+            const temp_id = std.fmt.allocPrint(self.allocator, "keys-verify-{s}", .{job.id}) catch return "out of memory";
+            defer self.allocator.free(temp_id);
+            const account = job.account_name orelse base.server.user;
+            const temp_server = servers.Server{
+                .id = temp_id,
+                .name = temp_id,
+                .host = base.server.host,
+                .port = base.server.port,
+                .user = account,
+                .auth_method = .key,
+                .key_path = v.path,
+                .key_has_passphrase = v.passphrase != null,
+                .host_fingerprint = base.server.host_fingerprint,
+                .via_server_id = base.server.via_server_id,
+            };
+            self.manager.disconnect(temp_id); // clear any stale record
+            _ = self.manager.connect(temp_server, null, v.passphrase) catch {
+                return "the verification connection could not be started; both keys remain";
+            };
+            defer self.manager.disconnect(temp_id);
+            const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + keys_verify_wait_ns;
+            while (std.Io.Timestamp.now(self.io, .real).nanoseconds < deadline) {
+                const session = self.manager.get(temp_id) orelse return "the verification connection was lost; both keys remain";
+                const status = session.status.load(.acquire);
+                if (status == .ready) return null;
+                if (status == .closed or status == .@"error" or status == .needs_trust) {
+                    const text = session.errorText();
+                    return std.fmt.bufPrint(err_buf, "the new key could not sign in as {s} ({s}); both keys remain", .{ account, if (text.len > 0) text else status.jsonName() }) catch "the new key could not sign in; both keys remain";
+                }
+                std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(50), .awake) catch return "interrupted; both keys remain";
+            }
+            return "verification timed out; both keys remain";
+        },
+    }
+}
+
+// --- capability probes -------------------------------------------------------
+
+/// internal-sftp gained read-only mode (-R) in OpenSSH 8.5; detect the
+/// server version through the local `ssh -V` banner (spec 08 §13 lists
+/// this as an assumption: the ssh client and sshd ship together on the
+/// supported servers).
+fn keysOpensshAllowsInternalReadOnly(self: *Context, server_id: []const u8) bool {
+    var ver = keysExec(self, server_id, "ssh -V 2>&1") orelse return false;
+    defer ver.output.deinit(self.allocator);
+    const text = std.mem.trim(u8, ver.output.items, " \t\r\n");
+    const prefix = "OpenSSH_";
+    const start = std.mem.indexOf(u8, text, prefix) orelse return false;
+    const rest = text[start + prefix.len ..];
+    const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return false;
+    const major = std.fmt.parseInt(u32, rest[0..dot], 10) catch return false;
+    var minor_end = dot + 1;
+    while (minor_end < rest.len and std.ascii.isDigit(rest[minor_end])) minor_end += 1;
+    const minor = std.fmt.parseInt(u32, rest[dot + 1 .. minor_end], 10) catch return false;
+    return major > 8 or (major == 8 and minor >= 5);
+}
+
+/// A binary SFTP subsystem is probed with `-R`: an option-error line
+/// means the build is too old for read-only mode. Leading characters of
+/// the diagnostic are matched loosely ("illegal"/"unknown"/"invalid").
+fn keysBinarySubsystemAllowsReadOnly(self: *Context, server_id: []const u8, binary: []const u8) bool {
+    const quoted = shellquote.quote(self.allocator, binary) catch return false;
+    defer self.allocator.free(quoted);
+    const cmd = std.fmt.allocPrint(self.allocator, "{s} -R </dev/null 2>&1 | head -c 512", .{quoted}) catch return false;
+    defer self.allocator.free(cmd);
+    var probe = keysExec(self, server_id, cmd) orelse return false;
+    defer probe.output.deinit(self.allocator);
+    const text = probe.output.items;
+    if (std.mem.indexOf(u8, text, "llegal option") != null or
+        std.mem.indexOf(u8, text, "nknown option") != null or
+        std.mem.indexOf(u8, text, "nvalid option") != null) return false;
+    return true;
+}
+
+/// Confirms the exact frozen forced command still works on this server
+/// before a read-only role is created or repaired against it.
+fn keysProbeForcedCommand(self: *Context, server_id: []const u8, forced_command: []const u8) bool {
+    if (!std.mem.endsWith(u8, forced_command, " -R")) return false;
+    const subsystem = forced_command[0 .. forced_command.len - " -R".len];
+    if (subsystem.len == 0) return false;
+    if (std.mem.eql(u8, subsystem, "internal-sftp")) {
+        return keysOpensshAllowsInternalReadOnly(self, server_id);
+    }
+    return keysBinarySubsystemAllowsReadOnly(self, server_id, subsystem);
+}
+
+fn keysChmod(self: *Context, server_id: []const u8, path: []const u8, mode: u32) bool {
+    const out = self.allocator.create(sessions.SftpOutcome) catch return false;
+    out.* = .{ .allocator = self.allocator };
+    self.manager.sftpChmod(server_id, path, mode, out) catch {
+        self.allocator.destroy(out);
+        return false;
+    };
+    if (!keysSftpWait(self, out)) return false;
+    defer self.allocator.destroy(out);
+    defer if (out.json) |j| self.allocator.free(j);
+    return out.ok;
+}
+
+/// Removes one file; a missing file counts as removed (idempotent
+/// deploy-key deletion).
+fn keysRmFile(self: *Context, server_id: []const u8, path: []const u8) bool {
+    const out = self.allocator.create(sessions.SftpOutcome) catch return false;
+    out.* = .{ .allocator = self.allocator };
+    self.manager.sftpRm(server_id, path, false, 0, out) catch {
+        self.allocator.destroy(out);
+        return false;
+    };
+    if (!keysSftpWait(self, out)) return false;
+    defer self.allocator.destroy(out);
+    defer if (out.json) |j| self.allocator.free(j);
+    if (out.ok) return true;
+    return out.fx == ssh.c.LIBSSH2_FX_NO_SUCH_FILE;
+}
+
+fn keysRunPlanCommand(self: *Context, server_id: []const u8, privilege: KeysPrivilege, command: []const u8) ?sessions.ExecOutcome {
+    if (privilege == .sudo_n) {
+        // The approved role-create command is compound; quote it as one shell
+        // program so every segment runs under sudo rather than only the first.
+        const quoted = shellquote.quote(self.allocator, command) catch return null;
+        defer self.allocator.free(quoted);
+        const cmd = std.fmt.allocPrint(self.allocator, "sudo -n sh -c {s}", .{quoted}) catch return null;
+        defer self.allocator.free(cmd);
+        return keysExec(self, server_id, cmd);
+    }
+    return keysExec(self, server_id, command);
+}
+
+// --- role job drivers --------------------------------------------------------
+
+fn keysDriveJobRole(self: *Context, registry: *keyjobs.Registry, job: *keyjobs.Job) void {
+    registry.jobSetStep(job, 0, .running, null);
+    if (keysJobCancelDrive(self, registry, job, 0)) return;
+    if (!keysSessionReady(self, job.server_id)) {
+        keysJobFinish(self, registry, job, 0, .@"error", "not connected", .partial);
+        return;
+    }
+    const privilege = keysProbePrivilege(self, job.server_id);
+    if (privilege == .none) {
+        keysJobFinish(self, registry, job, 0, .@"error", "root or approved sudo -n is no longer available; nothing was changed", .partial);
+        return;
+    }
+    registry.jobSetStep(job, 0, .done, null);
+    switch (job.kind) {
+        .role_create => keysDriveJobRoleCreate(self, registry, job, privilege),
+        .role_repair => keysDriveJobRoleRepair(self, registry, job, privilege),
+        .role_delete => keysDriveJobRoleDelete(self, registry, job, privilege),
+        else => unreachable,
+    }
+}
+
+/// Moves a parsed manifest slice into an owned list.
+fn keysAdoptRolesEntries(self: *Context, list: *std.ArrayList(RolesManifestEntry), found: []RolesManifestEntry) void {
+    for (found) |*entry| {
+        list.append(self.allocator, entry.*) catch {
+            entry.deinit(self.allocator);
+            continue;
+        };
+    }
+    self.allocator.free(found);
+}
+
+fn keysDriveJobRoleCreate(self: *Context, registry: *keyjobs.Registry, job: *keyjobs.Job, privilege: KeysPrivilege) void {
+    const p = &job.payload.role;
+    const read_only = std.mem.eql(u8, p.kind, "read_only_sftp");
+
+    registry.jobSetStep(job, 1, .running, null);
+    if (read_only) {
+        if (p.forced_command.len == 0) {
+            keysJobFinish(self, registry, job, 1, .@"error", "the read-only SFTP capability was not detected in the snapshot; take a fresh snapshot", .partial);
+            return;
+        }
+        if (!keysProbeForcedCommand(self, job.server_id, p.forced_command)) {
+            keysJobFinish(self, registry, job, 1, .@"error", "read-only SFTP is not available on this server; nothing was changed", .partial);
+            return;
+        }
+    }
+    registry.jobSetStep(job, 1, .done, null);
+
+    registry.jobSetStep(job, 2, .running, null);
+    if (keysJobCancelDrive(self, registry, job, 2)) return;
+    if (keysAccountFacts(self, job.server_id, p.name)) |existing| {
+        var facts = existing;
+        facts.deinit(self.allocator);
+        keysJobFinish(self, registry, job, 2, .conflict, "an account with this name already exists and is not Oars-managed", .partial);
+        return;
+    }
+    for (p.commands) |command| {
+        var check = keysRunPlanCommand(self, job.server_id, privilege, command) orelse {
+            keysJobFinish(self, registry, job, 2, .@"error", "not connected", .partial);
+            return;
+        };
+        const exit = check.exit;
+        var tail_buf: [128]u8 = undefined;
+        const out_text = std.mem.trim(u8, check.output.items, " \t\r\n");
+        const tail = std.fmt.bufPrint(&tail_buf, "{s}", .{out_text[0..@min(out_text.len, 100)]}) catch "";
+        check.output.deinit(self.allocator);
+        if (exit != 0) {
+            var msg_buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "account creation failed ({s}); check the account state before retrying", .{tail}) catch "account creation failed; check the account state before retrying";
+            keysJobFinish(self, registry, job, 2, .@"error", msg, .partial);
+            return;
+        }
+    }
+    registry.jobSetStep(job, 2, .done, null);
+
+    registry.jobSetStep(job, 3, .running, null);
+    if (keysJobCancelDrive(self, registry, job, 3)) return;
+    if (p.first_key_line) |line| {
+        var facts = keysAccountFacts(self, job.server_id, p.name) orelse {
+            keysJobFinish(self, registry, job, 3, .@"error", "the new account could not be resolved", .partial);
+            return;
+        };
+        defer facts.deinit(self.allocator);
+        const source_path = std.fmt.allocPrint(self.allocator, "{s}/.ssh/authorized_keys", .{facts.home}) catch {
+            keysJobFinish(self, registry, job, 3, .@"error", "out of memory", .partial);
+            return;
+        };
+        defer self.allocator.free(source_path);
+        if (keysEnsureDirFor(self, job.server_id, source_path, p.name, privilege)) |err| {
+            keysJobFinish(self, registry, job, 3, .@"error", err, .partial);
+            return;
+        }
+        const content = std.fmt.allocPrint(self.allocator, "{s}\n", .{line}) catch {
+            keysJobFinish(self, registry, job, 3, .@"error", "out of memory", .partial);
+            return;
+        };
+        defer self.allocator.free(content);
+        var err_buf: [256]u8 = undefined;
+        var hash: ?[]u8 = null;
+        defer if (hash) |h| self.allocator.free(h);
+        if (keysJobWriteSource(self, job.server_id, source_path, content, .missing, 0o600, p.name, privilege == .sudo_n, &err_buf, &hash)) |err| {
+            keysJobFinish(self, registry, job, 3, .@"error", err, .partial);
+            return;
+        }
+    }
+    registry.jobSetStep(job, 3, .done, null);
+
+    registry.jobSetStep(job, 4, .running, null);
+    if (keysJobCancelDrive(self, registry, job, 4)) return;
+    var entries: std.ArrayList(RolesManifestEntry) = .empty;
+    defer {
+        for (entries.items) |*entry| entry.deinit(self.allocator);
+        entries.deinit(self.allocator);
+    }
+    switch (keysRolesManifestRead(self, job.server_id, privilege)) {
+        .ok => |found| keysAdoptRolesEntries(self, &entries, found),
+        .missing => {},
+        .corrupt => keysQuarantine(self, job.server_id, roles_marker_path, privilege),
+        .unreadable => {
+            keysJobFinish(self, registry, job, 4, .@"error", "the role policy manifest could not be read", .partial);
+            return;
+        },
+    }
+    entries.append(self.allocator, .{
+        .name = self.allocator.dupe(u8, p.name) catch {
+            keysJobFinish(self, registry, job, 4, .@"error", "out of memory", .partial);
+            return;
+        },
+        .kind = self.allocator.dupe(u8, p.kind) catch {
+            keysJobFinish(self, registry, job, 4, .@"error", "out of memory", .partial);
+            return;
+        },
+        .forced_command = self.allocator.dupe(u8, p.forced_command) catch {
+            keysJobFinish(self, registry, job, 4, .@"error", "out of memory", .partial);
+            return;
+        },
+        .created_at_ms = keysNowMs(self),
+    }) catch {
+        keysJobFinish(self, registry, job, 4, .@"error", "out of memory", .partial);
+        return;
+    };
+    if (keysRolesManifestWrite(self, job.server_id, privilege, entries.items)) |err| {
+        keysJobFinish(self, registry, job, 4, .@"error", err, .partial);
+        return;
+    }
+    registry.jobSetStep(job, 4, .done, null);
+
+    registry.jobSetStep(job, 5, .running, null);
+    var verify_facts = keysAccountFacts(self, job.server_id, p.name) orelse {
+        keysJobFinish(self, registry, job, 5, .@"error", "the account could not be verified after creation", .partial);
+        return;
+    };
+    defer verify_facts.deinit(self.allocator);
+    if (p.first_key_line) |line| {
+        const source_path = std.fmt.allocPrint(self.allocator, "{s}/.ssh/authorized_keys", .{verify_facts.home}) catch {
+            keysJobFinish(self, registry, job, 5, .@"error", "out of memory", .partial);
+            return;
+        };
+        defer self.allocator.free(source_path);
+        // The fingerprint of the key we installed, from the frozen line.
+        var line_file = sshkeys.parse(self.allocator, line) catch {
+            keysJobFinish(self, registry, job, 5, .@"error", "the installed key line could not be parsed", .partial);
+            return;
+        };
+        defer line_file.deinit(self.allocator);
+        if (line_file.keys.len != 1 or !line_file.keys[0].parsed) {
+            keysJobFinish(self, registry, job, 5, .@"error", "the installed key line could not be parsed", .partial);
+            return;
+        }
+        const fingerprint = line_file.keys[0].fingerprint_sha256;
+        const read = keysJobReadSource(self, job.server_id, source_path, privilege == .sudo_n);
+        if (read.status != .readable) {
+            keysJobFinish(self, registry, job, 5, .@"error", "the installed key could not be verified", .partial);
+            return;
+        }
+        const content = read.content.?;
+        defer self.allocator.free(content);
+        var parsed = sshkeys.parse(self.allocator, content) catch {
+            keysJobFinish(self, registry, job, 5, .@"error", "the installed key could not be verified", .partial);
+            return;
+        };
+        defer parsed.deinit(self.allocator);
+        const found = sshkeys.findByFingerprint(&parsed, fingerprint) orelse {
+            keysJobFinish(self, registry, job, 5, .@"error", "the installed key was not found after the write", .partial);
+            return;
+        };
+        if (read_only and !keyjobs.verifyReadOnlyKeyOptions(found.options, p.forced_command)) {
+            keysJobFinish(self, registry, job, 5, .@"error", "the installed key does not carry the exact read-only policy", .partial);
+            return;
+        }
+    }
+    keysJobFinish(self, registry, job, 5, .done, null, .done);
+}
+
+fn keysDriveJobRoleRepair(self: *Context, registry: *keyjobs.Registry, job: *keyjobs.Job, privilege: KeysPrivilege) void {
+    const p = &job.payload.role;
+    const read_only = std.mem.eql(u8, p.kind, "read_only_sftp");
+
+    registry.jobSetStep(job, 1, .running, null);
+    if (keysJobCancelDrive(self, registry, job, 1)) return;
+    var facts = keysAccountFacts(self, job.server_id, p.name) orelse {
+        keysJobFinish(self, registry, job, 1, .@"error", "the account no longer exists; delete the role instead", .partial);
+        return;
+    };
+    defer facts.deinit(self.allocator);
+    const source_path = std.fmt.allocPrint(self.allocator, "{s}/.ssh/authorized_keys", .{facts.home}) catch {
+        keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+        return;
+    };
+    defer self.allocator.free(source_path);
+    const privileged = privilege == .sudo_n;
+    if (read_only) {
+        if (p.forced_command.len == 0 or !keysProbeForcedCommand(self, job.server_id, p.forced_command)) {
+            keysJobFinish(self, registry, job, 1, .@"error", "read-only SFTP is not available on this server; no repair was made", .partial);
+            return;
+        }
+        const read = keysJobReadSource(self, job.server_id, source_path, privileged);
+        switch (read.status) {
+            .missing => {}, // no keys: only the manifest needs repair
+            .readable => {
+                var current = read.content.?;
+                defer self.allocator.free(current);
+                // The write guard names the file as it was read, before
+                // any repair rewrite replaces the in-memory content.
+                const original_sha = sshkeys.fileSha256(self.allocator, current) catch {
+                    keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+                    return;
+                };
+                defer self.allocator.free(original_sha);
+                // Re-apply the exact role options to every divergent key,
+                // one rewrite at a time so untouched lines keep their
+                // bytes. Malformed rows fail closed.
+                while (true) {
+                    var parsed = sshkeys.parse(self.allocator, current) catch {
+                        keysJobFinish(self, registry, job, 1, .@"error", "the role source could not be parsed; no repair was made", .partial);
+                        return;
+                    };
+                    defer parsed.deinit(self.allocator);
+                    var malformed = false;
+                    var target_index: ?usize = null;
+                    var target_rest: []const u8 = "";
+                    for (parsed.keys) |*k| {
+                        if (!k.parsed) {
+                            malformed = true;
+                            break;
+                        }
+                        if (!keyjobs.verifyReadOnlyKeyOptions(k.options, p.forced_command)) {
+                            target_index = k.line_index;
+                            target_rest = if (k.comment.len > 0)
+                                std.fmt.allocPrint(self.allocator, "{s} {s} {s}", .{ k.key_type, k.key, k.comment }) catch ""
+                            else
+                                std.fmt.allocPrint(self.allocator, "{s} {s}", .{ k.key_type, k.key }) catch "";
+                            break;
+                        }
+                    }
+                    if (malformed) {
+                        keysJobFinish(self, registry, job, 1, .@"error", "the role source has rows Oars cannot parse; repair them by hand first", .partial);
+                        return;
+                    }
+                    const index = target_index orelse break;
+                    if (target_rest.len == 0) {
+                        keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+                        return;
+                    }
+                    defer self.allocator.free(target_rest);
+                    const options = keyjobs.readOnlyRoleOptions(self.allocator, p.forced_command) catch {
+                        keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+                        return;
+                    };
+                    defer self.allocator.free(options);
+                    const new_line = std.fmt.allocPrint(self.allocator, "{s} {s}", .{ options, target_rest }) catch {
+                        keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+                        return;
+                    };
+                    defer self.allocator.free(new_line);
+                    const rewritten = sshkeys.rewrite(self.allocator, &parsed, index, new_line) catch {
+                        keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+                        return;
+                    };
+                    self.allocator.free(current);
+                    current = rewritten;
+                }
+                var err_buf: [256]u8 = undefined;
+                var hash: ?[]u8 = null;
+                defer if (hash) |h| self.allocator.free(h);
+                if (keysJobWriteSource(self, job.server_id, source_path, current, .{ .sha256 = original_sha }, 0o600, p.name, privileged, &err_buf, &hash)) |err| {
+                    keysJobFinish(self, registry, job, 1, .@"error", err, .partial);
+                    return;
+                }
+            },
+            else => {
+                keysJobFinish(self, registry, job, 1, .@"error", "the role source could not be read; no repair was made", .partial);
+                return;
+            },
+        }
+    }
+
+    var entries: std.ArrayList(RolesManifestEntry) = .empty;
+    defer {
+        for (entries.items) |*entry| entry.deinit(self.allocator);
+        entries.deinit(self.allocator);
+    }
+    switch (keysRolesManifestRead(self, job.server_id, privilege)) {
+        .ok => |found| keysAdoptRolesEntries(self, &entries, found),
+        .missing => {},
+        .corrupt => keysQuarantine(self, job.server_id, roles_marker_path, privilege),
+        .unreadable => {
+            keysJobFinish(self, registry, job, 1, .@"error", "the role policy manifest could not be read", .partial);
+            return;
+        },
+    }
+    var replaced = false;
+    for (entries.items) |*entry| {
+        if (!std.mem.eql(u8, entry.name, p.name)) continue;
+        self.allocator.free(entry.kind);
+        entry.kind = self.allocator.dupe(u8, p.kind) catch {
+            keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+            return;
+        };
+        self.allocator.free(entry.forced_command);
+        entry.forced_command = self.allocator.dupe(u8, p.forced_command) catch {
+            keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+            return;
+        };
+        replaced = true;
+    }
+    if (!replaced) {
+        entries.append(self.allocator, .{
+            .name = self.allocator.dupe(u8, p.name) catch {
+                keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+                return;
+            },
+            .kind = self.allocator.dupe(u8, p.kind) catch {
+                keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+                return;
+            },
+            .forced_command = self.allocator.dupe(u8, p.forced_command) catch {
+                keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+                return;
+            },
+            .created_at_ms = keysNowMs(self),
+        }) catch {
+            keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+            return;
+        };
+    }
+    if (keysRolesManifestWrite(self, job.server_id, privilege, entries.items)) |err| {
+        keysJobFinish(self, registry, job, 1, .@"error", err, .partial);
+        return;
+    }
+    registry.jobSetStep(job, 1, .done, null);
+
+    registry.jobSetStep(job, 2, .running, null);
+    if (read_only) {
+        const verify = keysJobReadSource(self, job.server_id, source_path, privileged);
+        if (verify.status == .readable) {
+            const content = verify.content.?;
+            defer self.allocator.free(content);
+            var parsed = sshkeys.parse(self.allocator, content) catch {
+                keysJobFinish(self, registry, job, 2, .@"error", "the repaired source could not be parsed", .partial);
+                return;
+            };
+            defer parsed.deinit(self.allocator);
+            for (parsed.keys) |*k| {
+                if (k.parsed and !keyjobs.verifyReadOnlyKeyOptions(k.options, p.forced_command)) {
+                    keysJobFinish(self, registry, job, 2, .@"error", "a key still lacks the exact read-only policy", .partial);
+                    return;
+                }
+            }
+        }
+    }
+    keysJobFinish(self, registry, job, 2, .done, null, .done);
+}
+
+fn keysDriveJobRoleDelete(self: *Context, registry: *keyjobs.Registry, job: *keyjobs.Job, privilege: KeysPrivilege) void {
+    const p = &job.payload.role;
+
+    registry.jobSetStep(job, 1, .running, null);
+    if (keysJobCancelDrive(self, registry, job, 1)) return;
+    for (p.commands) |command| {
+        var check = keysRunPlanCommand(self, job.server_id, privilege, command) orelse {
+            keysJobFinish(self, registry, job, 1, .@"error", "not connected", .partial);
+            return;
+        };
+        const exit = check.exit;
+        check.output.deinit(self.allocator);
+        if (exit != 0) {
+            // Tolerate an already-removed account; anything else fails.
+            if (keysAccountFacts(self, job.server_id, p.name)) |existing| {
+                var facts = existing;
+                facts.deinit(self.allocator);
+                keysJobFinish(self, registry, job, 1, .@"error", "account deletion failed", .partial);
+                return;
+            }
+        }
+    }
+    registry.jobSetStep(job, 1, .done, null);
+
+    registry.jobSetStep(job, 2, .running, null);
+    var entries: std.ArrayList(RolesManifestEntry) = .empty;
+    defer {
+        for (entries.items) |*entry| entry.deinit(self.allocator);
+        entries.deinit(self.allocator);
+    }
+    switch (keysRolesManifestRead(self, job.server_id, privilege)) {
+        .ok => |found| keysAdoptRolesEntries(self, &entries, found),
+        .missing => {},
+        .corrupt => keysQuarantine(self, job.server_id, roles_marker_path, privilege),
+        .unreadable => {
+            keysJobFinish(self, registry, job, 2, .@"error", "the role policy manifest could not be read; the account is already deleted", .partial);
+            return;
+        },
+    }
     var i: usize = 0;
-    while (i < roles.items.len) {
-        if (std.mem.eql(u8, roles.items[i].name, payload.name)) {
-            const removed = roles.orderedRemove(i);
-            self.allocator.free(removed.name);
-            self.allocator.free(removed.forced_command);
-            found = true;
+    while (i < entries.items.len) {
+        if (std.mem.eql(u8, entries.items[i].name, p.name)) {
+            const removed = entries.orderedRemove(i);
+            var mutable = removed;
+            mutable.deinit(self.allocator);
         } else {
             i += 1;
         }
     }
-    if (!found) return respondError(output, "role not found");
+    if (keysRolesManifestWrite(self, job.server_id, privilege, entries.items)) |err| {
+        keysJobFinish(self, registry, job, 2, .@"error", err, .partial);
+        return;
+    }
+    registry.jobSetStep(job, 2, .done, null);
+    keysJobFinish(self, registry, job, 2, .done, null, .done);
+}
 
-    var err_response: []const u8 = "";
-    var del_buf: [96]u8 = undefined;
-    const del_cmd = std.fmt.bufPrint(&del_buf, "userdel {s}", .{payload.name}) catch return respondError(output, "invalid role name");
-    // userdel leaves the home dir (spec 08 §5).
-    if (!sshkeysExec(self, output, &err_response, server_id, del_cmd, "userdel failed")) return err_response;
-    if (!sshkeysRolesSave(self, server_id, &roles)) return respondError(output, "failed to save the roles marker");
-    var detail_buf: [128]u8 = undefined;
-    const detail = std.fmt.bufPrint(&detail_buf, "name={s}", .{payload.name}) catch "sshkeys.roles.delete";
-    sshkeysAudit(self, "sshkeys.roles.delete", server_id, detail);
+// --- deploy-key job drivers ----------------------------------------------------
+
+fn keysDriveJobDeployGenerate(self: *Context, registry: *keyjobs.Registry, job: *keyjobs.Job) void {
+    const p = &job.payload.deploy_generate;
+    registry.jobSetStep(job, 0, .running, null);
+    if (keysJobCancelDrive(self, registry, job, 0)) return;
+    if (!keysSessionReady(self, job.server_id)) {
+        keysJobFinish(self, registry, job, 0, .@"error", "not connected", .partial);
+        return;
+    }
+    var facts = keysAccountFacts(self, job.server_id, null) orelse {
+        keysJobFinish(self, registry, job, 0, .@"error", "the connected account could not be resolved", .partial);
+        return;
+    };
+    defer facts.deinit(self.allocator);
+    var entries: std.ArrayList(keyjobs.DeployKeyEntry) = .empty;
+    defer {
+        for (entries.items) |*entry| entry.deinit(self.allocator);
+        entries.deinit(self.allocator);
+    }
+    switch (keysDeployManifestRead(self, job.server_id, facts.home)) {
+        .ok => |found| {
+            for (found) |*entry| {
+                entries.append(self.allocator, entry.*) catch {
+                    entry.deinit(self.allocator);
+                    continue;
+                };
+            }
+            self.allocator.free(found);
+        },
+        .missing => {},
+        .corrupt => {
+            if (keysDeployManifestPath(self, facts.home)) |path| {
+                defer self.allocator.free(path);
+                keysQuarantine(self, job.server_id, path, .root);
+            }
+        },
+        .unreadable => {
+            keysJobFinish(self, registry, job, 0, .@"error", "the deploy-key manifest could not be read", .partial);
+            return;
+        },
+    }
+    if (entries.items.len >= keyjobs.max_deploy_manifest_entries) {
+        keysJobFinish(self, registry, job, 0, .@"error", "the deploy-key manifest is full (64 entries); delete one first", .partial);
+        return;
+    }
+    registry.jobSetStep(job, 0, .done, null);
+
+    registry.jobSetStep(job, 1, .running, null);
+    if (keysJobCancelDrive(self, registry, job, 1)) return;
+    const deploy_id = keyjobs.randomId(self.allocator, self.io, "dk") catch {
+        keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+        return;
+    };
+    defer self.allocator.free(deploy_id);
+    const key_path = std.fmt.allocPrint(self.allocator, "{s}/.ssh/{s}{s}", .{ facts.home, deploy_key_prefix, deploy_id }) catch {
+        keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+        return;
+    };
+    defer self.allocator.free(key_path);
+    if (sshkeysEnsureSshDir(self, job.server_id, key_path)) |err| {
+        keysJobFinish(self, registry, job, 1, .@"error", err, .partial);
+        return;
+    }
+    const comment_text = if (p.comment) |c|
+        self.allocator.dupe(u8, c) catch {
+            keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+            return;
+        }
+    else
+        std.fmt.allocPrint(self.allocator, "oars-deploy:{s}", .{p.repository_label}) catch {
+            keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+            return;
+        };
+    defer self.allocator.free(comment_text);
+    const quoted_path = shellquote.quote(self.allocator, key_path) catch {
+        keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+        return;
+    };
+    defer self.allocator.free(quoted_path);
+    const quoted_comment = shellquote.quote(self.allocator, comment_text) catch {
+        keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+        return;
+    };
+    defer self.allocator.free(quoted_comment);
+    // No passphrase: deploy keys sign unattended Git pulls. The private
+    // key stays on the server at 0600; authorized_keys is never touched.
+    const gen_cmd = std.fmt.allocPrint(self.allocator, "ssh-keygen -q -t ed25519 -N '' -f {s} -C {s}", .{ quoted_path, quoted_comment }) catch {
+        keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+        return;
+    };
+    defer self.allocator.free(gen_cmd);
+    var gen = keysExec(self, job.server_id, gen_cmd) orelse {
+        keysJobFinish(self, registry, job, 1, .@"error", "not connected", .partial);
+        return;
+    };
+    const gen_exit = gen.exit;
+    gen.output.deinit(self.allocator);
+    if (gen_exit != 0) {
+        keysJobFinish(self, registry, job, 1, .@"error", "ssh-keygen failed on the server", .partial);
+        return;
+    }
+    if (!keysChmod(self, job.server_id, key_path, 0o600)) {
+        keysJobFinish(self, registry, job, 1, .@"error", "could not set the private key to mode 0600", .partial);
+        return;
+    }
+    const pub_path = std.fmt.allocPrint(self.allocator, "{s}.pub", .{key_path}) catch {
+        keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+        return;
+    };
+    defer self.allocator.free(pub_path);
+    _ = keysChmod(self, job.server_id, pub_path, 0o644);
+    const pub_read = keysReadTyped(self, job.server_id, pub_path, 16 * 1024);
+    if (pub_read.status != .readable) {
+        keysJobFinish(self, registry, job, 1, .@"error", "the public key could not be read after generation", .partial);
+        return;
+    }
+    const pub_raw = pub_read.content.?;
+    defer self.allocator.free(pub_raw);
+    const public_key = std.mem.trim(u8, pub_raw, " \t\r\n");
+    var pub_file = sshkeys.parse(self.allocator, public_key) catch {
+        keysJobFinish(self, registry, job, 1, .@"error", "the generated public key could not be parsed", .partial);
+        return;
+    };
+    defer pub_file.deinit(self.allocator);
+    if (pub_file.keys.len != 1 or !pub_file.keys[0].parsed) {
+        keysJobFinish(self, registry, job, 1, .@"error", "the generated public key could not be parsed", .partial);
+        return;
+    }
+    const fingerprint = self.allocator.dupe(u8, pub_file.keys[0].fingerprint_sha256) catch {
+        keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+        return;
+    };
+    defer self.allocator.free(fingerprint);
+    registry.jobSetStep(job, 1, .done, null);
+
+    registry.jobSetStep(job, 2, .running, null);
+    if (keysJobCancelDrive(self, registry, job, 2)) return;
+    entries.append(self.allocator, .{
+        .id = self.allocator.dupe(u8, deploy_id) catch {
+            keysJobFinish(self, registry, job, 2, .@"error", "out of memory", .partial);
+            return;
+        },
+        .repository_label = self.allocator.dupe(u8, p.repository_label) catch {
+            keysJobFinish(self, registry, job, 2, .@"error", "out of memory", .partial);
+            return;
+        },
+        .path = self.allocator.dupe(u8, key_path) catch {
+            keysJobFinish(self, registry, job, 2, .@"error", "out of memory", .partial);
+            return;
+        },
+        .fingerprint = self.allocator.dupe(u8, fingerprint) catch {
+            keysJobFinish(self, registry, job, 2, .@"error", "out of memory", .partial);
+            return;
+        },
+        .comment = self.allocator.dupe(u8, comment_text) catch {
+            keysJobFinish(self, registry, job, 2, .@"error", "out of memory", .partial);
+            return;
+        },
+        .created_at_ms = keysNowMs(self),
+    }) catch {
+        keysJobFinish(self, registry, job, 2, .@"error", "out of memory", .partial);
+        return;
+    };
+    if (keysDeployManifestWrite(self, job.server_id, facts.home, entries.items)) |err| {
+        keysJobFinish(self, registry, job, 2, .@"error", err, .partial);
+        return;
+    }
+    registry.jobSetStep(job, 2, .done, null);
+
+    registry.jobSetStep(job, 3, .running, null);
+    const verify = keysReadTyped(self, job.server_id, key_path, 16 * 1024);
+    if (verify.status != .readable) {
+        keysJobFinish(self, registry, job, 3, .@"error", "the private key could not be verified after generation", .partial);
+        return;
+    }
+    if (verify.content) |c| self.allocator.free(c);
+    if (keysBuildResult(self, &.{
+        .{ "deploy_key_id", deploy_id },
+        .{ "public_key", public_key },
+        .{ "private_path", key_path },
+        .{ "fingerprint", fingerprint },
+    })) |fragment| {
+        registry.jobSetResult(job, fragment);
+    }
+    keysJobFinish(self, registry, job, 3, .done, null, .done);
+}
+
+fn keysDriveJobDeployDelete(self: *Context, registry: *keyjobs.Registry, job: *keyjobs.Job) void {
+    const p = &job.payload.deploy_delete;
+    registry.jobSetStep(job, 0, .running, null);
+    if (keysJobCancelDrive(self, registry, job, 0)) return;
+    if (!keysSessionReady(self, job.server_id)) {
+        keysJobFinish(self, registry, job, 0, .@"error", "not connected", .partial);
+        return;
+    }
+    var facts = keysAccountFacts(self, job.server_id, null) orelse {
+        keysJobFinish(self, registry, job, 0, .@"error", "the connected account could not be resolved", .partial);
+        return;
+    };
+    defer facts.deinit(self.allocator);
+    var entries: std.ArrayList(keyjobs.DeployKeyEntry) = .empty;
+    defer {
+        for (entries.items) |*entry| entry.deinit(self.allocator);
+        entries.deinit(self.allocator);
+    }
+    switch (keysDeployManifestRead(self, job.server_id, facts.home)) {
+        .ok => |found| {
+            for (found) |*entry| {
+                entries.append(self.allocator, entry.*) catch {
+                    entry.deinit(self.allocator);
+                    continue;
+                };
+            }
+            self.allocator.free(found);
+        },
+        .missing => {},
+        .corrupt => {
+            keysJobFinish(self, registry, job, 0, .@"error", "the deploy-key manifest is corrupt; take a snapshot to quarantine it first", .partial);
+            return;
+        },
+        .unreadable => {
+            keysJobFinish(self, registry, job, 0, .@"error", "the deploy-key manifest could not be read", .partial);
+            return;
+        },
+    }
+    var target_index: ?usize = null;
+    for (entries.items, 0..) |*entry, i| {
+        if (std.mem.eql(u8, entry.id, p.deploy_key_id)) {
+            target_index = i;
+            break;
+        }
+    }
+    const index = target_index orelse {
+        keysJobFinish(self, registry, job, 0, .conflict, "the deploy key is no longer in the manifest; refresh the snapshot", .partial);
+        return;
+    };
+    if (!std.mem.eql(u8, entries.items[index].fingerprint, p.confirm_fingerprint)) {
+        keysJobFinish(self, registry, job, 0, .conflict, "the typed fingerprint does not match the deploy key", .partial);
+        return;
+    }
+    const key_path = self.allocator.dupe(u8, entries.items[index].path) catch {
+        keysJobFinish(self, registry, job, 0, .@"error", "out of memory", .partial);
+        return;
+    };
+    defer self.allocator.free(key_path);
+    registry.jobSetStep(job, 0, .done, null);
+
+    registry.jobSetStep(job, 1, .running, null);
+    if (keysJobCancelDrive(self, registry, job, 1)) return;
+    const pub_path = std.fmt.allocPrint(self.allocator, "{s}.pub", .{key_path}) catch {
+        keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+        return;
+    };
+    defer self.allocator.free(pub_path);
+    // authorized_keys is never part of deploy-key deletion.
+    if (!keysRmFile(self, job.server_id, key_path) or !keysRmFile(self, job.server_id, pub_path)) {
+        keysJobFinish(self, registry, job, 1, .@"error", "the key files could not be removed", .partial);
+        return;
+    }
+    registry.jobSetStep(job, 1, .done, null);
+
+    registry.jobSetStep(job, 2, .running, null);
+    const removed = entries.orderedRemove(index);
+    var mutable = removed;
+    mutable.deinit(self.allocator);
+    if (keysDeployManifestWrite(self, job.server_id, facts.home, entries.items)) |err| {
+        keysJobFinish(self, registry, job, 2, .@"error", err, .partial);
+        return;
+    }
+    registry.jobSetStep(job, 2, .done, null);
+    keysJobFinish(self, registry, job, 2, .done, null, .done);
+}
+
+// --- local generation (local job worker) ---------------------------------------
+
+fn keysKeygenErrorText(err: keygen.KeygenError) []const u8 {
+    return switch (err) {
+        error.InvalidDestination => "the destination path is not usable",
+        error.DestinationMissing => "the destination directory does not exist",
+        error.DestinationExists => "the destination already exists; nothing was overwritten",
+        error.SshKeygenMissing => "OpenSSH ssh-keygen is not installed on this machine",
+        error.PtyFailed => "could not create a private terminal for ssh-keygen",
+        error.SpawnFailed => "ssh-keygen could not be started",
+        error.UnexpectedOutput => "ssh-keygen produced unexpected output; aborted",
+        error.PromptFailed => "the ssh-keygen passphrase prompt failed",
+        error.GenerationFailed => "ssh-keygen failed",
+        error.VerifyFailed => "the generated key could not be verified",
+        error.InstallFailed => "the key could not be installed at the destination",
+        error.Timeout => "ssh-keygen timed out",
+        error.Canceled => "canceled",
+        error.OutOfMemory => "out of memory",
+    };
+}
+
+fn keysDriveLocalJob(context: *anyopaque, registry: *keyjobs.Registry, job: *keyjobs.Job) void {
+    const self = contextOf(context);
+    const p = &job.payload.local_generate;
+    registry.jobSetStep(job, 0, .running, null);
+    const generated = keygen.generate(self.io, self.allocator, .{
+        .destination = p.destination,
+        .comment = p.comment,
+        .passphrase = p.passphrase,
+        .cancel = &job.cancel_requested,
+    }) catch |err| {
+        if (err == error.Canceled) {
+            keysJobFinish(self, registry, job, 0, .canceled, null, .canceled);
+        } else {
+            keysJobFinish(self, registry, job, 0, .@"error", keysKeygenErrorText(err), .partial);
+        }
+        return;
+    };
+    defer self.allocator.free(generated.public_key);
+    defer self.allocator.free(generated.private_path);
+    defer self.allocator.free(generated.fingerprint_sha256);
+    registry.jobSetStep(job, 0, .done, null);
+
+    registry.jobSetStep(job, 1, .running, null);
+    if (keysJobCancelDrive(self, registry, job, 1)) return;
+    // keygen already verified OpenSSH readability and mode 0600 before
+    // the no-clobber install. The keychain account is only a name: the
+    // frontend stores the passphrase itself when the user opted in.
+    const keychain_account = std.fmt.allocPrint(self.allocator, "localkey:{s}", .{generated.fingerprint_sha256}) catch {
+        keysJobFinish(self, registry, job, 1, .@"error", "out of memory", .partial);
+        return;
+    };
+    defer self.allocator.free(keychain_account);
+    if (keysBuildResult(self, &.{
+        .{ "public_key", generated.public_key },
+        .{ "private_path", generated.private_path },
+        .{ "fingerprint", generated.fingerprint_sha256 },
+        .{ "keychain_account", keychain_account },
+    })) |fragment| {
+        registry.jobSetResult(job, fragment);
+    }
+    keysJobFinish(self, registry, job, 1, .done, null, .done);
+}
+
+// --- driver dispatch -----------------------------------------------------------
+
+fn keysDriveJob(context: *anyopaque, registry: *keyjobs.Registry, job: *keyjobs.Job) void {
+    const self = contextOf(context);
+    switch (job.kind) {
+        .add => keysDriveJobAdd(self, registry, job),
+        .revoke => keysDriveJobRevoke(self, registry, job),
+        .rotate => keysDriveJobRotate(self, registry, job),
+        .role_create, .role_repair, .role_delete => keysDriveJobRole(self, registry, job),
+        .deploy_generate => keysDriveJobDeployGenerate(self, registry, job),
+        .deploy_delete => keysDriveJobDeployDelete(self, registry, job),
+        .local_generate => {}, // claimed by the local worker instead
+    }
+}
+
+// --- handlers (spec 08) --------------------------------------------------------
+
+const keys_empty_file_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+fn keysNowNs(self: *Context) i128 {
+    return std.Io.Timestamp.now(self.io, .real).nanoseconds;
+}
+
+// The find helpers below assume the caller holds the registry lock; the
+// returned pointers are only valid until the lock is released.
+
+fn keysFindSnapshotLocked(self: *Context, id: []const u8) ?*keyjobs.Snapshot {
+    for (self.keys.snapshots.items) |snap| {
+        if (std.mem.eql(u8, snap.id, id)) return snap;
+    }
+    return null;
+}
+
+fn keysFindJobLocked(self: *Context, id: []const u8) ?*keyjobs.Job {
+    for (self.keys.jobs.items) |job| {
+        if (std.mem.eql(u8, job.id, id)) return job;
+    }
+    return null;
+}
+
+fn keysLastCompletedSnapshotLocked(self: *Context, server_id: []const u8) ?*keyjobs.Snapshot {
+    var best: ?*keyjobs.Snapshot = null;
+    for (self.keys.snapshots.items) |snap| {
+        if (!std.mem.eql(u8, snap.server_id, server_id)) continue;
+        if (snap.state != .done and snap.state != .partial) continue;
+        if (best == null or snap.created_at_ns > best.?.created_at_ns) best = snap;
+    }
+    return best;
+}
+
+fn keysFindSource(snap: *keyjobs.Snapshot, path: []const u8) ?*keyjobs.Source {
+    for (snap.sources.items) |*source| {
+        if (std.mem.eql(u8, source.path, path)) return source;
+    }
+    return null;
+}
+
+fn keysFindRole(snap: *keyjobs.Snapshot, name: []const u8) ?*keyjobs.RoleEntry {
+    for (snap.roles.items) |*role| {
+        if (std.mem.eql(u8, role.name, name)) return role;
+    }
+    return null;
+}
+
+fn keysFindKey(snap: *keyjobs.Snapshot, source_path: []const u8, fingerprint: []const u8) ?*keyjobs.KeyEntry {
+    for (snap.keys.items) |*key| {
+        if (!key.parsed) continue;
+        if (std.mem.eql(u8, key.source_path, source_path) and std.mem.eql(u8, key.fingerprint_sha256, fingerprint)) return key;
+    }
+    return null;
+}
+
+/// Validates the frozen source identity for a mutation. Returns a static
+/// error message, or null when the source may be mutated through it.
+fn keysValidateSourceLocked(snap: *keyjobs.Snapshot, source_path: []const u8, file_sha256: []const u8) ?[]const u8 {
+    const source = keysFindSource(snap, source_path) orelse return "the source is not part of the snapshot; take a fresh snapshot";
+    if (!std.mem.eql(u8, source.kind, "static")) return "only static authorized_keys files can be changed";
+    if (!keyjobs.statusAllowsMutation(source.status)) return "the source could not be read; resolve the source error before changing it";
+    const frozen = source.file_sha256 orelse keys_empty_file_sha256;
+    if (!std.mem.eql(u8, frozen, file_sha256)) return "the source changed since the snapshot; refresh and review again";
+    return null;
+}
+
+/// Builds a job record with every owned field duped. Ownership of
+/// `payload` moves to the job; on failure everything is released here.
+fn keysNewJob(
+    self: *Context,
+    kind: keyjobs.JobKind,
+    operation_id: []const u8,
+    server_id: []const u8,
+    account_name: ?[]const u8,
+    source_path: []const u8,
+    file_sha256: []const u8,
+    payload: keyjobs.JobPayload,
+) !*keyjobs.Job {
+    const job = try self.allocator.create(keyjobs.Job);
+    errdefer self.allocator.destroy(job);
+    var payload_owned = payload;
+    errdefer payload_owned.deinit(self.allocator);
+    const now = keysNowNs(self);
+    const id = try keyjobs.randomId(self.allocator, self.io, "job");
+    errdefer self.allocator.free(id);
+    const operation_id_owned = try self.allocator.dupe(u8, operation_id);
+    errdefer self.allocator.free(operation_id_owned);
+    const server_id_owned = try self.allocator.dupe(u8, server_id);
+    errdefer self.allocator.free(server_id_owned);
+    const account_name_owned: ?[]u8 = if (account_name) |n| try self.allocator.dupe(u8, n) else null;
+    errdefer if (account_name_owned) |n| self.allocator.free(n);
+    const source_path_owned = try self.allocator.dupe(u8, source_path);
+    errdefer self.allocator.free(source_path_owned);
+    const file_sha256_owned = try self.allocator.dupe(u8, file_sha256);
+    errdefer self.allocator.free(file_sha256_owned);
+    const step_names = kind.steps();
+    const steps = try self.allocator.alloc(keyjobs.Step, step_names.len);
+    errdefer self.allocator.free(steps);
+    for (steps, 0..) |*step, i| step.* = .{ .id = step_names[i] };
+    job.* = .{
+        .id = id,
+        .operation_id = operation_id_owned,
+        .server_id = server_id_owned,
+        .kind = kind,
+        .account_name = account_name_owned,
+        .source_path = source_path_owned,
+        .file_sha256 = file_sha256_owned,
+        .payload = payload_owned,
+        .created_at_ns = now,
+        .steps = steps,
+        .touched_ns = now,
+    };
+    return job;
+}
+
+fn keysNewSnapshot(self: *Context, server_id: []const u8, account_kind: keyjobs.AccountKind, account_name: ?[]const u8) !*keyjobs.Snapshot {
+    const snap = try self.allocator.create(keyjobs.Snapshot);
+    errdefer self.allocator.destroy(snap);
+    const now = keysNowNs(self);
+    const id = try keyjobs.randomId(self.allocator, self.io, "snap");
+    errdefer self.allocator.free(id);
+    const server_id_owned = try self.allocator.dupe(u8, server_id);
+    errdefer self.allocator.free(server_id_owned);
+    const account_name_owned: ?[]u8 = if (account_name) |n| try self.allocator.dupe(u8, n) else null;
+    errdefer if (account_name_owned) |n| self.allocator.free(n);
+    snap.* = .{
+        .id = id,
+        .server_id = server_id_owned,
+        .account_kind = account_kind,
+        .account_name = account_name_owned,
+        .created_at_ns = now,
+        .touched_ns = now,
+    };
+    return snap;
+}
+
+fn keysNewPlan(
+    self: *Context,
+    server_id: []const u8,
+    name: []const u8,
+    kind: []const u8,
+    action: keyjobs.RolePlanAction,
+    privilege: []const u8,
+    forced_command: []const u8,
+    home: ?[]const u8,
+    commands: []const []const u8,
+    effects: []const []const u8,
+) !*keyjobs.RolePlan {
+    const plan = try self.allocator.create(keyjobs.RolePlan);
+    errdefer self.allocator.destroy(plan);
+    const id = try keyjobs.randomId(self.allocator, self.io, "plan");
+    errdefer self.allocator.free(id);
+    const server_id_owned = try self.allocator.dupe(u8, server_id);
+    errdefer self.allocator.free(server_id_owned);
+    const name_owned = try self.allocator.dupe(u8, name);
+    errdefer self.allocator.free(name_owned);
+    const kind_owned = try self.allocator.dupe(u8, kind);
+    errdefer self.allocator.free(kind_owned);
+    const privilege_owned = try self.allocator.dupe(u8, privilege);
+    errdefer self.allocator.free(privilege_owned);
+    const forced_owned = try self.allocator.dupe(u8, forced_command);
+    errdefer self.allocator.free(forced_owned);
+    const home_owned: ?[]u8 = if (home) |h| try self.allocator.dupe(u8, h) else null;
+    errdefer if (home_owned) |h| self.allocator.free(h);
+    const commands_owned = try self.allocator.alloc([]u8, commands.len);
+    var commands_filled: usize = 0;
+    errdefer {
+        for (commands_owned[0..commands_filled]) |c| self.allocator.free(c);
+        self.allocator.free(commands_owned);
+    }
+    for (commands, 0..) |c, i| {
+        commands_owned[i] = try self.allocator.dupe(u8, c);
+        commands_filled += 1;
+    }
+    const effects_owned = try self.allocator.alloc([]u8, effects.len);
+    var effects_filled: usize = 0;
+    errdefer {
+        for (effects_owned[0..effects_filled]) |e| self.allocator.free(e);
+        self.allocator.free(effects_owned);
+    }
+    for (effects, 0..) |e, i| {
+        effects_owned[i] = try self.allocator.dupe(u8, e);
+        effects_filled += 1;
+    }
+    const now_ms: i128 = keysNowMs(self);
+    plan.* = .{
+        .id = id,
+        .server_id = server_id_owned,
+        .name = name_owned,
+        .kind = kind_owned,
+        .action = action,
+        .privilege = privilege_owned,
+        .forced_command = forced_owned,
+        .home = home_owned,
+        .commands = commands_owned,
+        .effects = effects_owned,
+        .created_at_ms = now_ms,
+        .expires_at_ms = now_ms + keyjobs.plan_ttl_ms,
+    };
+    return plan;
+}
+
+/// One admission audit row per mutation, written when the job is
+/// registered. The terminal row comes from the driver (or from
+/// handleSshKeysJobCancel for a job that never started).
+fn keysAuditAdmission(self: *Context, job: *keyjobs.Job) void {
+    var kind_buf: [256]u8 = undefined;
+    const kind_text = keyjobs.kindDetail(job, &kind_buf);
+    var detail_buf: [320]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "admitted {s}", .{kind_text}) catch "admitted";
+    const target = if (job.server_id.len > 0) job.server_id else "local";
+    self.audit.append(self.io, job.kind.auditName(), target, detail) catch {};
+}
+
+/// Idempotent re-admission: a repeated operation_id returns the existing
+/// job (with the fingerprint the original response carried, when the
+/// kind defines one).
+fn keysRespondExistingJob(output: []u8, match: *const keyjobs.Registry.OperationMatch, fingerprint_field: ?[]const u8) []const u8 {
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"job_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, match.id) catch return output[0..0];
+    if (fingerprint_field) |field| {
+        if (match.fingerprint) |fp| {
+            writer.writeAll(",") catch return output[0..0];
+            json.writeJsonString(&writer, field) catch return output[0..0];
+            writer.writeAll(":") catch return output[0..0];
+            json.writeJsonString(&writer, fp) catch return output[0..0];
+        }
+    }
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+// Payload builders. These return real errors, so their errdefers release
+// every field on failure; on success ownership moves to the job.
+
+fn keysAddPayload(self: *Context, normalized_line: []const u8, fingerprint: []const u8) !keyjobs.JobPayload {
+    const line = try self.allocator.dupe(u8, normalized_line);
+    errdefer self.allocator.free(line);
+    const fp = try self.allocator.dupe(u8, fingerprint);
+    errdefer self.allocator.free(fp);
+    return .{ .add = .{ .normalized_line = line, .fingerprint = fp } };
+}
+
+fn keysRevokePayload(self: *Context, fingerprint: []const u8, line_hash: []const u8) !keyjobs.JobPayload {
+    const fp = try self.allocator.dupe(u8, fingerprint);
+    errdefer self.allocator.free(fp);
+    const hash = try self.allocator.dupe(u8, line_hash);
+    errdefer self.allocator.free(hash);
+    return .{ .revoke = .{ .fingerprint = fp, .line_hash = hash } };
+}
+
+fn keysRotatePayload(self: *Context, old_fingerprint: []const u8, line_hash: []const u8, new_line: []const u8, new_fingerprint: []const u8, old_options: []const u8) !keyjobs.JobPayload {
+    const old_fp = try self.allocator.dupe(u8, old_fingerprint);
+    errdefer self.allocator.free(old_fp);
+    const hash = try self.allocator.dupe(u8, line_hash);
+    errdefer self.allocator.free(hash);
+    const line = try self.allocator.dupe(u8, new_line);
+    errdefer self.allocator.free(line);
+    const new_fp = try self.allocator.dupe(u8, new_fingerprint);
+    errdefer self.allocator.free(new_fp);
+    const options = try self.allocator.dupe(u8, old_options);
+    errdefer self.allocator.free(options);
+    return .{ .rotate = .{
+        .old_fingerprint = old_fp,
+        .line_hash = hash,
+        .new_line = line,
+        .new_fingerprint = new_fp,
+        .old_options = options,
+    } };
+}
+
+fn keysLocalGeneratePayloadBuild(self: *Context, destination: []const u8, comment: ?[]const u8, passphrase: ?[]const u8) !keyjobs.JobPayload {
+    const dest = try self.allocator.dupe(u8, destination);
+    errdefer self.allocator.free(dest);
+    const comment_owned: ?[]u8 = if (comment) |c| try self.allocator.dupe(u8, c) else null;
+    errdefer if (comment_owned) |c| self.allocator.free(c);
+    const passphrase_owned: ?[]u8 = if (passphrase) |pp| try self.allocator.dupe(u8, pp) else null;
+    errdefer if (passphrase_owned) |pp| {
+        std.crypto.secureZero(u8, pp);
+        self.allocator.free(pp);
+    };
+    return .{ .local_generate = .{
+        .destination = dest,
+        .comment = comment_owned,
+        .passphrase = passphrase_owned,
+        .remember_passphrase = false,
+    } };
+}
+
+fn keysDeployGeneratePayload(self: *Context, repository_label: []const u8, comment: ?[]const u8) !keyjobs.JobPayload {
+    const label = try self.allocator.dupe(u8, repository_label);
+    errdefer self.allocator.free(label);
+    const comment_owned: ?[]u8 = if (comment) |c| try self.allocator.dupe(u8, c) else null;
+    errdefer if (comment_owned) |c| self.allocator.free(c);
+    return .{ .deploy_generate = .{ .repository_label = label, .comment = comment_owned } };
+}
+
+fn keysDeployDeletePayload(self: *Context, deploy_key_id: []const u8, confirm_fingerprint: []const u8) !keyjobs.JobPayload {
+    const id = try self.allocator.dupe(u8, deploy_key_id);
+    errdefer self.allocator.free(id);
+    const confirm = try self.allocator.dupe(u8, confirm_fingerprint);
+    errdefer self.allocator.free(confirm);
+    return .{ .deploy_delete = .{ .deploy_key_id = id, .confirm_fingerprint = confirm } };
+}
+
+fn keysLocalKeyVerification(self: *Context, path: []const u8, passphrase: ?[]const u8) !keyjobs.RotateVerification {
+    const path_owned = try self.allocator.dupe(u8, path);
+    errdefer self.allocator.free(path_owned);
+    const passphrase_owned: ?[]u8 = if (passphrase) |pp| try self.allocator.dupe(u8, pp) else null;
+    errdefer if (passphrase_owned) |pp| {
+        std.crypto.secureZero(u8, pp);
+        self.allocator.free(pp);
+    };
+    return .{ .local_private_key = .{ .path = path_owned, .passphrase = passphrase_owned } };
+}
+
+fn handleSshKeysInspect(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(KeysInspectPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (payload.public_key.len == 0 or payload.public_key.len > keys_max_key_text) return respondError(output, "invalid public key");
+    if (payload.comment) |comment| {
+        if (comment.len > keys_max_comment_text) return respondError(output, "comment is too long");
+    }
+    const normalized = sshkeys.normalizePublicKey(self.allocator, payload.public_key, payload.comment) catch |err| return respondError(output, switch (err) {
+        error.Multiline => "public key must be a single line",
+        else => "invalid public key",
+    });
+    defer {
+        self.allocator.free(normalized.line);
+        self.allocator.free(normalized.fingerprint_sha256);
+    }
+    var file = sshkeys.parse(self.allocator, normalized.line) catch return respondError(output, "invalid public key");
+    defer file.deinit(self.allocator);
+    if (file.keys.len != 1 or !file.keys[0].parsed) return respondError(output, "invalid public key");
+    const key = &file.keys[0];
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"normalized_public_key\":") catch return output[0..0];
+    json.writeJsonString(&writer, normalized.line) catch return output[0..0];
+    writer.writeAll(",\"fingerprint\":") catch return output[0..0];
+    json.writeJsonString(&writer, normalized.fingerprint_sha256) catch return output[0..0];
+    writer.writeAll(",\"key_type\":") catch return output[0..0];
+    json.writeJsonString(&writer, key.key_type) catch return output[0..0];
+    if (key.bits) |bits| {
+        writer.print(",\"bits\":{d}", .{bits}) catch return output[0..0];
+    }
+    writer.writeAll(",\"comment\":") catch return output[0..0];
+    json.writeJsonString(&writer, key.comment) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleSshKeysSnapshot(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(KeysSnapshotPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (!keysValidId(payload.server_id)) return respondError(output, "invalid server_id");
+    var kind: keyjobs.AccountKind = .connected;
+    var name: ?[]const u8 = null;
+    if (std.mem.eql(u8, payload.account.kind, "managed_role")) {
+        const role_name = payload.account.name orelse return respondError(output, "a role account name is required");
+        if (!access.safeUserName(role_name)) return respondError(output, "invalid role account name");
+        kind = .managed_role;
+        name = role_name;
+    } else if (!std.mem.eql(u8, payload.account.kind, "connected")) {
+        return respondError(output, "unknown account kind");
+    }
+    const snap = keysNewSnapshot(self, payload.server_id, kind, name) catch return respondError(output, "out of memory");
+    keysEnsureStarted(self);
+    self.keys.registerSnapshot(snap) catch |err| {
+        snap.deinit(self.allocator);
+        return respondError(output, switch (err) {
+            error.TooManyActive => "too many active snapshots; wait for one to finish",
+            else => "out of memory",
+        });
+    };
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"snapshot_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, snap.id) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleSshKeysSnapshotPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(KeysSnapshotIdPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    self.keys.lock();
+    defer self.keys.unlock();
+    const snap = keysFindSnapshotLocked(self, parsed.value.snapshot_id) orelse return respondError(output, "unknown snapshot");
+    snap.touched_ns = keysNowNs(self);
+    var writer = std.Io.Writer.fixed(output);
+    keysSnapshotPollWrite(self, &writer, snap) catch return respondError(output, "response too large");
+    return writer.buffered();
+}
+
+fn handleSshKeysSnapshotCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(KeysSnapshotIdPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    _ = self.keys.snapshotCancelById(parsed.value.snapshot_id) orelse return respondError(output, "unknown snapshot");
     return ok_json;
 }
 
-/// Server-side deploy key (spec 08 §5): `~/.ssh/oars_deploy` ed25519 with
-/// no passphrase, 0600, idempotent; authorized_keys is never touched.
-fn handleSshKeysDeployKeyGenerate(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+fn handleSshKeysAdd(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
-    var parsed = parsePayload(SshKeysDeployKeyPayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
+    var parsed = parsePayload(KeysAddPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
     defer parsed.deinit();
-    const server_id = parsed.value.server_id;
-    var cmd_buf: [512]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&cmd_buf, "mkdir -p ~/.ssh && chmod 700 ~/.ssh && (test -f ~/.ssh/{s} || ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/{s} -C oars-deploy) && chmod 600 ~/.ssh/{s} && cat ~/.ssh/{s}.pub", .{ deploy_key_name, deploy_key_name, deploy_key_name, deploy_key_name }) catch return respondError(output, "out of memory");
-    var check = self.manager.execWait(server_id, cmd, sshkeys_exec_cap, sshkeys_exec_timeout_ns) catch {
-        return respondError(output, "not connected");
+    const payload = parsed.value;
+    if (!keysValidId(payload.operation_id)) return respondError(output, "operation_id is required");
+    if (!keysValidId(payload.snapshot_id)) return respondError(output, "invalid snapshot_id");
+    if (!keysValidPath(payload.source_path)) return respondError(output, "invalid source path");
+    if (!keysValidHash(payload.file_sha256)) return respondError(output, "invalid file hash");
+    if (payload.public_key.len == 0 or payload.public_key.len > keys_max_key_text) return respondError(output, "invalid public key");
+    if (payload.comment) |comment| {
+        if (comment.len > keys_max_comment_text) return respondError(output, "comment is too long");
+    }
+    const normalized = sshkeys.normalizePublicKey(self.allocator, payload.public_key, payload.comment) catch |err| return respondError(output, switch (err) {
+        error.Multiline => "public key must be a single line",
+        else => "invalid public key",
+    });
+    defer {
+        self.allocator.free(normalized.line);
+        self.allocator.free(normalized.fingerprint_sha256);
+    }
+    if (self.keys.operationLookup(payload.operation_id)) |existing| {
+        var match = existing;
+        defer match.deinit(self.allocator);
+        if (match.kind != .add) return respondError(output, "operation_id was already used for a different operation");
+        return keysRespondExistingJob(output, &match, "fingerprint");
+    }
+
+    // Snapshot-side validation happens under one lock; every value the
+    // job needs is copied out before the lock is released.
+    var server_id: []u8 = undefined;
+    var account_name: ?[]u8 = null;
+    var role_options: ?[]u8 = null;
+    {
+        self.keys.lock();
+        defer self.keys.unlock();
+        const snap = keysFindSnapshotLocked(self, payload.snapshot_id) orelse return respondError(output, "unknown snapshot; take a fresh snapshot");
+        if (snap.state != .done and snap.state != .partial) return respondError(output, "the snapshot did not complete; take a fresh snapshot");
+        snap.touched_ns = keysNowNs(self);
+        if (keysValidateSourceLocked(snap, payload.source_path, payload.file_sha256)) |msg| return respondError(output, msg);
+
+        const forced: ?[]const u8 = blk: {
+            if (snap.account_kind != .managed_role) break :blk null;
+            const role = keysFindRole(snap, snap.account_name.?) orelse return respondError(output, "the managed role is missing from the snapshot; refresh");
+            if (role.policy_state != .verified) return respondError(output, "the role policy is not verified; repair the role before installing keys");
+            if (std.mem.eql(u8, role.kind, "read_only_sftp")) break :blk role.forced_command;
+            break :blk null;
+        };
+        server_id = self.allocator.dupe(u8, snap.server_id) catch return respondError(output, "out of memory");
+        account_name = if (snap.account_name) |n| self.allocator.dupe(u8, n) catch {
+            self.allocator.free(server_id);
+            return respondError(output, "out of memory");
+        } else null;
+        role_options = if (forced) |cmd| keyjobs.readOnlyRoleOptions(self.allocator, cmd) catch {
+            self.allocator.free(server_id);
+            if (account_name) |n| self.allocator.free(n);
+            return respondError(output, "out of memory");
+        } else null;
+    }
+    defer self.allocator.free(server_id);
+    defer if (account_name) |n| self.allocator.free(n);
+    defer if (role_options) |o| self.allocator.free(o);
+
+    const final_line: []const u8 = if (role_options) |opts|
+        std.fmt.allocPrint(self.allocator, "{s} {s}", .{ opts, normalized.line }) catch return respondError(output, "out of memory")
+    else
+        normalized.line;
+    defer if (role_options != null) self.allocator.free(final_line);
+    const payload_union = keysAddPayload(self, final_line, normalized.fingerprint_sha256) catch return respondError(output, "out of memory");
+    const job = keysNewJob(self, .add, payload.operation_id, server_id, account_name, payload.source_path, payload.file_sha256, payload_union) catch return respondError(output, "out of memory");
+    keysEnsureStarted(self);
+    self.keys.registerJob(job) catch |err| {
+        job.deinit(self.allocator);
+        return respondError(output, switch (err) {
+            error.TooManyActive => "too many active jobs; finish or cancel one before starting another",
+            else => "out of memory",
+        });
     };
-    defer check.output.deinit(self.allocator);
-    if (check.exit != 0) return respondError(output, "ssh-keygen failed on the server");
-    const pub_key = std.mem.trim(u8, check.output.items, " \t\r\n");
-    if (pub_key.len == 0) return respondError(output, "the deploy key could not be read");
-    sshkeysAudit(self, "sshkeys.deployKey.generate", server_id, "path=~/.ssh/oars_deploy");
+    keysAuditAdmission(self, job);
     var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,\"public_key\":") catch return output[0..0];
-    json.writeJsonString(&writer, pub_key) catch return output[0..0];
-    writer.writeAll(",\"path\":\"~/.ssh/oars_deploy\"}") catch return output[0..0];
+    writer.writeAll("{\"ok\":true,\"job_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, job.id) catch return output[0..0];
+    writer.writeAll(",\"fingerprint\":") catch return output[0..0];
+    json.writeJsonString(&writer, normalized.fingerprint_sha256) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleSshKeysRevoke(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(KeysRevokePayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (!keysValidId(payload.operation_id)) return respondError(output, "operation_id is required");
+    if (!keysValidId(payload.snapshot_id)) return respondError(output, "invalid snapshot_id");
+    if (!keysValidPath(payload.source_path)) return respondError(output, "invalid source path");
+    if (!keysValidHash(payload.file_sha256)) return respondError(output, "invalid file hash");
+    if (!keysValidFingerprint(payload.fingerprint)) return respondError(output, "invalid fingerprint");
+    if (!keysValidHash(payload.line_hash)) return respondError(output, "invalid line hash");
+    if (payload.confirm_fingerprint) |confirm| {
+        if (!keysValidFingerprint(confirm)) return respondError(output, "invalid confirmation fingerprint");
+        if (!std.mem.eql(u8, confirm, payload.fingerprint)) return respondError(output, "the confirmation fingerprint does not match the reviewed key");
+    }
+    if (self.keys.operationLookup(payload.operation_id)) |existing| {
+        var match = existing;
+        defer match.deinit(self.allocator);
+        if (match.kind != .revoke) return respondError(output, "operation_id was already used for a different operation");
+        return keysRespondExistingJob(output, &match, null);
+    }
+
+    var server_id: []u8 = undefined;
+    var account_name: ?[]u8 = null;
+    {
+        self.keys.lock();
+        defer self.keys.unlock();
+        const snap = keysFindSnapshotLocked(self, payload.snapshot_id) orelse return respondError(output, "unknown snapshot; take a fresh snapshot");
+        if (snap.state != .done and snap.state != .partial) return respondError(output, "the snapshot did not complete; take a fresh snapshot");
+        snap.touched_ns = keysNowNs(self);
+        if (keysValidateSourceLocked(snap, payload.source_path, payload.file_sha256)) |msg| return respondError(output, msg);
+        // Revoke stays available when the role policy drifted: removing a
+        // key never widens access.
+        const key = keysFindKey(snap, payload.source_path, payload.fingerprint) orelse return respondError(output, "the reviewed key is no longer in the source; refresh the snapshot");
+        if (!std.mem.eql(u8, key.line_hash, payload.line_hash)) return respondError(output, "the reviewed line changed; refresh and review again");
+        server_id = self.allocator.dupe(u8, snap.server_id) catch return respondError(output, "out of memory");
+        account_name = if (snap.account_name) |n| self.allocator.dupe(u8, n) catch {
+            self.allocator.free(server_id);
+            return respondError(output, "out of memory");
+        } else null;
+    }
+    defer self.allocator.free(server_id);
+    defer if (account_name) |n| self.allocator.free(n);
+
+    const payload_union = keysRevokePayload(self, payload.fingerprint, payload.line_hash) catch return respondError(output, "out of memory");
+    const job = keysNewJob(self, .revoke, payload.operation_id, server_id, account_name, payload.source_path, payload.file_sha256, payload_union) catch return respondError(output, "out of memory");
+    keysEnsureStarted(self);
+    self.keys.registerJob(job) catch |err| {
+        job.deinit(self.allocator);
+        return respondError(output, switch (err) {
+            error.TooManyActive => "too many active jobs; finish or cancel one before starting another",
+            else => "out of memory",
+        });
+    };
+    keysAuditAdmission(self, job);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"job_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, job.id) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleSshKeysRotate(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(KeysRotatePayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (!keysValidId(payload.operation_id)) return respondError(output, "operation_id is required");
+    if (!keysValidId(payload.snapshot_id)) return respondError(output, "invalid snapshot_id");
+    if (!keysValidPath(payload.source_path)) return respondError(output, "invalid source path");
+    if (!keysValidHash(payload.file_sha256)) return respondError(output, "invalid file hash");
+    if (!keysValidFingerprint(payload.old_fingerprint)) return respondError(output, "invalid fingerprint");
+    if (!keysValidHash(payload.line_hash)) return respondError(output, "invalid line hash");
+    if (payload.new_public_key.len == 0 or payload.new_public_key.len > keys_max_key_text) return respondError(output, "invalid public key");
+    const normalized = sshkeys.normalizePublicKey(self.allocator, payload.new_public_key, null) catch |err| return respondError(output, switch (err) {
+        error.Multiline => "public key must be a single line",
+        else => "invalid public key",
+    });
+    defer {
+        self.allocator.free(normalized.line);
+        self.allocator.free(normalized.fingerprint_sha256);
+    }
+    if (std.mem.eql(u8, normalized.fingerprint_sha256, payload.old_fingerprint)) return respondError(output, "the new key is the same as the old key");
+    if (self.keys.operationLookup(payload.operation_id)) |existing| {
+        var match = existing;
+        defer match.deinit(self.allocator);
+        if (match.kind != .rotate) return respondError(output, "operation_id was already used for a different operation");
+        return keysRespondExistingJob(output, &match, "new_fingerprint");
+    }
+
+    var server_id: []u8 = undefined;
+    var account_name: ?[]u8 = null;
+    var role_options: ?[]u8 = null;
+    var old_options: []u8 = undefined;
+    {
+        self.keys.lock();
+        defer self.keys.unlock();
+        const snap = keysFindSnapshotLocked(self, payload.snapshot_id) orelse return respondError(output, "unknown snapshot; take a fresh snapshot");
+        if (snap.state != .done and snap.state != .partial) return respondError(output, "the snapshot did not complete; take a fresh snapshot");
+        snap.touched_ns = keysNowNs(self);
+        if (keysValidateSourceLocked(snap, payload.source_path, payload.file_sha256)) |msg| return respondError(output, msg);
+        const old_key = keysFindKey(snap, payload.source_path, payload.old_fingerprint) orelse return respondError(output, "the reviewed key is no longer in the source; refresh the snapshot");
+        if (!std.mem.eql(u8, old_key.line_hash, payload.line_hash)) return respondError(output, "the reviewed line changed; refresh and review again");
+        if (keysFindKey(snap, payload.source_path, normalized.fingerprint_sha256) != null) return respondError(output, "the new key is already present in the source");
+        const forced: ?[]const u8 = blk: {
+            if (snap.account_kind != .managed_role) break :blk null;
+            const role = keysFindRole(snap, snap.account_name.?) orelse return respondError(output, "the managed role is missing from the snapshot; refresh");
+            if (role.policy_state != .verified) return respondError(output, "the role policy is not verified; repair the role before installing keys");
+            if (std.mem.eql(u8, role.kind, "read_only_sftp")) break :blk role.forced_command;
+            break :blk null;
+        };
+        server_id = self.allocator.dupe(u8, snap.server_id) catch return respondError(output, "out of memory");
+        account_name = if (snap.account_name) |n| self.allocator.dupe(u8, n) catch {
+            self.allocator.free(server_id);
+            return respondError(output, "out of memory");
+        } else null;
+        role_options = if (forced) |cmd| keyjobs.readOnlyRoleOptions(self.allocator, cmd) catch {
+            self.allocator.free(server_id);
+            if (account_name) |n| self.allocator.free(n);
+            return respondError(output, "out of memory");
+        } else null;
+        old_options = self.allocator.dupe(u8, old_key.options) catch {
+            self.allocator.free(server_id);
+            if (account_name) |n| self.allocator.free(n);
+            if (role_options) |o| self.allocator.free(o);
+            return respondError(output, "out of memory");
+        };
+    }
+    defer self.allocator.free(server_id);
+    defer if (account_name) |n| self.allocator.free(n);
+    defer if (role_options) |o| self.allocator.free(o);
+    defer self.allocator.free(old_options);
+
+    // The replacement line carries the old key's exact options (or the
+    // role's required ones), so a rotation never silently widens access.
+    const prefix: ?[]const u8 = if (role_options) |opts| opts else if (old_options.len > 0) old_options else null;
+    const new_line: []const u8 = if (prefix) |opts|
+        std.fmt.allocPrint(self.allocator, "{s} {s}", .{ opts, normalized.line }) catch return respondError(output, "out of memory")
+    else
+        normalized.line;
+    defer if (prefix != null) self.allocator.free(new_line);
+    const payload_union = keysRotatePayload(self, payload.old_fingerprint, payload.line_hash, new_line, normalized.fingerprint_sha256, old_options) catch return respondError(output, "out of memory");
+    const job = keysNewJob(self, .rotate, payload.operation_id, server_id, account_name, payload.source_path, payload.file_sha256, payload_union) catch return respondError(output, "out of memory");
+    keysEnsureStarted(self);
+    self.keys.registerJob(job) catch |err| {
+        job.deinit(self.allocator);
+        return respondError(output, switch (err) {
+            error.TooManyActive => "too many active jobs; finish or cancel one before starting another",
+            else => "out of memory",
+        });
+    };
+    keysAuditAdmission(self, job);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"job_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, job.id) catch return output[0..0];
+    writer.writeAll(",\"new_fingerprint\":") catch return output[0..0];
+    json.writeJsonString(&writer, normalized.fingerprint_sha256) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleSshKeysRotateCommit(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(KeysRotateCommitPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer {
+        // Scrub the passphrase copy inside the parsed payload before the
+        // arena is released.
+        if (parsed.value.verification.passphrase) |pp| {
+            if (pp.len > 0) std.crypto.secureZero(u8, @constCast(pp));
+        }
+        parsed.deinit();
+    }
+    const payload = parsed.value;
+    if (!keysValidId(payload.job_id)) return respondError(output, "invalid job_id");
+    var verification: keyjobs.RotateVerification = undefined;
+    if (std.mem.eql(u8, payload.verification.kind, "local_private_key")) {
+        const path = payload.verification.path orelse return respondError(output, "a private key path is required");
+        if (!keysValidPath(path)) return respondError(output, "invalid private key path");
+        if (payload.verification.passphrase) |pp| {
+            if (pp.len > keys_max_passphrase_text) return respondError(output, "passphrase is too long");
+        }
+        verification = keysLocalKeyVerification(self, path, payload.verification.passphrase) catch return respondError(output, "out of memory");
+    } else if (std.mem.eql(u8, payload.verification.kind, "external_confirmation")) {
+        const confirm = payload.verification.confirm_fingerprint orelse return respondError(output, "a confirmation fingerprint is required");
+        if (!keysValidFingerprint(confirm)) return respondError(output, "invalid confirmation fingerprint");
+        verification = .{ .external_confirmation = .{ .confirm_fingerprint = self.allocator.dupe(u8, confirm) catch return respondError(output, "out of memory") } };
+    } else {
+        return respondError(output, "unknown verification kind");
+    }
+    if (!self.keys.jobSubmitVerificationById(payload.job_id, verification)) {
+        var rejected = verification;
+        rejected.deinit(self.allocator);
+        return respondError(output, "the job is not waiting for verification");
+    }
+    return ok_json;
+}
+
+fn handleSshKeysJobPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(KeysJobIdPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    self.keys.lock();
+    defer self.keys.unlock();
+    const job = keysFindJobLocked(self, parsed.value.job_id) orelse return respondError(output, "unknown job");
+    job.touched_ns = keysNowNs(self);
+    var writer = std.Io.Writer.fixed(output);
+    keysJobPollWrite(self, &writer, job) catch return respondError(output, "response too large");
+    return writer.buffered();
+}
+
+fn handleSshKeysJobCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(KeysJobIdPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    var info = self.keys.jobCancelById(parsed.value.job_id) orelse return respondError(output, "unknown job");
+    defer info.deinit(self.allocator);
+    if (info.transitioned) {
+        // A queued or waiting job never reaches a driver, so the terminal
+        // audit row is written here (exactly once).
+        var detail_buf: [320]u8 = undefined;
+        const detail = std.fmt.bufPrint(&detail_buf, "state=canceled {s}", .{info.detail}) catch "state=canceled";
+        const target = if (info.server_id.len > 0) info.server_id else "local";
+        self.audit.append(self.io, info.kind.auditName(), target, detail) catch {};
+    }
+    return ok_json;
+}
+
+fn handleSshKeysLocalGenerate(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(KeysLocalGeneratePayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer {
+        if (parsed.value.passphrase) |pp| {
+            if (pp.len > 0) std.crypto.secureZero(u8, @constCast(pp));
+        }
+        parsed.deinit();
+    }
+    const payload = parsed.value;
+    if (!keysValidId(payload.operation_id)) return respondError(output, "operation_id is required");
+    if (!keysValidPath(payload.destination) or !std.fs.path.isAbsolute(payload.destination)) return respondError(output, "an absolute destination path is required");
+    if (payload.comment) |comment| {
+        if (comment.len > keys_max_comment_text) return respondError(output, "comment is too long");
+    }
+    if (payload.passphrase) |pp| {
+        if (pp.len > keys_max_passphrase_text) return respondError(output, "passphrase is too long");
+    }
+    if (self.keys.operationLookup(payload.operation_id)) |existing| {
+        var match = existing;
+        defer match.deinit(self.allocator);
+        if (match.kind != .local_generate) return respondError(output, "operation_id was already used for a different operation");
+        return keysRespondExistingJob(output, &match, null);
+    }
+    // server_id stays empty: the job runs on the local worker and audits
+    // against "local". remember_passphrase is always false here; the
+    // frontend writes the Keychain entry itself with the keychain_account
+    // from the job result.
+    const payload_union = keysLocalGeneratePayloadBuild(self, payload.destination, payload.comment, payload.passphrase) catch return respondError(output, "out of memory");
+    const job = keysNewJob(self, .local_generate, payload.operation_id, "", null, "", "", payload_union) catch return respondError(output, "out of memory");
+    keysEnsureStarted(self);
+    self.keys.registerJob(job) catch |err| {
+        job.deinit(self.allocator);
+        return respondError(output, switch (err) {
+            error.TooManyActive => "too many active jobs; finish or cancel one before starting another",
+            else => "out of memory",
+        });
+    };
+    keysAuditAdmission(self, job);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"job_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, job.id) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleSshKeysRolesPlan(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(KeysRolesPlanPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (!keysValidId(payload.server_id)) return respondError(output, "invalid server_id");
+    if (!access.safeUserName(payload.name)) return respondError(output, "invalid account name");
+    const read_only = std.mem.eql(u8, payload.kind, "read_only_sftp");
+    if (!read_only and !std.mem.eql(u8, payload.kind, "standard_ssh")) return respondError(output, "unknown role kind");
+    var action: keyjobs.RolePlanAction = undefined;
+    if (std.mem.eql(u8, payload.action, "create")) {
+        action = .create;
+    } else if (std.mem.eql(u8, payload.action, "repair")) {
+        action = .repair;
+    } else if (std.mem.eql(u8, payload.action, "delete")) {
+        action = .delete;
+    } else {
+        return respondError(output, "unknown role action");
+    }
+
+    // Everything the plan freezes comes from the latest completed
+    // snapshot; the values are copied out under one lock.
+    var privilege: []u8 = undefined;
+    var forced_command: []u8 = &.{};
+    var home: ?[]u8 = null;
+    {
+        self.keys.lock();
+        defer self.keys.unlock();
+        const snap = keysLastCompletedSnapshotLocked(self, payload.server_id) orelse return respondError(output, "take a snapshot before planning role changes");
+        snap.touched_ns = keysNowNs(self);
+        if (!std.mem.eql(u8, snap.privilege, "root") and !std.mem.eql(u8, snap.privilege, "sudo_n")) return respondError(output, "root or approved sudo -n is required for role changes");
+        const existing = keysFindRole(snap, payload.name);
+        var forced_source: []const u8 = "";
+        var home_source: ?[]const u8 = null;
+        switch (action) {
+            .create => {
+                if (existing != null) return respondError(output, "this account is already Oars-managed");
+                if (read_only) {
+                    if (!snap.sftp_read_only or snap.sftp_forced_command.len == 0) return respondError(output, "read-only SFTP is not available on this server");
+                    forced_source = snap.sftp_forced_command;
+                }
+            },
+            .repair => {
+                const role = existing orelse return respondError(output, "the role is not Oars-managed");
+                if (!std.mem.eql(u8, role.kind, payload.kind)) return respondError(output, "the role kind does not match the managed policy");
+                if (role.policy_state == .verified) return respondError(output, "the role policy is already verified");
+                if (read_only) forced_source = role.forced_command;
+                home_source = role.home;
+            },
+            .delete => {
+                const role = existing orelse return respondError(output, "the role is not Oars-managed");
+                if (!std.mem.eql(u8, role.kind, payload.kind)) return respondError(output, "the role kind does not match the managed policy");
+                home_source = role.home;
+            },
+        }
+        privilege = self.allocator.dupe(u8, snap.privilege) catch return respondError(output, "out of memory");
+        forced_command = self.allocator.dupe(u8, forced_source) catch {
+            self.allocator.free(privilege);
+            return respondError(output, "out of memory");
+        };
+        home = if (home_source) |h| self.allocator.dupe(u8, h) catch {
+            self.allocator.free(privilege);
+            self.allocator.free(forced_command);
+            return respondError(output, "out of memory");
+        } else null;
+    }
+    defer self.allocator.free(privilege);
+    defer self.allocator.free(forced_command);
+    defer if (home) |h| self.allocator.free(h);
+
+    // Account names pass safeUserName ([a-z0-9_-] only), so the plan
+    // commands need no shell quoting.
+    var cmd_buf: [384]u8 = undefined;
+    var commands: [1][]const u8 = undefined;
+    var command_count: usize = 0;
+    var effect_bufs: [3][256]u8 = undefined;
+    var effects: [3][]const u8 = undefined;
+    var effect_count: usize = 0;
+    var create_home_buf: [128]u8 = undefined;
+    switch (action) {
+        .create => {
+            commands[0] = sshkeysRoleCreateCommand(&cmd_buf, payload.name) catch return respondError(output, "out of memory");
+            command_count = 1;
+            home = blk: {
+                if (home) |h| break :blk h;
+                const text = std.fmt.bufPrint(&create_home_buf, "/home/{s}", .{payload.name}) catch return respondError(output, "out of memory");
+                break :blk self.allocator.dupe(u8, text) catch return respondError(output, "out of memory");
+            };
+            effects[0] = std.fmt.bufPrint(&effect_bufs[0], "Create the account '{s}' with a home directory; password login stays disabled", .{payload.name}) catch return respondError(output, "out of memory");
+            if (read_only) {
+                effects[1] = std.fmt.bufPrint(&effect_bufs[1], "Force every key for '{s}' to read-only SFTP with restrict and a forced command", .{payload.name}) catch return respondError(output, "out of memory");
+            } else {
+                effects[1] = std.fmt.bufPrint(&effect_bufs[1], "Install the first approved key in {s}/.ssh/authorized_keys (mode 0600)", .{home.?}) catch return respondError(output, "out of memory");
+            }
+            effects[2] = std.fmt.bufPrint(&effect_bufs[2], "Record '{s}' in the Oars role policy manifest", .{payload.name}) catch return respondError(output, "out of memory");
+            effect_count = 3;
+        },
+        .repair => {
+            effects[0] = std.fmt.bufPrint(&effect_bufs[0], "Re-verify the account, home, shell, and key source for '{s}'", .{payload.name}) catch return respondError(output, "out of memory");
+            if (read_only) {
+                effects[1] = std.fmt.bufPrint(&effect_bufs[1], "Reapply the approved forced read-only SFTP options to every parsed key for '{s}'", .{payload.name}) catch return respondError(output, "out of memory");
+                effects[2] = std.fmt.bufPrint(&effect_bufs[2], "Rewrite the Oars role policy entry for '{s}'", .{payload.name}) catch return respondError(output, "out of memory");
+                effect_count = 3;
+            } else {
+                effects[1] = std.fmt.bufPrint(&effect_bufs[1], "Rewrite the Oars role policy entry for '{s}'", .{payload.name}) catch return respondError(output, "out of memory");
+                effect_count = 2;
+            }
+        },
+        .delete => {
+            commands[0] = std.fmt.bufPrint(&cmd_buf, "userdel {s}", .{payload.name}) catch return respondError(output, "out of memory");
+            command_count = 1;
+            effects[0] = std.fmt.bufPrint(&effect_bufs[0], "Delete the account '{s}'; the home directory is left on disk", .{payload.name}) catch return respondError(output, "out of memory");
+            effects[1] = std.fmt.bufPrint(&effect_bufs[1], "Remove '{s}' from the Oars role policy manifest", .{payload.name}) catch return respondError(output, "out of memory");
+            effect_count = 2;
+        },
+    }
+
+    const plan = keysNewPlan(self, payload.server_id, payload.name, payload.kind, action, privilege, forced_command, home, commands[0..command_count], effects[0..effect_count]) catch return respondError(output, "out of memory");
+    self.keys.registerPlan(plan) catch |err| {
+        plan.deinit(self.allocator);
+        return respondError(output, switch (err) {
+            error.TooManyActive => "too many role plans; commit or discard one first",
+            else => "out of memory",
+        });
+    };
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"plan_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, plan.id) catch return output[0..0];
+    writer.print(",\"expires_at_ms\":{d}", .{plan.expires_at_ms}) catch return output[0..0];
+    writer.writeAll(",\"account\":") catch return output[0..0];
+    json.writeJsonString(&writer, plan.name) catch return output[0..0];
+    if (plan.home) |plan_home| {
+        writer.writeAll(",\"home\":") catch return output[0..0];
+        json.writeJsonString(&writer, plan_home) catch return output[0..0];
+    }
+    writer.writeAll(",\"commands\":[") catch return output[0..0];
+    for (plan.commands, 0..) |command, i| {
+        if (i > 0) writer.writeAll(",") catch return output[0..0];
+        json.writeJsonString(&writer, command) catch return output[0..0];
+    }
+    writer.writeAll("],\"effects\":[") catch return output[0..0];
+    for (plan.effects, 0..) |effect, i| {
+        if (i > 0) writer.writeAll(",") catch return output[0..0];
+        json.writeJsonString(&writer, effect) catch return output[0..0];
+    }
+    writer.writeAll("]}") catch return output[0..0];
+    return writer.buffered();
+}
+
+/// Builds the owned role payload from a committed plan (every slice
+/// duped; the plan itself is released by the caller).
+fn keysRolePayloadFromPlan(self: *Context, plan: *const keyjobs.RolePlan, first_key_line: ?[]const u8) !keyjobs.JobPayload {
+    const name = try self.allocator.dupe(u8, plan.name);
+    errdefer self.allocator.free(name);
+    const kind = try self.allocator.dupe(u8, plan.kind);
+    errdefer self.allocator.free(kind);
+    const privilege = try self.allocator.dupe(u8, plan.privilege);
+    errdefer self.allocator.free(privilege);
+    const forced = try self.allocator.dupe(u8, plan.forced_command);
+    errdefer self.allocator.free(forced);
+    const home: ?[]u8 = if (plan.home) |h| try self.allocator.dupe(u8, h) else null;
+    errdefer if (home) |h| self.allocator.free(h);
+    const commands = try self.allocator.alloc([]u8, plan.commands.len);
+    var commands_filled: usize = 0;
+    errdefer {
+        for (commands[0..commands_filled]) |c| self.allocator.free(c);
+        self.allocator.free(commands);
+    }
+    for (plan.commands, 0..) |c, i| {
+        commands[i] = try self.allocator.dupe(u8, c);
+        commands_filled += 1;
+    }
+    const first_key: ?[]u8 = if (first_key_line) |line| try self.allocator.dupe(u8, line) else null;
+    errdefer if (first_key) |k| self.allocator.free(k);
+    return .{ .role = .{
+        .name = name,
+        .kind = kind,
+        .privilege = privilege,
+        .forced_command = forced,
+        .home = home,
+        .commands = commands,
+        .first_key_line = first_key,
+    } };
+}
+
+fn handleSshKeysRolesCommit(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(KeysRolesCommitPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (!keysValidId(payload.operation_id)) return respondError(output, "operation_id is required");
+    if (!keysValidId(payload.plan_id)) return respondError(output, "invalid plan_id");
+    if (payload.public_key) |public_key| {
+        if (public_key.len == 0 or public_key.len > keys_max_key_text) return respondError(output, "invalid public key");
+    }
+    if (self.keys.operationLookup(payload.operation_id)) |existing| {
+        var match = existing;
+        defer match.deinit(self.allocator);
+        switch (match.kind) {
+            .role_create, .role_repair, .role_delete => return keysRespondExistingJob(output, &match, null),
+            else => return respondError(output, "operation_id was already used for a different operation"),
+        }
+    }
+    const plan = self.keys.takePlan(payload.plan_id) orelse return respondError(output, "unknown or expired plan; preview again");
+    defer plan.deinit(self.allocator);
+    if (plan.expired(keysNowMs(self))) return respondError(output, "the plan expired; preview again");
+
+    var first_key_line: ?[]u8 = null;
+    defer if (first_key_line) |line| self.allocator.free(line);
+    if (plan.action == .create) {
+        const public_key = payload.public_key orelse return respondError(output, "the first approved key is required to create a role");
+        const normalized = sshkeys.normalizePublicKey(self.allocator, public_key, null) catch |err| return respondError(output, switch (err) {
+            error.Multiline => "public key must be a single line",
+            else => "invalid public key",
+        });
+        defer {
+            self.allocator.free(normalized.line);
+            self.allocator.free(normalized.fingerprint_sha256);
+        }
+        first_key_line = if (plan.forced_command.len > 0) blk: {
+            const opts = keyjobs.readOnlyRoleOptions(self.allocator, plan.forced_command) catch return respondError(output, "out of memory");
+            defer self.allocator.free(opts);
+            break :blk std.fmt.allocPrint(self.allocator, "{s} {s}", .{ opts, normalized.line }) catch return respondError(output, "out of memory");
+        } else self.allocator.dupe(u8, normalized.line) catch return respondError(output, "out of memory");
+    }
+
+    const job_kind: keyjobs.JobKind = switch (plan.action) {
+        .create => .role_create,
+        .repair => .role_repair,
+        .delete => .role_delete,
+    };
+    const payload_union = keysRolePayloadFromPlan(self, plan, first_key_line) catch return respondError(output, "out of memory");
+    const job = keysNewJob(self, job_kind, payload.operation_id, plan.server_id, plan.name, "", "", payload_union) catch return respondError(output, "out of memory");
+    keysEnsureStarted(self);
+    self.keys.registerJob(job) catch |err| {
+        job.deinit(self.allocator);
+        return respondError(output, switch (err) {
+            error.TooManyActive => "too many active jobs; finish or cancel one before starting another",
+            else => "out of memory",
+        });
+    };
+
+    // The approved plan commands are recorded once at admission.
+    var joined: []u8 = &.{};
+    defer if (joined.len > 0) self.allocator.free(joined);
+    if (plan.commands.len > 0) {
+        var total: usize = 4 * (plan.commands.len - 1);
+        for (plan.commands) |command| total += command.len;
+        const buf = self.allocator.alloc(u8, total) catch return respondError(output, "out of memory");
+        var pos: usize = 0;
+        for (plan.commands, 0..) |command, i| {
+            if (i > 0) {
+                @memcpy(buf[pos..][0..4], " && ");
+                pos += 4;
+            }
+            @memcpy(buf[pos..][0..command.len], command);
+            pos += command.len;
+        }
+        std.debug.assert(pos == buf.len);
+        joined = buf;
+        self.history.record(self.io, .{
+            .id = "",
+            .operation_id = payload.operation_id,
+            .ts = @intCast(keysNowNs(self)),
+            .server_id = plan.server_id,
+            .kind = "sshkeys",
+            .command = joined,
+            .exit = null,
+            .duration_ms = null,
+            .output_snippet = "",
+            .redacted = false,
+        }) catch {};
+    }
+    var detail_buf: [256]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "name={s} kind={s} action={s}", .{ plan.name, plan.kind, @tagName(plan.action) }) catch "role plan";
+    self.audit.appendFull(self.io, payload.operation_id, job_kind.auditName(), plan.server_id, joined, "admitted", detail) catch {};
+
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"job_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, job.id) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleSshKeysDeployKeysGenerate(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(KeysDeployGeneratePayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (!keysValidId(payload.operation_id)) return respondError(output, "operation_id is required");
+    if (!keysValidId(payload.server_id)) return respondError(output, "invalid server_id");
+    const label = std.mem.trim(u8, payload.repository_label, " \t");
+    if (label.len == 0 or label.len > 256) return respondError(output, "a repository label of 1-256 characters is required");
+    if (std.mem.indexOfAny(u8, label, "\r\n") != null) return respondError(output, "the repository label must be a single line");
+    if (payload.comment) |comment| {
+        if (comment.len > keys_max_comment_text) return respondError(output, "comment is too long");
+    }
+    if (self.keys.operationLookup(payload.operation_id)) |existing| {
+        var match = existing;
+        defer match.deinit(self.allocator);
+        if (match.kind != .deploy_generate) return respondError(output, "operation_id was already used for a different operation");
+        return keysRespondExistingJob(output, &match, null);
+    }
+    const payload_union = keysDeployGeneratePayload(self, label, payload.comment) catch return respondError(output, "out of memory");
+    const job = keysNewJob(self, .deploy_generate, payload.operation_id, payload.server_id, null, "", "", payload_union) catch return respondError(output, "out of memory");
+    keysEnsureStarted(self);
+    self.keys.registerJob(job) catch |err| {
+        job.deinit(self.allocator);
+        return respondError(output, switch (err) {
+            error.TooManyActive => "too many active jobs; finish or cancel one before starting another",
+            else => "out of memory",
+        });
+    };
+    keysAuditAdmission(self, job);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"job_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, job.id) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleSshKeysDeployKeysDelete(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(KeysDeployDeletePayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (!keysValidId(payload.operation_id)) return respondError(output, "operation_id is required");
+    if (!keysValidId(payload.server_id)) return respondError(output, "invalid server_id");
+    if (!std.mem.startsWith(u8, payload.deploy_key_id, "dk-") or payload.deploy_key_id.len > 32) return respondError(output, "invalid deploy key id");
+    if (!keysValidFingerprint(payload.confirm_fingerprint)) return respondError(output, "invalid confirmation fingerprint");
+    if (self.keys.operationLookup(payload.operation_id)) |existing| {
+        var match = existing;
+        defer match.deinit(self.allocator);
+        if (match.kind != .deploy_delete) return respondError(output, "operation_id was already used for a different operation");
+        return keysRespondExistingJob(output, &match, null);
+    }
+    const payload_union = keysDeployDeletePayload(self, payload.deploy_key_id, payload.confirm_fingerprint) catch return respondError(output, "out of memory");
+    const job = keysNewJob(self, .deploy_delete, payload.operation_id, payload.server_id, null, "", "", payload_union) catch return respondError(output, "out of memory");
+    keysEnsureStarted(self);
+    self.keys.registerJob(job) catch |err| {
+        job.deinit(self.allocator);
+        return respondError(output, switch (err) {
+            error.TooManyActive => "too many active jobs; finish or cancel one before starting another",
+            else => "out of memory",
+        });
+    };
+    keysAuditAdmission(self, job);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"job_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, job.id) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
     return writer.buffered();
 }
 
@@ -6122,6 +9742,7 @@ fn accessAdvance(self: *Context, scan: *access.Scan, server: *access.ServerScan)
             .read_sftp => {
                 const sftp_out: *sessions.SftpOutcome = @ptrCast(@alignCast(pend.outcome.?));
                 const sftp_ok = sftp_out.ok;
+                const sftp_fx = sftp_out.fx;
                 const sftp_path = pend.sftp_path;
                 const acc_idx = pend.account_index;
                 var path_copy: [512]u8 = undefined;
@@ -6136,7 +9757,8 @@ fn accessAdvance(self: *Context, scan: *access.Scan, server: *access.ServerScan)
                 const acc2 = &server.accounts.items[acc_idx];
                 if (!sftp_ok) {
                     const msg = msg_copy[0..mlen];
-                    const missing = std.ascii.indexOfIgnoreCase(msg, "no such file") != null or
+                    const missing = sftp_fx == ssh.c.LIBSSH2_FX_NO_SUCH_FILE or
+                        std.ascii.indexOfIgnoreCase(msg, "no such file") != null or
                         std.ascii.indexOfIgnoreCase(msg, "not found") != null;
                     if (missing) {
                         accessContinueAccountSources(self, server, acc_idx);

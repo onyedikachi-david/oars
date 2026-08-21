@@ -8,6 +8,8 @@ import { STATUS_LABEL } from "./types";
 import { AlertTriangle, Copy, ShieldCheck, X } from "lucide-react";
 import { Button } from "./components/ui/button";
 import { OarsLoadingState } from "./components/OarsLoadingState";
+import { ApplicationOverlay } from "./components/ApplicationPortal";
+import { useModalFocus } from "./components/useModalFocus";
 
 const POLL_MS = 80;
 const INPUT_BUFFER_MAX = 256 * 1024;
@@ -408,75 +410,137 @@ export function TerminalTab({ server, onStatus, onServerUpdated }: Props) {
         </div>
       )}
       {retrustOpen && (
-        <div className="oars-modal-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !retrustBusy) setRetrustOpen(false); }}>
-          <div className="oars-modal oars-modal-narrow" role="dialog" aria-modal="true" aria-labelledby="retrust-title">
-            <div className="oars-modal-header">
-              <div className="oars-modal-title-row">
-                <span className="oars-modal-icon oars-modal-icon-danger" aria-hidden><AlertTriangle /></span>
-                <div>
-                  <h2 id="retrust-title">Review changed host identity</h2>
-                  <p className="oars-modal-subtitle">A changed key can mean that the server was rebuilt, or that another system is intercepting the connection.</p>
-                </div>
-                <Button variant="ghost" size="icon-sm" aria-label="Close" disabled={retrustBusy} onClick={() => setRetrustOpen(false)} className="oars-modal-close"><X /></Button>
-              </div>
-            </div>
-            <div className="oars-modal-body">
-              <div className="retrust-resource">
-                <strong>{server.name}</strong>
-                <code>{server.user}@{server.host}:{server.port}</code>
-              </div>
-              <div className="retrust-fingerprints">
-                <div><span>Stored fingerprint</span><code>{changedKey?.oldFingerprint ?? server.host_fingerprint ?? "Unknown"}</code></div>
-                <div><span>Presented fingerprint</span><code>{changedKey?.newFingerprint ?? "Unknown"}</code></div>
-              </div>
-              <p className="oars-hint oars-hint-warn">Verify the new fingerprint through a trusted channel. Clearing the stored key makes the next connection ask for approval again.</p>
-              <div className="oars-field">
-                <label htmlFor={`retrust-${server.id}`}>Type <strong>{server.name}</strong> to continue</label>
-                <input id={`retrust-${server.id}`} type="text" value={retrustConfirm} onChange={(event) => setRetrustConfirm(event.target.value)} autoComplete="off" />
-              </div>
-              {retrustError && <div className="oars-form-error" role="alert">{retrustError}</div>}
-              <div className="oars-modal-actions retrust-actions">
-                <Button variant="ghost" disabled={retrustBusy} onClick={() => setRetrustOpen(false)}>Cancel</Button>
-                <Button variant="destructive" disabled={retrustBusy || retrustConfirm !== server.name} onClick={handleRetrust}>{retrustBusy ? "Clearing…" : "Clear stored key"}</Button>
-              </div>
-            </div>
-          </div>
-        </div>
+        <RetrustModal
+          server={server}
+          changedKey={changedKey}
+          retrustConfirm={retrustConfirm}
+          setRetrustConfirm={setRetrustConfirm}
+          retrustBusy={retrustBusy}
+          retrustError={retrustError}
+          onClose={() => setRetrustOpen(false)}
+          onRetrust={handleRetrust}
+        />
       )}
       {trust && (
-        <div className="oars-modal-overlay" role="presentation">
-          <div className="oars-modal oars-modal-narrow" role="dialog" aria-modal="true" aria-labelledby="trust-title" onClick={(e) => e.stopPropagation()}>
-            <div className="oars-modal-header">
-              <div className="oars-modal-title-row">
-                <span className="oars-modal-icon" aria-hidden><ShieldCheck size={16} /></span>
-                <div>
-                  <h2 id="trust-title">Verify host key</h2>
-                  <p className="oars-modal-subtitle">First connection to <strong>{server.host}</strong>. Compare this identity with a trusted copy before you continue.</p>
-                </div>
-              </div>
+        <TrustModal
+          server={server}
+          trust={trust}
+          displayFp={displayFp}
+          copied={copied}
+          copyFingerprint={copyFingerprint}
+          handleTrust={handleTrust}
+        />
+      )}
+    </div>
+  );
+}
+
+function RetrustModal({
+  server,
+  changedKey,
+  retrustConfirm,
+  setRetrustConfirm,
+  retrustBusy,
+  retrustError,
+  onClose,
+  onRetrust,
+}: {
+  server: Server;
+  changedKey: { oldFingerprint?: string; newFingerprint?: string } | null;
+  retrustConfirm: string;
+  setRetrustConfirm: (val: string) => void;
+  retrustBusy: boolean;
+  retrustError: string | null;
+  onClose: () => void;
+  onRetrust: () => void;
+}) {
+  const dialogRef = useModalFocus(onClose, `#retrust-${server.id}`, !retrustBusy);
+  return (
+    <ApplicationOverlay role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !retrustBusy) onClose(); }}>
+      <div ref={dialogRef} className="oars-modal oars-modal-narrow" role="dialog" aria-modal="true" aria-labelledby="retrust-title" aria-describedby="retrust-desc">
+        <div className="oars-modal-header">
+          <div className="oars-modal-title-row">
+            <span className="oars-modal-icon oars-modal-icon-danger" aria-hidden><AlertTriangle /></span>
+            <div>
+              <h2 id="retrust-title">Review changed host identity</h2>
+              <p id="retrust-desc" className="oars-modal-subtitle">A changed key can mean that the server was rebuilt, or that another system is intercepting the connection.</p>
             </div>
-            <div className="oars-modal-body">
-              <div className="trust-algorithm">
-                <span>Key algorithm</span>
-                <code>{trust.algorithm || "Unknown"}</code>
-              </div>
-              <div className="trust-fp">
-                <code className="trust-fp-code" title={displayFp}>{displayFp || "—"}</code>
-                <Button variant="secondary" size="sm" onClick={copyFingerprint} aria-label="Copy fingerprint"><Copy size={14} aria-hidden /> {copied ? "Copied" : "Copy"}</Button>
-              </div>
-              <p className="oars-hint">Accepting stores this exact <code>SHA256:…</code> fingerprint for future connections.</p>
-              {displayFp && !displayFp.startsWith("SHA256:") && <p className="oars-hint oars-hint-warn">This is a legacy hexadecimal fingerprint. Oars will store the canonical OpenSSH form after verification.</p>}
-              <div className="oars-modal-actions" style={{ marginTop: 4 }}>
-                <span className="oars-hint">Reject disconnects without saving.</span>
-                <div className="oars-modal-actions-right">
-                  <Button variant="ghost" onClick={() => handleTrust(false)}>Reject</Button>
-                  <Button onClick={() => handleTrust(true)}>Accept fingerprint</Button>
-                </div>
-              </div>
+            <Button variant="ghost" size="icon-sm" aria-label="Close" disabled={retrustBusy} onClick={onClose} className="oars-modal-close"><X /></Button>
+          </div>
+        </div>
+        <div className="oars-modal-body">
+          <div className="retrust-resource">
+            <strong>{server.name}</strong>
+            <code>{server.user}@{server.host}:{server.port}</code>
+          </div>
+          <div className="retrust-fingerprints">
+            <div><span>Stored fingerprint</span><code>{changedKey?.oldFingerprint ?? server.host_fingerprint ?? "Unknown"}</code></div>
+            <div><span>Presented fingerprint</span><code>{changedKey?.newFingerprint ?? "Unknown"}</code></div>
+          </div>
+          <p className="oars-hint oars-hint-warn">Verify the new fingerprint through a trusted channel. Clearing the stored key makes the next connection ask for approval again.</p>
+          <div className="oars-field">
+            <label htmlFor={`retrust-${server.id}`}>Type <strong>{server.name}</strong> to continue</label>
+            <input id={`retrust-${server.id}`} type="text" value={retrustConfirm} onChange={(event) => setRetrustConfirm(event.target.value)} autoComplete="off" />
+          </div>
+          {retrustError && <div className="oars-form-error" role="alert">{retrustError}</div>}
+          <div className="oars-modal-actions retrust-actions">
+            <Button variant="ghost" disabled={retrustBusy} onClick={onClose}>Cancel</Button>
+            <Button variant="destructive" disabled={retrustBusy || retrustConfirm !== server.name} onClick={onRetrust}>{retrustBusy ? "Clearing…" : "Clear stored key"}</Button>
+          </div>
+        </div>
+      </div>
+    </ApplicationOverlay>
+  );
+}
+
+function TrustModal({
+  server,
+  trust,
+  displayFp,
+  copied,
+  copyFingerprint,
+  handleTrust,
+}: {
+  server: Server;
+  trust: { algorithm?: string; fingerprint: string };
+  displayFp: string;
+  copied: boolean;
+  copyFingerprint: () => void;
+  handleTrust: (accept: boolean) => void;
+}) {
+  const dialogRef = useModalFocus(() => handleTrust(false));
+  return (
+    <ApplicationOverlay role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) handleTrust(false); }}>
+      <div ref={dialogRef} className="oars-modal oars-modal-narrow" role="dialog" aria-modal="true" aria-labelledby="trust-title" aria-describedby="trust-desc" onClick={(e) => e.stopPropagation()}>
+        <div className="oars-modal-header">
+          <div className="oars-modal-title-row">
+            <span className="oars-modal-icon" aria-hidden><ShieldCheck size={16} /></span>
+            <div>
+              <h2 id="trust-title">Verify host key</h2>
+              <p id="trust-desc" className="oars-modal-subtitle">First connection to <strong>{server.host}</strong>. Compare this identity with a trusted copy before you continue.</p>
             </div>
           </div>
         </div>
-      )}
-    </div>
+        <div className="oars-modal-body">
+          <div className="trust-algorithm">
+            <span>Key algorithm</span>
+            <code>{trust.algorithm || "Unknown"}</code>
+          </div>
+          <div className="trust-fp">
+            <code className="trust-fp-code" title={displayFp}>{displayFp || "—"}</code>
+            <Button variant="secondary" size="sm" onClick={copyFingerprint} aria-label="Copy fingerprint"><Copy size={14} aria-hidden /> {copied ? "Copied" : "Copy"}</Button>
+          </div>
+          <p className="oars-hint">Accepting stores this exact <code>SHA256:…</code> fingerprint for future connections.</p>
+          {displayFp && !displayFp.startsWith("SHA256:") && <p className="oars-hint oars-hint-warn">This is a legacy hexadecimal fingerprint. Oars will store the canonical OpenSSH form after verification.</p>}
+          <div className="oars-modal-actions" style={{ marginTop: 4 }}>
+            <span className="oars-hint">Reject disconnects without saving.</span>
+            <div className="oars-modal-actions-right">
+              <Button variant="ghost" onClick={() => handleTrust(false)}>Reject</Button>
+              <Button onClick={() => handleTrust(true)}>Accept fingerprint</Button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </ApplicationOverlay>
   );
 }

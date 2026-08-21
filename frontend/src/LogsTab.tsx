@@ -17,43 +17,26 @@ import {
 } from "lucide-react";
 import { api, BridgeError, pickSaveFile } from "./bridge";
 import { Button } from "./components/ui/button";
+import { OarsSelect } from "./components/ui/select";
 import { OarsLoadingState } from "./components/OarsLoadingState";
+import { ApplicationNotice, ApplicationOverlay } from "./components/ApplicationPortal";
+import { useModalFocus } from "./components/useModalFocus";
 import { isCurrentLogRequest, nextLogCursor, type LogRequestToken } from "./log-view-state";
+import {
+  ageLabel,
+  sizeLabel,
+  modeLabel,
+  formatMtime,
+  GROUP_ORDER,
+  GROUP_LABEL,
+  LINE_COUNTS,
+  type LineCount,
+  FOLLOW_MAX_CHARS,
+  LINE_RENDER_CAP,
+} from "./logs-state";
 import type { LogSource, Server } from "./types";
 
 // ── Helpers ────────────────────────────────────────────────────────────────
-
-function ageLabel(sec: number): string {
-  if (sec < 60) return `${sec}s`;
-  if (sec < 3600) return `${Math.floor(sec / 60)}m`;
-  if (sec < 86400) return `${Math.floor(sec / 3600)}h`;
-  return `${Math.floor(sec / 86400)}d`;
-}
-
-function sizeLabel(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-}
-
-function modeLabel(mode: number): string {
-  const bits: Array<[number, string]> = [
-    [0o400, "r"], [0o200, "w"], [0o100, "x"],
-    [0o040, "r"], [0o020, "w"], [0o010, "x"],
-    [0o004, "r"], [0o002, "w"], [0o001, "x"],
-  ];
-  return bits.map(([bit, ch]) => (mode & bit ? ch : "-")).join("");
-}
-
-function formatMtime(epochSeconds: number): string {
-  return new Date(epochSeconds * 1000).toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
 
 function messageOf(error: unknown): string {
   return error instanceof BridgeError ? error.message : String(error);
@@ -98,22 +81,6 @@ interface DownloadState {
   localPath: string | null;
   error: string | null;
 }
-
-const GROUP_ORDER = ["web", "runtime", "system", "custom"];
-const GROUP_LABEL: Record<string, string> = {
-  web: "Web servers",
-  runtime: "Runtime & apps",
-  system: "System",
-  custom: "Custom",
-};
-const LINE_COUNTS = [200, 500, 1000, 5000] as const;
-type LineCount = (typeof LINE_COUNTS)[number];
-
-// The follow stream is bounded client-side; older bytes are trimmed and a
-// note is shown rather than letting the DOM grow without limit.
-const FOLLOW_MAX_CHARS = 1024 * 1024;
-// Spec 04 §10: clamp single-line rendering to 64 KB with an explicit marker.
-const LINE_RENDER_CAP = 64 * 1024;
 const FOLLOW_POLL_MS = 300;
 const DOWNLOAD_POLL_MS = 300;
 // The backend's identity-bound clear refuses with exactly this message when
@@ -166,7 +133,6 @@ export function LogsTab({ server }: { server: Server }) {
   const downloadTimerRef = useRef<number | null>(null);
   const downloadLocalRef = useRef<string | null>(null);
   const noticeTimerRef = useRef<number | null>(null);
-  const clearDialogRef = useRef<HTMLDivElement>(null);
 
   const followActive = follow.status === "starting" || follow.status === "live" || follow.status === "eof";
   const followRunning = follow.status === "starting" || follow.status === "live";
@@ -201,6 +167,59 @@ export function LogsTab({ server }: { server: Server }) {
       items: byGroup.get(g)!,
     }));
   }, [filteredSources]);
+
+  const allVisibleSources = useMemo(
+    () => grouped.flatMap((g) => g.items),
+    [grouped]
+  );
+  const [focusedSourceIndex, setFocusedSourceIndex] = useState(0);
+
+  useEffect(() => {
+    setFocusedSourceIndex((prev) => {
+      if (allVisibleSources.length === 0) return 0;
+      if (prev >= allVisibleSources.length) return allVisibleSources.length - 1;
+      return prev;
+    });
+  }, [allVisibleSources.length]);
+
+  const handleSourceRowKeyDown = (event: React.KeyboardEvent, sourcePath: string, index: number) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      const next = Math.min(allVisibleSources.length - 1, index + 1);
+      setFocusedSourceIndex(next);
+      const btns = document.querySelectorAll<HTMLButtonElement>(".logs-groups .logs-source");
+      btns[next]?.focus();
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      const prev = Math.max(0, index - 1);
+      setFocusedSourceIndex(prev);
+      const btns = document.querySelectorAll<HTMLButtonElement>(".logs-groups .logs-source");
+      btns[prev]?.focus();
+      return;
+    }
+    if (event.key === "Home") {
+      event.preventDefault();
+      setFocusedSourceIndex(0);
+      const btns = document.querySelectorAll<HTMLButtonElement>(".logs-groups .logs-source");
+      btns[0]?.focus();
+      return;
+    }
+    if (event.key === "End") {
+      event.preventDefault();
+      const last = allVisibleSources.length - 1;
+      setFocusedSourceIndex(last);
+      const btns = document.querySelectorAll<HTMLButtonElement>(".logs-groups .logs-source");
+      btns[last]?.focus();
+      return;
+    }
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      selectSource(sourcePath);
+      return;
+    }
+  };
 
   const selectedSource = useMemo(
     () => scan.sources.find((s) => s.path === selected) ?? null,
@@ -544,39 +563,6 @@ export function LogsTab({ server }: { server: Server }) {
 
   const clearIsConflict = clearError !== null && clearError.includes(CLEAR_CONFLICT_TEXT);
 
-  useEffect(() => {
-    if (!clearTarget) return;
-    const previous = document.activeElement as HTMLElement | null;
-    clearDialogRef.current?.querySelector<HTMLButtonElement>("[data-logs-clear-confirm]")?.focus();
-    const handleKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !clearBusy) {
-        event.preventDefault();
-        closeClear();
-        return;
-      }
-      if (event.key !== "Tab" || !clearDialogRef.current) return;
-      const focusable = Array.from(
-        clearDialogRef.current.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'),
-      );
-      if (focusable.length === 0) return;
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    window.addEventListener("keydown", handleKey);
-    return () => {
-      window.removeEventListener("keydown", handleKey);
-      previous?.focus();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clearTarget, clearBusy]);
-
   // ── Download through SFTP ────────────────────────────────────────────────
 
   const pollDownload = useCallback(async () => {
@@ -802,22 +788,17 @@ export function LogsTab({ server }: { server: Server }) {
           <div><strong>Scan was cut short</strong><span>{scan.reason}</span></div>
         </div>
       )}
-      {notice && <div className="logs-toast" role="status">{notice}</div>}
+      {notice && <ApplicationNotice><div className="logs-toast" role="status">{notice}</div></ApplicationNotice>}
 
-      <div className="logs-mobile-select">
-        <label htmlFor="logs-mobile-source">Log source</label>
-        <select
-          id="logs-mobile-source"
+      <div className="logs-mobile-source">
+        <label htmlFor="logs-mobile-select">Active log</label>
+        <OarsSelect
+          id="logs-mobile-select"
           value={selected ?? ""}
-          onChange={(e) => selectSource(e.target.value)}
-        >
-          {scan.sources.length === 0 && <option value="">No sources</option>}
-          {scan.sources.map((s) => (
-            <option key={s.path} value={s.path}>
-              {s.name} — {s.path}
-            </option>
-          ))}
-        </select>
+          onValueChange={(sourcePath) => { if (sourcePath) selectSource(sourcePath); }}
+          placeholder="Select a log source…"
+          options={scan.sources.map((source) => ({ value: source.path, label: `${source.name} — ${source.path}` }))}
+        />
       </div>
 
       <div className="logs-workspace">
@@ -835,10 +816,17 @@ export function LogsTab({ server }: { server: Server }) {
               placeholder="Filter sources…"
               value={sourceQuery}
               onChange={(e) => setSourceQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "ArrowDown" || e.key === "Enter") {
+                  e.preventDefault();
+                  const first = document.querySelector<HTMLButtonElement>(".logs-groups .logs-source");
+                  first?.focus();
+                }
+              }}
               aria-label="Filter log sources"
             />
           </div>
-          <div className="logs-groups">
+          <div className="logs-groups" role="listbox" aria-label="Log sources">
             {scan.status === "scanning" && (
               <div className="logs-skeleton" aria-hidden>
                 {[0, 1, 2].map((i) => <span key={i} />)}
@@ -868,23 +856,32 @@ export function LogsTab({ server }: { server: Server }) {
                   <span>{label}</span>
                   <span className="logs-group-count">{items.length}</span>
                 </div>
-                {items.map((s) => (
-                  <button
-                    key={s.path}
-                    type="button"
-                    className={`logs-source ${selected === s.path ? "is-active" : ""} ${!s.readable ? "is-unreadable" : ""}`}
-                    onClick={() => selectSource(s.path)}
-                    title={s.path}
-                  >
-                    <span className="logs-source-name">
-                      <span>{s.name}</span>
-                      {!s.readable && <Lock size={10} aria-label="Not readable" />}
-                    </span>
-                    <span className="logs-source-meta">
-                      {sizeLabel(s.size)} · {ageLabel(s.age_sec)} ago
-                    </span>
-                  </button>
-                ))}
+                {items.map((s) => {
+                  const sourceIndex = allVisibleSources.findIndex((it) => it.path === s.path);
+                  const isFocused = sourceIndex === focusedSourceIndex || (focusedSourceIndex === -1 && selected === s.path);
+                  return (
+                    <button
+                      key={s.path}
+                      type="button"
+                      role="option"
+                      tabIndex={isFocused ? 0 : -1}
+                      aria-selected={selected === s.path}
+                      className={`logs-source ${selected === s.path ? "is-active" : ""} ${!s.readable ? "is-unreadable" : ""}`}
+                      onFocus={() => setFocusedSourceIndex(sourceIndex)}
+                      onClick={() => selectSource(s.path)}
+                      onKeyDown={(e) => handleSourceRowKeyDown(e, s.path, sourceIndex)}
+                      title={s.path}
+                    >
+                      <span className="logs-source-name">
+                        <span>{s.name}</span>
+                        {!s.readable && <Lock size={10} aria-label="Not readable" />}
+                      </span>
+                      <span className="logs-source-meta">
+                        {sizeLabel(s.size)} · {ageLabel(s.age_sec)} ago
+                      </span>
+                    </button>
+                  );
+                })}
               </div>
             ))}
           </div>
@@ -934,19 +931,20 @@ export function LogsTab({ server }: { server: Server }) {
             >
               {followRunning ? <><Pause /> Stop</> : <><Play /> Follow</>}
             </Button>
-            <select
+            <OarsSelect
               className="logs-linecount"
-              value={lineCount}
-              onChange={(e) => changeLineCount(Number(e.target.value) as LineCount)}
+              value={String(lineCount)}
+              onValueChange={(value) => changeLineCount(Number(value) as LineCount)}
               disabled={followRunning}
               aria-label="Lines to load"
               title={followRunning ? "Stop following to change the loaded history" : undefined}
-            >
-              <option value={200}>200 lines</option>
-              <option value={500}>500 lines</option>
-              <option value={1000}>1,000 lines</option>
-              <option value={5000}>5,000 lines</option>
-            </select>
+              options={[
+                { value: "200", label: "200 lines" },
+                { value: "500", label: "500 lines" },
+                { value: "1000", label: "1,000 lines" },
+                { value: "5000", label: "5,000 lines" },
+              ]}
+            />
             <div className="logs-search">
               <Search aria-hidden />
               <input
@@ -1019,7 +1017,7 @@ export function LogsTab({ server }: { server: Server }) {
             </div>
           )}
 
-          <div ref={bodyRef} className="logs-body" onScroll={handleBodyScroll} aria-label="Log lines">
+          <div ref={bodyRef} className="logs-body" onScroll={handleBodyScroll} role="log" aria-live="polite" aria-atomic="false" tabIndex={0} aria-label="Log lines">
             {!followActive && read.status === "loading" && read.lines.length === 0 && (
               <div className="logs-skeleton logs-skeleton-rows" aria-hidden>
                 {[0, 1, 2, 3].map((i) => <span key={i} />)}
@@ -1115,7 +1113,15 @@ export function LogsTab({ server }: { server: Server }) {
                   {download.status === "canceled" && "Download canceled."}
                 </strong>
                 {download.status === "running" && download.total > 0 && (
-                  <span className="logs-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={downloadPercent}>
+                  <span
+                    className="logs-progress"
+                    role="progressbar"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={downloadPercent}
+                    aria-label="Log download progress"
+                    aria-valuetext={`${downloadPercent}% (${sizeLabel(download.bytes)} of ${sizeLabel(download.total)})`}
+                  >
                     <span style={{ width: `${downloadPercent}%` }} />
                   </span>
                 )}
@@ -1146,103 +1152,152 @@ export function LogsTab({ server }: { server: Server }) {
       </div>
 
       {clearTarget && (
-        <div
-          className="oars-modal-overlay"
-          role="presentation"
-          onMouseDown={(event) => { if (event.target === event.currentTarget && !clearBusy) closeClear(); }}
-        >
-          <div
-            ref={clearDialogRef}
-            className="oars-modal oars-modal-narrow logs-clear-modal"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="logs-clear-title"
-            aria-describedby="logs-clear-description"
-          >
-            <header className="oars-modal-header">
-              <div className="oars-modal-title-row">
-                <span className="oars-modal-icon oars-modal-icon-danger"><AlertTriangle /></span>
-                <div>
-                  <h2 id="logs-clear-title">Clear this log on the server?</h2>
-                  <p id="logs-clear-description" className="oars-modal-subtitle">
-                    This truncates the file on {server.name}. Permanent. Download first if needed.
-                  </p>
-                </div>
-                <Button variant="ghost" size="icon-sm" aria-label="Close" onClick={closeClear} disabled={clearBusy}>
-                  <X />
-                </Button>
-              </div>
-            </header>
-            <div className="oars-modal-body">
-              <div className="monitor-affected-resource">
-                <strong>{server.name}</strong>
-                <span>{clearTarget.path}</span>
-              </div>
-              <dl className="logs-clear-facts">
-                <div>
-                  <dt>Current size</dt>
-                  <dd>{sizeLabel(clearTarget.size)}</dd>
-                </div>
-                <div>
-                  <dt>Last modified</dt>
-                  <dd>{formatMtime(clearTarget.mtime_epoch)}</dd>
-                </div>
-                <div>
-                  <dt>Permissions</dt>
-                  <dd>{modeLabel(clearTarget.mode)}</dd>
-                </div>
-              </dl>
-              <p className="monitor-approval-warning">
-                The file is truncated to zero bytes on the server. This cannot be undone. Download the log
-                first if you may need it.
-              </p>
-              {clearError && (
-                <div className="logs-clear-error" role="alert">
-                  <strong>Clear refused</strong>
-                  <span>{clearError}</span>
-                  {clearIsConflict && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => void rescanForClear()}
-                      disabled={scan.status === "scanning"}
-                    >
-                      <RefreshCw className={scan.status === "scanning" ? "spin" : ""} />
-                      Re-scan and review
-                    </Button>
-                  )}
-                </div>
-              )}
-              {clearResult && (
-                <div className="logs-clear-result" role="status">
-                  <Check />
-                  <span>
-                    Cleared — {sizeLabel(clearResult.before)} → {sizeLabel(clearResult.after)}. The change is
-                    recorded in the audit log.
-                  </span>
-                </div>
-              )}
-            </div>
-            <footer className="oars-modal-actions">
-              <div className="oars-modal-actions-right">
-                <Button variant="ghost" onClick={closeClear} disabled={clearBusy}>
-                  {clearResult ? "Done" : "Cancel"}
-                </Button>
-                {!clearResult && (
-                  <Button
-                    data-logs-clear-confirm
-                    variant="destructive"
-                    onClick={() => void confirmClear()}
-                    disabled={clearBusy}
-                  >
-                    {clearBusy ? "Clearing…" : "Clear log"}
-                  </Button>
-                )}
-              </div>
-            </footer>
-          </div>
-        </div>
+        <LogClearModal
+          clearTarget={clearTarget}
+          server={server}
+          clearBusy={clearBusy}
+          clearError={clearError}
+          clearIsConflict={clearIsConflict}
+          clearResult={clearResult}
+          scan={scan}
+          closeClear={closeClear}
+          confirmClear={confirmClear}
+          rescanForClear={rescanForClear}
+        />
       )}
     </section>
+  );
+}
+
+function LogClearModal({
+  clearTarget,
+  server,
+  clearBusy,
+  clearError,
+  clearIsConflict,
+  clearResult,
+  scan,
+  closeClear,
+  confirmClear,
+  rescanForClear,
+}: {
+  clearTarget: LogSource;
+  server: Server;
+  clearBusy: boolean;
+  clearError: string | null;
+  clearIsConflict: boolean;
+  clearResult: { before: number; after: number } | null;
+  scan: any;
+  closeClear: () => void;
+  confirmClear: () => Promise<void>;
+  rescanForClear: () => Promise<void>;
+}) {
+  const dialogRef = useModalFocus(closeClear, "[data-logs-clear-confirm]", !clearBusy);
+  return (
+    <ApplicationOverlay
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget && !clearBusy) closeClear();
+      }}
+    >
+      <div
+        ref={dialogRef}
+        className="oars-modal oars-modal-narrow logs-clear-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="logs-clear-title"
+        aria-describedby="logs-clear-description"
+      >
+        <header className="oars-modal-header">
+          <div className="oars-modal-title-row">
+            <span className="oars-modal-icon oars-modal-icon-danger">
+              <AlertTriangle />
+            </span>
+            <div>
+              <h2 id="logs-clear-title">Clear this log on the server?</h2>
+              <p id="logs-clear-description" className="oars-modal-subtitle">
+                This truncates the file on {server.name}. Permanent. Download first if needed.
+              </p>
+            </div>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Close"
+              onClick={closeClear}
+              disabled={clearBusy}
+            >
+              <X />
+            </Button>
+          </div>
+        </header>
+        <div className="oars-modal-body">
+          <div className="monitor-affected-resource">
+            <strong>{server.name}</strong>
+            <span>{clearTarget.path}</span>
+          </div>
+          <dl className="logs-clear-facts">
+            <div>
+              <dt>Current size</dt>
+              <dd>{sizeLabel(clearTarget.size)}</dd>
+            </div>
+            <div>
+              <dt>Last modified</dt>
+              <dd>{formatMtime(clearTarget.mtime_epoch)}</dd>
+            </div>
+            <div>
+              <dt>Permissions</dt>
+              <dd>{modeLabel(clearTarget.mode)}</dd>
+            </div>
+          </dl>
+          <p className="monitor-approval-warning">
+            The file is truncated to zero bytes on the server. This cannot be undone. Download the log
+            first if you may need it.
+          </p>
+          {clearError && (
+            <div className="logs-clear-error" role="alert">
+              <strong>Clear refused</strong>
+              <span>{clearError}</span>
+              {clearIsConflict && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void rescanForClear()}
+                  disabled={scan.status === "scanning"}
+                >
+                  <RefreshCw className={scan.status === "scanning" ? "spin" : ""} />
+                  Re-scan and review
+                </Button>
+              )}
+            </div>
+          )}
+          {clearResult && (
+            <div className="logs-clear-result" role="status">
+              <Check />
+              <span>
+                Cleared — {sizeLabel(clearResult.before)} → {sizeLabel(clearResult.after)}. The change is
+                recorded in the audit log.
+              </span>
+            </div>
+          )}
+        </div>
+        <footer className="oars-modal-actions">
+          <div className="oars-modal-actions-right">
+            <Button variant="ghost" onClick={closeClear} disabled={clearBusy}>
+              {clearResult ? "Done" : "Cancel"}
+            </Button>
+            {!clearResult && (
+              <Button
+                data-logs-clear-confirm
+                variant="destructive"
+                onClick={() => void confirmClear()}
+                disabled={clearBusy}
+              >
+                {clearBusy ? "Clearing…" : "Clear log"}
+              </Button>
+            )}
+          </div>
+        </footer>
+      </div>
+    </ApplicationOverlay>
   );
 }

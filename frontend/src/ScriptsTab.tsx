@@ -21,7 +21,9 @@ import {
   XCircle,
 } from "lucide-react";
 import { api, BridgeError } from "./bridge";
+import { OarsSelect } from "./components/ui/select";
 import { useModalFocus } from "./components/useModalFocus";
+import { ApplicationOverlay } from "./components/ApplicationPortal";
 import {
   appendOutput,
   detectVariables,
@@ -230,6 +232,16 @@ export function ScriptsTab({
     () => (flow && flow.step === "running" ? summarizeBroadcast(flow.servers) : null),
     [flow]
   );
+
+  const [focusedScriptIndex, setFocusedScriptIndex] = useState(0);
+
+  useEffect(() => {
+    setFocusedScriptIndex((prev) => {
+      if (filtered.length === 0) return 0;
+      if (prev >= filtered.length) return filtered.length - 1;
+      return prev;
+    });
+  }, [filtered.length]);
 
   // ── server context (spec 06: never a hidden first-server fallback) ──
   if (!serverId) {
@@ -592,6 +604,45 @@ export function ScriptsTab({
 
   const serverName = (id: string) => servers.find((s) => s.id === id)?.name ?? id;
 
+  const handleScriptRowKeyDown = (event: React.KeyboardEvent, scriptId: string, index: number) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      const next = Math.min(filtered.length - 1, index + 1);
+      setFocusedScriptIndex(next);
+      const btns = document.querySelectorAll<HTMLButtonElement>(".scripts-library .scripts-row");
+      btns[next]?.focus();
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      const prev = Math.max(0, index - 1);
+      setFocusedScriptIndex(prev);
+      const btns = document.querySelectorAll<HTMLButtonElement>(".scripts-library .scripts-row");
+      btns[prev]?.focus();
+      return;
+    }
+    if (event.key === "Home") {
+      event.preventDefault();
+      setFocusedScriptIndex(0);
+      const btns = document.querySelectorAll<HTMLButtonElement>(".scripts-library .scripts-row");
+      btns[0]?.focus();
+      return;
+    }
+    if (event.key === "End") {
+      event.preventDefault();
+      const last = filtered.length - 1;
+      setFocusedScriptIndex(last);
+      const btns = document.querySelectorAll<HTMLButtonElement>(".scripts-library .scripts-row");
+      btns[last]?.focus();
+      return;
+    }
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      setSelectedId(scriptId);
+      return;
+    }
+  };
+
   return (
     <div className="scripts">
       <div className="scripts-toolbar">
@@ -602,15 +653,19 @@ export function ScriptsTab({
             placeholder="Search scripts…"
             value={q}
             onChange={(e) => setQ(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "ArrowDown" || e.key === "Enter") {
+                e.preventDefault();
+                const first = document.querySelector<HTMLButtonElement>(".scripts-library .scripts-row");
+                first?.focus();
+              }
+            }}
             aria-label="Search scripts"
           />
         </div>
         <label className="scripts-tag-filter">
           <Tag size={14} aria-hidden />
-          <select aria-label="Filter scripts by tag" value={tagFilter} onChange={(event) => setTagFilter(event.target.value)}>
-            <option value="">All tags</option>
-            {tags.map((tag) => <option key={tag} value={tag}>{tag}</option>)}
-          </select>
+          <OarsSelect aria-label="Filter scripts by tag" value={tagFilter} onValueChange={setTagFilter} options={[{ value: "", label: "All tags" }, ...tags.map((tag) => ({ value: tag, label: tag }))]} />
         </label>
         {loading && <OarsRefreshStatus label="Updating scripts" />}
         <Button size="sm" onClick={() => openEditor(null)}><Plus />New script</Button>
@@ -646,29 +701,36 @@ export function ScriptsTab({
       ) : (
         <div className="scripts-layout">
           <div className="scripts-library" role="listbox" aria-label="Script library">
-            {filtered.map((s) => (
-              <button
-                key={s.id}
-                role="option"
-                aria-selected={s.id === selectedId}
-                className={`scripts-row ${s.id === selectedId ? "selected" : ""}`}
-                onClick={() => setSelectedId(s.id)}
-              >
-                <span className="scripts-row-color" style={{ background: s.color || "transparent" }} aria-hidden />
-                <span className="scripts-row-main">
-                  <span className="scripts-row-name">{s.name}</span>
-                  <span className="scripts-row-meta muted">
-                    {s.run_count} runs · {formatLastRun(s.last_run_at, s.run_count)}
-                    {isDestructiveTagged(s.tags) && <span className="scripts-destructive-tag">destructive</span>}
+            {filtered.map((s, index) => {
+              const isSelected = s.id === selectedId;
+              const isFocused = index === focusedScriptIndex || (focusedScriptIndex === -1 && isSelected);
+              return (
+                <button
+                  key={s.id}
+                  role="option"
+                  tabIndex={isFocused ? 0 : -1}
+                  aria-selected={isSelected}
+                  className={`scripts-row ${isSelected ? "selected" : ""}`}
+                  onFocus={() => setFocusedScriptIndex(index)}
+                  onClick={() => setSelectedId(s.id)}
+                  onKeyDown={(e) => handleScriptRowKeyDown(e, s.id, index)}
+                >
+                  <span className="scripts-row-color" style={{ background: s.color || "transparent" }} aria-hidden />
+                  <span className="scripts-row-main">
+                    <span className="scripts-row-name">{s.name}</span>
+                    <span className="scripts-row-meta muted">
+                      {s.run_count} runs · {formatLastRun(s.last_run_at, s.run_count)}
+                      {isDestructiveTagged(s.tags) && <span className="scripts-destructive-tag">destructive</span>}
+                    </span>
                   </span>
-                </span>
-                {s.tags.length > 0 && (
-                  <span className="scripts-row-tags">
-                    {s.tags.slice(0, 3).map((t) => <span key={t} className="scripts-tag">{t}</span>)}
-                  </span>
-                )}
-              </button>
-            ))}
+                  {s.tags.length > 0 && (
+                    <span className="scripts-row-tags">
+                      {s.tags.slice(0, 3).map((t) => <span key={t} className="scripts-tag">{t}</span>)}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
           </div>
 
           <div className="scripts-detail" aria-live="polite">
@@ -820,7 +882,7 @@ function DeleteModal({
 }) {
   const dialogRef = useModalFocus(onCancel, "[data-delete-first]", !busy);
   return (
-    <div className="oars-modal-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onCancel(); }}>
+    <ApplicationOverlay role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onCancel(); }}>
       <div ref={dialogRef} className="oars-modal oars-modal-narrow" role="dialog" aria-modal="true" aria-labelledby="scripts-delete-title" aria-describedby="scripts-delete-desc">
         <header className="oars-modal-header">
           <div className="oars-modal-title-row">
@@ -840,7 +902,7 @@ function DeleteModal({
           </div>
         </footer>
       </div>
-    </div>
+    </ApplicationOverlay>
   );
 }
 
@@ -927,14 +989,14 @@ function EditorModal({
   };
 
   return (
-    <div className="oars-modal-overlay" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget && !saving) onCancel(); }}>
-      <div ref={dialogRef} className="oars-modal scripts-editor-modal" role="dialog" aria-modal="true" aria-labelledby="scripts-editor-title">
+    <ApplicationOverlay role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget && !saving) onCancel(); }}>
+      <div ref={dialogRef} className="oars-modal scripts-editor-modal" role="dialog" aria-modal="true" aria-labelledby="scripts-editor-title" aria-describedby="scripts-editor-subtitle">
         <header className="oars-modal-header">
           <div className="oars-modal-title-row">
             <span className="oars-modal-icon"><Pencil /></span>
             <div>
               <h2 id="scripts-editor-title">{draft.id ? "Edit script" : "New script"}</h2>
-              <p className="oars-modal-subtitle">Saved locally; run-time values are never stored.</p>
+              <p id="scripts-editor-subtitle" className="oars-modal-subtitle">Saved locally; run-time values are never stored.</p>
             </div>
             <Button variant="ghost" size="icon-sm" aria-label="Close" onClick={onCancel} disabled={saving}><X /></Button>
           </div>
@@ -988,6 +1050,13 @@ function EditorModal({
               onChange={(e) => {
                 onBodyChange(e.target.value);
                 updateAutocomplete(e.target.value, e.target.selectionStart);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Escape" && autocomplete) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setAutocomplete(null);
+                }
               }}
               onClick={(event) => updateAutocomplete(event.currentTarget.value, event.currentTarget.selectionStart)}
               onKeyUp={(event) => updateAutocomplete(event.currentTarget.value, event.currentTarget.selectionStart)}
@@ -1066,7 +1135,7 @@ function EditorModal({
           </div>
         </footer>
       </div>
-    </div>
+    </ApplicationOverlay>
   );
 }
 
@@ -1094,14 +1163,14 @@ function VarsModal({
   if (script.variables.length === 0) {
     // No variables: confirm directly (spec 06 — no prompt for nothing).
     return (
-      <div className="oars-modal-overlay" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) onCancel(); }}>
-        <div ref={dialogRef} className="oars-modal oars-modal-narrow" role="dialog" aria-modal="true" aria-labelledby="scripts-vars-title">
+      <ApplicationOverlay role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) onCancel(); }}>
+        <div ref={dialogRef} className="oars-modal oars-modal-narrow" role="dialog" aria-modal="true" aria-labelledby="scripts-vars-title" aria-describedby="scripts-vars-subtitle">
           <header className="oars-modal-header">
             <div className="oars-modal-title-row">
               <span className="oars-modal-icon"><Play /></span>
               <div>
                 <h2 id="scripts-vars-title">{script.name}</h2>
-                <p className="oars-modal-subtitle">This script has no variables.</p>
+                <p id="scripts-vars-subtitle" className="oars-modal-subtitle">This script has no variables.</p>
               </div>
             </div>
           </header>
@@ -1113,19 +1182,19 @@ function VarsModal({
           </footer>
           {error && <p className="oars-modal-error" role="alert">{error}</p>}
         </div>
-      </div>
+      </ApplicationOverlay>
     );
   }
 
   return (
-    <div className="oars-modal-overlay" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) onCancel(); }}>
-      <div ref={dialogRef} className="oars-modal scripts-vars-modal" role="dialog" aria-modal="true" aria-labelledby="scripts-vars-title">
+    <ApplicationOverlay role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) onCancel(); }}>
+      <div ref={dialogRef} className="oars-modal scripts-vars-modal" role="dialog" aria-modal="true" aria-labelledby="scripts-vars-title" aria-describedby="scripts-vars-subtitle">
         <header className="oars-modal-header">
           <div className="oars-modal-title-row">
             <span className="oars-modal-icon"><Play /></span>
             <div>
               <h2 id="scripts-vars-title">Values for “{script.name}”</h2>
-              <p className="oars-modal-subtitle">Used for this run only — never saved.</p>
+              <p id="scripts-vars-subtitle" className="oars-modal-subtitle">Used for this run only — never saved.</p>
             </div>
             <Button variant="ghost" size="icon-sm" aria-label="Close" onClick={onCancel}><X /></Button>
           </div>
@@ -1175,7 +1244,7 @@ function VarsModal({
           </div>
         </footer>
       </div>
-    </div>
+    </ApplicationOverlay>
   );
 }
 
@@ -1205,7 +1274,7 @@ function PreviewModal({
   const command = hasSecrets && !showCommand ? preview.redacted_command : preview.command;
 
   return (
-    <div className="oars-modal-overlay" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget && !busy) onCancel(); }}>
+    <ApplicationOverlay role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget && !busy) onCancel(); }}>
       <div ref={dialogRef} className="oars-modal scripts-preview-modal" role="dialog" aria-modal="true" aria-labelledby="scripts-preview-title" aria-describedby="scripts-preview-desc">
         <header className="oars-modal-header">
           <div className="oars-modal-title-row">
@@ -1257,7 +1326,7 @@ function PreviewModal({
           </div>
         </footer>
       </div>
-    </div>
+    </ApplicationOverlay>
   );
 }
 
@@ -1309,14 +1378,14 @@ function TargetsModal({
   };
 
   return (
-    <div className="oars-modal-overlay" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) onCancel(); }}>
-      <div ref={dialogRef} className="oars-modal scripts-targets-modal" role="dialog" aria-modal="true" aria-labelledby="scripts-targets-title">
+    <ApplicationOverlay role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) onCancel(); }}>
+      <div ref={dialogRef} className="oars-modal scripts-targets-modal" role="dialog" aria-modal="true" aria-labelledby="scripts-targets-title" aria-describedby="scripts-targets-subtitle">
         <header className="oars-modal-header">
           <div className="oars-modal-title-row">
             <span className="oars-modal-icon"><ServerIcon /></span>
             <div>
               <h2 id="scripts-targets-title">Select servers</h2>
-              <p className="oars-modal-subtitle">Every selected server runs the same prepared command.</p>
+              <p id="scripts-targets-subtitle" className="oars-modal-subtitle">Every selected server runs the same prepared command.</p>
             </div>
             <Button variant="ghost" size="icon-sm" aria-label="Close" onClick={onCancel}><X /></Button>
           </div>
@@ -1364,7 +1433,7 @@ function TargetsModal({
           </div>
         </footer>
       </div>
-    </div>
+    </ApplicationOverlay>
   );
 }
 
@@ -1402,16 +1471,16 @@ function RunPane({
           <span className="muted">{serverName}</span>
         </div>
         <div className="scripts-run-status">
-          {status === "running" && <span className="scripts-status-pill running"><Clock size={12} />running</span>}
-          {status === "done" && <span className="scripts-status-pill done"><CheckCircle2 size={12} />exit 0</span>}
-          {status === "failed" && <span className="scripts-status-pill failed"><XCircle size={12} />{error ?? `exit ${exit ?? "?"}`}</span>}
+          {status === "running" && <span className="scripts-status-pill running" role="status" aria-live="polite"><Clock size={12} />running</span>}
+          {status === "done" && <span className="scripts-status-pill done" role="status" aria-live="polite"><CheckCircle2 size={12} />exit 0</span>}
+          {status === "failed" && <span className="scripts-status-pill failed" role="status" aria-live="polite"><XCircle size={12} />{error ?? `exit ${exit ?? "?"}`}</span>}
           {gapReported && <span className="scripts-gap-warning" title="Some output was dropped by the retention buffer">output gap</span>}
           {(eof || error) && <Button variant="outline" size="sm" onClick={onRetry}>Run again</Button>}
           <Button variant="ghost" size="icon-sm" aria-label="Copy output" onClick={onCopy}><Copy /></Button>
           <Button variant="ghost" size="icon-sm" aria-label="Close output" onClick={onClose}><X /></Button>
         </div>
       </header>
-      <pre className="scripts-run-output">{output || (eof ? "(no output)" : "Waiting for output…")}</pre>
+      <pre className="scripts-run-output" role="log" aria-live="polite" aria-atomic="false" tabIndex={0} aria-label="Script execution output">{output || (eof ? "(no output)" : "Waiting for output…")}</pre>
     </section>
   );
 }
@@ -1487,9 +1556,9 @@ function BroadcastPane({
           <span className="muted">broadcast · {summary ? `${summary.done + summary.failed + summary.canceled + summary.skipped}/${summary.total} finished` : ""}</span>
         </div>
         <div className="scripts-run-status">
-          {!flow.done && <span className="scripts-status-pill running"><Clock size={12} />running</span>}
+          {!flow.done && <span className="scripts-status-pill running" role="status" aria-live="polite"><Clock size={12} />running</span>}
           {flow.done && summary && (
-            <span className="scripts-status-pill done">
+            <span className="scripts-status-pill done" role="status" aria-live="polite">
               <CheckCircle2 size={12} />
               {summary.failed === 0 && summary.canceled === 0 && summary.skipped === 0
                 ? `${summary.done}/${summary.total} succeeded`
@@ -1519,7 +1588,7 @@ function BroadcastPane({
                 <span className={`scripts-broadcast-status ${s.status}`}>{statusLabel(s)}</span>
               </button>
               {isExpanded && (
-                <pre className="scripts-broadcast-output">
+                <pre className="scripts-broadcast-output" role="log" aria-live="polite" aria-atomic="false" tabIndex={0} aria-label={`Script output for ${serverName(s.server_id)}`}>
                   {out || (s.status === "done" ? "(no output)" : "(no output yet)")}
                   {flow.gaps[s.server_id] && <span className="scripts-gap-warning">output gap</span>}
                 </pre>

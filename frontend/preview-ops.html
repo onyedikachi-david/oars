@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>Oars prototype — Windowed workspace</title>
+    <link rel="stylesheet" href="/preview-workspace.css" />
+  </head>
+  <body>
+    <main class="wm-shell">
+      <aside class="wm-sidebar" aria-label="Oars navigation">
+        <header class="wm-brand">
+          <span class="wm-brand-mark" aria-hidden>
+            <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="8.5" y="14" width="7" height="7" rx="2"/><path d="M6.5 10v2h11v-2M12 12v2"/></svg>
+          </span>
+          <span class="wm-brand-copy"><strong>oars</strong><small>LOCAL OPS</small></span>
+          <button id="collapse-nav" class="wm-icon-button wm-collapse-button" type="button" aria-label="Collapse navigation" title="Collapse navigation">
+            <svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg>
+          </button>
+        </header>
+
+        <div class="wm-workspace-switcher">
+          <span class="wm-workspace-icon" aria-hidden>
+            <svg viewBox="0 0 24 24"><path d="M4 18.5A2.5 2.5 0 0 1 1.5 16c0-1.2.85-2.2 2-2.45A5 5 0 0 1 13 10.5a3.5 3.5 0 0 1 1 6.85H4Z"/></svg>
+          </span>
+          <span class="wm-nav-copy"><small>Workspace</small><strong>Local machine</strong></span>
+        </div>
+
+        <nav class="wm-primary-nav" aria-label="Primary navigation">
+          <button type="button" title="Overview"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg><span class="wm-nav-copy">Overview</span></button>
+          <button type="button" class="is-active" title="Workspace"><svg viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M8 20v2M16 20v2M7 8h4v4H7zM14 8h3M14 12h3"/></svg><span class="wm-nav-copy">Workspace</span></button>
+          <button type="button" title="Activity"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg><span class="wm-nav-copy">Activity</span></button>
+        </nav>
+
+        <section class="wm-fleet" aria-labelledby="fleet-title">
+          <header>
+            <span id="fleet-title" class="wm-nav-copy">Fleet</span>
+            <span id="fleet-count" class="wm-nav-copy">4 profiles</span>
+          </header>
+          <label class="wm-fleet-search">
+            <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+            <input id="fleet-filter" type="search" placeholder="Filter servers" aria-label="Filter servers" />
+          </label>
+          <div id="fleet-list" class="wm-fleet-list"></div>
+        </section>
+
+        <footer class="wm-sidebar-footer">
+          <span class="wm-native-status"><i></i><span class="wm-nav-copy"><strong>Native bridge</strong><small>Connected · local</small></span></span>
+          <span class="wm-profile"><b>OP</b><span class="wm-nav-copy"><strong>Operator</strong><small>Local profile</small></span></span>
+        </footer>
+      </aside>
+
+      <section class="wm-main">
+        <header class="wm-topbar">
+          <div class="wm-breadcrumbs"><span>Oars</span><i>›</i><strong>Windowed workspace</strong></div>
+          <div class="wm-topbar-actions">
+            <span id="pane-limit" class="wm-pane-count">2 of 4 panes</span>
+            <button id="add-pane" class="wm-button wm-button-primary" type="button">
+              <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+              <span>Add server pane</span>
+            </button>
+          </div>
+        </header>
+
+        <section class="wm-stage" aria-labelledby="workspace-title">
+          <header class="wm-stage-heading">
+            <div>
+              <h1 id="workspace-title">Windowed workspace</h1>
+              <p id="layout-description">Drag a server bar to reorder panes. Oars keeps each session active while the layout changes.</p>
+            </div>
+            <div class="wm-stage-legend"><span><i class="is-ready"></i>2 connected</span><span>Maximum 4</span></div>
+          </header>
+          <div id="workspace-grid" class="wm-workspace-grid" aria-live="polite"></div>
+        </section>
+      </section>
+    </main>
+
+    <div id="wm-toast" class="wm-toast" role="status" aria-live="polite" hidden></div>
+
+    <nav class="wm-prototype-switcher" aria-label="Workspace layout variants">
+      <button id="previous-variant" type="button" aria-label="Previous layout">←</button>
+      <span id="variant-label">A — Tiled</span>
+      <button id="next-variant" type="button" aria-label="Next layout">→</button>
+    </nav>
+
+    <script type="module" src="/preview-workspace.js"></script>
+  </body>
+</html>

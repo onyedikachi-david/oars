@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { AlertTriangle, CheckCircle2, Clock3, Download, KeyRound, Plus, RefreshCw, ScanSearch, ShieldCheck, Trash2, UserRound, UsersRound, WifiOff, X } from "lucide-react";
 import { api, BridgeError, pickSaveFile } from "./bridge";
 import { Button } from "./components/ui/button";
+import { OarsSelect } from "./components/ui/select";
+import { ApplicationOverlay } from "./components/ApplicationPortal";
 import { useModalFocus } from "./components/useModalFocus";
 import type {
   AccessCoverage,
@@ -15,6 +17,13 @@ import type {
   AccessUnassigned,
 } from "./types";
 
+import {
+  grantKey,
+  phaseLabel,
+  defaultRoleAccountName,
+  type OnboardTargetChoice,
+} from "./access-state";
+
 function messageOf(error: unknown): string {
   return error instanceof BridgeError ? error.message : String(error);
 }
@@ -22,28 +31,6 @@ function messageOf(error: unknown): string {
 function newOperationId(): string {
   return `op-${Date.now()}-${crypto.getRandomValues(new Uint32Array(1))[0].toString(16)}`;
 }
-
-function grantKey(grant: AccessGrant): string {
-  return `${grant.server_id}:${grant.user}:${grant.source_path}:${grant.line_hash}`;
-}
-
-function phaseLabel(phase: string): string {
-  return ({ queued: "Queued", identity: "Reading account", sudo_probe: "Checking policy", enumerate: "Finding accounts", read_accounts: "Reading key sources", sshd_config: "Checking SSH policy", done: "Done", error: "Sync error" } as Record<string, string>)[phase] ?? phase;
-}
-
-function defaultRoleAccountName(personName: string): string {
-  const stem = personName.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "access";
-  return `${stem}-readonly`;
-}
-
-type OnboardTargetChoice = {
-  serverId: string;
-  serverName: string;
-  enabled: boolean;
-  kind: "account" | "read_only_role";
-  name: string;
-  accounts: string[];
-};
 
 type Dialog =
   | { kind: "scan"; scope: AccessScope; approved: boolean; error: string | null; busy: boolean }
@@ -59,7 +46,7 @@ function Modal({ title, description, busy, onClose, children, footer }: { title:
   const titleId = `access-${title.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-title`;
   const descriptionId = `${titleId}-description`;
   return (
-    <div className="oars-modal-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
+    <ApplicationOverlay role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
       <div ref={ref} className="oars-modal oars-modal-narrow" role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={descriptionId}>
         <header className="oars-modal-header">
           <div><h2 id={titleId}>{title}</h2><p id={descriptionId} className="oars-modal-subtitle">{description}</p></div>
@@ -67,7 +54,7 @@ function Modal({ title, description, busy, onClose, children, footer }: { title:
         <div className="oars-modal-body space-y-3">{children}</div>
         <footer className="oars-modal-actions oars-modal-footer"><div className="oars-modal-actions-right">{footer}</div></footer>
       </div>
-    </div>
+    </ApplicationOverlay>
   );
 }
 
@@ -376,7 +363,23 @@ export function AccessTab() {
         </div>
       </details>}
 
-      {scan?.state === "scanning" && <div className="security-progress"><span className="security-progress-icon"><RefreshCw className="is-spinning" /></span><div><strong>Scanning {scan.metrics.completed_servers} of {scan.metrics.target_servers} servers</strong><p>The last completed snapshot stays visible while session workers inspect the fleet.</p></div></div>}
+      {scan?.state === "scanning" && (
+        <div
+          className="security-progress"
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={scan.metrics.target_servers}
+          aria-valuenow={scan.metrics.completed_servers}
+          aria-label="Fleet access scan progress"
+          aria-valuetext={`Scanning ${scan.metrics.completed_servers} of ${scan.metrics.target_servers} servers`}
+        >
+          <span className="security-progress-icon"><RefreshCw className="is-spinning" /></span>
+          <div>
+            <strong>Scanning {scan.metrics.completed_servers} of {scan.metrics.target_servers} servers</strong>
+            <p>The last completed snapshot stays visible while session workers inspect the fleet.</p>
+          </div>
+        </div>
+      )}
 
       <div className="security-layout access-layout">
         <main className="security-panel access-people" aria-labelledby="access-people-title">
@@ -413,7 +416,7 @@ export function AccessTab() {
       </div>
 
       {dialog?.kind === "scan" && <Modal title="Scan fleet access" description="Choose the audit scope. Coverage is always stated for this exact scope." busy={dialog.busy} onClose={() => setDialog(null)} footer={<><Button variant="outline" onClick={() => setDialog(null)} disabled={dialog.busy}>Cancel</Button><Button data-access-first onClick={() => void startScan(dialog.scope, dialog.approved)} disabled={dialog.busy || (dialog.scope === "all_login_accounts" && !dialog.approved)}>Start scan</Button></>}>
-        <label className="block text-sm font-medium">Scope<select data-access-first className="border-input bg-background mt-1 w-full rounded-md border px-3 py-2" value={dialog.scope} onChange={(event) => setDialog({ ...dialog, scope: event.target.value as AccessScope, approved: false })}><option value="connected_accounts">Connected login accounts</option><option value="all_login_accounts">All login accounts</option></select></label>
+        <label className="block text-sm font-medium">Scope<OarsSelect data-access-first className="mt-1" value={dialog.scope} onValueChange={(scope) => setDialog({ ...dialog, scope: scope as AccessScope, approved: false })} options={[{ value: "connected_accounts", label: "Connected login accounts" }, { value: "all_login_accounts", label: "All login accounts" }]} /></label>
         {dialog.scope === "all_login_accounts" && <label className="flex gap-2 rounded-md border p-3 text-sm"><input type="checkbox" checked={dialog.approved} onChange={(event) => setDialog({ ...dialog, approved: event.target.checked })} /><span>I approve reads of other users’ SSH key files and sudo policy on the selected fleet.</span></label>}
         {dialog.error && <p className="oars-modal-error" role="alert">{dialog.error}</p>}
       </Modal>}
@@ -426,7 +429,7 @@ export function AccessTab() {
       </Modal>}
 
       {dialog?.kind === "attach" && <Modal title="Attach unassigned key" description="The key comment is a label only. Select the person who owns this exact fingerprint." busy={dialog.busy} onClose={() => setDialog(null)} footer={<><Button variant="outline" onClick={() => setDialog(null)} disabled={dialog.busy}>Cancel</Button><Button onClick={() => void attachFingerprint(dialog)} disabled={dialog.busy}>Attach key</Button></>}>
-        <p className="break-all rounded-md border p-2 font-mono text-xs">{dialog.item.fingerprint}</p><label className="block text-sm font-medium">Person<select data-access-first className="border-input bg-background mt-1 w-full rounded-md border px-3 py-2" value={dialog.identityId} onChange={(event) => setDialog({ ...dialog, identityId: event.target.value })}><option value="">Select a person</option>{identities.map((identity) => <option key={identity.id} value={identity.id}>{identity.name}</option>)}</select></label><label className="flex gap-2 text-sm"><input type="checkbox" checked={dialog.shared} onChange={(event) => setDialog({ ...dialog, shared: event.target.checked })} />Allow this fingerprint to be shared.</label>{dialog.error && <p className="oars-modal-error" role="alert">{dialog.error}</p>}
+        <p className="break-all rounded-md border p-2 font-mono text-xs">{dialog.item.fingerprint}</p><label className="block text-sm font-medium">Person<OarsSelect data-access-first className="mt-1" value={dialog.identityId} onValueChange={(identityId) => setDialog({ ...dialog, identityId })} options={[{ value: "", label: "Select a person" }, ...identities.map((identity) => ({ value: identity.id, label: identity.name }))]} /></label><label className="flex gap-2 text-sm"><input type="checkbox" checked={dialog.shared} onChange={(event) => setDialog({ ...dialog, shared: event.target.checked })} />Allow this fingerprint to be shared.</label>{dialog.error && <p className="oars-modal-error" role="alert">{dialog.error}</p>}
       </Modal>}
 
       {dialog?.kind === "delete" && <Modal title={`Delete ${dialog.identity.name}?`} description="This deletes the local label only. It does not remove remote access." busy={dialog.busy} onClose={() => setDialog(null)} footer={<><Button variant="outline" onClick={() => setDialog(null)} disabled={dialog.busy}>Keep person</Button><Button variant="destructive" onClick={() => void deleteIdentity(dialog)} disabled={dialog.busy || dialog.confirmation !== dialog.identity.name}>Delete local label</Button></>}><label className="block text-sm font-medium">Type {dialog.identity.name} to confirm<input data-access-first className="border-input bg-background mt-1 w-full rounded-md border px-3 py-2" value={dialog.confirmation} onChange={(event) => setDialog({ ...dialog, confirmation: event.target.value })} /></label>{dialog.error && <p className="oars-modal-error" role="alert">{dialog.error}</p>}</Modal>}
@@ -437,8 +440,8 @@ export function AccessTab() {
         <div className="access-target-matrix">
           {dialog.targets.map((target, targetIndex) => <section key={target.serverId} className={target.enabled ? "access-target-row is-enabled" : "access-target-row"}>
             <label className="access-target-server"><input data-access-first={targetIndex === 0 ? true : undefined} type="checkbox" checked={target.enabled} onChange={(event) => setDialog({ ...dialog, targets: dialog.targets.map((item) => item.serverId === target.serverId ? { ...item, enabled: event.target.checked } : item) })} /><span><strong>{target.serverName}</strong><small>{target.serverId}</small></span></label>
-            <label>Target type<select disabled={!target.enabled} value={target.kind} onChange={(event) => { const kind = event.target.value as OnboardTargetChoice["kind"]; setDialog({ ...dialog, targets: dialog.targets.map((item) => item.serverId === target.serverId ? { ...item, kind, name: kind === "account" ? (item.accounts[0] ?? "") : defaultRoleAccountName(dialog.person.name) } : item) }); }}><option value="account">Existing account</option><option value="read_only_role">Read-only SFTP role</option></select></label>
-            {target.kind === "account" && target.accounts.length > 0 ? <label>Login account<select disabled={!target.enabled} value={target.name} onChange={(event) => setDialog({ ...dialog, targets: dialog.targets.map((item) => item.serverId === target.serverId ? { ...item, name: event.target.value } : item) })}>{target.accounts.map((account) => <option key={account} value={account}>{account}</option>)}</select></label> : <label>{target.kind === "account" ? "Login account" : "Role account"}<input disabled={!target.enabled} value={target.name} placeholder={target.kind === "account" ? "No scanned account" : "reports-readonly"} onChange={(event) => setDialog({ ...dialog, targets: dialog.targets.map((item) => item.serverId === target.serverId ? { ...item, name: event.target.value } : item) })} /></label>}
+            <label>Target type<OarsSelect disabled={!target.enabled} value={target.kind} onValueChange={(value) => { const kind = value as OnboardTargetChoice["kind"]; setDialog({ ...dialog, targets: dialog.targets.map((item) => item.serverId === target.serverId ? { ...item, kind, name: kind === "account" ? (item.accounts[0] ?? "") : defaultRoleAccountName(dialog.person.name) } : item) }); }} options={[{ value: "account", label: "Existing account" }, { value: "read_only_role", label: "Read-only SFTP role" }]} /></label>
+            {target.kind === "account" && target.accounts.length > 0 ? <label>Login account<OarsSelect disabled={!target.enabled} value={target.name} onValueChange={(name) => setDialog({ ...dialog, targets: dialog.targets.map((item) => item.serverId === target.serverId ? { ...item, name } : item) })} options={target.accounts.map((account) => ({ value: account, label: account }))} /></label> : <label>{target.kind === "account" ? "Login account" : "Role account"}<input disabled={!target.enabled} value={target.name} placeholder={target.kind === "account" ? "No scanned account" : "reports-readonly"} onChange={(event) => setDialog({ ...dialog, targets: dialog.targets.map((item) => item.serverId === target.serverId ? { ...item, name: event.target.value } : item) })} /></label>}
           </section>)}
         </div>
         <label className="block text-sm font-medium">Public key<textarea className="border-input bg-background mt-1 min-h-24 w-full rounded-md border px-3 py-2 font-mono text-xs" value={dialog.publicKey} onChange={(event) => setDialog({ ...dialog, publicKey: event.target.value, fingerprint: "" })} onBlur={() => void inspectDialogKey(dialog)} /></label>{dialog.fingerprint && <p className="break-all text-xs"><strong>Fingerprint:</strong> {dialog.fingerprint}</p>}{dialog.error && <p className="oars-modal-error" role="alert">{dialog.error}</p>}

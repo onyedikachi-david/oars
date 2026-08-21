@@ -31,7 +31,7 @@ Built with a Zig core and a React frontend, shelled by the [Native SDK](https://
 | SSH / Crypto | Vendored `libssh2 1.11.1` + `mbedTLS 3.6.2` compiled via `zig cc` (`third_party/`) |
 | Desktop shell | Native SDK WebView (`app.zon` / `build.zig`) |
 | Frontend | React 19 + TypeScript + Vite 8, `xterm 5.3` + `xterm-addon-fit`, `@novnc/novnc 1.7`, Tailwind CSS 4 |
-| Platforms | macOS and Linux primary targets (Windows build plumbing in `build.zig`) |
+| Platforms | macOS and Linux (Windows packaging plumbing exists, but the app core is not yet Windows-compatible) |
 
 ## Project Structure
 
@@ -72,7 +72,8 @@ Built with a Zig core and a React frontend, shelled by the [Native SDK](https://
 - **Zig 0.16**
 - **Node.js 24** and **npm** (frontend)
 - **Native SDK CLI** (`native`) — expected at the path in `build.zig` (`default_native_sdk_path`), override with `-Dnative-sdk-path=…` if installed elsewhere
-- **macOS:** Xcode Command Line Tools (`xcode-select --install`) for the WebView/ObjC hosts; Linux: `gtk4` + `webkitgtk-6.0`
+- **macOS:** Xcode Command Line Tools (`xcode-select --install`) for the WebView/ObjC hosts
+- **Linux:** GTK4 and WebKitGTK 6.0 development packages (for Ubuntu: `sudo apt install pkg-config libgtk-4-dev libwebkitgtk-6.0-dev`)
 
 ## Quick Start
 
@@ -89,15 +90,20 @@ zig build run
 # tests
 zig build test
 
-# production bundle (frontend + native binary)
-zig build package
-# → zig-out/package/oars-0.1.0-<target>-<optimize>.{app,AppImage,…}
+# macOS production package (run on macOS)
+zig build package -Dpackage-target=macos
+
+# Linux production package (run on Linux)
+zig build package -Dpackage-target=linux
+# → zig-out/package/oars-0.1.0-<target>-ReleaseFast[.app]
 
 # sanity check for the manifest / SDK setup
 native doctor --manifest app.zon
 ```
 
 `zig build dev` starts the Vite dev server from `app.zon` (`http://127.0.0.1:5173`) and launches the shell with `NATIVE_SDK_FRONTEND_URL` once the dev server is ready. Frontend production assets are emitted to `frontend/dist`.
+
+Run each package command on its matching operating system. `-Dpackage-target` selects the package layout; it does not install or cross-compile the platform WebView dependencies. The GitHub Actions workflow in `.github/workflows/ci.yml` builds both supported targets on native runners and publishes them as workflow artifacts.
 
 ## Commands
 
@@ -106,7 +112,7 @@ native doctor --manifest app.zon
 | `zig build dev` | Vite dev server + native shell (fast edit loop) |
 | `zig build run` | Native shell with built frontend |
 | `zig build test` | Zig test suite (`std.testing.allocator` leak checks) |
-| `zig build package` | Release-optimized packaged artifact under `zig-out/package/` |
+| `zig build package -Dpackage-target=<macos\|linux>` | Release-optimized package for the current host OS under `zig-out/package/` |
 | `zig build frontend-install` | Explicit `npm install --prefix frontend` |
 | `zig build frontend-build` | Explicit `npm run build` for the frontend |
 | `native doctor --manifest app.zon` | Validate manifest / platform prerequisites |
