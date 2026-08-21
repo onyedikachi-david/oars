@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
 
 permissions:
   contents: read
@@ -75,9 +77,48 @@ jobs:
           echo "path=$(npm root --global)/@native-sdk/cli" >> "$GITHUB_OUTPUT"
       - name: Build package
         run: zig build package -Dpackage-target=${{ matrix.target }} -Dnative-sdk-path="${{ steps.native-sdk.outputs.path }}"
+      - name: Archive macOS package
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p zig-out/release
+          ditto -c -k --sequesterRsrc --keepParent zig-out/package/*.app "zig-out/release/oars-${{ github.ref_name }}-macos.zip"
+      - name: Archive Linux package
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p zig-out/release
+          tar -C zig-out/package -czf "zig-out/release/oars-${{ github.ref_name }}-linux-x86_64.tar.gz" .
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
           name: oars-${{ matrix.target }}
-          path: zig-out/package/
+          path: zig-out/release/
           if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: oars-*
+          path: release-assets
+          merge-multiple: true
+      - name: Generate checksums
+        run: sha256sum release-assets/* > release-assets/SHA256SUMS
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "${{ github.ref_name }}" release-assets/* --clobber --repo "${{ github.repository }}"
+          else
+            gh release create "${{ github.ref_name }}" release-assets/* --verify-tag --generate-notes --title "Oars ${{ github.ref_name }}" --repo "${{ github.repository }}"
+          fi

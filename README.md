@@ -105,6 +105,19 @@ native doctor --manifest app.zon
 
 Run each package command on its matching operating system. `-Dpackage-target` selects the package layout; it does not install or cross-compile the platform WebView dependencies. The GitHub Actions workflow in `.github/workflows/ci.yml` builds both supported targets on native runners and publishes them as workflow artifacts.
 
+## Downloads and releases
+
+Every successful branch or pull-request build exposes temporary `oars-macos` and `oars-linux` downloads in the **Artifacts** section of that Actions run. GitHub's **Packages** panel is for package registries and is not used for Oars desktop binaries.
+
+Push a version tag matching `app.zon` to create a permanent GitHub Release with the macOS ZIP, Linux tarball, generated release notes, and SHA-256 checksums:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Re-running the tagged workflow replaces its release assets without creating a duplicate release.
+
 ## Commands
 
 | Command | What it does |
