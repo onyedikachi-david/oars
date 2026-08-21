@@ -7,6 +7,7 @@
 //! deltas (polled by the frontend), an input queue, and an op queue.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ssh = @import("ssh.zig");
 const servers = @import("servers.zig");
 const openssh = @import("openssh.zig");
@@ -21,15 +22,38 @@ const preflight = @import("preflight.zig");
 const wsmod = @import("ws.zig");
 const agent = @import("agent.zig");
 
-// fcntl is variadic, so the cImport cannot translate it; declare the
-// exact signature we use, with the darwin/Linux constants pinned
-// (sys/fcntl.h: F_SETFL=4, O_NONBLOCK=0x0004 — identical on both).
+// fcntl is variadic, so the cImport cannot translate it; declare the exact
+// signature used by the supported POSIX targets. F_SETFL is 4 on both, while
+// O_NONBLOCK is platform-specific.
 extern fn fcntl(fd: c_int, cmd: c_int, flags: c_int) c_int;
 const F_SETFL: c_int = 4;
-const O_NONBLOCK: c_int = 0x0004;
-// macOS errno accessor (unistd-level EAGAIN is 35 on darwin/Linux).
-extern fn __error() *c_int;
-const EAGAIN: c_int = 35;
+const O_NONBLOCK: c_int = switch (builtin.os.tag) {
+    .macos => 0x0004,
+    .linux => 0x0800,
+    else => @compileError("session socket pumps require a supported POSIX target"),
+};
+
+fn configureNonBlockingSocket(fd: std.posix.socket_t) void {
+    _ = fcntl(fd, F_SETFL, O_NONBLOCK);
+    if (comptime @hasDecl(ssh.c, "SO_NOSIGPIPE")) {
+        var one: c_int = 1;
+        _ = ssh.c.setsockopt(fd, ssh.c.SOL_SOCKET, ssh.c.SO_NOSIGPIPE, &one, @sizeOf(c_int));
+    }
+}
+
+fn socketWriteNoSigpipe(fd: std.posix.socket_t, bytes: []const u8) isize {
+    if (comptime @hasDecl(ssh.c, "MSG_NOSIGNAL")) {
+        return ssh.c.send(fd, bytes.ptr, bytes.len, ssh.c.MSG_NOSIGNAL);
+    }
+    return ssh.c.write(fd, bytes.ptr, bytes.len);
+}
+
+/// Monitor cadence only needs differences over a few seconds. A signed 64-bit
+/// nanosecond clock is atomic on every supported desktop target and covers real
+/// timestamps through 2262; clamp defensively rather than requiring i128 atomics.
+pub fn monitorTimeNs(value: i128) i64 {
+    return std.math.cast(i64, value) orelse if (value < 0) std.math.minInt(i64) else std.math.maxInt(i64);
+}
 
 /// Blocking acquire on std.atomic.Mutex (spinlock) — 0.16's atomic.Mutex
 /// only exposes tryLock. Sections are short (buffer/cursor updates), so
@@ -949,12 +973,12 @@ pub const Session = struct {
     /// and written by the worker under its spinlock; the cadence fields are
     /// copied from the manager at connect.
     monitor_cache: monitor.Cache = .{},
-    monitor_last_poll_ns: std.atomic.Value(i128) = .init(0),
+    monitor_last_poll_ns: std.atomic.Value(i64) = .init(0),
     monitor_force: std.atomic.Value(bool) = .init(false),
-    monitor_last_probe_ns: std.atomic.Value(i128) = .init(0),
+    monitor_last_probe_ns: std.atomic.Value(i64) = .init(0),
     monitor_probe_active: std.atomic.Value(bool) = .init(false),
-    monitor_interval_ns: i128 = 2 * std.time.ns_per_s,
-    monitor_liveness_ns: i128 = 4 * std.time.ns_per_s,
+    monitor_interval_ns: i64 = 2 * std.time.ns_per_s,
+    monitor_liveness_ns: i64 = 4 * std.time.ns_per_s,
     /// Set by dropCaches so the next completed probe writes the after
     /// snapshot audit entry (before/after contract, spec 03 §6).
     monitor_drop_pending: std.atomic.Value(bool) = .init(false),
@@ -1036,8 +1060,8 @@ pub const Manager = struct {
     home: ?[]const u8 = null,
     /// Monitor probe cadence, copied to each session at connect (tests
     /// shrink these to keep probe assertions fast).
-    monitor_interval_ns: i128 = 2 * std.time.ns_per_s,
-    monitor_liveness_ns: i128 = 4 * std.time.ns_per_s,
+    monitor_interval_ns: i64 = 2 * std.time.ns_per_s,
+    monitor_liveness_ns: i64 = 4 * std.time.ns_per_s,
     /// Monotonic VNC tunnel ids (the WS URL token carries the randomness).
     next_tunnel_id: std.atomic.Value(u32) = .init(1),
     mutex: std.atomic.Mutex = .unlocked,
@@ -1932,14 +1956,14 @@ pub const Manager = struct {
 
     /// Marks monitor poll activity: the worker probes only while polls are
     /// recent (spec 03 §6: no poll → no probe traffic).
-    pub fn monitorTouch(self: *Manager, server_id: []const u8, now_ns: i128) !void {
+    pub fn monitorTouch(self: *Manager, server_id: []const u8, now_ns: i64) !void {
         const session = self.get(server_id) orelse return error.NoSession;
         session.monitor_last_poll_ns.store(now_ns, .release);
     }
 
     /// Enqueues an immediate probe (manual refresh, or right after a
     /// mutating monitor action so the cache refreshes).
-    pub fn monitorForce(self: *Manager, server_id: []const u8, now_ns: i128) !void {
+    pub fn monitorForce(self: *Manager, server_id: []const u8, now_ns: i64) !void {
         const session = self.get(server_id) orelse return error.NoSession;
         if (session.status.load(.acquire) != .ready) return error.NotReady;
         session.monitor_last_poll_ns.store(now_ns, .release);
@@ -2162,13 +2186,9 @@ fn workerMain(session: *Session) void {
         // its run loop (a blocking read would freeze every other channel
         // of the via session), and the target's libssh2 runs EAGAIN loops
         // on fds[1] (libssh2_session_set_blocking does NOT alter the
-        // socket itself). SO_NOSIGPIPE keeps a closed peer from
-        // signalling the process on write.
-        for (&fds) |fd| {
-            _ = fcntl(fd, F_SETFL, O_NONBLOCK);
-            var one: c_int = 1;
-            _ = ssh.c.setsockopt(fd, ssh.c.SOL_SOCKET, ssh.c.SO_NOSIGPIPE, &one, @sizeOf(c_int));
-        }
+        // socket itself). Darwin uses SO_NOSIGPIPE; Linux writes use
+        // MSG_NOSIGNAL through socketWriteNoSigpipe.
+        for (&fds) |fd| configureNonBlockingSocket(fd);
         var outcome: JumpStartOutcome = .{};
         const host_owned = allocator.dupe(u8, session.server.host) catch {
             _ = ssh.c.close(fds[0]);
@@ -2616,7 +2636,7 @@ fn workerMain(session: *Session) void {
         // no monitor view generates no probe traffic.
         if (!session.monitor_probe_active.load(.acquire)) {
             const force = session.monitor_force.swap(false, .acquire);
-            const now = std.Io.Timestamp.now(io, .real).nanoseconds;
+            const now = monitorTimeNs(std.Io.Timestamp.now(io, .real).nanoseconds);
             const poll_recent = now - session.monitor_last_poll_ns.load(.acquire) < session.monitor_liveness_ns;
             if (force or (poll_recent and now - session.monitor_last_probe_ns.load(.acquire) >= session.monitor_interval_ns)) {
                 session.monitor_last_probe_ns.store(now, .release);
@@ -3349,9 +3369,9 @@ fn processJumpTunnels(session: *Session, io: std.Io) void {
                 if (revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) {
                     remove = true;
                 } else if (revents & std.posix.POLL.OUT != 0) {
-                    const w = ssh.c.write(jt.fd, jt.to_fd_buf.items.ptr, jt.to_fd_buf.items.len);
+                    const w = socketWriteNoSigpipe(jt.fd, jt.to_fd_buf.items);
                     if (w < 0) {
-                        if (__error().* != EAGAIN) remove = true;
+                        if (std.posix.errno(w) != .AGAIN) remove = true;
                     } else if (w > 0) {
                         const n: usize = @intCast(w);
                         jt.bytes_down += n;
@@ -3511,7 +3531,7 @@ fn tunnelFlushWs(t: *Tunnel) usize {
         const ready = std.posix.poll(&fds, 0) catch return total;
         if (ready == 0 or fds[0].revents & std.posix.POLL.OUT == 0) return total;
         const chunk = t.send_buf.items[0..@min(t.send_buf.items.len, 16 * 1024)];
-        const rc = std.c.write(fd, chunk.ptr, chunk.len);
+        const rc = socketWriteNoSigpipe(fd, chunk);
         if (rc <= 0) return total; // EAGAIN or error — retain the buffer
         const n: usize = @intCast(rc);
         std.mem.copyForwards(u8, t.send_buf.items[0 .. t.send_buf.items.len - n], t.send_buf.items[n..]);
@@ -3750,12 +3770,9 @@ fn connectAgentSocket(session: *Session) !std.posix.socket_t {
     const fd = ssh.c.socket(ssh.c.AF_UNIX, ssh.c.SOCK_STREAM, 0);
     if (fd < 0) return error.ConnectionFailed;
     errdefer _ = ssh.c.close(fd);
-    // Non-blocking from the start (a blocking connect or write would
-    // freeze the via worker's run loop) and SO_NOSIGPIPE so a closed
-    // agent never signals the process.
-    _ = fcntl(fd, F_SETFL, O_NONBLOCK);
-    var one: c_int = 1;
-    _ = ssh.c.setsockopt(fd, ssh.c.SOL_SOCKET, ssh.c.SO_NOSIGPIPE, &one, @sizeOf(c_int));
+    // Non-blocking from the start (a blocking connect or write would freeze
+    // the via worker's run loop); writes suppress SIGPIPE per platform.
+    configureNonBlockingSocket(fd);
     var addr: ssh.c.sockaddr_un = .{};
     addr.sun_family = ssh.c.AF_UNIX;
     if (@hasField(@TypeOf(addr), "sun_len")) {
@@ -3763,17 +3780,19 @@ fn connectAgentSocket(session: *Session) !std.posix.socket_t {
     }
     @memcpy(@as([*]u8, @ptrCast(&addr.sun_path))[0..path.len], path[0..path.len]);
     const addr_len: c_uint = @intCast(@offsetOf(ssh.c.sockaddr_un, "sun_path") + path.len + 1);
-    if (ssh.c.connect(fd, @ptrCast(&addr), addr_len) != 0) {
-        if (__error().* == EAGAIN or __error().* == 36) { // EAGAIN/EINPROGRESS
-            // Non-blocking connect: wait for writability, then verify.
-            var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
-            const ready = std.posix.poll(&pfd, 2000) catch return error.ConnectionFailed;
-            if (ready == 0) return error.ConnectionFailed;
-            var so_error: c_int = 0;
-            var so_len: std.posix.socklen_t = @sizeOf(c_int);
-            if (ssh.c.getsockopt(fd, ssh.c.SOL_SOCKET, ssh.c.SO_ERROR, &so_error, &so_len) != 0 or so_error != 0) return error.ConnectionFailed;
-        } else {
-            return error.ConnectionFailed;
+    const connect_rc = ssh.c.connect(fd, @ptrCast(&addr), addr_len);
+    if (connect_rc != 0) {
+        switch (std.posix.errno(connect_rc)) {
+            .AGAIN, .INPROGRESS => {
+                // Non-blocking connect: wait for writability, then verify.
+                var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
+                const ready = std.posix.poll(&pfd, 2000) catch return error.ConnectionFailed;
+                if (ready == 0) return error.ConnectionFailed;
+                var so_error: c_int = 0;
+                var so_len: std.posix.socklen_t = @sizeOf(c_int);
+                if (ssh.c.getsockopt(fd, ssh.c.SOL_SOCKET, ssh.c.SO_ERROR, &so_error, &so_len) != 0 or so_error != 0) return error.ConnectionFailed;
+            },
+            else => return error.ConnectionFailed,
         }
     }
     return fd;
@@ -3829,9 +3848,9 @@ fn processForwardChannels(session: *Session, io: std.Io) void {
         // buffered for the next pass, so no bytes are dropped and the
         // worker loop never stalls).
         if (ft.to_socket_buf.items.len > 0) {
-            const w = ssh.c.write(ft.agent_fd, ft.to_socket_buf.items.ptr, ft.to_socket_buf.items.len);
+            const w = socketWriteNoSigpipe(ft.agent_fd, ft.to_socket_buf.items);
             if (w < 0) {
-                if (__error().* != EAGAIN) remove = true;
+                if (std.posix.errno(w) != .AGAIN) remove = true;
             } else if (w > 0) {
                 const n: usize = @intCast(w);
                 std.mem.copyForwards(u8, ft.to_socket_buf.items[0 .. ft.to_socket_buf.items.len - n], ft.to_socket_buf.items[n..]);

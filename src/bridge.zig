@@ -1199,7 +1199,7 @@ fn handleMonitorPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocati
     const session = self.manager.get(parsed.value.server_id) orelse return monitor_not_ready;
     if (session.status.load(.acquire) != .ready) return monitor_not_ready;
 
-    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+    const now = sessions.monitorTimeNs(std.Io.Timestamp.now(self.io, .real).nanoseconds);
     session.monitor_last_poll_ns.store(now, .release);
     // Refresh-if-stale: enqueue one probe when the cache is stale and no
     // probe is already running (spec 03 §6).
@@ -1238,7 +1238,7 @@ fn handleMonitorProbe(context: *anyopaque, invocation: native_sdk.bridge.Invocat
         return respondError(output, "invalid payload");
     };
     defer parsed.deinit();
-    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+    const now = sessions.monitorTimeNs(std.Io.Timestamp.now(self.io, .real).nanoseconds);
     self.manager.monitorForce(parsed.value.server_id, now) catch |err| {
         return respondError(output, switch (err) {
             error.NoSession => "not connected",
@@ -1354,7 +1354,7 @@ fn handleMonitorDropCaches(context: *anyopaque, invocation: native_sdk.bridge.In
         return respondError(output, "drop-caches ran but the audit entry could not be written");
     };
     session.monitor_drop_pending.store(true, .release);
-    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+    const now = sessions.monitorTimeNs(std.Io.Timestamp.now(self.io, .real).nanoseconds);
     self.manager.monitorForce(parsed.value.server_id, now) catch {};
 
     var writer = std.Io.Writer.fixed(output);
@@ -12231,7 +12231,8 @@ fn handleAiContext(context: *anyopaque, invocation: native_sdk.bridge.Invocation
     const snap = session.monitor_cache.current() orelse &ai_empty_snapshot;
     // Refresh-if-stale: enqueue one monitor probe when the cache is
     // stale and none is running (same contract as oars.monitor.poll).
-    if (now - session.monitor_last_probe_ns.load(.acquire) >= session.monitor_interval_ns and
+    const monitor_now = sessions.monitorTimeNs(now);
+    if (monitor_now - session.monitor_last_probe_ns.load(.acquire) >= session.monitor_interval_ns and
         !session.monitor_probe_active.load(.acquire))
     {
         session.monitor_force.store(true, .release);

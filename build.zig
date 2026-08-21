@@ -326,6 +326,7 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{
         .root_module = app_mod,
         .filters = if (test_filter) |filter| &.{filter} else &.{},
+        .use_llvm = useLlvmWorkaround(target),
     });
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
