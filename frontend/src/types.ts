@@ -578,7 +578,7 @@ export interface DeployHistoryRecord { id: number; server_id: string; app_id: st
 
 export type BackupTransferKind = "sync" | "copy";
 export type BackupDestinationType = "s3" | "local";
-export type BackupProvider = "aws" | "r2" | "b2" | "wasabi" | "minio" | "spaces";
+export type BackupProvider = "aws" | "r2" | "b2" | "b2_s3" | "wasabi" | "minio" | "spaces";
 export type BackupScheduleMode = "manual" | "interval" | "custom";
 export type BackupIntervalUnit = "hours" | "days";
 export type BackupRunStatus = "queued" | "running" | "success" | "failed" | "no_changes" | "canceled" | "interrupted";
@@ -621,6 +621,7 @@ export interface BackupJob {
 export interface BackupJobInput {
   id?: string;
   server_id: string;
+  expected_revision?: number;
   name: string;
   source_path: string;
   destination: Partial<BackupDestination> & {
@@ -638,23 +639,47 @@ export interface BackupCredentials {
 }
 
 export interface BackupJobsListResult {
-  ok: boolean;
+  ok: true;
   jobs: BackupJob[];
+  recovery_error?: string;
 }
 
 export interface BackupJobSaveResult {
-  ok: boolean;
+  ok: true;
   job: BackupJob;
 }
 
+export type BackupErrorCode =
+  | "invalid_payload" | "invalid_job" | "invalid_credentials"
+  | "not_connected" | "session_not_ready" | "unsupported_target"
+  | "rclone_missing" | "cron_missing" | "cron_stopped"
+  | "source_missing" | "source_unreadable" | "source_too_large"
+  | "plan_expired" | "conflict" | "busy" | "not_found"
+  | "permission_denied" | "timeout" | "transport_error"
+  | "capability_failed" | "cleanup_failed" | "store_corrupt"
+  | "canceled" | "interrupted" | "internal";
+
+export interface BackupFailure {
+  ok: false;
+  code: BackupErrorCode;
+  error: string;
+  retryable: boolean;
+  detail?: { step?: string; path?: string; remote_object?: string };
+}
+
+export type BackupCheckState = "passed" | "failed";
+
 export interface BackupTestResult {
-  ok: boolean;
+  ok: true;
   checks: {
-    list: boolean;
-    write: boolean;
-    read: boolean;
-    delete: boolean;
+    list: BackupCheckState;
+    write: BackupCheckState;
+    read: BackupCheckState;
+    delete: BackupCheckState;
+    cleanup_verify: BackupCheckState;
   };
+  capability_proof?: { id: string; expires_at_ms: number; binding_sha256: string };
+  leftover_remote_object?: string;
 }
 
 export interface BackupRunStartResult {
@@ -709,6 +734,68 @@ export interface BackupCronStatusResult {
   rclone: boolean;
   cron_installed: boolean;
   cron_running: boolean;
+}
+
+// NEXT-SPEC typed operation / plan surfaces (wire ms).
+export type BackupOperationState = "queued" | "running" | "done" | "partial" | "failed" | "canceled";
+export type BackupStepState = "pending" | "running" | "done" | "conflict" | "failed" | "cancel_requested" | "canceled" | "skipped";
+export interface BackupOperation {
+  ok: true;
+  operation_id: string;
+  kind: "refresh" | "test" | "save" | "delete" | "install" | "cleanup";
+  state: BackupOperationState;
+  steps: Array<{ id: string; state: BackupStepState; error?: BackupFailure }>;
+  started_at_ms: number;
+  finished_at_ms?: number;
+  result?: unknown;
+  error?: BackupFailure;
+}
+export interface BackupPlanResult {
+  ok: true;
+  plan_id: string;
+  expires_at_ms: number;
+  job: BackupJob;
+  requires_connection_test: boolean;
+  requires_remote_secret: boolean;
+  effects: string[];
+  warnings: string[];
+  schedule_preview?: { timezone: string; crontab_block: string };
+}
+export interface BackupTestPlanResult {
+  ok: true;
+  test_plan_id: string;
+  expires_at_ms: number;
+  remote_object: string;
+  checks: ["list", "write", "read", "delete", "cleanup_verify"];
+  mutates: true;
+}
+export interface BackupServerStatus {
+  rclone_path: string;
+  rclone_version: string;
+  crontab_impl: string;
+  cron_running: boolean;
+  home: string;
+  timezone: string;
+  stale_imports?: number;
+  cleanup_required?: string[];
+}
+export interface BackupHistoryLogResult {
+  ok: true;
+  cursor: number;
+  delta: string;
+  eof: boolean;
+  dropped: number;
+}
+export interface BackupInstallPlanResult {
+  ok: true;
+  plan_id: string;
+  expires_at_ms: number;
+  target: string;
+  privilege: string;
+  commands: string[];
+  effects: string[];
+  rollback: string[];
+  manual: boolean;
 }
 
 // ============================================================================

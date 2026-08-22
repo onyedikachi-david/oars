@@ -11369,6 +11369,8 @@ fn backupJobToJson(writer: anytype, job: *const backup.Job) !void {
     try json.writeJsonString(writer, job.id);
     try writer.writeAll(",\"server_id\":");
     try json.writeJsonString(writer, job.server_id);
+    try writer.writeAll(",\"revision\":");
+    try writer.print("{d}", .{job.revision});
     try writer.writeAll(",\"name\":");
     try json.writeJsonString(writer, job.name);
     try writer.writeAll(",\"source_path\":");
@@ -11396,7 +11398,8 @@ fn backupJobToJson(writer: anytype, job: *const backup.Job) !void {
     try writer.print(",\"interval_every\":{d},\"expr\":", .{job.schedule.interval_every});
     try json.writeJsonString(writer, job.schedule.expr);
     try writer.print(",\"enabled\":{s}}}", .{if (job.schedule.enabled) "true" else "false"});
-    try writer.print(",\"created_at_ns\":{d},\"updated_at_ns\":{d}}}", .{ job.created_at_ns, job.updated_at_ns });
+    // Back-compat ns + new ms (NEXT-SPEC requires ms).
+    try writer.print(",\"created_at_ns\":{d},\"updated_at_ns\":{d},\"created_at_ms\":{d},\"updated_at_ms\":{d}}}", .{ job.created_at_ns, job.updated_at_ns, @divFloor(job.created_at_ns, std.time.ns_per_ms), @divFloor(job.updated_at_ns, std.time.ns_per_ms) });
 }
 
 /// Reads the current crontab (empty when none exists). Owned.

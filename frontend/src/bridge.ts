@@ -56,6 +56,12 @@ import type {
   BackupPollResult,
   BackupInstallResult,
   BackupCronStatusResult,
+  BackupServerStatus,
+  BackupPlanResult,
+  BackupTestPlanResult,
+  BackupOperation,
+  BackupHistoryLogResult,
+  BackupInstallPlanResult,
   AiContextBundle,
   AiProviderGetResult,
   AiProviderSetResult,
@@ -89,9 +95,13 @@ declare global {
 
 export class BridgeError extends Error {
   code: string;
-  constructor(code: string, message: string) {
+  retryable?: boolean;
+  detail?: { step?: string; path?: string; remote_object?: string };
+  constructor(code: string, message: string, retryable?: boolean, detail?: { step?: string; path?: string; remote_object?: string }) {
     super(message);
     this.code = code;
+    this.retryable = retryable;
+    this.detail = detail;
   }
 }
 
@@ -110,8 +120,10 @@ export async function invoke<T = unknown>(
   }
   // Our handlers resolve with an envelope when they hit a user-facing
   // error; the framework rejects for transport-level failures.
+  // Preserve typed BackupFailure codes instead of collapsing to command_failed.
   if (result && typeof result === "object" && (result as { ok?: boolean }).ok === false) {
-    throw new BridgeError("command_failed", (result as { error?: string }).error ?? "command failed");
+    const obj = result as { ok: false; code?: string; error?: string; retryable?: boolean; detail?: { step?: string; path?: string; remote_object?: string } };
+    throw new BridgeError(obj.code ?? "command_failed", obj.error ?? "command failed", obj.retryable, obj.detail);
   }
   return result as T;
 }
@@ -172,6 +184,13 @@ export const vault = {
       secret,
     });
     // Do not cache backup secrets in-process.
+  },
+  async backupDelete(account: string): Promise<void> {
+    await invoke("native-sdk.credentials.delete", {
+      service: this.service,
+      account,
+    });
+    secretCache.delete(account);
   },
   async delete(account: string): Promise<void> {
     await invoke("native-sdk.credentials.delete", {
@@ -458,6 +477,10 @@ export const api = {
       }),
   },
   backup: {
+    // Current (legacy) paths — kept for the placeholder BackupsTab until the
+    // typed controller migrates. The new typed paths (status/refresh/plan/
+    // operationPoll/historyLog/installPlan) are added alongside; legacy ones
+    // are not removed until all callers are migrated.
     list: (serverId?: string) =>
       invoke<BackupJobsListResult>("oars.backup.jobs.list", serverId ? { server_id: serverId } : {}),
     save: (job: BackupJobInput, scheduleCredentials?: BackupCredentials) =>
@@ -504,6 +527,44 @@ export const api = {
       }),
     cronStatus: (serverId: string) =>
       invoke<BackupCronStatusResult>("oars.backup.cronStatus", { server_id: serverId }),
+    // NEXT-SPEC typed paths (added now for the new controller).
+    status: (serverId: string) =>
+      invoke<{ ok: true; status: BackupServerStatus | null; stale: boolean }>("oars.backup.status", { server_id: serverId }),
+    refresh: (operationId: string, serverId: string) =>
+      invoke<{ ok: true; operation_id: string }>("oars.backup.refresh", { operation_id: operationId, server_id: serverId }),
+    jobsPlan: (job: BackupJobInput, expectedRevision?: number) =>
+      invoke<BackupPlanResult>("oars.backup.jobs.plan", { job, ...(expectedRevision !== undefined ? { expected_revision: expectedRevision } : {}) }),
+    jobsSaveOp: (operationId: string, planId: string, opts?: { capabilityProofId?: string; scheduleCredentials?: BackupCredentials; approvedRemoteSecret?: boolean }) =>
+      invoke<{ ok: true; operation_id: string; job_id: string }>("oars.backup.jobs.save", {
+        operation_id: operationId,
+        plan_id: planId,
+        ...(opts?.capabilityProofId ? { capability_proof_id: opts.capabilityProofId } : {}),
+        ...(opts?.scheduleCredentials ? { schedule_credentials: opts.scheduleCredentials } : {}),
+        ...(opts?.approvedRemoteSecret !== undefined ? { approved_remote_secret: opts.approvedRemoteSecret } : {}),
+      }),
+    testPlan: (jobPlanId: string) =>
+      invoke<BackupTestPlanResult>("oars.backup.test.plan", { job_plan_id: jobPlanId }),
+    testOp: (operationId: string, testPlanId: string, credentials?: BackupCredentials) =>
+      invoke<{ ok: true; operation_id: string }>("oars.backup.test", { operation_id: operationId, test_plan_id: testPlanId, ...(credentials ? { credentials } : {}) }),
+    runOp: (operationId: string, serverId: string, jobId: string, expectedRevision: number, opts?: { credentials?: BackupCredentials; confirmJobName?: string }) =>
+      invoke<BackupRunStartResult>("oars.backup.run", {
+        operation_id: operationId,
+        server_id: serverId,
+        job_id: jobId,
+        expected_revision: expectedRevision,
+        ...(opts?.credentials ? { credentials: opts.credentials } : {}),
+        ...(opts?.confirmJobName ? { confirm_job_name: opts.confirmJobName } : {}),
+      }),
+    runCancel: (runId: string) =>
+      invoke<{ ok: true }>("oars.backup.cancel", { run_id: runId }),
+    operationPoll: (operationId: string) =>
+      invoke<BackupOperation>("oars.backup.operationPoll", { operation_id: operationId }),
+    operationCancel: (operationId: string) =>
+      invoke<{ ok: true }>("oars.backup.operationCancel", { operation_id: operationId }),
+    historyLog: (serverId: string, runId: string, cursor?: number, max?: number) =>
+      invoke<BackupHistoryLogResult>("oars.backup.historyLog", { server_id: serverId, run_id: runId, ...(cursor !== undefined ? { cursor } : {}), ...(max !== undefined ? { max } : {}) }),
+    installPlan: (serverId: string, what: "rclone" | "cron" | "start_cron") =>
+      invoke<BackupInstallPlanResult>("oars.backup.install.plan", { server_id: serverId, what }),
   },
   ai: {
     context: (serverId: string) =>
