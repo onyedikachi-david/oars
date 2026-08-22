@@ -377,12 +377,25 @@ fn validCronElement(element: []const u8, min: u32, max: u32) bool {
     return value >= min and value <= max;
 }
 
-/// Interval schedules become five-field expressions.
+/// Interval schedules as five-field expressions (v1 shim).
+/// The guide notes that `*/N` in hours operates within the calendar field
+/// (e.g. `*/23` is 0 and 23, not every 23h) and `*/N` in month-day resets
+/// each month — neither is a truthful elapsed-interval. The next spec
+/// replaces this with a once-per-minute wrapper gated on `next_due_epoch`.
+/// For now, cap to truthful bounds and reject out-of-range values rather
+/// than silently clamping to a different interval.
 pub fn intervalToCronExpr(allocator: std.mem.Allocator, unit: []const u8, every: u32) ![]u8 {
     if (std.mem.eql(u8, unit, "days")) {
-        return std.fmt.allocPrint(allocator, "0 0 */{d} * *", .{@min(every, 31)});
+        if (every == 0 or every > 365) return error.InvalidSchedule;
+        if (every > 31) return error.InvalidSchedule; // field-step cannot represent >31 truthfully
+        return std.fmt.allocPrint(allocator, "0 0 */{d} * *", .{every});
     }
-    return std.fmt.allocPrint(allocator, "0 */{d} * * *", .{@min(every, 23)});
+    if (std.mem.eql(u8, unit, "hours")) {
+        if (every == 0 or every > 168) return error.InvalidSchedule;
+        if (every > 23) return error.InvalidSchedule;
+        return std.fmt.allocPrint(allocator, "0 */{d} * * *", .{every});
+    }
+    return error.InvalidSchedule;
 }
 
 /// `%` is newline to cron — escape it in generated commands.
@@ -825,13 +838,24 @@ pub const HistoryStore = struct {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         std.json.Stringify.value(runs, .{ .whitespace = .indent_2 }, &out.writer) catch return error.SerializeFailed;
-        var file = try cwd.createFile(io, self.path, .{});
-        defer file.close(io);
-        if (file.stat(io)) |stat| {
-            if (stat.permissions.toMode() & 0o077 != 0) file.setPermissions(io, .fromMode(0o600)) catch {};
+        var tmp_buf: [4096]u8 = undefined;
+        const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{self.path}) catch return error.SerializeFailed;
+        {
+            var file = try cwd.createFile(io, tmp, .{});
+            defer file.close(io);
+            file.setPermissions(io, .fromMode(0o600)) catch {};
+            try file.writeStreamingAll(io, out.writer.buffered());
+            try file.sync(io);
+        }
+        try std.Io.Dir.renameAbsolute(tmp, self.path, io);
+        // Ensure the file is owner-only after the rename.
+        if (cwd.openFile(io, self.path, .{ .mode = .read_write })) |*f| {
+            var file = f.*;
+            defer file.close(io);
+            if (file.stat(io)) |stat| {
+                if (stat.permissions.toMode() & 0o077 != 0) file.setPermissions(io, .fromMode(0o600)) catch {};
+            } else |_| {}
         } else |_| {}
-        try file.writeStreamingAll(io, out.writer.buffered());
-        try file.sync(io);
     }
 
     /// Appends a completed run; prunes records older than the retention
@@ -972,13 +996,23 @@ pub const JobStore = struct {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         std.json.Stringify.value(jobs, .{ .whitespace = .indent_2 }, &out.writer) catch return error.SerializeFailed;
-        var file = try cwd.createFile(io, self.path, .{});
-        defer file.close(io);
-        if (file.stat(io)) |stat| {
-            if (stat.permissions.toMode() & 0o077 != 0) file.setPermissions(io, .fromMode(0o600)) catch {};
+        var tmp_buf: [4096]u8 = undefined;
+        const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{self.path}) catch return error.SerializeFailed;
+        {
+            var file = try cwd.createFile(io, tmp, .{});
+            defer file.close(io);
+            file.setPermissions(io, .fromMode(0o600)) catch {};
+            try file.writeStreamingAll(io, out.writer.buffered());
+            try file.sync(io);
+        }
+        try std.Io.Dir.renameAbsolute(tmp, self.path, io);
+        if (cwd.openFile(io, self.path, .{ .mode = .read_write })) |*f| {
+            var file = f.*;
+            defer file.close(io);
+            if (file.stat(io)) |stat| {
+                if (stat.permissions.toMode() & 0o077 != 0) file.setPermissions(io, .fromMode(0o600)) catch {};
+            } else |_| {}
         } else |_| {}
-        try file.writeStreamingAll(io, out.writer.buffered());
-        try file.sync(io);
     }
 
     /// Upserts a job (secrets never persisted). `schedule_credentials`
@@ -1308,6 +1342,10 @@ test "cron expression grammar" {
     try std.testing.expect(validCronExpr("15,45 9-17 * * 1-5"));
     try std.testing.expect(validCronExpr("0 0 */2 * 0"));
     try std.testing.expect(validCronExpr("0 0 * * 7"));
+    try std.testing.expect(validCronExpr("0\t2\t*\t*\t*")); // tabs as separators
+    try std.testing.expect(validCronExpr("1-5/2 * * * *")); // range steps
+    try std.testing.expect(validCronExpr("*/2 * * * *"));
+    try std.testing.expect(validCronExpr("1,2,3 * * * *"));
     try std.testing.expect(!validCronExpr("60 * * * *"));
     try std.testing.expect(!validCronExpr("* 24 * * *"));
     try std.testing.expect(!validCronExpr("* * 0 * *"));
@@ -1317,12 +1355,17 @@ test "cron expression grammar" {
     try std.testing.expect(!validCronExpr("0 2 * * * *"));
     try std.testing.expect(!validCronExpr("@daily"));
     try std.testing.expect(!validCronExpr(""));
+    try std.testing.expect(!validCronExpr("0 2 * * %")); // % is newline to cron
+    try std.testing.expect(!validCronExpr("0 2 * * *\n"));
+    try std.testing.expect(!validCronExpr("1-5/0 * * * *"));
     const hours = try intervalToCronExpr(std.testing.allocator, "hours", 4);
     defer std.testing.allocator.free(hours);
     try std.testing.expectEqualStrings("0 */4 * * *", hours);
     const days = try intervalToCronExpr(std.testing.allocator, "days", 2);
     defer std.testing.allocator.free(days);
     try std.testing.expectEqualStrings("0 0 */2 * *", days);
+    try std.testing.expectError(error.InvalidSchedule, intervalToCronExpr(std.testing.allocator, "hours", 48));
+    try std.testing.expectError(error.InvalidSchedule, intervalToCronExpr(std.testing.allocator, "days", 60));
 }
 
 test "crontab add/remove round trip with id markers" {
