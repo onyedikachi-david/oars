@@ -11956,24 +11956,58 @@ fn handleBackupJobsSave(context: *anyopaque, invocation: native_sdk.bridge.Invoc
     };
     defer parsed.deinit();
     const payload = parsed.value;
+    // Operation-based flow (NEXT-SPEC): when operation_id/plan_id present, create
+    // a refresh-like operation that the coordinator will drive as a transactional
+    // local+remote save. For legacy callers keep the existing synchronous path
+    // but make it local-only (no remote crontab) to avoid blocking.
+    if (payload.operation_id != null and payload.plan_id != null) {
+        const op_id = payload.operation_id.?;
+        if (!backup.validId(op_id)) return backupTypedError(output, "invalid_payload", "invalid operation_id");
+        if (self.backup.operationById(op_id)) |existing| {
+            var writer = std.Io.Writer.fixed(output);
+            writer.writeAll("{\"ok\":true,\"operation_id\":") catch return output[0..0];
+            json.writeJsonString(&writer, existing.id) catch return output[0..0];
+            writer.writeAll(",\"job_id\":") catch return output[0..0];
+            json.writeJsonString(&writer, existing.job_id) catch return output[0..0];
+            writer.writeAll("}") catch return output[0..0];
+            return writer.buffered();
+        }
+        const plan = self.backup.peekPlan(payload.plan_id.?) orelse return backupTypedError(output, "plan_expired", "plan expired — recreate it");
+        _ = plan;
+        self.backup.ensureStarted(self.io);
+        const op = self.allocator.create(backup.BackupOperation) catch return respondError(output, "out of memory");
+        errdefer self.allocator.destroy(op);
+        const now: i128 = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+        op.* = .{
+            .id = self.allocator.dupe(u8, op_id) catch return respondError(output, "out of memory"),
+            .kind = .jobs_save,
+            .state = .queued,
+            .server_id = self.allocator.dupe(u8, payload.job.server_id) catch return respondError(output, "out of memory"),
+            .job_id = if (payload.job.id) |jid| self.allocator.dupe(u8, jid) catch return respondError(output, "out of memory") else "",
+            .created_at_ns = now,
+            .touched_ns = now,
+        };
+        const job_id_for_resp: []const u8 = if (op.job_id.len > 0) op.job_id else op.id;
+        self.backup.registerOperation(op) catch return backupTypedError(output, "internal", "too many operations");
+        var writer = std.Io.Writer.fixed(output);
+        writer.writeAll("{\"ok\":true,\"operation_id\":") catch return output[0..0];
+        json.writeJsonString(&writer, op.id) catch return output[0..0];
+        writer.writeAll(",\"job_id\":") catch return output[0..0];
+        json.writeJsonString(&writer, job_id_for_resp) catch return output[0..0];
+        writer.writeAll("}") catch return output[0..0];
+        return writer.buffered();
+    }
     const now = @as(i64, @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds));
     var saved = self.backup.jobs.save(self.io, payload.job, if (payload.schedule_credentials) |_| "x" else null, now) catch |err| {
         const msg = backupSaveErrorString(err);
-        // Typed code for conflicts / store errors so frontend can surface them.
         if (err == error.RevConflict) return backupTypedError(output, "conflict", msg);
         if (err == error.StoreCorrupt) return backupTypedError(output, "store_corrupt", msg);
         if (err == error.TooManyJobs) return backupTypedError(output, "invalid_job", msg);
         return respondError(output, msg);
     };
     defer saved.deinit(self.allocator);
-
-    if (backupSessionReady(self, output, saved.server_id)) |err| return err;
-    if (saved.schedule.enabled and !std.mem.eql(u8, saved.schedule.mode, "manual")) {
-        var write_err_buf: [256]u8 = undefined;
-        if (backupInstallSchedule(self, output, &saved, payload.schedule_credentials, &write_err_buf)) |msg| return respondError(output, msg);
-    } else {
-        if (backupRemoveSchedule(self, saved.id, saved.server_id)) |msg| return respondError(output, msg);
-    }
+    // Legacy path: local-only to avoid blocking. Remote schedule moves to
+    // the operation-based flow above (coordinator installs via session worker).
     var detail_buf: [256]u8 = undefined;
     const detail = std.fmt.bufPrint(&detail_buf, "job={s} schedule={s}", .{ saved.id, if (saved.schedule.enabled) "enabled" else "disabled" }) catch "backup.jobs.save";
     backupAudit(self, "backup.jobs.save", saved.server_id, detail);
@@ -11998,11 +12032,10 @@ fn handleBackupJobsDelete(context: *anyopaque, invocation: native_sdk.bridge.Inv
         e.deinit(self.allocator);
     }
     if (!std.mem.eql(u8, existing.server_id, payload.server_id)) return backupTypedError(output, "not_found", "job not found on this server");
+    // Local-only delete to avoid blocking UI. Remote crontab/config cleanup
+    // moves to an operation (coordinator verifies removal + readback).
     if (!(self.backup.jobs.delete(self.io, payload.job_id) catch return backupTypedError(output, "store_corrupt", "job registry is unreadable"))) {
         return backupTypedError(output, "not_found", "unknown job");
-    }
-    if (backupSessionReady(self, output, payload.server_id) == null) {
-        if (backupRemoveSchedule(self, payload.job_id, payload.server_id)) |msg| return respondError(output, msg);
     }
     var detail_buf: [128]u8 = undefined;
     const detail = std.fmt.bufPrint(&detail_buf, "job={s}", .{payload.job_id}) catch "backup.jobs.delete";

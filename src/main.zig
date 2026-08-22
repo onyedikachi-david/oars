@@ -1607,14 +1607,13 @@ test "backup jobs save/list/delete, run gates, and capability-test gates through
     try app.init();
     defer app.deinit();
 
-    // 1. Save a MinIO job with schedule credentials. The server is not
-    //    connected, so the job persists locally and the handler reports
-    //    the session state explicitly (the schedule install is deferred
-    //    until the next connected save).
+    // 1. Save a MinIO job with schedule credentials. The job persists
+    //    locally; remote schedule install moved to the coordinator flow so
+    //    legacy save no longer blocks on the session gate.
     const saved = app.dispatch(
         \\{"id":"1","command":"oars.backup.jobs.save","payload":{"job":{"server_id":"s1","name":"daily-website","source_path":"/var/www/html","destination":{"type":"s3","provider":"minio","bucket":"acme","endpoint":"http://127.0.0.1:9000","storage_class":"standard"},"transfer":"sync","schedule":{"mode":"interval","interval_unit":"hours","interval_every":24,"enabled":true}},"schedule_credentials":{"access_key":"AKID","secret_key":"SECRET"}}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, saved, "not connected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"ok\":true") != null);
 
     // The job persisted despite the session state; secrets never do.
     const listed = app.dispatch(
@@ -1647,7 +1646,7 @@ test "backup jobs save/list/delete, run gates, and capability-test gates through
     var edit_buf: [512]u8 = undefined;
     const edit_req = try std.fmt.bufPrint(&edit_buf, "{{\"id\":\"4\",\"command\":\"oars.backup.jobs.save\",\"payload\":{{\"job\":{{\"id\":\"{s}\",\"server_id\":\"s1\",\"name\":\"daily-www\",\"source_path\":\"/var/www/html\",\"destination\":{{\"type\":\"s3\",\"provider\":\"minio\",\"bucket\":\"acme\",\"endpoint\":\"http://127.0.0.1:9000\"}},\"transfer\":\"sync\",\"schedule\":{{\"mode\":\"manual\",\"enabled\":false}}}},\"schedule_credentials\":{{\"access_key\":\"AKID\",\"secret_key\":\"SECRET\"}}}}}}", .{job_id});
     const edited = app.dispatch(edit_req);
-    try std.testing.expect(std.mem.indexOf(u8, edited, "not connected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edited, "\"ok\":true") != null);
 
     // 4. Shape errors surface with the spec messages.
     const bad_bucket = app.dispatch(
