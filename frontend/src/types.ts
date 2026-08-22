@@ -605,6 +605,7 @@ export interface BackupSchedule {
 export interface BackupJob {
   id: string;
   server_id: string;
+  revision: number;
   name: string;
   source_path: string;
   destination: BackupDestination;

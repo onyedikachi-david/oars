@@ -11516,12 +11516,27 @@ fn backupRemoveSchedule(self: *Context, job_id: []const u8, server_id: []const u
 }
 
 const BackupStatusFile = struct {
+    v: ?u32 = null,
     job_id: []const u8 = "",
+    run_id: []const u8 = "",
     ts: []const u8 = "",
     exit: []const u8 = "",
     started_at: []const u8 = "",
     finished_at: []const u8 = "",
+    status: []const u8 = "",
 };
+
+fn backupTypedError(output: []u8, code: []const u8, msg: []const u8) []const u8 {
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":false,\"code\":") catch return output[0..0];
+    json.writeJsonString(&writer, code) catch return output[0..0];
+    writer.writeAll(",\"error\":") catch return output[0..0];
+    json.writeJsonString(&writer, msg) catch return output[0..0];
+    writer.writeAll(",\"retryable\":") catch return output[0..0];
+    writer.writeAll(if (std.mem.eql(u8, code, "transport_error") or std.mem.eql(u8, code, "timeout")) "true" else "false") catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
 
 /// Imports completed scheduled runs staged on the server (the wrapper
 /// writes `<ts>.status` + `<ts>.log`; cron may have run while Oars was
