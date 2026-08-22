@@ -1410,12 +1410,118 @@ pub const Runs = struct {
     }
 };
 
-/// Handler-owned registry: job store, run history, and live runs.
+const coordinator_idle_ms: u64 = 10;
+const coordinator_plan_ttl_ms: i64 = 5 * 60 * 1000;
+const coordinator_op_ttl_ms: i64 = 30 * 60 * 1000;
+const backup_max_ops: usize = 64;
+const backup_max_plans: usize = 32;
+
+pub const OperationState = enum {
+    queued,
+    running,
+    done,
+    partial,
+    failed,
+    canceled,
+
+    pub fn jsonName(self: OperationState) []const u8 {
+        return switch (self) {
+            .queued => "queued",
+            .running => "running",
+            .done => "done",
+            .partial => "partial",
+            .failed => "failed",
+            .canceled => "canceled",
+        };
+    }
+    pub fn terminal(self: OperationState) bool {
+        return switch (self) {
+            .done, .partial, .failed, .canceled => true,
+            .queued, .running => false,
+        };
+    }
+};
+
+pub const OperationKind = enum {
+    status_refresh,
+    jobs_save,
+    jobs_delete,
+    test_capability,
+    run_manual,
+    install,
+};
+
+pub const BackupOperation = struct {
+    id: []const u8,
+    kind: OperationKind,
+    state: OperationState = .queued,
+    server_id: []const u8 = "",
+    job_id: []const u8 = "",
+    run_id: []const u8 = "",
+    created_at_ns: i128 = 0,
+    touched_ns: i128 = 0,
+    finished_at_ns: ?i128 = null,
+    claimed: bool = false,
+    cancel_requested: std.atomic.Value(bool) = .init(false),
+    error_detail: ?[]u8 = null,
+    result_json: ?[]u8 = null,
+
+    pub fn deinit(self: *BackupOperation, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        if (self.server_id.len > 0) allocator.free(self.server_id);
+        if (self.job_id.len > 0) allocator.free(self.job_id);
+        if (self.run_id.len > 0) allocator.free(self.run_id);
+        if (self.error_detail) |e| allocator.free(e);
+        if (self.result_json) |r| allocator.free(r);
+    }
+};
+
+pub const BackupPlan = struct {
+    id: []const u8,
+    server_id: []const u8 = "",
+    job_id: []const u8 = "",
+    created_at_ms: i64 = 0,
+    expires_at_ms: i64 = 0,
+    payload_json: []const u8 = "",
+
+    pub fn deinit(self: *BackupPlan, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        if (self.server_id.len > 0) allocator.free(self.server_id);
+        if (self.job_id.len > 0) allocator.free(self.job_id);
+        if (self.payload_json.len > 0) allocator.free(self.payload_json);
+    }
+    pub fn expired(self: *const BackupPlan, now_ms: i64) bool {
+        return now_ms >= self.expires_at_ms;
+    }
+};
+
+pub const CachedServerStatus = struct {
+    server_id: []const u8 = "",
+    stale: bool = true,
+    updated_at_ns: i128 = 0,
+    json: ?[]u8 = null,
+
+    pub fn deinit(self: *CachedServerStatus, allocator: std.mem.Allocator) void {
+        if (self.server_id.len > 0) allocator.free(self.server_id);
+        if (self.json) |j| allocator.free(j);
+    }
+};
+
+/// Coordinator-owned registry: job store, run history, live runs, plus
+/// bounded plans/ops and cached server status. One coordinator thread
+/// (plus optional helpers) drives queued ops off the bridge thread.
 pub const Registry = struct {
     allocator: std.mem.Allocator,
     jobs: JobStore = .{},
     history: HistoryStore = .{},
     runs: Runs = .{},
+    ops: std.ArrayList(*BackupOperation) = .empty,
+    plans: std.ArrayList(*BackupPlan) = .empty,
+    statuses: std.ArrayList(*CachedServerStatus) = .empty,
+    mutex: std.atomic.Mutex = .unlocked,
+    coordinator: ?std.Thread = null,
+    stop: std.atomic.Value(bool) = .init(false),
+    io: ?std.Io = null,
 
     pub fn init(allocator: std.mem.Allocator, jobs_path: []const u8, history_path: []const u8) Registry {
         return .{
@@ -1426,8 +1532,221 @@ pub const Registry = struct {
         };
     }
 
+    fn nowNs(self: *Registry) i128 {
+        const io = self.io orelse return 0;
+        return std.Io.Timestamp.now(io, .real).nanoseconds;
+    }
+
+    pub fn ensureStarted(self: *Registry, io: std.Io) void {
+        lockSpin(&self.mutex);
+        const started = self.coordinator != null;
+        if (!started) self.io = io;
+        self.mutex.unlock();
+        if (started) return;
+        self.coordinator = std.Thread.spawn(.{}, coordinatorMain, .{self}) catch null;
+    }
+
     pub fn deinit(self: *Registry) void {
+        self.stop.store(true, .release);
+        if (self.coordinator) |t| t.join();
         self.runs.deinit();
+        lockSpin(&self.mutex);
+        for (self.ops.items) |op| {
+            op.deinit(self.allocator);
+            self.allocator.destroy(op);
+        }
+        self.ops.deinit(self.allocator);
+        for (self.plans.items) |plan| {
+            plan.deinit(self.allocator);
+            self.allocator.destroy(plan);
+        }
+        self.plans.deinit(self.allocator);
+        for (self.statuses.items) |st| {
+            st.deinit(self.allocator);
+            self.allocator.destroy(st);
+        }
+        self.statuses.deinit(self.allocator);
+        self.mutex.unlock();
+    }
+
+    fn sweepLocked(self: *Registry, now_ns: i128) void {
+        const now_ms: i64 = @intCast(@divTrunc(now_ns, std.time.ns_per_ms));
+        var i: usize = 0;
+        while (i < self.plans.items.len) {
+            if (self.plans.items[i].expired(now_ms)) {
+                const p = self.plans.orderedRemove(i);
+                p.deinit(self.allocator);
+                self.allocator.destroy(p);
+            } else i += 1;
+        }
+        i = 0;
+        while (i < self.ops.items.len) {
+            const op = self.ops.items[i];
+            if (op.state.terminal() and now_ns - (op.finished_at_ns orelse op.touched_ns) > coordinator_op_ttl_ms * std.time.ns_per_ms) {
+                op.deinit(self.allocator);
+                self.allocator.destroy(op);
+                _ = self.ops.orderedRemove(i);
+            } else i += 1;
+        }
+    }
+
+    fn makeRoomForOpLocked(self: *Registry) !void {
+        self.sweepLocked(self.nowNs());
+        while (self.ops.items.len >= backup_max_ops) {
+            var victim: ?usize = null;
+            var oldest: i128 = std.math.maxInt(i128);
+            for (self.ops.items, 0..) |op, idx| {
+                if (!op.state.terminal()) continue;
+                if (op.touched_ns < oldest) {
+                    oldest = op.touched_ns;
+                    victim = idx;
+                }
+            }
+            const idx = victim orelse return error.TooManyActive;
+            const rem = self.ops.orderedRemove(idx);
+            rem.deinit(self.allocator);
+            self.allocator.destroy(rem);
+        }
+    }
+
+    pub fn registerPlan(self: *Registry, plan: *BackupPlan) !void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        self.sweepLocked(self.nowNs());
+        while (self.plans.items.len >= backup_max_plans) {
+            const r = self.plans.orderedRemove(0);
+            r.deinit(self.allocator);
+            self.allocator.destroy(r);
+        }
+        try self.plans.append(self.allocator, plan);
+    }
+
+    pub fn takePlan(self: *Registry, id: []const u8) ?*BackupPlan {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.plans.items, 0..) |plan, i| {
+            if (std.mem.eql(u8, plan.id, id)) {
+                _ = self.plans.orderedRemove(i);
+                return plan;
+            }
+        }
+        return null;
+    }
+
+    pub fn peekPlan(self: *Registry, id: []const u8) ?*BackupPlan {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.plans.items) |plan| if (std.mem.eql(u8, plan.id, id)) return plan;
+        return null;
+    }
+
+    pub fn registerOperation(self: *Registry, op: *BackupOperation) !void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        try self.makeRoomForOpLocked();
+        try self.ops.append(self.allocator, op);
+    }
+
+    pub fn operationById(self: *Registry, id: []const u8) ?*BackupOperation {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.ops.items) |op| if (std.mem.eql(u8, op.id, id)) return op;
+        return null;
+    }
+
+    pub fn opCancelById(self: *Registry, id: []const u8) ?bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.ops.items) |op| {
+            if (!std.mem.eql(u8, op.id, id)) continue;
+            if (op.state == .queued) {
+                op.state = .canceled;
+                op.finished_at_ns = self.nowNs();
+                op.touched_ns = op.finished_at_ns.?;
+                return true;
+            }
+            if (op.state == .running) {
+                op.cancel_requested.store(true, .release);
+                return false;
+            }
+            return false;
+        }
+        return null;
+    }
+
+    pub fn setStatus(self: *Registry, server_id: []const u8, json: []const u8, stale: bool) void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.statuses.items) |st| {
+            if (std.mem.eql(u8, st.server_id, server_id)) {
+                if (st.json) |old| self.allocator.free(old);
+                st.json = self.allocator.dupe(u8, json) catch null;
+                st.stale = stale;
+                st.updated_at_ns = self.nowNs();
+                return;
+            }
+        }
+        const st = self.allocator.create(CachedServerStatus) catch return;
+        st.* = .{
+            .server_id = self.allocator.dupe(u8, server_id) catch return,
+            .stale = stale,
+            .updated_at_ns = self.nowNs(),
+            .json = self.allocator.dupe(u8, json) catch null,
+        };
+        self.statuses.append(self.allocator, st) catch {
+            st.deinit(self.allocator);
+            self.allocator.destroy(st);
+        };
+    }
+
+    pub fn getStatus(self: *Registry, server_id: []const u8) ?struct { json: ?[]const u8, stale: bool } {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.statuses.items) |st| if (std.mem.eql(u8, st.server_id, server_id)) return .{ .json = st.json, .stale = st.stale };
+        return null;
+    }
+
+    fn claimNextOp(self: *Registry) ?*BackupOperation {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.ops.items) |op| {
+            if (op.state == .queued and !op.claimed) {
+                op.claimed = true;
+                op.state = .running;
+                op.touched_ns = self.nowNs();
+                return op;
+            }
+        }
+        return null;
+    }
+
+    fn coordinatorMain(self: *Registry) void {
+        const io = self.io orelse return;
+        while (!self.stop.load(.acquire)) {
+            if (self.claimNextOp()) |op| {
+                // For now the coordinator only marks the op done so handlers
+                // can prove they no longer block. Real remote work will drive
+                // through session workers in a follow-up commit.
+                // Cooperative cancel check.
+                if (op.cancel_requested.load(.acquire)) {
+                    lockSpin(&self.mutex);
+                    op.state = .canceled;
+                    op.finished_at_ns = self.nowNs();
+                    op.touched_ns = op.finished_at_ns.?;
+                    op.claimed = false;
+                    self.mutex.unlock();
+                } else {
+                    lockSpin(&self.mutex);
+                    op.state = .done;
+                    op.finished_at_ns = self.nowNs();
+                    op.touched_ns = op.finished_at_ns.?;
+                    op.claimed = false;
+                    self.mutex.unlock();
+                }
+                continue;
+            }
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(coordinator_idle_ms), .awake) catch return;
+        }
     }
 };
 
