@@ -11300,7 +11300,13 @@ const BackupCredentials = struct {
 };
 const BackupJobsSavePayload = struct {
     job: backup.JobInput,
+    // Legacy save (no operation_id/plan_id) vs new plan→op flow. When
+    // operation_id is present the payload uses the NEXT-SPEC typed flow.
+    operation_id: ?[]const u8 = null,
+    plan_id: ?[]const u8 = null,
+    capability_proof_id: ?[]const u8 = null,
     schedule_credentials: ?BackupCredentials = null,
+    approved_remote_secret: ?bool = null,
 };
 const BackupJobsDeletePayload = struct {
     server_id: []const u8,
@@ -11642,6 +11648,33 @@ fn handleBackupJobsList(context: *anyopaque, invocation: native_sdk.bridge.Invoc
     return writer.buffered();
 }
 
+fn backupSaveErrorString(err: backup.SaveError) []const u8 {
+    return switch (err) {
+        error.MissingName, error.InvalidName => "invalid job name",
+        error.MissingServer => "missing server",
+        error.InvalidId => "invalid id",
+        error.MissingSource, error.InvalidSource => "invalid source path",
+        error.InvalidDestination => "invalid destination",
+        error.InvalidProvider => "unsupported provider",
+        error.InvalidBucket => "invalid bucket name",
+        error.InvalidEndpoint => "invalid endpoint",
+        error.InvalidRegion => "invalid region",
+        error.InvalidStorageClass => "storage class not supported by this provider",
+        error.IamRequiresAws => "IAM role access is only supported on AWS",
+        error.InvalidTransfer => "invalid transfer type",
+        error.InvalidSchedule => "invalid schedule",
+        error.InvalidCronExpr => "invalid cron expression",
+        error.EnabledScheduleNeedsCredentials => "credentials are required to enable an unattended schedule (they are copied into the server's rclone config, mode 0600; rclone obscuring is not encryption)",
+        error.UnknownId => "unknown job",
+        error.TooManyJobs => "too many jobs for this server",
+        error.ImmutableServerId => "server_id is immutable",
+        error.RevConflict => "revision conflict — refresh and retry",
+        error.InvalidPrefix => "invalid prefix",
+        error.InvalidCredentials => "invalid credentials",
+        else => "job registry is unreadable",
+    };
+}
+
 fn handleBackupJobsSave(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
     var parsed = parsePayload(BackupJobsSavePayload, self.allocator, invocation.request.payload) catch {
@@ -11651,24 +11684,12 @@ fn handleBackupJobsSave(context: *anyopaque, invocation: native_sdk.bridge.Invoc
     const payload = parsed.value;
     const now = @as(i64, @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds));
     var saved = self.backup.jobs.save(self.io, payload.job, if (payload.schedule_credentials) |_| "x" else null, now) catch |err| {
-        return respondError(output, switch (err) {
-            error.MissingName, error.InvalidName => "invalid job name",
-            error.MissingServer => "missing server",
-            error.MissingSource, error.InvalidSource => "invalid source path",
-            error.InvalidDestination => "invalid destination",
-            error.InvalidProvider => "unsupported provider",
-            error.InvalidBucket => "invalid bucket name",
-            error.InvalidEndpoint => "invalid endpoint",
-            error.InvalidRegion => "invalid region",
-            error.InvalidStorageClass => "storage class not supported by this provider",
-            error.IamRequiresAws => "IAM role access is only supported on AWS",
-            error.InvalidTransfer => "invalid transfer type",
-            error.InvalidSchedule => "invalid schedule",
-            error.InvalidCronExpr => "invalid cron expression",
-            error.EnabledScheduleNeedsCredentials => "credentials are required to enable an unattended schedule (they are copied into the server's rclone config, mode 0600; rclone obscuring is not encryption)",
-            error.UnknownId => "unknown job",
-            else => "job registry is unreadable",
-        });
+        const msg = backupSaveErrorString(err);
+        // Typed code for conflicts / store errors so frontend can surface them.
+        if (err == error.RevConflict) return backupTypedError(output, "conflict", msg);
+        if (err == error.StoreCorrupt) return backupTypedError(output, "store_corrupt", msg);
+        if (err == error.TooManyJobs) return backupTypedError(output, "invalid_job", msg);
+        return respondError(output, msg);
     };
     defer saved.deinit(self.allocator);
 
@@ -11696,8 +11717,15 @@ fn handleBackupJobsDelete(context: *anyopaque, invocation: native_sdk.bridge.Inv
     };
     defer parsed.deinit();
     const payload = parsed.value;
-    if (!(self.backup.jobs.delete(self.io, payload.job_id) catch return respondError(output, "job registry is unreadable"))) {
-        return respondError(output, "unknown job");
+    if (!backup.validId(payload.job_id) or !backup.validId(payload.server_id)) return backupTypedError(output, "invalid_payload", "invalid id");
+    const existing = (self.backup.jobs.find(self.io, payload.job_id) catch return backupTypedError(output, "store_corrupt", "job registry is unreadable")) orelse return backupTypedError(output, "not_found", "unknown job");
+    defer {
+        var e = existing;
+        e.deinit(self.allocator);
+    }
+    if (!std.mem.eql(u8, existing.server_id, payload.server_id)) return backupTypedError(output, "not_found", "job not found on this server");
+    if (!(self.backup.jobs.delete(self.io, payload.job_id) catch return backupTypedError(output, "store_corrupt", "job registry is unreadable"))) {
+        return backupTypedError(output, "not_found", "unknown job");
     }
     if (backupSessionReady(self, output, payload.server_id) == null) {
         if (backupRemoveSchedule(self, payload.job_id, payload.server_id)) |msg| return respondError(output, msg);
@@ -12052,11 +12080,13 @@ fn handleBackupHistory(context: *anyopaque, invocation: native_sdk.bridge.Invoca
     };
     defer parsed.deinit();
     const payload = parsed.value;
+    if (!backup.validId(payload.server_id) or !backup.validId(payload.job_id)) return backupTypedError(output, "invalid_payload", "invalid id");
     const connected = self.manager.get(payload.server_id) != null and self.manager.get(payload.server_id).?.status.load(.acquire) == .ready;
     if (connected) backupImportStaged(self, payload.server_id, payload.job_id);
-    const limit = payload.limit orelse 20;
+    const limit_raw = payload.limit orelse 20;
+    const limit = @min(limit_raw, 20);
     const runs = self.backup.history.listForJob(self.io, payload.job_id, limit) catch {
-        return respondError(output, "run history is unreadable");
+        return backupTypedError(output, "store_corrupt", "run history is unreadable");
     };
     defer {
         for (runs) |*r| r.deinit(self.allocator);
