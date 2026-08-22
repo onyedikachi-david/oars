@@ -154,6 +154,25 @@ export const vault = {
   async transientForget(account: string): Promise<void> {
     secretCache.delete(account);
   },
+  // Backup credentials are transient and must never linger in the
+  // in-process cache. Real backup secret handling (no-cache account
+  // `backup:<job_id>`) lands with the backup controller in the next
+  // incremental commit.
+  async backupTransientGet(account: string): Promise<string | null> {
+    const secret = await invoke<string | null>("native-sdk.credentials.get", {
+      service: this.service,
+      account,
+    });
+    return secret;
+  },
+  async backupSet(account: string, secret: string): Promise<void> {
+    await invoke("native-sdk.credentials.set", {
+      service: this.service,
+      account,
+      secret,
+    });
+    // Do not cache backup secrets in-process.
+  },
   async delete(account: string): Promise<void> {
     await invoke("native-sdk.credentials.delete", {
       service: this.service,

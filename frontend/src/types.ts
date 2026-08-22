@@ -581,7 +581,7 @@ export type BackupDestinationType = "s3" | "local";
 export type BackupProvider = "aws" | "r2" | "b2" | "wasabi" | "minio" | "spaces";
 export type BackupScheduleMode = "manual" | "interval" | "custom";
 export type BackupIntervalUnit = "hours" | "days";
-export type BackupRunStatus = "queued" | "running" | "success" | "failed" | "no_changes" | "canceled";
+export type BackupRunStatus = "queued" | "running" | "success" | "failed" | "no_changes" | "canceled" | "interrupted";
 
 export interface BackupDestination {
   type: BackupDestinationType;
@@ -610,8 +610,12 @@ export interface BackupJob {
   destination: BackupDestination;
   transfer: BackupTransferKind;
   schedule: BackupSchedule;
+  // Timestamps on the wire will move to integer milliseconds (NEXT-SPEC).
+  // Keep ns fields for backwards compat until the bridge migration lands.
   created_at_ns: number;
   updated_at_ns: number;
+  created_at_ms?: number;
+  updated_at_ms?: number;
 }
 
 export interface BackupJobInput {
