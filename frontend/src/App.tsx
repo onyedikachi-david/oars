@@ -1280,9 +1280,13 @@ export default function App() {
           ) : activeSection === "Backups" ? (
             <div className="content-stack">
               <SectionTitle eyebrow="Data protection" title="Backups" description="Encrypted jobs, vault portability, and restore history without cloud sync."/>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }} className="protection-grid">
                 <div className="panel" style={{ padding: 0, overflow: "hidden" }}><VaultTab /></div>
-                <div className="panel" style={{ padding: 0, overflow: "hidden", minHeight: 320 }}>{servers[0] ? <BackupsTab serverId={servers[0].id} /> : <div style={{ padding: 22 }} className="muted">Add a server to configure backups.</div>}</div>
+                <div className="panel" style={{ padding: 0, overflow: "hidden", minHeight: 320 }}>
+                  {servers.length === 0 ? <div style={{ padding: 22 }} className="muted">Add a server to configure backups.</div> : (
+                    <ProtectionBackupsPanel servers={servers} />
+                  )}
+                </div>
               </div>
             </div>
           ) : (
@@ -1307,5 +1311,25 @@ export default function App() {
 
       {toast && <ApplicationNotice><div className="toast"><Check /> {toast}</div></ApplicationNotice>}
     </main>
+  );
+}
+
+function ProtectionBackupsPanel({ servers }: { servers: OarsServer[] }) {
+  const [activeId, setActiveId] = useState<string>(() => servers[0]?.id ?? "");
+  useEffect(() => {
+    if (!activeId && servers[0]) setActiveId(servers[0].id);
+    if (activeId && !servers.find((s) => s.id === activeId) && servers[0]) setActiveId(servers[0].id);
+  }, [servers, activeId]);
+  if (!activeId) return <div style={{ padding: 22 }} className="muted">Select a server.</div>;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", minHeight: 320 }}>
+      <div style={{ display: "flex", gap: 8, padding: "8px 10px", borderBottom: "1px solid var(--border)", alignItems: "center", flexWrap: "wrap" }}>
+        <span className="muted" style={{ fontSize: 11 }}>Server</span>
+        <select value={activeId} onChange={(e) => setActiveId(e.target.value)} style={{ fontSize: 12, padding: "4px 6px", borderRadius: 6, border: "1px solid var(--border)" }}>
+          {servers.map((s) => <option key={s.id} value={s.id}>{s.name} — {s.host}</option>)}
+        </select>
+      </div>
+      <BackupsTab serverId={activeId} />
+    </div>
   );
 }

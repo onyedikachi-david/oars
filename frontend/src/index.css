@@ -894,6 +894,7 @@ html.light {
 .oars-modal-actions-left { display: flex; align-items: center; gap: 8px; }
 .oars-danger-ghost { color: var(--destructive); }
 .oars-danger-ghost:hover { color: var(--destructive); background: oklch(0.66 0.14 32 / 0.08); }
+@media (max-width: 900px) { .protection-grid { grid-template-columns: 1fr !important; } }
 .oars-confirm { display: inline-flex; align-items: center; gap: 6px; color: var(--foreground); font-size: 11px; }
 .vnc-loading { position: absolute; z-index: 2; inset: 0; display: grid; place-items: center; padding: 16px; overflow: hidden; background: var(--muted); pointer-events: none; }
 .vnc-rfb-target { position: absolute; z-index: 0; inset: 0; overflow: hidden; background: #0f1318; }
