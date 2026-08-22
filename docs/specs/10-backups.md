@@ -1,6 +1,10 @@
 # Spec 10 — Backups
 
-**Status:** 📋 · **Depends on:** 02 (exec/follow) · **Spec owner:** core
+**Status:** 🚧 in progress (feat/spec-10-backups) · **Depends on:** 02 (exec/follow) · **Spec owner:** core
+
+> **This spec is under active implementation on branch `feat/spec-10-backups`
+> per `docs/NEXT-SPEC.md`. Acceptance boxes above reflect the landed slice
+> at `bc2aa83`; the remaining 12 gates live in NEXT-SPEC.**
 
 ## 1. Overview
 
