@@ -1,0 +1,28 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "release-type": "simple",
+  "include-v-in-tag": true,
+  "include-component-in-tag": false,
+  "changelog-sections": [
+    { "type": "feat", "section": "Added" },
+    { "type": "fix", "section": "Fixed" },
+    { "type": "perf", "section": "Performance" },
+    { "type": "refactor", "section": "Changed" },
+    { "type": "security", "section": "Security" },
+    { "type": "docs", "section": "Documentation" },
+    { "type": "build", "section": "Build system" },
+    { "type": "ci", "section": "Continuous integration" },
+    { "type": "test", "section": "Tests", "hidden": true },
+    { "type": "chore", "section": "Miscellaneous", "hidden": true }
+  ],
+  "packages": {
+    ".": {
+      "component": "oars",
+      "package-name": "oars",
+      "extra-files": [
+        { "type": "generic", "path": "app.zon" },
+        { "type": "generic", "path": "build.zig" }
+      ]
+    }
+  }
+}

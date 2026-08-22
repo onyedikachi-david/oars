@@ -34,6 +34,7 @@ const PackageTarget = enum {
 
 const default_native_sdk_path = "/Users/onyedikachi/.nvm/versions/node/v24.18.0/lib/node_modules/@native-sdk/cli";
 const app_exe_name = "oars";
+const app_version = "0.1.0"; // x-release-please-version
 
 // ---------------------------------------------------------------------------
 // Vendored C libraries (built with zig cc, hermetic, no system deps):
@@ -299,7 +300,7 @@ pub fn build(b: *std.Build) void {
         "--optimize",
         package_optimize_name,
         "--output",
-        b.fmt("zig-out/package/{s}-0.1.0-{s}-{s}{s}", .{ app_exe_name, @tagName(package_target), package_optimize_name, packageSuffix(package_target) }),
+        b.fmt("zig-out/package/{s}-{s}-{s}-{s}{s}", .{ app_exe_name, app_version, @tagName(package_target), package_optimize_name, packageSuffix(package_target) }),
         "--binary",
     });
     // The CLI resolves SDK-owned package inputs (the vendored WebView2

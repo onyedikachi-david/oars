@@ -1,12 +1,11 @@
 name: CI
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches:
       - main
-    tags:
-      - "v*"
 
 permissions:
   contents: read
@@ -20,8 +19,14 @@ jobs:
     name: Logic tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - name: Verify release version consistency
+        shell: bash
+        run: |
+          VERSION="$(tr -d '\r\n' < version.txt)"
+          grep -F ".version = \"$VERSION\"" app.zon
+          grep -F "const app_version = \"$VERSION\"" build.zig
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -39,9 +44,67 @@ jobs:
       - name: Run Zig tests
         run: zig build test -Dplatform=null -Dnative-sdk-path="${{ steps.native-sdk.outputs.path }}"
 
+  release-please:
+    name: Prepare release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Update release PR or create release
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  release-state:
+    name: Resolve release state
+    if: always() && needs.test.result == 'success' && needs.release-please.result != 'cancelled'
+    needs:
+      - test
+      - release-please
+    runs-on: ubuntu-latest
+    outputs:
+      is_release: ${{ steps.state.outputs.is_release }}
+      tag_name: ${{ steps.state.outputs.tag_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Resolve current release tag
+        id: state
+        env:
+          RELEASE_PLEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+        shell: bash
+        run: |
+          TAG="$RELEASE_PLEASE_TAG"
+          if [ -z "$TAG" ]; then
+            TAG="$(git tag --points-at HEAD --list 'v*' --sort=-v:refname | sed -n '1p')"
+          fi
+          if [ -n "$TAG" ]; then
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+            echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            echo "tag_name=" >> "$GITHUB_OUTPUT"
+          fi
+
   package:
     name: Package ${{ matrix.name }}
-    needs: test
+    if: needs.test.result == 'success' && needs.release-state.result == 'success'
+    needs:
+      - test
+      - release-state
+    env:
+      PACKAGE_LABEL: ${{ needs.release-state.outputs.tag_name || format('ci-{0}', github.run_number) }}
     strategy:
       fail-fast: false
       matrix:
@@ -54,8 +117,8 @@ jobs:
             target: linux
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -82,43 +145,41 @@ jobs:
         shell: bash
         run: |
           mkdir -p zig-out/release
-          ditto -c -k --sequesterRsrc --keepParent zig-out/package/*.app "zig-out/release/oars-${{ github.ref_name }}-macos.zip"
+          ditto -c -k --sequesterRsrc --keepParent zig-out/package/*.app "zig-out/release/oars-${PACKAGE_LABEL}-macos.zip"
       - name: Archive Linux package
         if: runner.os == 'Linux'
         shell: bash
         run: |
           mkdir -p zig-out/release
-          tar -C zig-out/package -czf "zig-out/release/oars-${{ github.ref_name }}-linux-x86_64.tar.gz" .
+          tar -C zig-out/package -czf "zig-out/release/oars-${PACKAGE_LABEL}-linux-x86_64.tar.gz" .
       - name: Upload package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: oars-${{ matrix.target }}
           path: zig-out/release/
           if-no-files-found: error
+          compression-level: 0
 
-  release:
-    name: Publish GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: package
+  publish-release:
+    name: Attach release packages
+    if: needs.release-state.outputs.is_release == 'true'
+    needs:
+      - release-state
+      - package
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - name: Download packaged artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: oars-*
           path: release-assets
           merge-multiple: true
       - name: Generate checksums
         run: sha256sum release-assets/* > release-assets/SHA256SUMS
-      - name: Publish release assets
+      - name: Upload packages to the generated release
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release upload "${{ github.ref_name }}" release-assets/* --clobber --repo "${{ github.repository }}"
-          else
-            gh release create "${{ github.ref_name }}" release-assets/* --verify-tag --generate-notes --title "Oars ${{ github.ref_name }}" --repo "${{ github.repository }}"
-          fi
+          RELEASE_TAG: ${{ needs.release-state.outputs.tag_name }}
+        run: gh release upload "$RELEASE_TAG" release-assets/* --clobber --repo "${{ github.repository }}"

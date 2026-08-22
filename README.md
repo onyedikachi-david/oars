@@ -95,7 +95,7 @@ zig build package -Dpackage-target=macos
 
 # Linux production package (run on Linux)
 zig build package -Dpackage-target=linux
-# → zig-out/package/oars-0.1.0-<target>-ReleaseFast[.app]
+# → zig-out/package/oars-<version>-<target>-ReleaseFast[.app]
 
 # sanity check for the manifest / SDK setup
 native doctor --manifest app.zon
@@ -107,16 +107,13 @@ Run each package command on its matching operating system. `-Dpackage-target` se
 
 ## Downloads and releases
 
-Every successful branch or pull-request build exposes temporary `oars-macos` and `oars-linux` downloads in the **Artifacts** section of that Actions run. GitHub's **Packages** panel is for package registries and is not used for Oars desktop binaries.
+Every successful CI run exposes temporary `oars-macos` and `oars-linux` downloads in the **Artifacts** section of that Actions run. GitHub's **Packages** panel is for package registries and is not used for Oars desktop binaries.
 
-Push a version tag matching `app.zon` to create a permanent GitHub Release with the macOS ZIP, Linux tarball, generated release notes, and SHA-256 checksums:
+Release Please reads Conventional Commits on `main` and automatically maintains a release pull request containing the next SemVer version and a detailed `CHANGELOG.md`. Merge that release PR when it is ready. The same workflow then creates the `vX.Y.Z` tag and GitHub Release, builds both desktop packages, and attaches the macOS ZIP, Linux tarball, and SHA-256 checksums. Do not create release tags manually.
 
-```sh
-git tag v0.1.0
-git push origin v0.1.0
-```
+The application version is synchronized through `version.txt`, `app.zon`, and `build.zig`. Repository settings must allow the release bot to write and open pull requests: **Settings → Actions → General → Workflow permissions → Read and write permissions**, then enable **Allow GitHub Actions to create and approve pull requests**.
 
-Re-running the tagged workflow replaces its release assets without creating a duplicate release.
+Use Conventional Commit prefixes so the version and changelog category are calculated correctly: `feat:` for a minor release, `fix:` for a patch, and `feat!:`/`fix!:` or a `BREAKING CHANGE:` footer for a major release.
 
 ## Commands
 

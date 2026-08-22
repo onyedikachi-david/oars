@@ -2,7 +2,7 @@
     .id = "dev.native_sdk.oars",
     .name = "oars",
     .display_name = "Oars",
-    .version = "0.1.0",
+    .version = "0.1.0", // x-release-please-version
     .icons = .{"assets/icon.png"},
     .platforms = .{ "macos", "linux" },
     .permissions = .{ "dialog", "credentials" },
