@@ -12388,8 +12388,8 @@ fn handleBackupHistory(context: *anyopaque, invocation: native_sdk.bridge.Invoca
     defer parsed.deinit();
     const payload = parsed.value;
     if (!backup.validId(payload.server_id) or !backup.validId(payload.job_id)) return backupTypedError(output, "invalid_payload", "invalid id");
-    const connected = self.manager.get(payload.server_id) != null and self.manager.get(payload.server_id).?.status.load(.acquire) == .ready;
-    if (connected) backupImportStaged(self, payload.server_id, payload.job_id);
+    // Local-only; staged import is via refresh (coordinator), not inline.
+    self.backup.ensureStarted(self.io);
     const limit_raw = payload.limit orelse 20;
     const limit = @min(limit_raw, 20);
     const runs = self.backup.history.listForJob(self.io, payload.job_id, limit) catch {
