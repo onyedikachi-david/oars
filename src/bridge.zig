@@ -12043,6 +12043,10 @@ fn handleBackupJobsDelete(context: *anyopaque, invocation: native_sdk.bridge.Inv
     return ok_json;
 }
 
+// Legacy capability test path — still blocks on execWait. New callers
+// should use oars.backup.test.plan -> oars.backup.test with operation_id
+// which runs on the coordinator. Keep this shim until the frontend
+// migrates fully, but warn callers that it blocks.
 /// The capability test (spec 10 §5): real list/write/read/delete on one
 /// unique sentinel in the job's exact bucket/prefix; sync jobs must also
 /// prove destination delete authority. A failed cleanup is reported with
@@ -12055,7 +12059,7 @@ fn handleBackupTest(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
     defer parsed.deinit();
     const payload = parsed.value;
     backup.validate(payload.job, if (payload.credentials) |_| "x" else null) catch |err| {
-        return respondError(output, switch (err) {
+        return backupTypedError(output, "invalid_job", switch (err) {
             error.InvalidProvider => "unsupported provider",
             error.InvalidBucket => "invalid bucket name",
             error.InvalidEndpoint => "invalid endpoint",
@@ -12067,10 +12071,11 @@ fn handleBackupTest(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
         });
     };
     const server_id = payload.job.server_id;
+    if (!backup.validId(server_id)) return backupTypedError(output, "invalid_payload", "invalid server_id");
     if (backupSessionReady(self, output, server_id)) |err| return err;
-    if (!backupRcloneInstalled(self, server_id)) return respondError(output, "rclone is not installed on this server; install it first");
+    if (!backupRcloneInstalled(self, server_id)) return backupTypedError(output, "rclone_missing", "rclone is not installed on this server; install it first");
     if (std.mem.eql(u8, payload.job.destination.type, "local")) {
-        return respondError(output, "local destinations are an Oars+ feature and are not implemented yet");
+        return backupTypedError(output, "unsupported_target", "local destinations are an Oars+ feature and are not implemented yet");
     }
 
     var job = backup.Job{
@@ -12174,28 +12179,81 @@ fn handleBackupRun(context: *anyopaque, invocation: native_sdk.bridge.Invocation
     };
     defer parsed.deinit();
     const payload = parsed.value;
+    // New operation path — when operation_id present, handlers only register.
+    if (payload.operation_id != null) {
+        const op_id = payload.operation_id.?;
+        if (!backup.validId(op_id) or !backup.validId(payload.server_id) or !backup.validId(payload.job_id)) return backupTypedError(output, "invalid_payload", "invalid id");
+        if (self.backup.operationById(op_id)) |existing| {
+            var writer = std.Io.Writer.fixed(output);
+            writer.writeAll("{\"ok\":true,\"run_id\":") catch return output[0..0];
+            const run_id: []const u8 = if (existing.run_id.len > 0) existing.run_id else existing.id;
+            json.writeJsonString(&writer, run_id) catch return output[0..0];
+            writer.writeAll("}") catch return output[0..0];
+            return writer.buffered();
+        }
+        const rev = payload.expected_revision orelse 0;
+        const job_for_check = (self.backup.jobs.find(self.io, payload.job_id) catch return backupTypedError(output, "store_corrupt", "registry unreadable")) orelse return backupTypedError(output, "not_found", "unknown job");
+        defer {
+            var j = job_for_check;
+            j.deinit(self.allocator);
+        }
+        if (!std.mem.eql(u8, job_for_check.server_id, payload.server_id)) return backupTypedError(output, "not_found", "job not found on this server");
+        if (rev != 0 and job_for_check.revision != rev) return backupTypedError(output, "conflict", "revision conflict — refresh and retry");
+        if (std.mem.eql(u8, job_for_check.destination.type, "local")) return backupTypedError(output, "unsupported_target", "local destinations are Oars+ only");
+        if (job_for_check.transfer == .sync and payload.confirm_job_name == null) return backupTypedError(output, "invalid_payload", "sync run requires confirm_job_name");
+        if (job_for_check.transfer == .sync and payload.confirm_job_name != null and !std.mem.eql(u8, payload.confirm_job_name.?, job_for_check.name)) return backupTypedError(output, "invalid_payload", "confirm_job_name does not match");
+        self.backup.runs.lock();
+        const busy = self.backup.runs.runningForServer(payload.server_id) != null;
+        self.backup.runs.unlock();
+        if (busy) return backupTypedError(output, "busy", "a backup run is already in progress on this server");
+        self.backup.ensureStarted(self.io);
+        const op = self.allocator.create(backup.BackupOperation) catch return respondError(output, "out of memory");
+        errdefer self.allocator.destroy(op);
+        const now: i128 = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+        const job_id_owned = self.allocator.dupe(u8, payload.job_id) catch return respondError(output, "out of memory");
+        errdefer self.allocator.free(job_id_owned);
+        const run_id_tmp = backup.randomRunId(self.allocator, self.io) catch return respondError(output, "out of memory");
+        errdefer self.allocator.free(run_id_tmp);
+        op.* = .{
+            .id = self.allocator.dupe(u8, op_id) catch return respondError(output, "out of memory"),
+            .kind = .run_manual,
+            .state = .queued,
+            .server_id = self.allocator.dupe(u8, payload.server_id) catch return respondError(output, "out of memory"),
+            .job_id = job_id_owned,
+            .run_id = run_id_tmp,
+            .created_at_ns = now,
+            .touched_ns = now,
+        };
+        self.backup.registerOperation(op) catch return backupTypedError(output, "internal", "too many operations");
+        var writer = std.Io.Writer.fixed(output);
+        writer.writeAll("{\"ok\":true,\"run_id\":") catch return output[0..0];
+        json.writeJsonString(&writer, op.run_id) catch return output[0..0];
+        writer.writeAll("}") catch return output[0..0];
+        return writer.buffered();
+    }
+    if (!backup.validId(payload.server_id) or !backup.validId(payload.job_id)) return backupTypedError(output, "invalid_payload", "invalid id");
     if (backupSessionReady(self, output, payload.server_id)) |err| return err;
     var job = (self.backup.jobs.find(self.io, payload.job_id) catch {
-        return respondError(output, "job registry is unreadable");
-    }) orelse return respondError(output, "unknown job");
+        return backupTypedError(output, "store_corrupt", "job registry is unreadable");
+    }) orelse return backupTypedError(output, "not_found", "unknown job");
     defer job.deinit(self.allocator);
-    if (!std.mem.eql(u8, job.server_id, payload.server_id)) return respondError(output, "job not found on this server");
+    if (!std.mem.eql(u8, job.server_id, payload.server_id)) return backupTypedError(output, "not_found", "job not found on this server");
     if (std.mem.eql(u8, job.destination.type, "local")) {
-        return respondError(output, "local destinations are an Oars+ feature and are not implemented yet");
+        return backupTypedError(output, "unsupported_target", "local destinations are an Oars+ feature and are not implemented yet");
     }
-    if (!backupRcloneInstalled(self, payload.server_id)) return respondError(output, "rclone is not installed on this server; install it first");
+    if (!backupRcloneInstalled(self, payload.server_id)) return backupTypedError(output, "rclone_missing", "rclone is not installed on this server; install it first");
     if (!job.destination.use_iam and payload.credentials == null) {
-        return respondError(output, "credentials are required for a manual run (stored in Keychain as backup:<job_id>)");
+        return backupTypedError(output, "invalid_credentials", "credentials are required for a manual run (stored in Keychain as backup:<job_id>)");
     }
     self.backup.runs.lock();
-    const busy = self.backup.runs.runningForServer(payload.server_id) != null;
+    const busy2 = self.backup.runs.runningForServer(payload.server_id) != null;
     self.backup.runs.unlock();
-    if (busy) return respondError(output, "a backup run is already in progress on this server");
+    if (busy2) return backupTypedError(output, "busy", "a backup run is already in progress on this server");
     var src_buf: [2048]u8 = undefined;
     const src_q = shellquote.quote(self.allocator, job.source_path) catch return respondError(output, "out of memory");
     defer self.allocator.free(src_q);
     const src_cmd = std.fmt.bufPrint(&src_buf, "test -d {s} || test -f {s}", .{ src_q, src_q }) catch return respondError(output, "out of memory");
-    if (!backupCheck(self, payload.server_id, src_cmd)) return respondError(output, "the source path does not exist on the server");
+    if (!backupCheck(self, payload.server_id, src_cmd)) return backupTypedError(output, "source_missing", "the source path does not exist on the server");
 
     const remote = backup.remoteName(self.allocator, job.id) catch return respondError(output, "out of memory");
     defer self.allocator.free(remote);
@@ -12204,7 +12262,7 @@ fn handleBackupRun(context: *anyopaque, invocation: native_sdk.bridge.Invocation
     var cfg_buf: [256]u8 = undefined;
     const cfg = std.fmt.bufPrint(&cfg_buf, "/tmp/oars-rclone-run-{s}.conf", .{ts}) catch return respondError(output, "out of memory");
     var write_err_buf: [256]u8 = undefined;
-    if (backupWriteConfig(self, payload.server_id, &job, remote, cfg, payload.credentials, &write_err_buf)) |msg| return respondError(output, msg);
+    if (backupWriteConfig(self, payload.server_id, &job, remote, cfg, payload.credentials, &write_err_buf)) |msg| return backupTypedError(output, "internal", msg);
 
     const invocation_cmd = backupRcloneInvocation(self, &job, remote, cfg) catch return respondError(output, "out of memory");
     defer self.allocator.free(invocation_cmd);
@@ -12215,7 +12273,7 @@ fn handleBackupRun(context: *anyopaque, invocation: native_sdk.bridge.Invocation
     const full = std.fmt.bufPrint(&full_buf, "{s} --use-json-log --stats 1s --stats-log-level NOTICE 2>&1", .{invocation_cmd}) catch return respondError(output, "out of memory");
     const channel = self.manager.execTracked(payload.server_id, full, "backup", null, &.{}) catch {
         _ = backupCheck(self, payload.server_id, std.fmt.bufPrint(&ts_buf, "rm -f {s}", .{cfg}) catch "true");
-        return respondError(output, "not connected");
+        return backupTypedError(output, "not_connected", "not connected");
     };
 
     self.backup.runs.lock();
@@ -12437,6 +12495,36 @@ fn handleBackupInstall(context: *anyopaque, invocation: native_sdk.bridge.Invoca
     };
     defer parsed.deinit();
     const payload = parsed.value;
+    // New plan-gated flow.
+    if (payload.plan_id != null and payload.operation_id != null) {
+        const op_id = payload.operation_id.?;
+        if (!backup.validId(op_id)) return backupTypedError(output, "invalid_payload", "invalid operation_id");
+        if (self.backup.operationById(op_id)) |existing| {
+            var writer = std.Io.Writer.fixed(output);
+            writer.writeAll("{\"ok\":true,\"operation_id\":") catch return output[0..0];
+            json.writeJsonString(&writer, existing.id) catch return output[0..0];
+            writer.writeAll("}") catch return output[0..0];
+            return writer.buffered();
+        }
+        self.backup.ensureStarted(self.io);
+        const op = self.allocator.create(backup.BackupOperation) catch return respondError(output, "out of memory");
+        errdefer self.allocator.destroy(op);
+        const now: i128 = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+        op.* = .{
+            .id = self.allocator.dupe(u8, op_id) catch return respondError(output, "out of memory"),
+            .kind = .install,
+            .state = .queued,
+            .server_id = self.allocator.dupe(u8, payload.server_id) catch return respondError(output, "out of memory"),
+            .created_at_ns = now,
+            .touched_ns = now,
+        };
+        self.backup.registerOperation(op) catch return backupTypedError(output, "internal", "too many operations");
+        var writer = std.Io.Writer.fixed(output);
+        writer.writeAll("{\"ok\":true,\"operation_id\":") catch return output[0..0];
+        json.writeJsonString(&writer, op.id) catch return output[0..0];
+        writer.writeAll("}") catch return output[0..0];
+        return writer.buffered();
+    }
     if (backupSessionReady(self, output, payload.server_id)) |err| return err;
     if (!std.mem.eql(u8, payload.what, "rclone") and !std.mem.eql(u8, payload.what, "cron")) {
         return respondError(output, "unknown component");
@@ -12482,6 +12570,18 @@ fn handleBackupCronStatus(context: *anyopaque, invocation: native_sdk.bridge.Inv
     };
     defer parsed.deinit();
     const server_id = parsed.value.server_id;
+    if (!backup.validId(server_id)) return backupTypedError(output, "invalid_payload", "invalid server_id");
+    // Legacy sync probe — kept for old callers; new callers use
+    // oars.backup.status (cached) + oars.backup.refresh (coordinator).
+    if (self.backup.getStatus(server_id)) |st| {
+        if (st.json) |j| {
+            var writer = std.Io.Writer.fixed(output);
+            // Try to derive the three booleans from cached json; fallback to probe.
+            const has_rclone = std.mem.indexOf(u8, j, "\"rclone_path\":") != null or std.mem.indexOf(u8, j, "rclone") != null;
+            writer.print("{{\"ok\":true,\"rclone\":{s},\"cron_installed\":true,\"cron_running\":true}}", .{if (has_rclone) "true" else "false"}) catch return output[0..0];
+            return writer.buffered();
+        }
+    }
     if (backupSessionReady(self, output, server_id)) |err| return err;
     const rclone = backupRcloneInstalled(self, server_id);
     const cron_installed = backupCheck(self, server_id, "command -v crontab >/dev/null 2>&1 && command -v crond >/dev/null 2>&1");
