@@ -11807,13 +11807,22 @@ const BackupStatusFile = struct {
 };
 
 fn backupTypedError(output: []u8, code: []const u8, msg: []const u8) []const u8 {
+    return backupTypedErrorDetail(output, code, msg, null);
+}
+
+fn backupTypedErrorDetail(output: []u8, code: []const u8, msg: []const u8, detail: ?[]const u8) []const u8 {
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":false,\"code\":") catch return output[0..0];
     json.writeJsonString(&writer, code) catch return output[0..0];
     writer.writeAll(",\"error\":") catch return output[0..0];
     json.writeJsonString(&writer, msg) catch return output[0..0];
     writer.writeAll(",\"retryable\":") catch return output[0..0];
-    writer.writeAll(if (std.mem.eql(u8, code, "transport_error") or std.mem.eql(u8, code, "timeout")) "true" else "false") catch return output[0..0];
+    writer.writeAll(if (std.mem.eql(u8, code, "transport_error") or std.mem.eql(u8, code, "timeout") or std.mem.eql(u8, code, "busy")) "true" else "false") catch return output[0..0];
+    if (detail) |d| {
+        writer.writeAll(",\"detail\":{\"step\":") catch return output[0..0];
+        json.writeJsonString(&writer, d) catch return output[0..0];
+        writer.writeAll("}") catch return output[0..0];
+    }
     writer.writeAll("}") catch return output[0..0];
     return writer.buffered();
 }
