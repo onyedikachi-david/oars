@@ -11897,17 +11897,17 @@ fn handleBackupJobsList(context: *anyopaque, invocation: native_sdk.bridge.Invoc
     };
     defer parsed.deinit();
     const server_id = parsed.value.server_id;
-    const connected = self.manager.get(server_id) != null and self.manager.get(server_id).?.status.load(.acquire) == .ready;
+    if (!backup.validId(server_id)) return backupTypedError(output, "invalid_payload", "invalid server_id");
 
+    // Local-only per NEXT-SPEC. Probe/import is via refresh (coordinator),
+    // not inline in list. Keep last-good snapshot visible while refreshing.
+    self.backup.ensureStarted(self.io);
     const jobs = self.backup.jobs.listForServer(self.io, server_id) catch {
-        return respondError(output, "job registry is unreadable");
+        return backupTypedError(output, "store_corrupt", "job registry is unreadable");
     };
     defer {
         for (jobs) |*j| j.deinit(self.allocator);
         self.allocator.free(jobs);
-    }
-    if (connected) {
-        for (jobs) |*j| backupImportStaged(self, server_id, j.id);
     }
 
     var writer = std.Io.Writer.fixed(output);
