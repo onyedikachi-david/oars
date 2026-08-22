@@ -52,11 +52,14 @@ pub const Provider = enum(u8) {
     }
 
     /// The provider's rclone `provider` value (s3 backend).
+    /// B2 is accessed through the S3-compatible endpoint, so the rclone S3
+    /// `provider` is `Other` — there is no `B2` value in rclone's S3
+    /// backend. R2's S3 adapter is `Cloudflare` (region = auto).
     pub fn rcloneName(self: Provider) []const u8 {
         return switch (self) {
             .aws => "AWS",
             .r2 => "Cloudflare",
-            .b2 => "B2",
+            .b2 => "Other",
             .wasabi => "Wasabi",
             .minio => "Minio",
             .spaces => "DigitalOcean",
@@ -79,21 +82,29 @@ pub const Provider = enum(u8) {
 
     /// Storage classes the s3 backend accepts for this provider (the
     /// spec's adapter-scoped set — never universal Glacier names).
+    /// Empty means provider default; only the allow-list is exposed.
     pub fn storageClasses(self: Provider) []const []const u8 {
-        _ = self;
-        return generic_classes;
+        return switch (self) {
+            .aws => &aws_classes,
+            .wasabi => &wasabi_classes,
+            else => &generic_classes,
+        };
     }
 
-    const generic_classes = [_][]const u8{ "standard", "standard_ia", "onezone_ia" };
+    /// Non-AWS adapters expose only the default class in v1; named classes
+    /// are provider-specific and require direct evidence.
+    const generic_classes = [_][]const u8{"standard"};
     const aws_classes = [_][]const u8{
         "standard",            "reduced_redundancy",
         "standard_ia",         "onezone_ia",
         "intelligent_tiering", "glacier",
         "deep_archive",        "glacier_ir",
     };
+    const wasabi_classes = [_][]const u8{"standard"};
 
     pub fn supportsStorageClass(self: Provider, class: []const u8) bool {
-        const classes: []const []const u8 = if (self == .aws) &aws_classes else &generic_classes;
+        if (class.len == 0) return true; // provider default — omitted from config
+        const classes = self.storageClasses();
         for (classes) |c| {
             if (std.mem.eql(u8, c, class)) return true;
         }
@@ -279,13 +290,23 @@ pub fn validate(input: JobInput, schedule_credentials: ?[]const u8) SaveError!vo
 
 /// Validates cronie's five-field grammar (numeric, wildcards, steps,
 /// ranges, lists). Names (JAN, SUN) are not accepted — the supported
-/// grammar is the documented subset (spec 10 §13).
+/// grammar is the documented subset (spec 10 §13). Tabs are accepted as
+/// field separators like spaces (cronie behaviour); `%` is rejected because
+/// cron treats it as newline.
 pub fn validCronExpr(expr: []const u8) bool {
     if (expr.len == 0 or expr.len > max_cron_expr_len) return false;
+    if (std.mem.indexOfScalar(u8, expr, '%') != null) return false;
+    if (std.mem.indexOfScalar(u8, expr, '\n') != null or std.mem.indexOfScalar(u8, expr, '\r') != null) return false;
+    if (std.mem.indexOfScalar(u8, expr, 0) != null) return false;
     var fields: [5][]const u8 = undefined;
     var n: usize = 0;
-    var it = std.mem.splitScalar(u8, expr, ' ');
-    while (it.next()) |f| {
+    var i: usize = 0;
+    while (i < expr.len) {
+        while (i < expr.len and (expr[i] == ' ' or expr[i] == '\t')) : (i += 1) {}
+        if (i >= expr.len) break;
+        const start = i;
+        while (i < expr.len and expr[i] != ' ' and expr[i] != '\t') : (i += 1) {}
+        const f = expr[start..i];
         if (f.len == 0) return false;
         if (n >= fields.len) return false;
         fields[n] = f;
@@ -293,8 +314,8 @@ pub fn validCronExpr(expr: []const u8) bool {
     }
     if (n != 5) return false;
     const bounds = [_][2]u32{ .{ 0, 59 }, .{ 0, 23 }, .{ 1, 31 }, .{ 1, 12 }, .{ 0, 7 } };
-    for (fields, 0..) |field, i| {
-        if (!validCronField(field, bounds[i][0], bounds[i][1])) return false;
+    for (fields, 0..) |field, idx| {
+        if (!validCronField(field, bounds[idx][0], bounds[idx][1])) return false;
     }
     return true;
 }
@@ -309,8 +330,34 @@ fn validCronField(field: []const u8, min: u32, max: u32) bool {
 }
 
 fn validCronElement(element: []const u8, min: u32, max: u32) bool {
+    if (element.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, element, '%') != null) return false;
+    if (std.mem.indexOfScalar(u8, element, '\t') != null) return false;
     if (std.mem.eql(u8, element, "*")) return true;
-    // a-b[/step]
+    // Step forms contain '/', handle them before bare '-' so "1-5/2" works.
+    if (std.mem.indexOfScalar(u8, element, '/') != null) {
+        var parts = std.mem.splitScalar(u8, element, '/');
+        const range = parts.next() orelse return false;
+        const step_str = parts.next() orelse return false;
+        if (parts.next() != null) return false;
+        if (range.len == 0 or step_str.len == 0) return false;
+        const step = std.fmt.parseInt(u32, step_str, 10) catch return false;
+        if (step == 0) return false;
+        if (std.mem.eql(u8, range, "*")) return true;
+        if (std.mem.indexOfScalar(u8, range, '-') != null) {
+            var rp = std.mem.splitScalar(u8, range, '-');
+            const a_str = rp.next() orelse return false;
+            const b_str = rp.next() orelse return false;
+            if (rp.next() != null) return false;
+            const a = std.fmt.parseInt(u32, a_str, 10) catch return false;
+            const b = std.fmt.parseInt(u32, b_str, 10) catch return false;
+            if (a < min or b > max or a > b) return false;
+            return true;
+        }
+        const v = std.fmt.parseInt(u32, range, 10) catch return false;
+        return v >= min and v <= max;
+    }
+    // Bare range a-b
     if (std.mem.indexOfScalar(u8, element, '-') != null) {
         var parts = std.mem.splitScalar(u8, element, '-');
         const a_str = parts.next() orelse return false;
@@ -321,20 +368,10 @@ fn validCronElement(element: []const u8, min: u32, max: u32) bool {
         if (a < min or b > max or a > b) return false;
         return true;
     }
-    // */step
+    // Wildcard step "*/n" without the '/' path above (kept for clarity)
     if (std.mem.startsWith(u8, element, "*/")) {
         const step = std.fmt.parseInt(u32, element[2..], 10) catch return false;
         return step > 0;
-    }
-    // a-b/step
-    if (std.mem.indexOfScalar(u8, element, '/') != null) {
-        var parts = std.mem.splitScalar(u8, element, '/');
-        const range = parts.next() orelse return false;
-        const step_str = parts.next() orelse return false;
-        if (parts.next() != null) return false;
-        const step = std.fmt.parseInt(u32, step_str, 10) catch return false;
-        if (step == 0) return false;
-        return validCronElement(range, min, max);
     }
     const value = std.fmt.parseInt(u32, element, 10) catch return false;
     return value >= min and value <= max;
@@ -420,9 +457,14 @@ pub fn remoteName(allocator: std.mem.Allocator, job_id: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "oars-{s}", .{job_id});
 }
 
-/// Builds the `[remote]` section for the s3 backend. `access_key` and
-/// `secret_key` are omitted for IAM (rclone falls back to its env/role
-/// chain). Values are written verbatim; secrets never appear in argv.
+/// Builds the `[remote]` section for the s3 backend. In AWS runtime/IAM
+/// mode the config must be `env_auth = true` with blank key fields so
+/// rclone falls back to its env/role chain (omitting keys is not enough).
+/// Values are written verbatim; secrets never appear in argv.
+/// An empty/default storage_class is omitted — only adapter allow-listed
+/// values are emitted.
+// INI injection: access/secret keys must be validated (no CR/LF/NUL)
+// before calling this; bridge admission rejects them.
 pub fn remoteConfigSection(
     allocator: std.mem.Allocator,
     job: *const Job,
@@ -438,27 +480,40 @@ pub fn remoteConfigSection(
         defer allocator.free(part);
         try out.appendSlice(allocator, part);
     }
-    if (!job.destination.use_iam) {
+    if (job.destination.use_iam) {
+        if (provider != .aws) return error.IamRequiresAws;
+        try out.appendSlice(allocator, "env_auth = true\n");
+        try out.appendSlice(allocator, "access_key_id = \nsecret_access_key = \n");
+    } else {
+        // Validate credential shape to prevent INI injection (CR/LF/NUL).
+        if (access_key) |k| if (std.mem.indexOfScalar(u8, k, '\n') != null or std.mem.indexOfScalar(u8, k, '\r') != null or std.mem.indexOfScalar(u8, k, 0) != null) return error.InvalidDestination;
+        if (secret_key) |k| if (std.mem.indexOfScalar(u8, k, '\n') != null or std.mem.indexOfScalar(u8, k, '\r') != null or std.mem.indexOfScalar(u8, k, 0) != null) return error.InvalidDestination;
         const part = try std.fmt.allocPrint(allocator, "access_key_id = {s}\nsecret_access_key = {s}\n", .{ access_key orelse "", secret_key orelse "" });
         defer allocator.free(part);
         try out.appendSlice(allocator, part);
     }
+    const is_r2 = provider == .r2;
     if (job.destination.endpoint.len > 0) {
         const part = try std.fmt.allocPrint(allocator, "endpoint = {s}\n", .{job.destination.endpoint});
         defer allocator.free(part);
         try out.appendSlice(allocator, part);
+    } else if (is_r2) {
+        return error.InvalidEndpoint; // R2 requires endpoint
     }
-    if (job.destination.region.len > 0) {
+    if (is_r2) {
+        try out.appendSlice(allocator, "region = auto\n");
+    } else if (job.destination.region.len > 0) {
         const part = try std.fmt.allocPrint(allocator, "region = {s}\n", .{job.destination.region});
         defer allocator.free(part);
         try out.appendSlice(allocator, part);
     }
-    // The S3 storage class is canonical uppercase (STANDARD, STANDARD_IA,
-    // GLACIER…): strict endpoints like MinIO reject the lowercase form.
-    var sc_buf: [64]u8 = undefined;
-    if (job.destination.storage_class.len == 0 or job.destination.storage_class.len > sc_buf.len) return error.InvalidStorageClass;
-    const sc = std.ascii.upperString(sc_buf[0..job.destination.storage_class.len], job.destination.storage_class);
-    {
+    // Only emit storage_class for providers with an explicit allow-list
+    // beyond the default; empty/default means provider default.
+    if (job.destination.storage_class.len > 0 and !std.mem.eql(u8, job.destination.storage_class, "standard")) {
+        if (!provider.supportsStorageClass(job.destination.storage_class)) return error.InvalidStorageClass;
+        var sc_buf: [64]u8 = undefined;
+        if (job.destination.storage_class.len > sc_buf.len) return error.InvalidStorageClass;
+        const sc = std.ascii.upperString(sc_buf[0..job.destination.storage_class.len], job.destination.storage_class);
         const part = try std.fmt.allocPrint(allocator, "storage_class = {s}\n", .{sc});
         defer allocator.free(part);
         try out.appendSlice(allocator, part);
@@ -573,11 +628,13 @@ const RawLine = struct {
     eta: ?f64 = null,
     speed: ?f64 = null,
     totalBytes: ?u64 = null,
+    totalTransfers: ?u64 = null,
     transfers: ?u64 = null,
     stats: ?struct {
         bytes: ?u64 = null,
         totalBytes: ?u64 = null,
         transfers: ?u64 = null,
+        totalTransfers: ?u64 = null,
         speed: ?f64 = null,
         eta: ?f64 = null,
     } = null,
@@ -606,16 +663,16 @@ pub fn parseJsonLogLine(allocator: std.mem.Allocator, line: []const u8) LogLine 
             .bytes_done = s.bytes orelse 0,
             .bytes_total = s.totalBytes orelse 0,
             .files_done = s.transfers orelse 0,
-            .files_total = 0,
+            .files_total = s.totalTransfers orelse 0,
             .speed_bps = @intFromFloat(s.speed orelse 0),
             .eta_sec = @intFromFloat(s.eta orelse 0),
         };
-    } else if (raw.bytes != null or raw.transfers != null or raw.speed != null) {
+    } else if (raw.bytes != null or raw.transfers != null or raw.totalTransfers != null or raw.speed != null) {
         stats = .{
             .bytes_done = raw.bytes orelse 0,
             .bytes_total = raw.totalBytes orelse 0,
             .files_done = raw.transfers orelse 0,
-            .files_total = 0,
+            .files_total = raw.totalTransfers orelse 0,
             .speed_bps = @intFromFloat(raw.speed orelse 0),
             .eta_sec = @intFromFloat(raw.eta orelse 0),
         };
@@ -1343,9 +1400,30 @@ test "rclone config section generation" {
     defer job.deinit(allocator);
     const section = try remoteConfigSection(allocator, &job, "oars-bk-1", "AKID", "SECRET");
     defer allocator.free(section);
+    // "standard" is the provider default — omitted from config.
     const expected =
-        "[oars-bk-1]\ntype = s3\nprovider = Minio\naccess_key_id = AKID\nsecret_access_key = SECRET\nendpoint = http://127.0.0.1:9000\nstorage_class = STANDARD\n";
+        "[oars-bk-1]\ntype = s3\nprovider = Minio\naccess_key_id = AKID\nsecret_access_key = SECRET\nendpoint = http://127.0.0.1:9000\n";
     try std.testing.expectEqualStrings(expected, section);
+    var gl_job = Job{
+        .id = try allocator.dupe(u8, "bk-gl"),
+        .server_id = try allocator.dupe(u8, "s1"),
+        .name = try allocator.dupe(u8, "daily"),
+        .source_path = try allocator.dupe(u8, "/var/www"),
+        .destination = .{
+            .type = try allocator.dupe(u8, "s3"),
+            .provider = try allocator.dupe(u8, "aws"),
+            .bucket = try allocator.dupe(u8, "acme"),
+            .prefix = "",
+            .endpoint = "",
+            .region = try allocator.dupe(u8, "us-east-1"),
+            .storage_class = try allocator.dupe(u8, "glacier"),
+        },
+        .schedule = .{ .mode = try allocator.dupe(u8, "manual"), .interval_unit = try allocator.dupe(u8, "hours"), .expr = "" },
+    };
+    defer gl_job.deinit(allocator);
+    const gl_section = try remoteConfigSection(allocator, &gl_job, "oars-bk-gl", "AKID", "SECRET");
+    defer allocator.free(gl_section);
+    try std.testing.expect(std.mem.indexOf(u8, gl_section, "storage_class = GLACIER") != null);
 
     // IAM: no key material at all.
     var iam_job = Job{
@@ -1372,7 +1450,8 @@ test "rclone config section generation" {
     defer iam_job.deinit(allocator);
     const iam_section = try remoteConfigSection(allocator, &iam_job, "oars-bk-2", null, null);
     defer allocator.free(iam_section);
-    try std.testing.expect(std.mem.indexOf(u8, iam_section, "access_key") == null);
+    try std.testing.expect(std.mem.indexOf(u8, iam_section, "env_auth = true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, iam_section, "access_key_id = \n") != null);
     try std.testing.expect(std.mem.indexOf(u8, iam_section, "provider = AWS") != null);
 }
 
