@@ -1364,9 +1364,11 @@ fn readStoreContent(io: std.Io, path: []const u8, allocator: std.mem.Allocator, 
 
 fn syncStoreParent(io: std.Io, path: []const u8) !void {
     const parent_path = std.fs.path.dirname(path) orelse ".";
-    var parent = std.Io.Dir.cwd().openDir(io, parent_path, .{}) catch |err| return classifyStoreAccessError(err);
-    defer parent.close(io);
-    const parent_file = std.Io.File{ .handle = parent.handle, .flags = .{ .nonblocking = false } };
+    var parent_file = std.Io.Dir.cwd().openFile(io, parent_path, .{
+        .mode = .read_only,
+        .allow_directory = true,
+    }) catch |err| return classifyStoreAccessError(err);
+    defer parent_file.close(io);
     parent_file.sync(io) catch |err| return classifyStoreAccessError(err);
 }
 
@@ -6648,6 +6650,24 @@ test "lastStatsFromLog returns the final stats and error" {
     try std.testing.expectEqual(@as(u64, 100), result.stats.bytes_done);
     try std.testing.expectEqual(@as(u64, 5), result.stats.files_done);
     try std.testing.expectEqualStrings("boom", result.@"error");
+}
+
+test "store parent directory sync uses a sync-capable handle" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var nonce: [8]u8 = undefined;
+    try std.Io.randomSecure(io, &nonce);
+    const nonce_hex = std.fmt.bytesToHex(nonce, .lower);
+    var dir_buf: [160]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/oars-store-parent-sync-{s}", .{nonce_hex});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var path_buf: [200]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/state.json", .{dir});
+
+    try writeStoreAtomically(allocator, io, path, "{\"ok\":true}");
+    const content = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64));
+    defer allocator.free(content);
+    try std.testing.expectEqualStrings("{\"ok\":true}", content);
 }
 
 test "history store appends, prunes, and lists newest first" {
