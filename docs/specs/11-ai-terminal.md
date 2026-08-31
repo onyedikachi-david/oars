@@ -1,6 +1,6 @@
 # Spec 11 — AI Terminal
 
-**Status:** 📋 Planned · **Depends on:** 02 (exec), 03 (context), 04 (log context), 06 (save as script), 15 (audit) · **Spec owner:** core + frontend
+**Status:** Partial: native provider, durable turn/proposal, exact SSH execution, cancellation, and the React workflow are implemented; live-provider, real credential-store, forced-restart, and final accessibility evidence remain · **Depends on:** 02 (exec), 03 (context), 04 (log context), 06 (save as script), 15 (audit) · **Spec owner:** core + frontend
 
 ## 1. Overview
 
@@ -10,6 +10,10 @@ validated command proposal or one question. The user can edit and approve the
 proposal. Oars runs only the exact server-bound command that the Zig core
 stored for that approval. Each run has durable state, command history, and an
 audit record.
+
+Spec 19 extends this baseline with ordinary assistant messages and a
+conversation-first UI. Its reviewed command card still projects this Spec 11
+proposal lifecycle; it does not give the provider direct execution authority.
 
 ## 2. Goals and non-goals
 
@@ -189,10 +193,10 @@ oars.ai.context.cancel {operation_id}
 ```
 
 `context.get` reads a cache only. It does not start SSH work. `refresh` queues
-the probe on the selected server session worker and returns without a network
-wait. The returned context contains operating-system and monitor summaries and
-available log metadata. It does not contain log bytes. `turn.start` reads only
-the selected bounded log tail.
+one complete operating-system, monitor, process, disk, and log-metadata probe
+on the selected server session worker and returns without a network wait. It
+does not depend on the separate Monitor-tab cache. The returned context does
+not contain log bytes. `turn.start` reads only the selected bounded log tail.
 
 ### 5.3 Threads, turns, and proposals
 
@@ -201,7 +205,7 @@ oars.ai.thread.list {server_id?, limit}
   -> {ok, threads:[ThreadSummary]}
 
 oars.ai.thread.get {thread_id}
-  -> {ok, thread, turns, active_proposal?}
+  -> {ok, thread, turns, turns_start, turn_count, active_proposal?}
 
 oars.ai.thread.delete {operation_id, thread_id, expected_revision}
   -> {ok}
@@ -234,6 +238,12 @@ oars.ai.proposal.run {
 oars.ai.proposal.cancel {operation_id, proposal_id, expected_revision}
   -> {ok, state:"canceled"}
 ```
+
+`thread.get` returns all turns when they fit the bridge response bound. For a
+larger thread, it returns the largest latest-turn suffix that fits.
+`turns_start` identifies the first returned turn and `turn_count` reports the
+durable total. The command returns `limit_exceeded` when the latest turn alone
+cannot fit.
 
 The summary action is a new provider request. Before admission, the UI shows
 the exact bounded command-output range that it will send. Save as script opens
@@ -528,10 +538,10 @@ V1 bounds are:
   reject or deduplicate admission as specified.
 - [ ] The Zig destructive fixture list and React mirror agree. An edited
   destructive command requires the warning acknowledgement.
-- [ ] One approved harmless command runs on the real SSH container, streams
+- [x] One approved harmless command runs on the real SSH container, streams
   through cursor polling, records `history_kind:"ai"`, and completes the same
   operation in history and audit. Generic SSH rows do not appear as AI runs.
-- [ ] Provider cancel has an honest terminal state. SSH cancel stops and
+- [x] Provider cancel has an honest terminal state. SSH cancel stops and
   verifies the remote process group and its child process. An uncertain stop
   remains `cancel_requested` or `recovery_required`.
 - [ ] Forced restart at every non-terminal state causes no duplicate provider

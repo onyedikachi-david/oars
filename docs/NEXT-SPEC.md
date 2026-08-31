@@ -2,7 +2,7 @@
 
 > **Target:** Spec 11 — AI Terminal
 >
-> **Status:** 📋 Planned
+> **Status:** Partial
 >
 > **Prepared:** 2026-08-31 against HEAD
 > `48091a9aba80a0a0cd6d3fdb151d57090093fe03` and the full working tree
@@ -13,12 +13,15 @@ Implement the target in `docs/specs/11-ai-terminal.md`. That specification is
 the product contract. This guide fixes the implementation order, ownership
 boundaries, and evidence needed to change its status.
 
-Spec 11 is not implemented. The present checkout has provider metadata
-storage, a synchronous context probe, and a generic SSH audit view. It has no
-provider request, typed provider stream, durable turn, validated proposal,
-backend approval, AI-specific execution, hard cancellation, restart recovery,
-or complete UI. Keep the status Planned and keep every gate open until the
-same checkout has all evidence in this guide.
+Spec 11 is substantially implemented, but it is not release-complete. The
+current checkout has native provider transport and credentials, typed streams,
+durable turns, validated proposals, backend approval, AI-specific tracked SSH
+execution, verified process-group cancellation, restart classification, and the
+complete React workflow. Unit, frontend, browser-fixture, and real SSH evidence
+is recorded in `docs/research/spec-11-implementation-checklist.md`. Keep the
+status Partial until the real operating-system credential lifecycle, live
+OpenAI, pinned compatibility provider, forced process-restart, and remaining
+accessibility gates pass on this checkout.
 
 ## Read before editing
 
@@ -60,10 +63,11 @@ Read these source groups before their named slices:
   Structured Outputs, conversation-state, authentication, data-control, and
   function-calling pages in the final source section before Slices 4 and 5.
 
-## Current baseline and P0 blockers
+## Preparation baseline and resolved P0 blockers
 
-The existing code is scaffolding. Preserve useful tests and migrate the stored
-metadata, but do not design the target around these limits:
+The pre-implementation audit found the following scaffolding. The current
+implementation replaces these paths; this list remains as the historical
+baseline that drove the work:
 
 - `src/ai.zig` has one provider record, a prefix-based URL check, probe
   parsing, and a five-second context cache. It has no provider transport,
@@ -110,6 +114,8 @@ Review every slice against these rules:
 6. **The model has no authority.** V1 sends no provider tools. Only one fully
    validated, durable proposal can reach the AI approval handler. A raw model
    event, restored record, or public `oars.ssh.exec` call cannot approve it.
+   Spec 19 can present that proposal as an inline chat tool, but the same native
+   approval and execution boundary remains authoritative.
 7. **Frozen identity.** Approval binds proposal ID, revision, command SHA-256,
    server and connection identity, provider revision, expiry, and destructive
    acknowledgement under one lock.
@@ -540,7 +546,7 @@ oars.ai.thread.list {server_id?, limit}
   -> {ok, threads:[ThreadSummary]}
 
 oars.ai.thread.get {thread_id}
-  -> {ok, thread, turns, active_proposal?}
+  -> {ok, thread, turns, turns_start, turn_count, active_proposal?}
 
 oars.ai.thread.delete {operation_id, thread_id, expected_revision}
   -> {ok}
@@ -579,6 +585,10 @@ oars.ai.proposal.cancel {
 `ThreadSummary` is `{id, revision, server_id, provider_id, model, title,
 state, turn_count, updated_at_ms}`. A thread stores the provider adapter and
 model snapshot used for continuation. A mismatch requires a new thread.
+`thread.get` returns all turns when they fit the bridge response bound. If the
+full detail is too large, it returns the largest latest-turn suffix that fits;
+`turns_start` is the zero-based index of that suffix and `turn_count` is the
+durable total. It returns `limit_exceeded` if the latest turn cannot fit.
 
 `TurnState` is:
 
@@ -1013,11 +1023,11 @@ Every gate remains open while Spec 11 is Planned:
 - [ ] **Destructive gate:** the shared Zig and React fixture set agrees, edited
   commands are reclassified, and the backend requires the warning
   acknowledgement.
-- [ ] **Execution and audit gate:** one harmless approved container command
+- [x] **Execution and audit gate:** one harmless approved container command
   uses `history_kind = "ai"`, streams through independent cursors, and
   finishes the same operation in AI history and audit. Generic SSH rows stay
   out.
-- [ ] **Cancellation gate:** provider cancel has honest semantics. SSH cancel
+- [x] **Cancellation gate:** provider cancel has honest semantics. SSH cancel
   stops and verifies the remote process group and child. An uncertain stop
   remains `cancel_requested|recovery_required`.
 - [ ] **Recovery gate:** forced restart at every non-terminal state produces no

@@ -73,6 +73,7 @@ const App = struct {
     backup_jobs_path_buf: [2048]u8 = undefined,
     backup_runs_path_buf: [2048]u8 = undefined,
     ai_path_buf: [2048]u8 = undefined,
+    ai_journal_path_buf: [2048]u8 = undefined,
     data_dir_buf: [1024]u8 = undefined,
     fallback_dir_buf: [1024]u8 = undefined,
 
@@ -153,6 +154,11 @@ const App = struct {
             &self.ai_path_buf,
             &.{ base, "ai.json" },
         ) catch unreachable;
+        const ai_journal_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.ai_journal_path_buf,
+            &.{ base, "ai_journal.jsonl" },
+        ) catch unreachable;
         self.store = .{ .allocator = self.allocator, .path = store_path };
         self.audit_store = .{ .allocator = self.allocator, .path = audit_path };
         self.history_store = .{ .allocator = self.allocator, .path = history_path };
@@ -162,7 +168,9 @@ const App = struct {
         self.deploy_history_store = .{ .allocator = self.allocator, .path = deploy_history_path };
         self.access_registry = access.Registry.init(self.allocator, access_path);
         self.backup_registry = backup.Registry.init(self.allocator, backup_jobs_path, backup_runs_path);
-        self.ai_registry = ai.Registry.init(self.allocator, ai_path);
+        self.ai_registry = ai.Registry.init(self.allocator, ai_path, ai_journal_path);
+        try self.ai_registry.journal_store.ensureLoaded(self.io);
+        self.ai_registry.startProviderTests(self.io);
 
         self.manager = sessions.Manager.init(self.allocator, self.io, &self.store, &self.audit_store, &self.history_store, self.env_map.get("HOME"));
         self.bridge_ctx = .{
@@ -182,6 +190,7 @@ const App = struct {
             .keys = keyjobs.Registry.init(self.allocator),
         };
         try self.bridge_ctx.startBackupCoordinator();
+        self.bridge_ctx.startAiCoordinator();
     }
 
     fn deinit(self: *App) void {
@@ -201,6 +210,47 @@ const App = struct {
             .name = "oars",
             .source = native_sdk.frontend.productionSource(.{ .dist = "frontend/dist" }),
             .source_fn = source,
+            .start_fn = start,
+            .stop_fn = stop,
+        };
+    }
+
+    fn start(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        self.ai_registry.credential_facade.install(.{
+            .context = runtime,
+            .set_fn = credentialSet,
+            .get_fn = credentialGet,
+            .delete_fn = credentialDelete,
+        });
+    }
+
+    fn stop(context: *anyopaque, _: *native_sdk.Runtime) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        self.ai_registry.stopProviderTests();
+        self.ai_registry.credential_facade.clear();
+    }
+
+    fn credentialSet(context: *anyopaque, service: []const u8, account: []const u8, secret: []const u8) ai.credentials.ServiceError!void {
+        const runtime: *native_sdk.Runtime = @ptrCast(@alignCast(context));
+        runtime.setCredential(.{ .service = service, .account = account, .secret = secret }) catch |err| return credentialServiceError(err);
+    }
+
+    fn credentialGet(context: *anyopaque, service: []const u8, account: []const u8, output: []u8) ai.credentials.ServiceError!?usize {
+        const runtime: *native_sdk.Runtime = @ptrCast(@alignCast(context));
+        const value = runtime.getCredential(.{ .service = service, .account = account }, output) catch |err| return credentialServiceError(err);
+        return if (value) |secret| secret.len else null;
+    }
+
+    fn credentialDelete(context: *anyopaque, service: []const u8, account: []const u8) ai.credentials.ServiceError!bool {
+        const runtime: *native_sdk.Runtime = @ptrCast(@alignCast(context));
+        return runtime.deleteCredential(.{ .service = service, .account = account }) catch |err| return credentialServiceError(err);
+    }
+
+    fn credentialServiceError(err: anyerror) ai.credentials.ServiceError {
+        return switch (err) {
+            error.UnsupportedService => error.Unavailable,
+            else => error.Denied,
         };
     }
 
@@ -282,7 +332,9 @@ test "servers.save round trips through the bridge dispatcher" {
     defer backup_registry.deinit();
     var ai_path_buf: [512]u8 = undefined;
     const ai_path = std.fmt.bufPrint(&ai_path_buf, "/tmp/{s}/ai.json", .{dir_name}) catch unreachable;
-    var ai_registry = ai.Registry.init(store_alloc, ai_path);
+    var ai_journal_path_buf: [512]u8 = undefined;
+    const ai_journal_path = std.fmt.bufPrint(&ai_journal_path_buf, "/tmp/{s}/ai_journal.jsonl", .{dir_name}) catch unreachable;
+    var ai_registry = ai.Registry.init(store_alloc, ai_path, ai_journal_path);
     defer ai_registry.deinit();
     var manager = sessions.Manager.init(store_alloc, io, &store, &audit_store, &history_store, null);
     defer manager.deinit();
@@ -316,6 +368,37 @@ test "servers.save round trips through the bridge dispatcher" {
 
 test "app name is configured" {
     try std.testing.expectEqualStrings("oars", "oars");
+}
+
+test "profile credential bridge reaches the native credential service" {
+    var app_state: u8 = 0;
+    const test_app = native_sdk.App{
+        .context = &app_state,
+        .name = "oars-credential-policy",
+        .source = native_sdk.WebViewSource.html("<p>Credentials</p>"),
+    };
+    const harness = try native_sdk.TestHarness().create(std.testing.allocator, .{});
+    defer harness.destroy(std.testing.allocator);
+    harness.runtime.options.security.permissions = &app_permissions;
+    harness.runtime.options.builtin_bridge = .{ .enabled = true, .commands = &builtin_policies };
+
+    try harness.runtime.dispatchPlatformEvent(test_app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"set\",\"command\":\"native-sdk.credentials.set\",\"payload\":{\"service\":\"dev.oars.test\",\"account\":\"profile\",\"secret\":\"test-only-value\"}}",
+        .origin = "zero://app",
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
+
+    try harness.runtime.dispatchPlatformEvent(test_app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"get\",\"command\":\"native-sdk.credentials.get\",\"payload\":{\"service\":\"dev.oars.test\",\"account\":\"profile\"}}",
+        .origin = "zero://app",
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"result\":\"test-only-value\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(test_app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"delete\",\"command\":\"native-sdk.credentials.delete\",\"payload\":{\"service\":\"dev.oars.test\",\"account\":\"profile\"}}",
+        .origin = "zero://app",
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"result\":true") != null);
 }
 
 // --- spec 01 bridge tests --------------------------------------------------
@@ -376,6 +459,7 @@ const TestApp = struct {
     backup_jobs_path_buf: [512]u8 = undefined,
     backup_runs_path_buf: [512]u8 = undefined,
     ai_path_buf: [512]u8 = undefined,
+    ai_journal_path_buf: [512]u8 = undefined,
     dir_name: []const u8,
 
     fn init(self: *TestApp) !void {
@@ -395,6 +479,7 @@ const TestApp = struct {
         const backup_jobs_path = try std.fmt.bufPrint(&self.backup_jobs_path_buf, "/tmp/{s}/backups.json", .{self.dir_name});
         const backup_runs_path = try std.fmt.bufPrint(&self.backup_runs_path_buf, "/tmp/{s}/backup_runs.json", .{self.dir_name});
         const ai_path = try std.fmt.bufPrint(&self.ai_path_buf, "/tmp/{s}/ai.json", .{self.dir_name});
+        const ai_journal_path = try std.fmt.bufPrint(&self.ai_journal_path_buf, "/tmp/{s}/ai_journal.jsonl", .{self.dir_name});
         const store_alloc = self.arena.allocator();
         self.store = .{ .allocator = store_alloc, .path = store_path };
         self.audit_store = .{ .allocator = store_alloc, .path = audit_path };
@@ -405,9 +490,11 @@ const TestApp = struct {
         self.deploy_history_store = .{ .allocator = store_alloc, .path = deploy_history_path };
         self.access_registry = access.Registry.init(store_alloc, access_path);
         self.backup_registry = backup.Registry.init(store_alloc, backup_jobs_path, backup_runs_path);
-        self.ai_registry = ai.Registry.init(store_alloc, ai_path);
+        self.ai_registry = ai.Registry.init(store_alloc, ai_path, ai_journal_path);
+        self.ai_registry.startProviderTests(io);
         self.manager = sessions.Manager.init(store_alloc, io, &self.store, &self.audit_store, &self.history_store, null);
         self.ctx = .{ .allocator = store_alloc, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .history = &self.history_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store, .access = &self.access_registry, .keys = keyjobs.Registry.init(store_alloc), .backup = &self.backup_registry, .ai = &self.ai_registry };
+        self.ctx.startAiCoordinator();
         self.dispatcher = self.ctx.dispatcher();
     }
 
@@ -1883,64 +1970,109 @@ test "backup registry teardown drains an admitted disconnect hook" {
     try std.testing.expect(hook.done.load(.acquire));
 }
 
-test "ai provider config and context/history gates through the dispatcher" {
+test "ai provider list and save use the frozen dispatcher contract" {
     var app: TestApp = undefined;
     try app.init();
     defer app.deinit();
 
-    // No provider configured yet.
+    // No provider is configured yet.
     const empty = app.dispatch(
-        \\{"id":"1","command":"oars.ai.provider.get","payload":{}}
+        \\{"id":"1","command":"oars.ai.provider.list","payload":{}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, empty, "\"provider\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, empty, "\"providers\":[]") != null);
 
-    // A valid HTTPS provider round trips; the key never enters JSON.
-    const set_ok = app.dispatch(
-        \\{"id":"2","command":"oars.ai.provider.set","payload":{"provider":{"adapter":"openai_compatible","base_url":"https://api.openai.com/v1","model":"gpt-4o-mini","capabilities":{"instruction_role":"developer","streaming":true,"structured_output":true}}}}
+    // A Responses provider round trips without compatibility switches or a key.
+    const save_ok = app.dispatch(
+        \\{"id":"2","command":"oars.ai.provider.save","payload":{"operation_id":"provider-save-main-1","provider":{"name":"OpenAI","adapter":"openai_responses","base_url":"https://api.openai.com/v1/","model":"gpt-5"}}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, set_ok, "\"ok\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, set_ok, "\"adapter\":\"openai_compatible\"") != null);
-    const got = app.dispatch(
-        \\{"id":"3","command":"oars.ai.provider.get","payload":{}}
-    );
-    try std.testing.expect(std.mem.indexOf(u8, got, "gpt-4o-mini") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got, "\"instruction_role\":\"developer\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, save_ok, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, save_ok, "\"adapter\":\"openai_responses\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, save_ok, "\"revision\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, save_ok, "api_key") == null);
+    const ProviderSave = struct {
+        result: struct {
+            provider: struct { id: []const u8 },
+        },
+    };
+    var saved = try std.json.parseFromSlice(ProviderSave, std.testing.allocator, save_ok, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    defer saved.deinit();
+    const provider_id = saved.value.result.provider.id;
 
-    // Loopback http is accepted (user-chosen local model server)...
+    // Credential bridge traffic contains provider identity only. TestApp has
+    // no runtime facade, so every native credential action reports the
+    // explicit unavailable status and never falls back to WebView input.
+    var credential_status_buffer: [256]u8 = undefined;
+    const credential_status_request = try std.fmt.bufPrint(&credential_status_buffer, "{{\"id\":\"2a\",\"command\":\"oars.ai.credential.status\",\"payload\":{{\"provider_id\":\"{s}\"}}}}", .{provider_id});
+    const credential_status = app.dispatch(credential_status_request);
+    try std.testing.expect(std.mem.indexOf(u8, credential_status, "\"status\":\"missing\"") != null);
+    var credential_configure_buffer: [320]u8 = undefined;
+    const credential_configure_request = try std.fmt.bufPrint(&credential_configure_buffer, "{{\"id\":\"2b\",\"command\":\"oars.ai.credential.configure\",\"payload\":{{\"operation_id\":\"credential-configure-main-1\",\"provider_id\":\"{s}\"}}}}", .{provider_id});
+    const credential_configure = app.dispatch(credential_configure_request);
+    try std.testing.expect(std.mem.indexOf(u8, credential_configure, "\"status\":\"unavailable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, credential_configure_request, "secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, credential_configure_request, "api_key") == null);
+    var credential_delete_buffer: [320]u8 = undefined;
+    const credential_delete_request = try std.fmt.bufPrint(&credential_delete_buffer, "{{\"id\":\"2c\",\"command\":\"oars.ai.credential.delete\",\"payload\":{{\"operation_id\":\"credential-delete-main-1\",\"provider_id\":\"{s}\"}}}}", .{provider_id});
+    const credential_delete = app.dispatch(credential_delete_request);
+    try std.testing.expect(std.mem.indexOf(u8, credential_delete, "\"status\":\"unavailable\"") != null);
+    var provider_test_buffer: [384]u8 = undefined;
+    const provider_test_request = try std.fmt.bufPrint(&provider_test_buffer, "{{\"id\":\"2d\",\"command\":\"oars.ai.provider.test\",\"payload\":{{\"operation_id\":\"provider-test-main-1\",\"provider_id\":\"{s}\",\"expected_revision\":1}}}}", .{provider_id});
+    const provider_test = app.dispatch(provider_test_request);
+    try std.testing.expect(std.mem.indexOf(u8, provider_test, "\"code\":\"credential_missing\"") != null);
+    const listed = app.dispatch(
+        \\{"id":"3","command":"oars.ai.provider.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, listed, "gpt-5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "https://api.openai.com/v1") != null);
+
+    // Chat Completions requires explicit compatibility choices; loopback HTTP
+    // is accepted for a user-selected local provider.
     const loopback = app.dispatch(
-        \\{"id":"4","command":"oars.ai.provider.set","payload":{"provider":{"adapter":"custom","base_url":"http://localhost:11434/v1","model":"llama3","capabilities":{"instruction_role":"system","streaming":false,"structured_output":false}}}}
+        \\{"id":"4","command":"oars.ai.provider.save","payload":{"operation_id":"provider-save-main-2","provider":{"name":"Local","adapter":"openai_chat_completions","base_url":"http://localhost:11434/v1","model":"qwen3","instruction_role":"system","structured_output":"json_schema"}}}
     );
     try std.testing.expect(std.mem.indexOf(u8, loopback, "\"ok\":true") != null);
 
-    // ...but plain http anywhere else is refused, as are bad shapes.
+    // Plain remote HTTP and incomplete Chat Completions compatibility are
+    // typed invalid-argument failures.
     const plain_http = app.dispatch(
-        \\{"id":"5","command":"oars.ai.provider.set","payload":{"provider":{"adapter":"openai_compatible","base_url":"http://api.example.com/v1","model":"x"}}}
+        \\{"id":"5","command":"oars.ai.provider.save","payload":{"operation_id":"provider-save-main-3","provider":{"name":"Unsafe","adapter":"openai_responses","base_url":"http://api.example.com/v1","model":"x"}}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, plain_http, "the base URL must be https") != null);
-    const bad_adapter = app.dispatch(
-        \\{"id":"6","command":"oars.ai.provider.set","payload":{"provider":{"adapter":"claude","base_url":"https://api.example.com/v1","model":"x"}}}
+    try std.testing.expect(std.mem.indexOf(u8, plain_http, "\"code\":\"invalid_argument\"") != null);
+    const missing_compatibility = app.dispatch(
+        \\{"id":"6","command":"oars.ai.provider.save","payload":{"operation_id":"provider-save-main-4","provider":{"name":"Incomplete","adapter":"openai_chat_completions","base_url":"https://api.example.com/v1","model":"x"}}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, bad_adapter, "unsupported adapter") != null);
-    const bad_model = app.dispatch(
-        \\{"id":"7","command":"oars.ai.provider.set","payload":{"provider":{"adapter":"openai_compatible","base_url":"https://api.example.com/v1","model":" "}}}
-    );
-    try std.testing.expect(std.mem.indexOf(u8, bad_model, "invalid model name") != null);
-    const bad_role = app.dispatch(
-        \\{"id":"8","command":"oars.ai.provider.set","payload":{"provider":{"adapter":"openai_compatible","base_url":"https://api.example.com/v1","model":"x","capabilities":{"instruction_role":"assistant"}}}}
-    );
-    try std.testing.expect(std.mem.indexOf(u8, bad_role, "invalid capabilities") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing_compatibility, "adapter compatibility settings are invalid") != null);
+}
 
-    // Context needs a live session; history is local and never blocks on
-    // the server.
-    const ctx = app.dispatch(
-        \\{"id":"9","command":"oars.ai.context","payload":{"server_id":"ghost"}}
+test "ai context bridge is cache-only and admits work asynchronously" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    const cached = app.dispatch(
+        \\{"id":"1","command":"oars.ai.context.get","payload":{"server_id":"ghost"}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, ctx, "not connected") != null);
-    const hist_response = app.dispatch(
-        \\{"id":"10","command":"oars.ai.history","payload":{"server_id":"ghost","limit":10}}
+    try std.testing.expect(std.mem.indexOf(u8, cached, "\"state\":\"missing\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cached, "\"context\":null") != null);
+
+    // Admission returns a typed connection failure without waiting for SSH.
+    const refresh = app.dispatch(
+        \\{"id":"2","command":"oars.ai.context.refresh","payload":{"operation_id":"context-ghost-1","server_id":"ghost"}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, hist_response, "\"ok\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, hist_response, "\"runs\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refresh, "\"code\":\"not_connected\"") != null);
+
+    // The admitted operation remains pollable and carries the terminal event
+    // through a non-destructive versioned cursor.
+    const first_poll = app.dispatch(
+        \\{"id":"3","command":"oars.ai.context.poll","payload":{"operation_id":"context-ghost-1","cursor":0}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, first_poll, "\"finished\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_poll, "\"type\":\"context.failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_poll, "\"payload\":{\"code\":\"not_connected\"") != null);
+    const mirrored_poll = app.dispatch(
+        \\{"id":"4","command":"oars.ai.context.poll","payload":{"operation_id":"context-ghost-1","cursor":0}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, mirrored_poll, "\"type\":\"context.failed\"") != null);
 }
 
 test "vnc handlers require a session and validate payloads" {
@@ -2066,14 +2198,13 @@ test "spec 15: history record/list/replay and audit list/clear over the bridge" 
 
     // Audit: a mutating action writes a row; list shows it with filters.
     const set = app.dispatch(
-        \\{"id":"11","command":"oars.ai.provider.set","payload":{"provider":{"adapter":"openai_compatible","base_url":"https://api.openai.com/v1","model":"gpt-4o-mini","capabilities":{"instruction_role":"developer","streaming":true,"structured_output":true}}}}
+        \\{"id":"11","command":"oars.ai.provider.save","payload":{"operation_id":"provider-audit-save","provider":{"name":"OpenAI","adapter":"openai_responses","base_url":"https://api.openai.com/v1","model":"gpt-5"}}}
     );
     try std.testing.expect(std.mem.indexOf(u8, set, "\"ok\":true") != null);
     const audit_list = app.dispatch(
         \\{"id":"12","command":"oars.audit.list","payload":{}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, audit_list, "\"type\":\"ai.provider.set\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, audit_list, "\"target\":\"-\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_list, "\"type\":\"ai.provider.save\"") != null);
     const audit_typed = app.dispatch(
         \\{"id":"12","command":"oars.audit.list","payload":{"type":"ssh.exec"}}
     );
@@ -2081,7 +2212,7 @@ test "spec 15: history record/list/replay and audit list/clear over the bridge" 
     const audit_queried = app.dispatch(
         \\{"id":"13","command":"oars.audit.list","payload":{"q":"openai"}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, audit_queried, "ai.provider.set") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_queried, "ai.provider.save") != null);
 
     // Clear requires type-to-confirm; CLEAR empties the journal.
     const wrong = app.dispatch(

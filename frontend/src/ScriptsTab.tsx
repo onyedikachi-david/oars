@@ -110,6 +110,8 @@ export function ScriptsTab({
   statuses,
   onOpenServer,
   initialScriptId,
+  initialDraft,
+  onInitialDraftConsumed,
 }: {
   serverId: string | null;
   servers: Server[];
@@ -118,6 +120,9 @@ export function ScriptsTab({
   onOpenServer?: (serverId: string) => void;
   /** Command-palette entry point (spec 06): preselect this script. */
   initialScriptId?: string | null;
+  /** AI Terminal handoff: an unsaved exact command for user review. */
+  initialDraft?: ScriptDraft | null;
+  onInitialDraftConsumed?: () => void;
 }) {
   const [scripts, setScripts] = useState<Script[]>([]);
   const [q, setQ] = useState("");
@@ -200,6 +205,18 @@ export function ScriptsTab({
       setSelectedId(initialScriptId);
     }
   }, [initialScriptId, scripts]);
+
+  useEffect(() => {
+    if (!initialDraft) return;
+    setEditor({
+      ...initialDraft,
+      tags: [...initialDraft.tags],
+      variables: initialDraft.variables.map((variable) => ({ ...variable })),
+    });
+    setEditorError(null);
+    setEditorValidation(null);
+    onInitialDraftConsumed?.();
+  }, [initialDraft, onInitialDraftConsumed]);
 
   // Every timer and prepared/run record is owned by this view. Server
   // changes and unmounts release them so no quota or channel is orphaned.

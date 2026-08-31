@@ -62,11 +62,24 @@ import type {
   BackupSaveAdmission,
   BackupStatusResult,
   BackupTestPlanResult,
-  AiContextBundle,
-  AiProviderGetResult,
-  AiProviderSetResult,
-  AiProviderInput,
-  AiHistoryResult,
+  AiContextEvent,
+  AiContextGetResult,
+  AiContextOperationState,
+  AiCredentialConfigureStatus,
+  AiCredentialStatusResult,
+  AiEventPoll,
+  AiOperationAdmission,
+  AiProviderDraft,
+  AiProviderListResult,
+  AiProviderSaveResult,
+  AiProviderTestEvent,
+  AiProviderTestOperationState,
+  AiThreadGetResult,
+  AiThreadListResult,
+  AiTurnAdmission,
+  AiTurnEvent,
+  AiExecutionAdmission,
+  AiProposal,
   HistoryEntry,
   HistoryRecordInput,
   HistoryListFilter,
@@ -595,17 +608,82 @@ export const api = {
       invoke<BackupOperationAdmission>("oars.backup.install", payload),
   },
   ai: {
-    context: (serverId: string) =>
-      invoke<AiContextBundle>("oars.ai.context", { server_id: serverId }),
-    providerGet: () =>
-      invoke<AiProviderGetResult>("oars.ai.provider.get", {}),
-    providerSet: (provider: AiProviderInput) =>
-      invoke<AiProviderSetResult>("oars.ai.provider.set", { provider }),
-    history: (serverId?: string, limit?: number) =>
-      invoke<AiHistoryResult>("oars.ai.history", {
-        ...(serverId ? { server_id: serverId } : {}),
-        ...(limit !== undefined ? { limit } : {}),
+    providerList: () => invoke<AiProviderListResult>("oars.ai.provider.list", {}),
+    providerSave: (operationId: string, provider: AiProviderDraft, expectedRevision?: number) =>
+      invoke<AiProviderSaveResult>("oars.ai.provider.save", {
+        operation_id: operationId,
+        provider,
+        ...(expectedRevision === undefined ? {} : { expected_revision: expectedRevision }),
       }),
+    providerDelete: (operationId: string, providerId: string, expectedRevision: number) =>
+      invoke<{ ok: true }>("oars.ai.provider.delete", {
+        operation_id: operationId,
+        provider_id: providerId,
+        expected_revision: expectedRevision,
+      }),
+    providerTest: (operationId: string, providerId: string, expectedRevision: number) =>
+      invoke<AiOperationAdmission<AiProviderTestOperationState>>("oars.ai.provider.test", {
+        operation_id: operationId,
+        provider_id: providerId,
+        expected_revision: expectedRevision,
+      }),
+    providerTestPoll: (operationId: string, cursor = 0, rewind = false) =>
+      invoke<AiEventPoll<AiProviderTestEvent>>("oars.ai.provider.testPoll", { operation_id: operationId, cursor, rewind }),
+    providerTestCancel: (operationId: string) =>
+      invoke<{ ok: true; state: AiProviderTestOperationState }>("oars.ai.provider.testCancel", { operation_id: operationId }),
+    credentialConfigure: (operationId: string, providerId: string) =>
+      invoke<AiCredentialStatusResult<AiCredentialConfigureStatus>>("oars.ai.credential.configure", {
+        operation_id: operationId,
+        provider_id: providerId,
+      }),
+    credentialStatus: (providerId: string) =>
+      invoke<AiCredentialStatusResult>("oars.ai.credential.status", { provider_id: providerId }),
+    credentialDelete: (operationId: string, providerId: string) =>
+      invoke<AiCredentialStatusResult>("oars.ai.credential.delete", {
+        operation_id: operationId,
+        provider_id: providerId,
+      }),
+    contextGet: (serverId: string) => invoke<AiContextGetResult>("oars.ai.context.get", { server_id: serverId }),
+    contextRefresh: (operationId: string, serverId: string) =>
+      invoke<AiOperationAdmission<AiContextOperationState>>("oars.ai.context.refresh", { operation_id: operationId, server_id: serverId }),
+    contextPoll: (operationId: string, cursor = 0, rewind = false) =>
+      invoke<AiEventPoll<AiContextEvent>>("oars.ai.context.poll", { operation_id: operationId, cursor, rewind }),
+    contextCancel: (operationId: string) =>
+      invoke<{ ok: true; state: AiContextOperationState }>("oars.ai.context.cancel", { operation_id: operationId }),
+    threadList: (serverId?: string, limit = 20) =>
+      invoke<AiThreadListResult>("oars.ai.thread.list", {
+        ...(serverId === undefined ? {} : { server_id: serverId }),
+        limit,
+      }),
+    threadGet: (threadId: string) => invoke<AiThreadGetResult>("oars.ai.thread.get", { thread_id: threadId }),
+    threadDelete: (operationId: string, threadId: string, expectedRevision: number) =>
+      invoke<{ ok: true }>("oars.ai.thread.delete", { operation_id: operationId, thread_id: threadId, expected_revision: expectedRevision }),
+    turnStart: (payload: {
+      operation_id: string;
+      thread_id?: string;
+      server_id: string;
+      provider_id: string;
+      expected_provider_revision: number;
+      message: string;
+      context_selection: { os: boolean; monitor: boolean; log?: { source_id: string; tail_bytes: number } };
+    }) => invoke<AiTurnAdmission>("oars.ai.turn.start", payload),
+    turnPoll: (turnId: string, cursor = 0, rewind = false) =>
+      invoke<AiEventPoll<AiTurnEvent>>("oars.ai.turn.poll", { turn_id: turnId, cursor, rewind }),
+    turnCancel: (turnId: string) => invoke<{ ok: true; state: string }>("oars.ai.turn.cancel", { turn_id: turnId }),
+    turnSummarize: (payload: { operation_id: string; thread_id: string; execution_id: string; output_selection: { start_cursor: number; end_cursor: number } }) =>
+      invoke<AiTurnAdmission>("oars.ai.turn.summarize", payload),
+    proposalEdit: (operationId: string, proposalId: string, expectedRevision: number, command: string) =>
+      invoke<{ ok: true; proposal: AiProposal }>("oars.ai.proposal.edit", { operation_id: operationId, proposal_id: proposalId, expected_revision: expectedRevision, command }),
+    proposalRun: (operationId: string, proposalId: string, expectedRevision: number, commandSha256: string, destructiveWarningAck: boolean) =>
+      invoke<AiExecutionAdmission>("oars.ai.proposal.run", {
+        operation_id: operationId,
+        proposal_id: proposalId,
+        expected_revision: expectedRevision,
+        command_sha256: commandSha256,
+        destructive_warning_ack: destructiveWarningAck,
+      }),
+    proposalCancel: (operationId: string, proposalId: string, expectedRevision: number) =>
+      invoke<{ ok: true; state: "canceled" }>("oars.ai.proposal.cancel", { operation_id: operationId, proposal_id: proposalId, expected_revision: expectedRevision }),
   },
   vnc: {
     start: (serverId: string, opts?: { host?: string; port?: number }) =>

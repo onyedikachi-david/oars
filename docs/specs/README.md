@@ -21,7 +21,7 @@ already exists.
 | 08 | [SSH Management](08-ssh-management.md) | Partial: corrected worker-driven management, guarded mutations, staged rotation, fail-closed roles, deploy keys, UI, and Docker evidence land; required desktop/narrow in-app browser review remains unavailable |
 | 09 | [Access Management](09-access.md) | Partial: typed app-level UI, worker-driven jobs, strict mutations, and atomic exports exist; effective per-account OpenSSH sources, expiry, independent per-server target/role selection, and complete two-server integration evidence remain |
 | 10 | [Backups](10-backups.md) | ✅ v1 frontend + backend implemented: planned S3 jobs, exact capability proof, hard cancellation, disconnected cron import, durable recovery, Keychain flow, typed UI |
-| 11 | [AI Terminal](11-ai-terminal.md) | 📋 |
+| 11 | [AI Terminal](11-ai-terminal.md) | Partial: native provider and credential boundaries, durable turns and proposals, exact tracked SSH execution, cancellation, typed React workflow, and deterministic browser fixtures land; live providers, real credential stores, forced restart, and final accessibility evidence remain |
 | 12 | [Remote Desktop (VNC)](12-vnc.md) | ✅ v1 frontend + backend implemented |
 | 13 | [Command Palette & Keyboard UX](13-command-palette.md) | 📋 (Oars+) |
 | 14 | [Server Groups & Fleet Views](14-groups.md) | ✅ backend in (UI pending): group/tags validation + normalization on `servers.save` (one-level path rule, case-insensitive dedupe) |
@@ -29,6 +29,7 @@ already exists.
 | 16 | [Themes & Terminal Appearance](16-themes.md) | 📋 (Oars+) |
 | 17 | [Export / Import (Vault)](17-export-import.md) | ✅ backend in (UI pending): AES-256-GCM vault + plain JSON export/import, merge preview, credential-binding conflicts, atomic write-back |
 | 18 | [SSH Agent & Jump Hosts](18-agent-jump-hosts.md) | 📋 (Oars+) |
+| 19 | [Conversational AI and Reviewed Tools](19-ai-chat-tools.md) | Partial: normal assistant messages and the chat projection are in progress; native provider tool-call parsing, result continuation, and final integration evidence remain |
 
 ## Template used by every spec
 

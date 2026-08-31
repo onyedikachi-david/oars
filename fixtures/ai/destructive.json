@@ -1,0 +1,16 @@
+[
+  { "command": "uname -a", "destructive": false },
+  { "command": "df -h", "destructive": false },
+  { "command": "systemctl status nginx", "destructive": false },
+  { "command": "journalctl -n 100 --no-pager", "destructive": false },
+  { "command": "rm -rf /var/cache/example", "destructive": true },
+  { "command": "sudo apt remove nginx", "destructive": true },
+  { "command": "dnf purge example", "destructive": true },
+  { "command": "mkfs.ext4 /dev/sdb1", "destructive": true },
+  { "command": "dd if=/dev/zero of=/dev/sdb", "destructive": true },
+  { "command": "shutdown -h now", "destructive": true },
+  { "command": "sudo reboot", "destructive": true },
+  { "command": "kill -9 1234", "destructive": true },
+  { "command": "chmod -R 777 /srv/app", "destructive": true },
+  { "command": "chown -R root:root /srv/app", "destructive": true }
+]

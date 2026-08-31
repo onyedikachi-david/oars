@@ -1,15 +1,8 @@
-//! AI Terminal (spec 11) backend: provider config storage and the server
-//! context bundle.
+//! AI Terminal (spec 11) native backend.
 //!
-//! The AI call itself is frontend-side (spec 11 §6: Zig adds only
-//! `oars.ai.context` and history filtering). This module provides:
-//!   - the provider store (`<data>/ai.json`: adapter, base URL, model,
-//!     explicit capabilities — never the API key, which lives in the
-//!     frontend Keychain under `ai:<base_url>`),
-//!   - the context probe command + parser (OS, hostname, and per-source
-//!     log mtimes; the monitor snapshot is composed by the bridge
-//!     handler from the spec 03 cache),
-//!   - the ≤ 5 s per-server context cache.
+//! Provider requests, credentials, durable turns, proposals, and approved
+//! SSH execution stay in the native process. This root module also owns the
+//! light server-context probe helpers used by the asynchronous context worker.
 //!
 //! The probe is marker-delimited like the monitor probe (spec 03) and
 //! the logs scan (spec 04): `%BEGIN_OS%` (PRETTY_NAME with a `uname -sr`
@@ -19,233 +12,45 @@
 
 const std = @import("std");
 const shellquote = @import("shellquote.zig");
+const monitor = @import("monitor.zig");
 
-pub const max_base_url_len = 512;
-pub const max_model_len = 256;
-pub const max_adapter_len = 32;
-/// The context probe result is cached per server for 5 s (spec 11 §5).
-pub const context_cache_ttl_ns: i128 = 5 * std.time.ns_per_s;
-/// Servers with a cached probe result (a small ring; evicts oldest).
-pub const max_cached_servers = 16;
+pub const types = @import("ai/types.zig");
+pub const provider_domain = @import("ai/provider.zig");
+pub const credentials = @import("ai/credentials.zig");
+pub const sse = @import("ai/sse.zig");
+pub const proposal = @import("ai/proposal.zig");
+pub const responses = @import("ai/responses.zig");
+pub const chat = @import("ai/chat.zig");
+pub const transport = @import("ai/transport.zig");
+pub const events = @import("ai/events.zig");
+pub const context = @import("ai/context.zig");
+pub const provider_test = @import("ai/provider_test.zig");
+pub const journal = @import("ai/journal.zig");
+pub const request_slots = @import("ai/request_slots.zig");
+pub const coordinator = @import("ai/coordinator.zig");
+
+comptime {
+    _ = types;
+    _ = provider_domain;
+    _ = credentials;
+    _ = sse;
+    _ = proposal;
+    _ = responses;
+    _ = chat;
+    _ = transport;
+    _ = events;
+    _ = context;
+    _ = provider_test;
+    _ = journal;
+    _ = request_slots;
+    _ = coordinator;
+}
+
 /// The bundle carries at most this many log sources (most recently
 /// written first — the spec's "defaults to the most recently active").
 pub const max_active_logs = 10;
-pub const history_default_limit: usize = 20;
-pub const history_max_limit: usize = 100;
 /// Exec audit detail is capped so a huge command cannot bloat the line.
 pub const audit_cmd_cap = 120;
-
-// --- provider config ------------------------------------------------------
-
-pub const Adapter = enum(u8) {
-    /// Chat Completions baseline with reviewed defaults (spec 11 §13).
-    openai_compatible,
-    /// User picks role/streaming/structured-output explicitly.
-    custom,
-
-    pub fn jsonName(self: Adapter) []const u8 {
-        return @tagName(self);
-    }
-
-    pub fn fromJsonName(name: []const u8) ?Adapter {
-        if (std.mem.eql(u8, name, "openai_compatible")) return .openai_compatible;
-        if (std.mem.eql(u8, name, "custom")) return .custom;
-        return null;
-    }
-};
-
-pub const Capabilities = struct {
-    /// `developer` (OpenAI-style) or `system` — never assumed (spec 11
-    /// §13: compatible providers differ).
-    instruction_role: []const u8 = "system",
-    streaming: bool = true,
-    structured_output: bool = false,
-};
-
-pub const Provider = struct {
-    adapter: Adapter,
-    base_url: []const u8,
-    model: []const u8,
-    capabilities: Capabilities = .{},
-    updated_at_ns: i64 = 0,
-
-    pub fn deinit(self: *Provider, allocator: std.mem.Allocator) void {
-        // Validated non-empty (validate()); free unconditionally is safe.
-        allocator.free(self.base_url);
-        allocator.free(self.model);
-        allocator.free(self.capabilities.instruction_role);
-    }
-};
-
-pub const ProviderInput = struct {
-    adapter: []const u8,
-    base_url: []const u8,
-    model: []const u8,
-    capabilities: Capabilities = .{},
-};
-
-pub const SaveError = error{
-    InvalidAdapter,
-    InvalidBaseUrl,
-    InvalidModel,
-    InvalidCapabilities,
-    StoreCorrupt,
-    SerializeFailed,
-    OutOfMemory,
-};
-
-fn hasControlChars(s: []const u8) bool {
-    for (s) |ch| {
-        if (ch == 0 or ch < 0x20 or ch == 0x7f) return true;
-    }
-    return false;
-}
-
-/// HTTPS always; plain HTTP only for loopback hosts (a user-chosen local
-/// model server — spec 11 §5: "HTTPS is required except for
-/// user-approved loopback URLs").
-pub fn validBaseUrl(url: []const u8) bool {
-    if (url.len == 0 or url.len > max_base_url_len) return false;
-    if (hasControlChars(url)) return false;
-    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return false;
-    const scheme = url[0..scheme_end];
-    const rest = url[scheme_end + 3 ..];
-    if (rest.len == 0) return false;
-    if (std.mem.eql(u8, scheme, "https")) return true;
-    if (!std.mem.eql(u8, scheme, "http")) return false;
-    const host_end = std.mem.indexOfAny(u8, rest, "/:") orelse rest.len;
-    var host = rest[0..host_end];
-    if (host.len > 0 and host[0] == '[') {
-        // Bracketed IPv6: the split at ':' lands inside the brackets.
-        const close = std.mem.indexOfScalar(u8, rest, ']') orelse return false;
-        host = rest[0 .. close + 1];
-    }
-    return std.mem.eql(u8, host, "localhost") or
-        std.mem.eql(u8, host, "127.0.0.1") or
-        std.mem.eql(u8, host, "[::1]") or
-        std.mem.eql(u8, host, "::1");
-}
-
-pub fn validate(input: ProviderInput) SaveError!void {
-    if (Adapter.fromJsonName(input.adapter) == null) return error.InvalidAdapter;
-    const base_url = std.mem.trim(u8, input.base_url, " \t\r\n");
-    if (!validBaseUrl(base_url)) return error.InvalidBaseUrl;
-    const model = std.mem.trim(u8, input.model, " \t\r\n");
-    if (model.len == 0 or model.len > max_model_len or hasControlChars(model)) return error.InvalidModel;
-    const role = input.capabilities.instruction_role;
-    if (!std.mem.eql(u8, role, "developer") and !std.mem.eql(u8, role, "system")) return error.InvalidCapabilities;
-}
-
-/// The persisted provider config — one JSON object (or `null`), no key.
-pub const ProviderStore = struct {
-    allocator: std.mem.Allocator = undefined,
-    path: []const u8 = "",
-    mutex: std.atomic.Mutex = .unlocked,
-
-    pub const Loaded = struct {
-        parsed: std.json.Parsed(?Provider),
-        content: ?[]u8,
-        quarantined: ?[]const u8 = null,
-
-        pub fn deinit(self: *Loaded, allocator: std.mem.Allocator) void {
-            self.parsed.deinit();
-            if (self.content) |c| allocator.free(c);
-            if (self.quarantined) |q| allocator.free(q);
-        }
-    };
-
-    pub fn get(self: *ProviderStore, io: std.Io) !?Provider {
-        lockSpin(&self.mutex);
-        defer self.mutex.unlock();
-        var loaded = self.loadLocked(io) catch return error.StoreCorrupt;
-        defer loaded.deinit(self.allocator);
-        const p = loaded.parsed.value orelse return null;
-        return try cloneProvider(self.allocator, p);
-    }
-
-    pub fn set(self: *ProviderStore, io: std.Io, input: ProviderInput, now_ns: i64) SaveError!Provider {
-        try validate(input);
-        lockSpin(&self.mutex);
-        defer self.mutex.unlock();
-        const adapter = Adapter.fromJsonName(input.adapter) orelse return error.InvalidAdapter;
-        const base_url = std.mem.trim(u8, input.base_url, " \t\r\n");
-        const model = std.mem.trim(u8, input.model, " \t\r\n");
-        var saved = Provider{
-            .adapter = adapter,
-            .base_url = try self.allocator.dupe(u8, base_url),
-            .model = try self.allocator.dupe(u8, model),
-            .capabilities = .{
-                .instruction_role = try self.allocator.dupe(u8, input.capabilities.instruction_role),
-                .streaming = input.capabilities.streaming,
-                .structured_output = input.capabilities.structured_output,
-            },
-            .updated_at_ns = now_ns,
-        };
-        errdefer saved.deinit(self.allocator);
-        self.saveLocked(io, &saved) catch return error.SerializeFailed;
-        return saved;
-    }
-
-    fn cloneProvider(allocator: std.mem.Allocator, p: Provider) !Provider {
-        return .{
-            .adapter = p.adapter,
-            .base_url = try allocator.dupe(u8, p.base_url),
-            .model = try allocator.dupe(u8, p.model),
-            .capabilities = .{
-                .instruction_role = try allocator.dupe(u8, p.capabilities.instruction_role),
-                .streaming = p.capabilities.streaming,
-                .structured_output = p.capabilities.structured_output,
-            },
-            .updated_at_ns = p.updated_at_ns,
-        };
-    }
-
-    fn loadLocked(self: *ProviderStore, io: std.Io) !Loaded {
-        const cwd = std.Io.Dir.cwd();
-        const content = cwd.readFileAlloc(io, self.path, self.allocator, .limited(1024 * 1024)) catch {
-            // No store yet — an absent config is `null`, not corruption.
-            return .{
-                .parsed = try std.json.parseFromSlice(?Provider, self.allocator, "null", .{}),
-                .content = null,
-            };
-        };
-        const parsed = std.json.parseFromSlice(?Provider, self.allocator, content, .{}) catch {
-            self.allocator.free(content);
-            var loaded = Loaded{
-                .parsed = try std.json.parseFromSlice(?Provider, self.allocator, "null", .{}),
-                .content = null,
-            };
-            loaded.quarantined = self.quarantine(io) catch null;
-            return loaded;
-        };
-        return .{ .parsed = parsed, .content = content };
-    }
-
-    fn quarantine(self: *ProviderStore, io: std.Io) !?[]const u8 {
-        const now = std.Io.Timestamp.now(io, .real).nanoseconds;
-        var buf: [512]u8 = undefined;
-        const dir = std.fs.path.dirname(self.path) orelse return null;
-        const base = std.fs.path.basename(self.path);
-        const new_path = try std.fmt.bufPrint(&buf, "{s}/{s}.corrupt-{d}", .{ dir, base, now });
-        std.Io.Dir.renameAbsolute(self.path, new_path, io) catch return null;
-        return try self.allocator.dupe(u8, new_path);
-    }
-
-    fn saveLocked(self: *ProviderStore, io: std.Io, p: *const Provider) !void {
-        const cwd = std.Io.Dir.cwd();
-        if (std.fs.path.dirname(self.path)) |dir| try cwd.createDirPath(io, dir);
-        var out: std.Io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        std.json.Stringify.value(p, .{ .whitespace = .indent_2 }, &out.writer) catch return error.SerializeFailed;
-        var file = try cwd.createFile(io, self.path, .{});
-        defer file.close(io);
-        if (file.stat(io)) |stat| {
-            if (stat.permissions.toMode() & 0o077 != 0) file.setPermissions(io, .fromMode(0o600)) catch {};
-        } else |_| {}
-        try file.writeStreamingAll(io, out.writer.buffered());
-        try file.sync(io);
-    }
-};
 
 // --- context bundle probe -------------------------------------------------
 
@@ -262,8 +67,9 @@ pub const ProbeParse = struct {
     logs: []const LogProbe = &.{},
 };
 
-/// One exec: OS identity, hostname, and a `stat` per configured log
-/// source. Busybox-compatible (`stat -c '%Y %n'`, `grep -m1`, /proc).
+/// One exec: OS identity, hostname, monitor facts, and a `stat` per
+/// configured log source. The AI context does not depend on the Monitor tab
+/// having populated its separate on-demand cache first.
 pub fn buildProbeCommand(allocator: std.mem.Allocator, log_paths: []const []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -274,7 +80,8 @@ pub fn buildProbeCommand(allocator: std.mem.Allocator, log_paths: []const []cons
         try out.append(allocator, ' ');
         try out.appendSlice(allocator, q);
     }
-    try out.appendSlice(allocator, "; do stat -c '%Y %n' \"$p\" 2>/dev/null; done; true");
+    try out.appendSlice(allocator, "; do stat -c '%Y %n' \"$p\" 2>/dev/null; done; true; ");
+    try out.appendSlice(allocator, monitor.probe_command);
     return out.toOwnedSlice(allocator);
 }
 
@@ -304,6 +111,10 @@ pub fn parseProbeOutput(allocator: std.mem.Allocator, text: []const u8) !ProbePa
         }
         if (std.mem.eql(u8, trimmed, "%BEGIN_LOGS%")) {
             section = .logs;
+            continue;
+        }
+        if (std.mem.startsWith(u8, trimmed, "%BEGIN_") and std.mem.endsWith(u8, trimmed, "%")) {
+            section = .none;
             continue;
         }
         if (trimmed.len == 0) continue;
@@ -369,200 +180,47 @@ pub fn buildActiveLogs(
     return out.toOwnedSlice(allocator);
 }
 
-// --- per-server context cache (≤ 5 s) -------------------------------------
-
-pub const ContextCache = struct {
-    allocator: std.mem.Allocator = undefined,
-    mutex: std.atomic.Mutex = .unlocked,
-    entries: std.ArrayList(CacheEntry) = .empty,
-
-    pub const CacheEntry = struct {
-        server_id: []const u8,
-        os: []const u8,
-        hostname: []const u8,
-        active_logs: []LogInfo,
-        ts_ns: i128 = 0,
-
-        pub fn deinit(self: *CacheEntry, allocator: std.mem.Allocator) void {
-            if (self.server_id.len > 0) allocator.free(self.server_id);
-            if (self.os.len > 0) allocator.free(self.os);
-            if (self.hostname.len > 0) allocator.free(self.hostname);
-            for (self.active_logs) |*l| l.deinit(allocator);
-            allocator.free(self.active_logs);
-        }
-    };
-
-    /// Fresh entry for the server, or null (missing or older than 5 s).
-    /// The pointer stays valid until the next `put` — bridge handlers
-    /// run on one thread.
-    pub fn fresh(self: *ContextCache, server_id: []const u8, now_ns: i128) ?*CacheEntry {
-        lockSpin(&self.mutex);
-        defer self.mutex.unlock();
-        for (self.entries.items) |*e| {
-            if (std.mem.eql(u8, e.server_id, server_id)) {
-                if (now_ns - e.ts_ns < context_cache_ttl_ns) return e;
-                return null;
-            }
-        }
-        return null;
-    }
-
-    /// Takes ownership of `entry`: replaces the server's previous entry,
-    /// or evicts the oldest when at capacity.
-    pub fn put(self: *ContextCache, entry: CacheEntry) !void {
-        lockSpin(&self.mutex);
-        defer self.mutex.unlock();
-        for (self.entries.items, 0..) |*e, i| {
-            if (std.mem.eql(u8, e.server_id, entry.server_id)) {
-                var old = self.entries.items[i];
-                self.entries.items[i] = entry;
-                old.deinit(self.allocator);
-                return;
-            }
-        }
-        if (self.entries.items.len >= max_cached_servers) {
-            var oldest: usize = 0;
-            for (self.entries.items, 0..) |*e, i| {
-                if (e.ts_ns < self.entries.items[oldest].ts_ns) oldest = i;
-            }
-            var removed = self.entries.orderedRemove(oldest);
-            removed.deinit(self.allocator);
-        }
-        try self.entries.append(self.allocator, entry);
-    }
-
-    pub fn deinit(self: *ContextCache) void {
-        for (self.entries.items) |*e| e.deinit(self.allocator);
-        self.entries.deinit(self.allocator);
-    }
-};
-
 // --- registry -------------------------------------------------------------
 
 pub const Registry = struct {
     allocator: std.mem.Allocator,
-    provider: ProviderStore = .{},
-    cache: ContextCache = .{},
+    providers: provider_domain.Store = .{},
+    journal_store: journal.Store = undefined,
+    request_limiter: request_slots.Limiter = .{},
+    credential_facade: credentials.Facade = .{},
+    context_ops: context.Registry = undefined,
+    provider_tests: ?provider_test.Registry = null,
+    turns: ?coordinator.Registry = null,
 
-    pub fn init(allocator: std.mem.Allocator, provider_path: []const u8) Registry {
+    pub fn init(allocator: std.mem.Allocator, provider_path: []const u8, journal_path: []const u8) Registry {
         return .{
             .allocator = allocator,
-            .provider = .{ .allocator = allocator, .path = provider_path },
-            .cache = .{ .allocator = allocator },
+            .providers = .{ .allocator = allocator, .path = provider_path },
+            .journal_store = .{ .allocator = allocator, .path = journal_path },
+            .context_ops = .{ .allocator = allocator },
         };
     }
 
+    pub fn startProviderTests(self: *Registry, io: std.Io) void {
+        if (self.provider_tests == null) self.provider_tests = provider_test.Registry.init(self.allocator, io, &self.providers, &self.request_limiter);
+        if (self.turns == null) self.turns = coordinator.Registry.init(self.allocator, io, &self.providers, &self.journal_store, &self.request_limiter);
+    }
+
+    pub fn stopProviderTests(self: *Registry) void {
+        if (self.provider_tests) |*tests| tests.deinit();
+        self.provider_tests = null;
+        if (self.turns) |*turns| turns.deinit();
+        self.turns = null;
+    }
+
     pub fn deinit(self: *Registry) void {
-        self.cache.deinit();
+        self.stopProviderTests();
+        self.journal_store.deinit();
+        self.context_ops.deinit();
     }
 };
 
-fn lockSpin(m: *std.atomic.Mutex) void {
-    while (!m.tryLock()) std.atomic.spinLoopHint();
-}
-
 // --- unit tests -----------------------------------------------------------
-
-test "base URL validation: https always, http only on loopback" {
-    try std.testing.expect(validBaseUrl("https://api.openai.com/v1"));
-    try std.testing.expect(validBaseUrl("https://127.0.0.1:8443/v1"));
-    try std.testing.expect(validBaseUrl("http://localhost:11434/v1"));
-    try std.testing.expect(validBaseUrl("http://127.0.0.1:8000"));
-    try std.testing.expect(validBaseUrl("http://[::1]:8080"));
-    try std.testing.expect(!validBaseUrl("http://::1:8080")); // bare IPv6 is not a URI
-    try std.testing.expect(!validBaseUrl("http://example.com/v1"));
-    try std.testing.expect(!validBaseUrl("http://10.0.0.5/v1"));
-    try std.testing.expect(!validBaseUrl("ftp://example.com"));
-    try std.testing.expect(!validBaseUrl("api.openai.com/v1"));
-    try std.testing.expect(!validBaseUrl("https://"));
-    try std.testing.expect(!validBaseUrl("https://api.openai.com/v1\n"));
-    try std.testing.expect(!validBaseUrl(""));
-}
-
-test "provider validation rejects bad adapters, models, and roles" {
-    const good = ProviderInput{
-        .adapter = "openai_compatible",
-        .base_url = "https://api.openai.com/v1",
-        .model = "gpt-4o-mini",
-    };
-    try validate(good);
-
-    var bad_adapter = good;
-    bad_adapter.adapter = "claude";
-    try std.testing.expectError(error.InvalidAdapter, validate(bad_adapter));
-
-    var bad_url = good;
-    bad_url.base_url = "http://evil.example/v1";
-    try std.testing.expectError(error.InvalidBaseUrl, validate(bad_url));
-
-    var bad_model = good;
-    bad_model.model = "  ";
-    try std.testing.expectError(error.InvalidModel, validate(bad_model));
-
-    var bad_role = good;
-    bad_role.capabilities.instruction_role = "assistant";
-    try std.testing.expectError(error.InvalidCapabilities, validate(bad_role));
-
-    var custom = good;
-    custom.adapter = "custom";
-    custom.capabilities = .{ .instruction_role = "developer", .streaming = false, .structured_output = true };
-    try validate(custom);
-}
-
-test "provider store round trip: set, get, replace, no secrets, quarantine" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var dir_buf: [160]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/oars-ai-itest-{d}", .{std.Io.Timestamp.now(io, .real).nanoseconds});
-    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
-    var path_buf: [200]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/ai.json", .{dir});
-    var store = ProviderStore{ .allocator = allocator, .path = path };
-
-    try std.testing.expect((try store.get(io)) == null); // absent config
-
-    var saved = try store.set(io, .{
-        .adapter = "openai_compatible",
-        .base_url = "https://api.openai.com/v1",
-        .model = "gpt-4o-mini",
-    }, 1000);
-    defer saved.deinit(allocator);
-    try std.testing.expectEqualStrings("openai_compatible", saved.adapter.jsonName());
-    try std.testing.expectEqualStrings("gpt-4o-mini", saved.model);
-    try std.testing.expectEqual(@as(i64, 1000), saved.updated_at_ns);
-
-    var got = (try store.get(io)).?;
-    defer got.deinit(allocator);
-    try std.testing.expectEqualStrings("https://api.openai.com/v1", got.base_url);
-    try std.testing.expectEqualStrings("system", got.capabilities.instruction_role);
-
-    // Replace preserves nothing stale and moves updated_at forward.
-    var replaced = try store.set(io, .{
-        .adapter = "custom",
-        .base_url = "http://localhost:11434/v1",
-        .model = "llama3",
-        .capabilities = .{ .instruction_role = "developer", .streaming = false, .structured_output = true },
-    }, 2000);
-    defer replaced.deinit(allocator);
-    var got2 = (try store.get(io)).?;
-    defer got2.deinit(allocator);
-    try std.testing.expectEqualStrings("http://localhost:11434/v1", got2.base_url);
-    try std.testing.expectEqual(.custom, got2.adapter);
-    try std.testing.expect(!got2.capabilities.streaming);
-    try std.testing.expectEqual(@as(i64, 2000), got2.updated_at_ns);
-
-    // The persisted file is config only — key material never appears.
-    const content = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 * 1024));
-    defer allocator.free(content);
-    try std.testing.expect(std.mem.indexOf(u8, content, "sk-") == null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "\"adapter\"") != null);
-
-    // A corrupt file is quarantined (renamed away) and reads back as absent.
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "{corrupt" });
-    try std.testing.expect((try store.get(io)) == null);
-    const gone = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024)) catch |err| err;
-    try std.testing.expect(gone == error.FileNotFound);
-}
 
 test "probe command quotes log paths and is busybox-shaped" {
     const allocator = std.testing.allocator;
@@ -572,9 +230,10 @@ test "probe command quotes log paths and is busybox-shaped" {
     try std.testing.expect(std.mem.indexOf(u8, cmd, "%BEGIN_OS%") != null);
     try std.testing.expect(std.mem.indexOf(u8, cmd, "%BEGIN_HOSTNAME%") != null);
     try std.testing.expect(std.mem.indexOf(u8, cmd, "%BEGIN_LOGS%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "%BEGIN_DF%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "%BEGIN_PS%") != null);
     try std.testing.expect(std.mem.indexOf(u8, cmd, "'/var/log/nginx/access.log'") != null);
     try std.testing.expect(std.mem.indexOf(u8, cmd, "'/var/log/my app.log'") != null);
-    try std.testing.expect(std.mem.endsWith(u8, cmd, "done; true"));
 }
 
 test "probe output parses os, hostname, and log mtimes (views)" {
@@ -592,6 +251,13 @@ test "probe output parses os, hostname, and log mtimes (views)" {
     try std.testing.expectEqualStrings("/var/log/nginx/access.log", parsed.logs[0].path); // output order preserved
     try std.testing.expectEqual(@as(u64, 1754000000), parsed.logs[0].last_write);
     try std.testing.expectEqualStrings("/var/log/my app.log", parsed.logs[1].path); // space survives
+
+    const with_monitor =
+        "%BEGIN_LOGS%\n1754000000 /var/log/nginx/access.log\n" ++
+        "%BEGIN_PS%\n1234 node 2.2 3.3\n";
+    const parsed_with_monitor = try parseProbeOutput(allocator, with_monitor);
+    defer allocator.free(parsed_with_monitor.logs);
+    try std.testing.expectEqual(@as(usize, 1), parsed_with_monitor.logs.len);
     try std.testing.expectEqual(@as(u64, 1753999900), parsed.logs[1].last_write);
 
     // uname fallback and garbage lines.
@@ -630,50 +296,4 @@ test "active logs filter to configured sources, newest first, capped" {
         allocator.free(none);
     }
     try std.testing.expectEqual(@as(usize, 0), none.len);
-}
-
-test "context cache: fresh hit, ttl expiry, replacement, eviction" {
-    const allocator = std.testing.allocator;
-    var cache = ContextCache{ .allocator = allocator };
-    defer cache.deinit();
-
-    try std.testing.expect(cache.fresh("s1", 1000) == null);
-
-    const e1 = ContextCache.CacheEntry{
-        .server_id = try allocator.dupe(u8, "s1"),
-        .os = try allocator.dupe(u8, "Alpine"),
-        .hostname = try allocator.dupe(u8, "box"),
-        .active_logs = &.{},
-        .ts_ns = 1000,
-    };
-    try cache.put(e1);
-    try std.testing.expect(cache.fresh("s1", 1001) != null);
-    try std.testing.expectEqualStrings("Alpine", cache.fresh("s1", 1001).?.os);
-    try std.testing.expect(cache.fresh("s1", 1000 + 5 * std.time.ns_per_s + 1) == null); // expired
-
-    // Replacement frees the old entry (leak-checked by the allocator).
-    const e2 = ContextCache.CacheEntry{
-        .server_id = try allocator.dupe(u8, "s1"),
-        .os = try allocator.dupe(u8, "Debian"),
-        .hostname = "",
-        .active_logs = &.{},
-        .ts_ns = 10_000,
-    };
-    try cache.put(e2);
-    try std.testing.expectEqualStrings("Debian", cache.fresh("s1", 10_001).?.os);
-
-    // Eviction: fill past capacity, oldest goes.
-    var i: usize = 0;
-    while (i < max_cached_servers + 2) : (i += 1) {
-        var id_buf: [16]u8 = undefined;
-        const id = try std.fmt.bufPrint(&id_buf, "s{d}", .{i + 10});
-        try cache.put(.{
-            .server_id = try allocator.dupe(u8, id),
-            .os = "",
-            .hostname = "",
-            .active_logs = &.{},
-            .ts_ns = 20_000 + @as(i128, @intCast(i)),
-        });
-    }
-    try std.testing.expectEqual(@as(usize, max_cached_servers), cache.entries.items.len);
 }
