@@ -2135,16 +2135,21 @@ const FakeRunner = struct {
     document: []const u8 = "{\"kind\":\"command\",\"command\":\"uname -s\",\"question\":null,\"explanation\":\"Read the kernel name.\",\"destructive\":false,\"needs_sudo\":false}",
     failure: ?anyerror = null,
 
-    fn run(context: ?*anyopaque, allocator: std.mem.Allocator, _: std.Io, _: *const provider.Public, secret: *const credentials.SecretBuffer, _: []const u8, _: []const u8, context_json: []const u8, _: []const u8, _: *transport.Cancellation, _: transport.Observer) anyerror!RunOutput {
+    fn run(context: ?*anyopaque, allocator: std.mem.Allocator, _: std.Io, selected: *const provider.Public, secret: *const credentials.SecretBuffer, _: []const u8, _: []const u8, context_json: []const u8, _: []const u8, _: *transport.Cancellation, _: transport.Observer) anyerror!RunOutput {
         const self: *FakeRunner = @ptrCast(@alignCast(context.?));
         if (!std.mem.eql(u8, secret.slice(), "fixture-secret")) return error.AuthenticationFailed;
-        if (std.mem.indexOf(u8, context_json, "server-one") == null) return error.InvalidContext;
+        if (std.mem.indexOf(u8, context_json, "server-one") == null and std.mem.indexOf(u8, context_json, "command_output") == null) return error.InvalidContext;
         if (self.failure) |failure| return failure;
         var meta = transport.Meta{ .status = 200 };
         @memcpy(meta.provider_request_id[0.."provider-request-1".len], "provider-request-1");
         meta.provider_request_id_len = "provider-request-1".len;
         var validated = try proposal_domain.parse(allocator, self.document);
         errdefer validated.deinit(allocator);
+        validated.tool_mode = selected.tool_mode;
+        if (selected.tool_mode == .native_function and validated.kind == .command) {
+            if (validated.provider_call_id == null) validated.provider_call_id = try allocator.dupe(u8, "call_1");
+            if (validated.tool_name == null) validated.tool_name = try allocator.dupe(u8, "run_server_command");
+        }
         return .{ .validated = validated, .meta = meta, .continuation_json = try allocator.dupe(u8, "[]"), .received_bytes = self.document.len };
     }
 
@@ -2478,7 +2483,7 @@ test "coordinator handles native tool proposal, preamble emission, and recovery"
     var fake = FakeRunner{
         .document = "{\"kind\":\"command\",\"command\":\"df -h\",\"question\":null,\"explanation\":\"Check disk space.\",\"destructive\":false,\"needs_sudo\":false}",
     };
-    registry.runner = fake.runner();
+    registry.runner = fake.adapter();
 
     const selected = try providers.get(io, configured.id);
     const admission = try registry.admitOwned("turn-native-1", null, "server-one", selected, generation, 7, "Check disk", "{\"server_id\":\"server-one\"}", 10);
@@ -2544,7 +2549,7 @@ test "coordinator continues native tool execution with reviewed output explanati
     var fake = FakeRunner{
         .document = "{\"kind\":\"command\",\"command\":\"df -h\",\"question\":null,\"explanation\":\"Check disk space.\",\"destructive\":false,\"needs_sudo\":false}",
     };
-    registry.runner = fake.runner();
+    registry.runner = fake.adapter();
 
     const selected = try providers.get(io, configured.id);
     const admission = try registry.admitOwned("turn-native-1", null, "server-one", selected, generation, 7, "Check disk", "{\"server_id\":\"server-one\"}", 10);
