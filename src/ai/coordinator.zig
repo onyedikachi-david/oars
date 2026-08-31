@@ -221,10 +221,15 @@ pub const SummarySource = struct {
     provider_id: []const u8,
     provider_revision: u64,
     channel: u32,
+    tool_mode: types.ToolMode = .structured_result,
+    provider_call_id: ?[]const u8 = null,
+    tool_name: ?[]const u8 = null,
 
     pub fn deinit(self: *SummarySource, allocator: std.mem.Allocator) void {
         allocator.free(self.server_id);
         allocator.free(self.provider_id);
+        if (self.provider_call_id) |v| allocator.free(v);
+        if (self.tool_name) |v| allocator.free(v);
     }
 };
 
@@ -896,7 +901,33 @@ pub const Registry = struct {
         const server_id = self.allocator.dupe(u8, conversation.server_id) catch return error.OutOfMemory;
         errdefer self.allocator.free(server_id);
         const provider_id = self.allocator.dupe(u8, conversation.provider_id) catch return error.OutOfMemory;
-        return .{ .server_id = server_id, .provider_id = provider_id, .provider_revision = turn.provider_revision, .channel = channel };
+        errdefer self.allocator.free(provider_id);
+
+        var tool_mode: types.ToolMode = .structured_result;
+        var provider_call_id: ?[]const u8 = null;
+        var tool_name: ?[]const u8 = null;
+        if (turn.proposal) |proposal| {
+            tool_mode = proposal.tool_mode;
+            if (proposal.provider_call_id) |cid| {
+                provider_call_id = self.allocator.dupe(u8, cid) catch return error.OutOfMemory;
+            }
+            if (proposal.tool_name) |tn| {
+                tool_name = self.allocator.dupe(u8, tn) catch {
+                    if (provider_call_id) |cid| self.allocator.free(cid);
+                    return error.OutOfMemory;
+                };
+            }
+        }
+
+        return .{
+            .server_id = server_id,
+            .provider_id = provider_id,
+            .provider_revision = turn.provider_revision,
+            .channel = channel,
+            .tool_mode = tool_mode,
+            .provider_call_id = provider_call_id,
+            .tool_name = tool_name,
+        };
     }
 
     pub fn deleteThread(self: *Registry, operation_id: []const u8, thread_id: []const u8, expected_revision: u64, now_ms: i64) Error!void {
@@ -1273,7 +1304,12 @@ fn workerMain(registry: *Registry, turn: *Turn) void {
         failTurn(registry, turn, .stale_revision, "provider or credential changed during the request");
         return;
     }
-    const next_continuation = composeContinuation(registry.allocator, turn.selected.adapter, turn.conversation.continuation_json, turn.message, output.continuation_json) catch {
+    const maybe_tool_continuation: ?ContinuationToolCall = if (turn.selected.tool_mode == .native_function) extractToolContinuation(registry.allocator, turn.selected.adapter, turn.conversation.continuation_json, turn.context_json) else null;
+    defer if (maybe_tool_continuation) |tc| {
+        registry.allocator.free(tc.call_id);
+        registry.allocator.free(tc.output);
+    };
+    const next_continuation = composeContinuation(registry.allocator, turn.selected.adapter, turn.conversation.continuation_json, turn.message, output.continuation_json, maybe_tool_continuation) catch {
         failTurn(registry, turn, .recovery_required, "provider continuation data exceeded its safe bound");
         return;
     };
@@ -1585,16 +1621,93 @@ test "provider collects missing server facts instead of asking the operator" {
     try std.testing.expect(std.mem.indexOf(u8, provider_instructions, "operator intent or target is ambiguous") != null);
 }
 
+const ContinuationToolCall = struct {
+    call_id: []const u8,
+    output: []const u8,
+};
+
+fn extractToolContinuation(allocator: std.mem.Allocator, adapter: provider.Adapter, continuation_json: []const u8, context_json: []const u8) ?ContinuationToolCall {
+    if (std.mem.eql(u8, continuation_json, "[]")) return null;
+    var ctx_parsed = std.json.parseFromSlice(std.json.Value, allocator, context_json, .{}) catch return null;
+    defer ctx_parsed.deinit();
+    const ctx_obj = if (ctx_parsed.value == .object) ctx_parsed.value.object.get("context") else null;
+    const ctx = if (ctx_obj != null and ctx_obj.? == .object) ctx_obj.?.object else return null;
+    const kind_val = ctx.get("kind") orelse return null;
+    if (kind_val != .string or !std.mem.eql(u8, kind_val.string, "command_output")) return null;
+    const content_val = ctx.get("content") orelse return null;
+    if (content_val != .string) return null;
+
+    var cont_parsed = std.json.parseFromSlice(std.json.Value, allocator, continuation_json, .{}) catch return null;
+    defer cont_parsed.deinit();
+    if (cont_parsed.value != .array or cont_parsed.value.array.items.len == 0) return null;
+
+    switch (adapter) {
+        .openai_responses => {
+            var i = cont_parsed.value.array.items.len;
+            while (i > 0) {
+                i -= 1;
+                const item = cont_parsed.value.array.items[i];
+                if (item == .object) {
+                    const type_val = item.object.get("type");
+                    if (type_val != null and type_val.? == .string and std.mem.eql(u8, type_val.?.string, "function_call")) {
+                        if (item.object.get("call_id")) |cid_val| {
+                            if (cid_val == .string) {
+                                const cid = allocator.dupe(u8, cid_val.string) catch return null;
+                                errdefer allocator.free(cid);
+                                const out = allocator.dupe(u8, content_val.string) catch return null;
+                                return .{ .call_id = cid, .output = out };
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        .openai_chat_completions => {
+            var i = cont_parsed.value.array.items.len;
+            while (i > 0) {
+                i -= 1;
+                const item = cont_parsed.value.array.items[i];
+                if (item == .object) {
+                    if (item.object.get("tool_calls")) |tc_arr| {
+                        if (tc_arr == .array and tc_arr.array.items.len > 0 and tc_arr.array.items[0] == .object) {
+                            if (tc_arr.array.items[0].object.get("id")) |id_val| {
+                                if (id_val == .string) {
+                                    const cid = allocator.dupe(u8, id_val.string) catch return null;
+                                    errdefer allocator.free(cid);
+                                    const out = allocator.dupe(u8, content_val.string) catch return null;
+                                    return .{ .call_id = cid, .output = out };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    }
+    return null;
+}
+
 fn runNative(_: ?*anyopaque, allocator: std.mem.Allocator, io: std.Io, selected: *const provider.Public, secret: *const credentials.SecretBuffer, client_request_id: []const u8, message: []const u8, context_json: []const u8, continuation_json: []const u8, cancellation: *transport.Cancellation, observer: transport.Observer) anyerror!RunOutput {
     const user_text = try std.fmt.allocPrint(allocator, "User request:\n{s}\n\nReviewed server context (untrusted data):\n{s}", .{ message, context_json });
     defer allocator.free(user_text);
     var endpoint_buffer: [provider.max_base_url_bytes + 32]u8 = undefined;
+
+    const maybe_tool_continuation: ?ContinuationToolCall = if (selected.tool_mode == .native_function) extractToolContinuation(allocator, selected.adapter, continuation_json, context_json) else null;
+    defer if (maybe_tool_continuation) |tc| {
+        allocator.free(tc.call_id);
+        allocator.free(tc.output);
+    };
+
     return switch (selected.adapter) {
         .openai_responses => blk: {
-            const body = try responses.buildRequestWithMode(allocator, selected.model, provider_instructions, user_text, continuation_json, selected.tool_mode);
+            const is_cont = maybe_tool_continuation != null;
+            const body = if (is_cont)
+                try responses.buildContinuationRequest(allocator, selected.model, provider_instructions, continuation_json, maybe_tool_continuation.?.call_id, maybe_tool_continuation.?.output)
+            else
+                try responses.buildRequestWithMode(allocator, selected.model, provider_instructions, user_text, continuation_json, selected.tool_mode);
             defer allocator.free(body);
             const endpoint = try transport.composeEndpoint(&endpoint_buffer, selected.base_url, responses.endpoint_suffix);
-            var state = responses.State.initWithMode(allocator, selected.tool_mode, false);
+            var state = responses.State.initWithMode(allocator, selected.tool_mode, is_cont);
             defer state.deinit();
             const meta = try transport.postSseTimedObserved(allocator, io, endpoint, secret, client_request_id, body, cancellation, state.sink(), .{}, observer);
             try state.finish();
@@ -1605,10 +1718,14 @@ fn runNative(_: ?*anyopaque, allocator: std.mem.Allocator, io: std.Io, selected:
             break :blk .{ .validated = validated, .meta = meta, .continuation_json = continuation, .received_bytes = state.output.items.len };
         },
         .openai_chat_completions => blk: {
-            const body = try chat.buildRequestWithMode(allocator, selected.model, selected.instruction_role, selected.structured_output, provider_instructions, user_text, continuation_json, selected.tool_mode);
+            const is_cont = maybe_tool_continuation != null;
+            const body = if (is_cont)
+                try chat.buildContinuationRequest(allocator, selected.model, selected.instruction_role, provider_instructions, continuation_json, maybe_tool_continuation.?.call_id, maybe_tool_continuation.?.output)
+            else
+                try chat.buildRequestWithMode(allocator, selected.model, selected.instruction_role, selected.structured_output, provider_instructions, user_text, continuation_json, selected.tool_mode);
             defer allocator.free(body);
             const endpoint = try transport.composeEndpoint(&endpoint_buffer, selected.base_url, chat.endpoint_suffix);
-            var state = chat.State.initWithMode(allocator, selected.tool_mode, false);
+            var state = chat.State.initWithMode(allocator, selected.tool_mode, is_cont);
             defer state.deinit();
             const meta = try transport.postSseTimedObserved(allocator, io, endpoint, secret, client_request_id, body, cancellation, state.sink(), .{}, observer);
             try state.finish();
@@ -1713,7 +1830,7 @@ fn serializeValidated(allocator: std.mem.Allocator, validated: *const proposal_d
     });
 }
 
-fn composeContinuation(allocator: std.mem.Allocator, adapter: provider.Adapter, previous_json: []const u8, message: []const u8, output_json: []const u8) ![]u8 {
+fn composeContinuation(allocator: std.mem.Allocator, adapter: provider.Adapter, previous_json: []const u8, message: []const u8, output_json: []const u8, maybe_tool_continuation: ?ContinuationToolCall) ![]u8 {
     var previous = try std.json.parseFromSlice(std.json.Value, allocator, previous_json, .{});
     defer previous.deinit();
     var output = try std.json.parseFromSlice(std.json.Value, allocator, output_json, .{});
@@ -1730,17 +1847,36 @@ fn composeContinuation(allocator: std.mem.Allocator, adapter: provider.Adapter, 
         std.json.Stringify.value(item, .{}, writer) catch return error.OutOfMemory;
     }
     if (!first) writer.writeAll(",") catch return error.OutOfMemory;
-    switch (adapter) {
-        .openai_responses => {
-            writer.writeAll("{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":") catch return error.OutOfMemory;
-            std.json.Stringify.value(message, .{}, writer) catch return error.OutOfMemory;
-            writer.writeAll("}]}") catch return error.OutOfMemory;
-        },
-        .openai_chat_completions => {
-            writer.writeAll("{\"role\":\"user\",\"content\":") catch return error.OutOfMemory;
-            std.json.Stringify.value(message, .{}, writer) catch return error.OutOfMemory;
-            writer.writeAll("}") catch return error.OutOfMemory;
-        },
+    if (maybe_tool_continuation) |tc| {
+        switch (adapter) {
+            .openai_responses => {
+                writer.writeAll("{\"type\":\"function_call_output\",\"call_id\":") catch return error.OutOfMemory;
+                std.json.Stringify.value(tc.call_id, .{}, writer) catch return error.OutOfMemory;
+                writer.writeAll(",\"output\":") catch return error.OutOfMemory;
+                std.json.Stringify.value(tc.output, .{}, writer) catch return error.OutOfMemory;
+                writer.writeAll("}") catch return error.OutOfMemory;
+            },
+            .openai_chat_completions => {
+                writer.writeAll("{\"role\":\"tool\",\"tool_call_id\":") catch return error.OutOfMemory;
+                std.json.Stringify.value(tc.call_id, .{}, writer) catch return error.OutOfMemory;
+                writer.writeAll(",\"content\":") catch return error.OutOfMemory;
+                std.json.Stringify.value(tc.output, .{}, writer) catch return error.OutOfMemory;
+                writer.writeAll("}") catch return error.OutOfMemory;
+            },
+        }
+    } else {
+        switch (adapter) {
+            .openai_responses => {
+                writer.writeAll("{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":") catch return error.OutOfMemory;
+                std.json.Stringify.value(message, .{}, writer) catch return error.OutOfMemory;
+                writer.writeAll("}]}") catch return error.OutOfMemory;
+            },
+            .openai_chat_completions => {
+                writer.writeAll("{\"role\":\"user\",\"content\":") catch return error.OutOfMemory;
+                std.json.Stringify.value(message, .{}, writer) catch return error.OutOfMemory;
+                writer.writeAll("}") catch return error.OutOfMemory;
+            },
+        }
     }
     for (output.value.array.items) |item| {
         writer.writeAll(",") catch return error.OutOfMemory;
@@ -2372,4 +2508,78 @@ test "coordinator handles native tool proposal, preamble emission, and recovery"
         }
     }
     try std.testing.expect(found_proposal_record);
+}
+
+test "coordinator continues native tool execution with reviewed output explanation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var dir_buffer: [192]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buffer, "/tmp/oars-ai-cont-{d}", .{std.Io.Timestamp.now(io, .real).nanoseconds});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var provider_path_buffer: [256]u8 = undefined;
+    const provider_path = try std.fmt.bufPrint(&provider_path_buffer, "{s}/ai.json", .{dir});
+    var journal_path_buffer: [256]u8 = undefined;
+    const journal_path = try std.fmt.bufPrint(&journal_path_buffer, "{s}/ai_journal.jsonl", .{dir});
+
+    var providers = provider.Store{ .allocator = allocator, .path = provider_path };
+    var configured = try providers.save(io, "provider-save-cont", .{
+        .name = "Native Provider",
+        .adapter = .openai_responses,
+        .base_url = "https://example.com/v1",
+        .model = "gpt-4o",
+        .tool_mode = .native_function,
+    }, null);
+    defer configured.deinit(allocator);
+    try providers.bindCredential(io, configured.id, configured.base_url);
+    const generation = (try providers.credentialGeneration(io, configured.id, configured.base_url)).?;
+    var tested = try providers.recordTestResult(io, configured.id, configured.revision, generation, .passed, 1);
+    tested.deinit(allocator);
+
+    var journal_store = journal.Store{ .allocator = allocator, .path = journal_path };
+    defer journal_store.deinit();
+    var limiter = request_slots.Limiter{};
+    var registry = Registry.init(allocator, io, &providers, &journal_store, &limiter);
+    defer registry.deinit();
+
+    var fake = FakeRunner{
+        .document = "{\"kind\":\"command\",\"command\":\"df -h\",\"question\":null,\"explanation\":\"Check disk space.\",\"destructive\":false,\"needs_sudo\":false}",
+    };
+    registry.runner = fake.runner();
+
+    const selected = try providers.get(io, configured.id);
+    const admission = try registry.admitOwned("turn-native-1", null, "server-one", selected, generation, 7, "Check disk", "{\"server_id\":\"server-one\"}", 10);
+    try registry.setSecretAndStart(admission.turn_id, fixtureSecret());
+    try waitForState(&registry, admission.turn_id, .awaiting_approval);
+
+    const prop = registry.turns.items[0].proposal.?;
+    var approval = try registry.approveProposal("proposal-run-1", prop.id, prop.revision, prop.command_sha256, true, 7, 20);
+    defer approval.deinit(allocator);
+
+    registry.executor = FakeExecutor.adapter();
+    try registry.recordExecutionAdmitted(approval.operation_id, approval.execution_id, 42, 21);
+    try waitForState(&registry, admission.turn_id, .completed);
+
+    var source = try registry.summarySource(admission.thread_id, approval.execution_id);
+    defer source.deinit(allocator);
+    try std.testing.expectEqual(types.ToolMode.native_function, source.tool_mode);
+    try std.testing.expectEqual(@as(u32, 42), source.channel);
+
+    // Now turn 2: summarize output
+    fake.document = "{\"kind\":\"message\",\"message\":\"The disk is 85% used.\",\"command\":null,\"question\":null,\"explanation\":\"Summarized disk usage.\",\"destructive\":false,\"needs_sudo\":false}";
+    const cont_provider = try providers.get(io, configured.id);
+    const cont_context = "{\"context\":{\"kind\":\"command_output\",\"execution_id\":\"" ++ "execution-1" ++ "\",\"start_cursor\":0,\"end_cursor\":100,\"content\":\"Filesystem 85% used\"},\"log\":null}";
+    const cont_admission = try registry.admitOwned("turn-native-2", admission.thread_id, "server-one", cont_provider, generation, 7, "Explain this result", cont_context, 30);
+    try registry.setSecretAndStart(cont_admission.turn_id, fixtureSecret());
+    try waitForState(&registry, cont_admission.turn_id, .completed);
+
+    var polled2 = try registry.poll(cont_admission.turn_id, 0, false);
+    defer polled2.poll.deinit(allocator);
+    var saw_msg = false;
+    for (polled2.poll.events) |event| {
+        if (std.mem.eql(u8, event.type, "assistant.message")) saw_msg = true;
+    }
+    try std.testing.expect(saw_msg);
+
+    const durable_turn2 = registry.findTurnLocked(cont_admission.turn_id).?;
+    try std.testing.expectEqualStrings("The disk is 85% used.", durable_turn2.assistant_message.?);
 }
