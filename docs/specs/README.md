@@ -20,7 +20,7 @@ already exists.
 | 07 | [One-Click Deployment](07-deployment.md) | ✅ v1 frontend + backend implemented: managed-state-safe preflight with frozen plan and port checks, exact Node/PM2 releases, per-app SSH identity, verified cancellation, cursor polling, masked history |
 | 08 | [SSH Management](08-ssh-management.md) | Partial: corrected worker-driven management, guarded mutations, staged rotation, fail-closed roles, deploy keys, UI, and Docker evidence land; required desktop/narrow in-app browser review remains unavailable |
 | 09 | [Access Management](09-access.md) | Partial: typed app-level UI, worker-driven jobs, strict mutations, and atomic exports exist; effective per-account OpenSSH sources, expiry, independent per-server target/role selection, and complete two-server integration evidence remain |
-| 10 | [Backups](10-backups.md) | 📋 |
+| 10 | [Backups](10-backups.md) | ✅ v1 frontend + backend implemented: planned S3 jobs, exact capability proof, hard cancellation, disconnected cron import, durable recovery, Keychain flow, typed UI |
 | 11 | [AI Terminal](11-ai-terminal.md) | 📋 |
 | 12 | [Remote Desktop (VNC)](12-vnc.md) | ✅ v1 frontend + backend implemented |
 | 13 | [Command Palette & Keyboard UX](13-command-palette.md) | 📋 (Oars+) |

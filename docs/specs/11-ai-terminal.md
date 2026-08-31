@@ -1,230 +1,631 @@
 # Spec 11 — AI Terminal
 
-**Status:** 📋 · **Depends on:** 02 (exec), 03 (context), 04 (log context), 06 (save-as-script), 15 (audit) · **Spec owner:** frontend + core (thin)
+**Status:** 📋 Planned · **Depends on:** 02 (exec), 03 (context), 04 (log context), 06 (save as script), 15 (audit) · **Spec owner:** core + frontend
 
 ## 1. Overview
 
-Plain English → the exact command, explained, waiting for approval. The
-AI proposes; the human disposes. BYO key to any OpenAI-compatible
-provider; nothing runs on a server without a click; every executed
-command is logged.
+The user asks a question about one selected server. A native Zig provider
+worker sends the selected context to the configured model and returns one
+validated command proposal or one question. The user can edit and approve the
+proposal. Oars runs only the exact server-bound command that the Zig core
+stored for that approval. Each run has durable state, command history, and an
+audit record.
 
-## 2. Goals / non-goals
+## 2. Goals and non-goals
 
 **Goals**
-- Chat-style panel per server: ask, see command + explanation, Run / Edit / Cancel.
-- Destructive-operation flagging (heuristic + model flag) with amber warning.
-- Context bundle: OS/hostname/uptime + monitor snapshot + tail of a chosen log.
-- Provider config: an OpenAI-compatible Chat Completions base URL, model, API
-  key (Keychain), and capability flags. Native Anthropic or Gemini APIs need
-  separate adapters; their names alone do not make them compatible.
-- Save approved command as a script; every run appended to audit history.
+
+- Provide a persistent conversation for each server, with explicit provider
+  and context selection.
+- Support the `openai_responses` adapter and the separate
+  `openai_chat_completions` compatibility adapter.
+- Keep provider HTTP, Transport Layer Security (TLS), stream parsing, and API
+  key use in native Zig code.
+- Return a strict command or question object. Do not extract a command from
+  free text or incomplete streamed data.
+- Freeze each command proposal in Zig before the UI can approve it. Bind the
+  approval to the server, proposal revision, and command hash.
+- Stream command output, support honest cancellation and restart recovery,
+  save a reviewed command as a script, and write AI-specific history and
+  audit records.
 
 **Non-goals**
-- No autonomous execution (approval is mandatory), no tool-use beyond the
-  command card in v1 (MCP is a later stage), no telemetry, no CtrlOps-style
-  cloud proxy — prompts go straight from the app to the user's provider.
+
+- The WebView does not call a provider and does not read an API key.
+- The model cannot execute a command, call a local function, use Model Context
+  Protocol (MCP), or use an OpenAI built-in tool in v1.
+- Oars does not execute a proposal automatically, retry an ambiguous provider
+  request automatically, or run a command after restart.
+- Oars does not provide a cloud proxy or telemetry service.
 
 ## 3. User stories
 
-- "why is the disk full" → `du -sh /var/log/* | sort -rh | head` with an explanation; I approve; output streams; I get a one-line summary.
-- "clean up old docker images" → command flagged "Destructive — removes unused volumes"; I still approve after reading.
-- "ban the IP that keeps hammering ssh" → ufw command; approved; audited.
-- I approve a command I'll run weekly → "Save as script" with variables auto-suggested.
+- I ask why a selected server has little free disk space. I review one command
+  and its explanation before I run it.
+- I select a bounded log tail. Oars shows the exact fields that will leave my
+  computer before it sends the request.
+- I edit a proposal. Oars creates a new revision and checks the edited command
+  again before it enables Run.
+- I cancel a provider request or a remote command. Oars shows whether the stop
+  is verified or still uncertain.
+- I close and reopen Oars. My local conversation and an unexpired proposal
+  return, but Oars does not repeat a provider request or a command.
+- I open an approved command in the script editor and review it before I save
+  it.
 
-## 4. UI/UX
+## 4. UI and interaction
 
-### 4.1 AI panel (per-server tab, toggleable side panel)
-- Thread view: user asks (plain text) · assistant cards: **command block** (mono, syntax-tinted) + explanation + badges (Destructive, Read-only, Needs sudo) + buttons **Run · Edit · Cancel**.
-- Editing the command re-renders the card; Run executes on the server; output streams below the card (terminal-styled); on completion: summary line + exit code.
-- **Context chips** above the input: OS · load · disk · last-log (clickable to pick a log from spec 04; defaults to the most recently active).
-- Provider selector + "no key configured" empty state with setup button.
+### 4.1 Header and provider setup
 
-### 4.2 Destructive flagging
-- Heuristic list (client-side, before the model even replies): `rm -rf`, `dd `, `mkfs`, `fdisk`, `shutdown`, `reboot`, `:(){`, `DROP TABLE`, `DROP DATABASE`, `git push --force`, `chmod -R 777`, `> /dev/sd`, `kill -9` (unless PID from monitoring flow)…
-- Model-provided `destructive: true` from the prompt contract also triggers it.
-- Amber banner on the card: "Destructive — review carefully." Run requires the card's Run click (no extra confirm; the flag IS the warning — per CtrlOps parity).
+- The header always shows the selected server, SSH user, provider, endpoint
+  origin, model, and credential status. The AI panel must never select
+  `servers[0]` as a fallback.
+- Provider setup includes name, adapter, base URL, model, and adapter-specific
+  compatibility fields. The user must run **Test provider** before Ask is
+  enabled. The test warns that it can use provider quota.
+- **Configure key** opens a native secure-entry sheet. React receives only
+  `configured`, `missing`, `denied`, or `unavailable`. If native secure
+  entry is unavailable, provider setup is unavailable. There is no WebView
+  input fallback for the key.
 
-### 4.3 States
-- Asking → spinner with "thinking"; provider error → inline retry; timeout (60 s) → cancel.
-- Server not connected → ask blocked with "connect first".
-- Audit: "Ran with your approval — logged" note on executed cards.
+### 4.2 Context disclosure
+
+- Context controls cover operating-system data, monitor data, and one optional
+  log tail. Log content is off by default.
+- Before the first request, and after any selection change, a disclosure view
+  shows each selected field, the log source, and the maximum bytes that Oars
+  will send. The user can remove any optional field.
+- Host names, process text, user text, and log text are untrusted data. Oars
+  puts them in labeled user content. Oars never puts them in the developer
+  instruction.
+
+### 4.3 Turn and proposal
+
+- The turn states are `queued`, `collecting_context`, `requesting`,
+  `streaming`, `validating`, `awaiting_approval`, `approved`, `executing`,
+  `summarizing`, `completed`, `failed`, `cancel_requested`, `canceled`,
+  `interrupted`, and `recovery_required`.
+- During a model stream, the UI shows progress. It does not show partial JSON
+  as assistant text and does not show a Run button.
+- A validated command card shows the exact server, command, explanation,
+  `Destructive` and `Needs sudo` states, revision, and expiry.
+  The actions are **Run**, **Edit**, **Cancel**, and **Open in script editor**.
+- A question result shows the question and has no Run action. A refusal,
+  incomplete response, schema error, or protocol error has no command card.
+- An edit goes through Zig and creates a new revision. The old revision cannot
+  run. Zig is authoritative for destructive detection. React can use the same
+  fixture list only to give faster feedback.
+- Destructive state is the logical OR of the model flag and the Zig heuristic.
+  The card shows a clear warning. Run must send
+  `destructive_warning_ack:true` for that revision.
+- A command that needs an interactive sudo password is blocked. The UI tells
+  the user to use the interactive terminal. Oars never asks the model or the
+  AI panel for a sudo password.
+
+### 4.4 Output, cancellation, and errors
+
+- Command output uses the existing SSH cursor stream and shows output gaps,
+  exit status, duration, and the final verified state.
+- Cancel before approval expires the proposal. Provider Cancel stops local
+  network work, but the UI states that the provider can already have received
+  and billed the request.
+- A remote command is `canceled` only after Oars signals its tracked remote
+  process group and verifies termination. Otherwise the state remains
+  `cancel_requested` or becomes `recovery_required`.
+- The UI has explicit states for no server, disconnected server, no provider,
+  untested provider, missing key, denied key access, context loading, stale or
+  partial context, authentication failure, rate limit, timeout, invalid model
+  output, connection loss, expired proposal, stale proposal, used proposal,
+  dropped output, and restart recovery.
+- Status uses text and an icon, not color alone. Controls remain keyboard
+  reachable, and focus returns to the action that opened a sheet. Commands use
+  monospace text. Normal interface text does not.
 
 ## 5. Bridge API
 
-The AI call is client-side in v1. This only works when the provider permits the
-app origin through CORS. There is no standard capability-discovery endpoint
-shared by all products described as OpenAI-compatible. A shipped provider
-adapter supplies reviewed defaults; a Custom adapter makes the user select the
-message role, streaming format, and structured-output mode. **Test provider**
-runs the selected contract only after a user click and states that a completion
-test can consume provider quota. HTTPS is required except for user-approved
-loopback URLs such as a local model server. A later native HTTP bridge can
-remove the CORS limit.
+All timestamps are integer epoch milliseconds. Revisions and cursors are
+integers. An `operation_id` is 1 to 64 ASCII letters, digits, dots, colons,
+underscores, or hyphens. A caller reuses it only to retry the same mutation.
+User-facing failures return `{ok:false, code, error}`. Stable codes include
+`invalid_argument`, `not_found`, `conflict`, `stale_revision`,
+`not_connected`, `credential_missing`, `provider_untested`, `busy`,
+`limit_exceeded`, `provider_auth`, `provider_rate_limited`,
+`provider_timeout`, `provider_protocol`, and `recovery_required`.
 
-### `oars.ai.context` `{server_id}` → `{ok, os, hostname, uptime_sec, load, mem, disk, top_processes:[…], active_logs:[{path, last_write}]}`
-(bundled from monitor cache + a light probe; cached ≤ 5 s)
-### `oars.ai.provider.get` → `{ok, provider: {adapter, base_url, model, capabilities:{instruction_role, streaming, structured_output}}}` (no key!) · `oars.ai.provider.set` `{provider}` → `{ok}` (key stored via Keychain `ai:<base_url>`)
-### `oars.ai.history` `{server_id, limit}` → audit-filtered runs (spec 15)
-### Execution reuses `oars.ssh.exec` (channel id); Save-as-script reuses `oars.scripts.save`.
+### 5.1 Provider and credential
 
-### Prompt contract (structured command proposal)
+```text
+oars.ai.provider.list {}
+  -> {ok, providers:[ProviderPublic]}
+
+oars.ai.provider.save {operation_id, provider, expected_revision?}
+  -> {ok, provider:ProviderPublic}
+
+oars.ai.provider.delete {operation_id, provider_id, expected_revision}
+  -> {ok}
+
+oars.ai.provider.test {operation_id, provider_id, expected_revision}
+  -> {ok, operation_id, state}
+
+oars.ai.provider.testPoll {operation_id, cursor, rewind?}
+  -> EventPoll
+
+oars.ai.provider.testCancel {operation_id}
+  -> {ok, state}
+
+oars.ai.credential.configure {operation_id, provider_id}
+  -> {ok, status:"configured"|"canceled"|"denied"|"unavailable"}
+
+oars.ai.credential.status {provider_id}
+  -> {ok, status:"configured"|"missing"|"denied"|"unavailable"}
+
+oars.ai.credential.delete {operation_id, provider_id}
+  -> {ok, status:"missing"}
 ```
-You write Linux commands. Respond ONLY with one JSON variant:
-{"kind":"command","command":"…","explanation":"…","destructive":bool,"needs_sudo":bool}
-{"kind":"question","question":"…","explanation":"…"}
+
+The provider draft is `{id?, name, adapter, base_url, model,
+instruction_role?, structured_output?}`. `ProviderPublic` adds `{revision,
+tested_at_ms?, test_status}` and never contains a key. `adapter` is
+`openai_responses` or `openai_chat_completions`. `test_status` is `untested`,
+`passed`, `failed`, or `stale`. A route, model, adapter, compatibility-setting,
+or credential change makes the test stale. The Keychain account is
+`ai:<provider_id>`. Deleting provider metadata does not silently delete its
+credential; the UI offers the separate credential delete action.
+
+### 5.2 Context
+
+```text
+oars.ai.context.get {server_id}
+  -> {ok, state, context?, stale, updated_at_ms?}
+
+oars.ai.context.refresh {operation_id, server_id}
+  -> {ok, operation_id, state}
+
+oars.ai.context.poll {operation_id, cursor, rewind?}
+  -> EventPoll
+
+oars.ai.context.cancel {operation_id}
+  -> {ok, state}
 ```
-- Context is untrusted data. Wrap it in a distinct data field and state that
-  log text, host names, and process text are not instructions.
-- When the provider supports Chat Completions Structured Outputs, send a strict
-  `response_format` JSON schema. Otherwise use JSON mode when supported, then a
-  prompt-only fallback. Capability fallback is explicit; a parse failure never
-  executes or silently extracts a command from arbitrary markdown.
-- A streamed JSON object cannot safely render its explanation until fields are
-  parsed. Show provider progress while streaming, then render the validated
-  card when the object is complete.
+
+`context.get` reads a cache only. It does not start SSH work. `refresh` queues
+the probe on the selected server session worker and returns without a network
+wait. The returned context contains operating-system and monitor summaries and
+available log metadata. It does not contain log bytes. `turn.start` reads only
+the selected bounded log tail.
+
+### 5.3 Threads, turns, and proposals
+
+```text
+oars.ai.thread.list {server_id?, limit}
+  -> {ok, threads:[ThreadSummary]}
+
+oars.ai.thread.get {thread_id}
+  -> {ok, thread, turns, active_proposal?}
+
+oars.ai.thread.delete {operation_id, thread_id, expected_revision}
+  -> {ok}
+
+oars.ai.turn.start {
+  operation_id, thread_id?, server_id, provider_id,
+  expected_provider_revision, message,
+  context_selection:{os, monitor, log:{source_id, tail_bytes}?}
+} -> {ok, thread_id, turn_id, state}
+
+oars.ai.turn.poll {turn_id, cursor, rewind?}
+  -> EventPoll
+
+oars.ai.turn.cancel {turn_id}
+  -> {ok, state}
+
+oars.ai.turn.summarize {
+  operation_id, thread_id, execution_id,
+  output_selection:{start_cursor, end_cursor}
+} -> {ok, turn_id, state}
+
+oars.ai.proposal.edit {operation_id, proposal_id, expected_revision, command}
+  -> {ok, proposal:Proposal}
+
+oars.ai.proposal.run {
+  operation_id, proposal_id, expected_revision,
+  command_sha256, destructive_warning_ack
+} -> {ok, execution_id, channel, state}
+
+oars.ai.proposal.cancel {operation_id, proposal_id, expected_revision}
+  -> {ok, state:"canceled"}
+```
+
+The summary action is a new provider request. Before admission, the UI shows
+the exact bounded command-output range that it will send. Save as script opens
+the Spec 06 editor with the proposal command as a draft. The editor calls
+`oars.scripts.save` only after the user reviews the script. An existing thread
+remains bound to its server, provider adapter, and model. A mismatch requires a
+new thread.
+
+### 5.4 Versioned events
+
+`EventPoll` is `{ok, stream_id, cursor, dropped, finished, state, events}`.
+Each event is `{version:1, sequence, stream_id, type, payload}`. The
+cursor is an absolute event sequence. Reads are non-destructive. `rewind:true`
+starts at the first retained event. `dropped` reports the number of events that
+the caller missed.
+
+Provider-test events are `provider.test_started`, `provider.test_succeeded`,
+`provider.test_failed`, and `provider.test_canceled`. Context-refresh events
+are `context.refresh_started`, `context.ready`, `context.failed`, and
+`context.canceled`.
+
+Turn event types are:
+
+```text
+turn.started
+context.ready | context.failed
+provider.request_started
+provider.response_created
+provider.progress
+proposal.ready
+question.ready
+provider.refusal
+turn.incomplete
+turn.failed
+turn.cancel_requested
+turn.canceled
+turn.completed
+```
+
+Provider JSON and provider server-sent event (SSE) names do not cross the
+bridge. The adapter converts them to these domain events. `proposal.ready` is
+written only after the full response passes the local schema and domain checks
+and the proposal is durable. Command bytes remain in `oars.ssh.poll`; Oars does
+not copy them into the AI event journal.
 
 ## 6. Zig core design
 
-- Zig adds only `oars.ai.context` (aggregates existing caches + one probe) and history filtering. Everything else is frontend. This keeps the AI layer swappable and testable without mocking the bridge.
-- **CSP note:** the packaged frontend policy is static while provider origins
-  are user-configurable. V1 therefore declares `connect-src https:` plus
-  loopback HTTP for local providers and still depends on provider CORS. This is
-  a documented security tradeoff, not a claim that the Native SDK navigation
-  allowlist controls `fetch`. A native HTTP bridge is the path to a narrower
-  WebView policy.
+### 6.1 Runtime and credential ownership
 
-## 7. Data model
+- The installed Native SDK exposes `App.start_fn(context, *Runtime)` and
+  `Runtime.setCredential`, `Runtime.getCredential`, and
+  `Runtime.deleteCredential`. Oars must set `App.start_fn` to install a narrow
+  credential service in `bridge.Context`. The current bridge does not have
+  this runtime pointer.
+- The Native SDK does not state that credential methods are safe on any
+  thread. The facade is runtime-thread-bound. A bridge admission handler
+  validates the provider and operation, reads at most 4096 key bytes into a
+  request-job buffer, queues the job, and returns. The worker overwrites the
+  key buffer on every exit path.
+- The raw `Runtime` pointer does not enter the AI worker. `App.stop_fn` stops
+  new admission, cancels and joins provider workers, overwrites pending secret
+  buffers, and then clears the facade.
+- Native key configuration uses a native secure-entry service and calls the
+  facade. This secure-entry service is an implementation prerequisite. The
+  existing JSON credential bridge is not acceptable because its payload
+  originates in the WebView.
 
-- Provider config: `<data>/ai.json` (adapter, base URL, model, and explicit
-  capability choices — no key). Key: Keychain `ai:<base_url>`.
-- Threads are ephemeral (per session). Runs → audit history (spec 15).
+### 6.2 Provider coordinator and transport
 
-## 8. Security
+- A native coordinator owns bounded provider workers, HTTP clients, request
+  cancellation, adapters, events, and the journal. The runtime main thread
+  performs validation, short credential reads, queue operations, and snapshot
+  reads only. It does not wait for SSH or provider network work.
+- V1 permits two active provider requests in total and one active request per
+  thread. An accepted request is journaled before the worker can send it.
+- Provider URLs must parse as HTTPS. User-approved HTTP is permitted only for
+  a loopback address. URLs with user information, a fragment, or query data
+  are invalid. Path joining is deterministic. Authenticated POST requests do
+  not follow redirects.
+- The credential is bound to the reviewed normalized origin. Oars does not
+  send it to a redirect target. Oars never logs authorization headers,
+  prompts, context bodies, or response bodies.
+- A provider POST is not retried after any request byte can have reached the
+  provider. Retry is an explicit new operation and can use more quota.
+- Oars sends a generated `X-Client-Request-Id` to OpenAI and records the
+  returned `x-request-id` when available. Errors and audit data contain only
+  redacted request metadata.
 
-- The approval gate is the security model: nothing executes without Run and
-  the destructive flag is visible. Commands run as the SSH user. Oars does not
-  send a sudo password through an exec channel; a command that needs sudo can
-  use only pre-approved non-interactive sudo authority or must move to the
-  interactive terminal.
-- Before the first request to a provider, show which server context fields will
-  leave the machine and let the user remove log content. Send only the minimum
-  selected context.
-- The key persists only in Keychain. A request reads it into frontend memory
-  and sends it to the configured provider in the authorization header. Do not
-  say that it "never leaves the Keychain."
-- Model output and destructive heuristics are advisory. The approval card is
-  the execution boundary, and the exact edited command is shown again at Run.
+### 6.3 Provider adapters and model output
 
-## 9. Performance
+Each adapter owns request construction, status handling, incremental byte
+parsing, final validation, and retry classification.
 
-- Context bundle ≤ 1 s (cached); command execution rides the standard exec path; streaming renders as tokens arrive.
+- `openai_responses` uses `POST /v1/responses` with `stream:true`,
+  `store:false`, `background:false`, and strict `text.format` JSON Schema.
+  It requests `reasoning.encrypted_content` in `include`. It does not use
+  `previous_response_id` or a Conversation object. A later turn replays the
+  locally retained output items that OpenAI requires, including the opaque
+  encrypted reasoning item when OpenAI returns one.
+- `openai_chat_completions` uses `POST /v1/chat/completions`. It is a separate
+  compatibility adapter with separately tested SSE parsing, instruction role,
+  and structured-output mode. It supports only `json_schema` or `json_object`.
+  There is no prompt-only JSON fallback.
+- Provider Test sends the exact selected route, model, instruction role, stream
+  format, and schema mode. A models-list request is not capability proof. A
+  failed or stale test blocks Ask.
+- The Responses parser accepts typed lifecycle, output-item, text, refusal,
+  incomplete, failure, and error events. It ignores unknown bounded event
+  types because OpenAI can add event types. It rejects malformed known events,
+  inconsistent item identity, duplicate terminal state, and a missing terminal
+  state.
+- The SSE parser supports UTF-8, CRLF and LF line endings, comments, multiple
+  `data:` lines, and input split at any byte boundary.
+
+The strict proposal object is:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "kind": {"type": "string", "enum": ["command", "question"]},
+    "command": {"type": ["string", "null"]},
+    "question": {"type": ["string", "null"]},
+    "explanation": {"type": "string"},
+    "destructive": {"type": "boolean"},
+    "needs_sudo": {"type": "boolean"}
+  },
+  "required": [
+    "kind", "command", "question", "explanation", "destructive",
+    "needs_sudo"
+  ]
+}
+```
+
+The local validator checks the discriminator, the one non-null payload, byte
+limits, UTF-8, NUL bytes, and the complete command. It permits recognized
+reasoning items but requires exactly one proposal-bearing message and one
+structured result. A refusal, incomplete result, extra schema field, multiple
+structured results, or validation error cannot create a proposal.
+
+The OpenAI request does not declare tools. A returned function call, shell
+call, computer call, MCP call, or other tool call is a protocol error. The
+local Run action is not a provider tool. A future tool implementation needs a
+separate specification with strict arguments, `call_id` correlation,
+`parallel_tool_calls:false`, durable `awaiting_approval` state, and explicit
+approval before local execution and before Oars sends a tool result.
+
+### 6.4 Approval and execution
+
+`Proposal` contains `{id, turn_id, revision, server_id, provider_id,
+provider_revision, context_hash, command, command_sha256, explanation,
+model_destructive, local_destructive, needs_sudo, created_at_ms,
+expires_at_ms, state}`. A proposal expires after 10 minutes.
+
+Run checks the proposal state, revision, hash, expiry, server identity,
+connection identity, provider revision, and destructive acknowledgement under
+one lock. It writes `ai.approved` before it admits the exact frozen command to
+the tracked SSH exec path with `history_kind:"ai"` and the same operation ID.
+A second Run returns the first admission result and does not start a second
+channel. The public `oars.ssh.exec` command is not the AI approval boundary.
+
+AI execution must start and track a remote process group. Cancel sends a
+signal to that group and verifies termination. Channel close alone is not a
+verified stop. Completion updates the same operation with exit status,
+duration, and a bounded redacted output sample.
+
+## 7. Data model and persistence
+
+- `<data>/ai.json` stores provider metadata with stable IDs and integer
+  revisions. It contains no key. Write a mode-0600 temporary file, sync it,
+  and rename it atomically.
+- `<data>/ai_journal.jsonl` stores versioned thread, turn, proposal, approval,
+  execution, and recovery records. Append and sync each state transition.
+  Compaction writes and syncs a mode-0600 temporary file before atomic rename.
+- The journal stores user messages, validated assistant results, and the
+  adapter-owned continuation items needed for `store:false` conversations.
+  It keeps `reasoning.encrypted_content` opaque and never shows or interprets
+  it. It does not store raw log context by default. It stores the log
+  selection, byte count, and hash. Clear Thread removes local conversation
+  data but does not erase audit or command history.
+- The key stays in the operating-system credential store as
+  `ai:<provider_id>`. A transient native request buffer contains it only while
+  Oars builds and sends one request. The provider receives the key in its
+  authorization header.
+- On startup, `queued`, `collecting_context`, `requesting`, `streaming`, and
+  `validating` become `interrupted`. They do not restart. An unexpired
+  `awaiting_approval` proposal can return. `approved` without an execution
+  admission becomes `recovery_required`. An `executing` turn reconciles with
+  its tracked channel; an absent channel becomes `recovery_required`. Oars
+  never repeats a provider POST or SSH command during recovery.
+
+V1 bounds are:
+
+- 16 providers, 100 threads, and 50 turns per thread.
+- 16 KiB for one user message, 64 KiB for one command, 8 KiB for one
+  explanation or question, and 64 KiB for one selected log tail.
+- 128 KiB for a provider request body, 64 KiB for response headers, 256 KiB
+  for one SSE event, 128 KiB for accumulated structured output, and 8 KiB for
+  a retained provider error body before redaction.
+- 1024 retained domain events or 1 MiB per turn, whichever is reached first.
+  The cursor response reports dropped events.
+- 512 KiB of adapter continuation items per thread. Compaction removes the
+  oldest terminal turns first and never removes an active proposal or
+  execution. If required continuation items still exceed this limit, Oars
+  blocks another turn and asks the user to start a new thread. It does not
+  silently remove protocol items.
+
+## 8. Security and privacy
+
+- A standard provider API key never enters React memory, browser storage,
+  bridge JSON, frontend traces, configuration files, journals, audit records,
+  history, or error text. Tests scan all of these paths. Native buffers are
+  overwritten after use.
+- Keep the packaged WebView Content Security Policy narrow. Provider CORS is
+  not part of the request path because all provider HTTP is native.
+- Static policy goes in the developer instruction. User text and server
+  context remain labeled untrusted user data. Prompt injection in a log cannot
+  change the local schema, create an approval, or call SSH.
+- `store:false` prevents Responses application-state storage for the request.
+  It does not promise that the provider keeps no abuse-monitoring data. The
+  disclosure view links to the selected provider policy.
+- A model result is untrusted input. Only the validated, durable proposal can
+  reach the approval handler, and only the exact approved revision can reach
+  the AI execution path.
+- Deleting a thread, provider, or credential is explicit. No delete action
+  silently removes a different class of data.
+
+## 9. Performance and time limits
+
+- A bridge handler must not wait for SSH or provider network input. Unrelated
+  bridge calls must remain responsive during a 20-second context probe and a
+  slow provider stream.
+- Provider time limits are 10 seconds to connect, 30 seconds to the first
+  response byte, 30 seconds of stream idle time, and 120 seconds total. The UI
+  can cancel sooner.
+- Context cache age is at most 5 seconds for a fresh result. A stale result is
+  labeled and does not start a hidden refresh.
+- Provider progress events are coalesced to at most 10 updates per second.
+  Command output continues to use the Spec 02 stream bounds.
 
 ## 10. Edge cases
 
-- Provider rate-limited/401 → inline error with key-check hint.
-- Model returns invalid or schema-breaking output → show a parse error and
-  offer an explicit retry. Never scrape a code block and treat it as approved
-  structured output.
-- Command is a pipeline with heredocs → exec via `bash -c '<cmd>'` with escaping (same as spec 06).
-- Ambiguous ask → model returns the `kind:"question"` variant → UI prompts for
-  clarification and never renders a Run button.
-- User edits command into something destructive → heuristic re-flags on the edited card.
+- A server, provider, or proposal revision changes while a card is open. Run
+  rejects the stale card and requires a new proposal.
+- The provider returns 401, 429, 5xx, invalid UTF-8, a redirect, an oversized
+  event, a refusal, or an incomplete response. Oars returns the typed state and
+  never creates a command from invalid data. It ignores an unknown bounded
+  event and continues to require a valid known terminal event.
+- The connection drops after request bytes are sent. Oars marks the turn
+  interrupted and requires an explicit new request.
+- A pipeline, heredoc, quote, or newline occurs in a command. Oars preserves
+  the complete frozen string and uses the same checked shell-command transport
+  as Spec 06. It does not split the string into a false argument vector.
+- The user edits a safe proposal into a destructive command. Zig adds the
+  warning to the new revision before Run can succeed.
+- Oars restarts between approval and SSH admission. The turn becomes
+  `recovery_required`; it does not execute on startup.
 
 ## 11. Testing
 
-- Unit: destructive heuristic table (known commands), prompt-building fixtures, JSON contract parsing (valid/invalid model output).
-- Integration (container): ask → approve → run `du -sh`; verify audit entry; destructive flag on `rm -rf`; save-as-script round trip.
-- Manual: streaming UX, provider errors, context chips.
+| Layer | Required proof |
+|---|---|
+| Zig unit | URL and redirect policy, request bounds, every SSE byte split, CRLF and LF, multi-line data, unknown and malformed events, adapter terminal states, strict schema, destructive fixtures, stale revisions, double Run, journal replay, truncated tail, compaction, and every restart state. |
+| Native credential integration | Configure, replace, status, read, delete, denied and unavailable services, the 4096-byte bound, runtime-thread dispatch, worker-buffer overwrite, shutdown order, and no secret in frontend or persistent data. |
+| Local provider integration | A deterministic native HTTP fixture checks authorization without printing it, fragments streams, delays data, returns 401, 429, and 500, attempts a redirect, drops a connection, and verifies cancel cleanup and no automatic retry. |
+| SSH container integration | Ask fixture, validate, edit, approve, run the exact command, stream output, record AI history and audit, reject a second Run, switch servers, disconnect, hard-cancel a child process, restart during each state, and open a script draft. |
+| React tests | Exhaustive reducer states, cursor gaps, stale poll responses, explicit server selection, context disclosure, no partial runnable card, edit revision, destructive acknowledgement, credential status only, focus return, keyboard use, and accessible status labels. |
+| Live provider acceptance | One real OpenAI Responses turn uses `store:false`, strict Structured Outputs, typed streaming, request IDs, a harmless approved container command, and no secret in app data or traces. One pinned Ollama or vLLM version passes the explicit Chat Completions adapter separately. |
+| Manual review | Desktop and narrow widths, light and dark themes, long host, model, explanation, and command values, every error class, dropped output, reduced motion, and restart recovery. |
 
 ## 12. Acceptance criteria
 
-- [ ] Full ask → approve → run → audit loop works with a real OpenAI-compatible endpoint.
-      (frontend + a live provider key; the backend half — context bundle,
-      provider store, audited exec, history — is container-tested.)
-- [ ] Destructive heuristic flags the fixture list; edited commands re-flag.
-      (frontend-owned per §6 — Zig adds no AI logic; unit tests live with
-      the React app.)
-- [x] Nothing executes without an explicit Run click (verified by audit log).
-      (backend: every `oars.ssh.exec` is audited (`ssh.exec` with the
-      truncated command); `oars.ai.history` serves the audit-filtered
-      view. The approval gate itself is the frontend Run button.)
-- [x] Keys persist only in the Keychain; provider requests use an in-memory
-      copy and config JSON has no secrets. (backend: `ai.json` holds
-      adapter/base URL/model/capabilities only; the dispatcher test
-      asserts no key material round-trips; the key remains frontend
-      Keychain `ai:<base_url>`.)
-- [ ] Save-as-script produces a working script. (frontend — reuses the
-      spec 06 `oars.scripts.save`, already covered by its own tests.)
+- [ ] A slow context refresh and provider stream do not delay unrelated bridge
+  calls. No bridge handler waits on network work.
+- [ ] Native secure entry, `App.start_fn` credential injection, request use,
+  buffer overwrite, delete, and shutdown pass without a key entering React or
+  persistent app data.
+- [ ] A real OpenAI Responses request uses `store:false`, strict
+  `text.format`, typed streaming, and request IDs, then produces one validated
+  proposal.
+- [ ] One pinned compatible provider passes the explicit
+  `openai_chat_completions` adapter test. A failed or stale provider test
+  blocks Ask.
+- [ ] The user reviews the exact context fields and bounded log selection.
+  Prompt injection fixtures cannot change policy or execute a command.
+- [ ] No runnable card exists before complete stream validation. Refusal,
+  incomplete output, schema failure, malformed known events, timeout, and
+  multiple structured results fail closed.
+- [ ] Run executes the exact frozen command for the visible server. Edit,
+  server switch, provider change, expiry, hash mismatch, and a second click
+  reject or deduplicate admission as specified.
+- [ ] The Zig destructive fixture list and React mirror agree. An edited
+  destructive command requires the warning acknowledgement.
+- [ ] One approved harmless command runs on the real SSH container, streams
+  through cursor polling, records `history_kind:"ai"`, and completes the same
+  operation in history and audit. Generic SSH rows do not appear as AI runs.
+- [ ] Provider cancel has an honest terminal state. SSH cancel stops and
+  verifies the remote process group and its child process. An uncertain stop
+  remains `cancel_requested` or `recovery_required`.
+- [ ] Forced restart at every non-terminal state causes no duplicate provider
+  POST and no duplicate SSH command. An unexpired proposal restores exactly.
+- [ ] Local multi-turn continuation with `store:false` replays all required
+  adapter items, including returned encrypted reasoning items. Clear Thread
+  removes local conversation data.
+- [ ] Save as script opens the exact proposal as a draft and the reviewed
+  script runs through the Spec 06 contract.
+- [ ] The full UI state set passes desktop, narrow, keyboard, focus,
+  screen-reader, light-theme, and dark-theme review with the server and
+  provider always visible.
+- [ ] The same checkout passes:
 
-Backend status (this cycle):
+  ```sh
+  git diff --name-only --diff-filter=ACMR -- '*.zig' | xargs zig fmt --check
+  zig build
+  zig build test
+  scripts/integration-test.sh
+  npm --prefix frontend test
+  npm --prefix frontend run build
+  git diff --check
+  ```
 
-- `oars.ai.context` — monitor snapshot (spec 03 cache, refresh-if-stale)
-  + one light probe (OS via `/etc/os-release` PRETTY_NAME with `uname -sr`
-  fallback, hostname via /proc, per-source `stat -c '%Y %n'` log mtimes),
-  probe part cached ≤ 5 s per server; container-tested against the dev
-  sshd (Alpine) with a configured log source.
-- `oars.ai.provider.get/set` — `ai.json` store, validation (https
-  everywhere except loopback http for local model servers; adapter ∈
-  {openai_compatible, custom}; instruction_role ∈ {developer, system}),
-  quarantine on corrupt files, mode 0600; audited on set.
-- `oars.ai.history` — audit-filtered `ssh.exec` runs, newest first,
-  default 20 / max 100.
-- `oars.ssh.exec` now audits every executed command (`cmd=` truncated to
-  120 chars) — the “every executed command is logged” contract.
+All boxes remain unchecked while this spec is Planned. A mock provider, a
+direct `oars.ssh.exec` call, or a unit-only credential test is not end-to-end
+release evidence.
 
-Frontend-owned (spec §6), pending the UI cycle: the provider call, the
-prompt contract (JSON mode / Structured Outputs), the destructive
-heuristic table, save-as-script, and the ask → approve → run loop.
+## 13. Research and references
 
-## 13. Research & References
+Research on 2026-08-31 corrected these parts of the previous draft:
 
-- **Chat Completions API** — verified against OpenAI's current API
-  schema (`https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create`):
-  - Endpoint `POST /chat/completions`; request: `model`, `messages[]`
-    with roles `developer`/`system`/`user`/`assistant`/`tool`, `stream`
-    (bool), `stream_options: {include_usage}` (final chunk carries
-    token usage before `data: [DONE]`), `temperature`, `tools`/
-    `tool_choice` (unused in v1 — no tool-use per §2).
-  - Response: `choices[].message` (`content`, `role`),
-    `finish_reason` ∈ {stop, length, tool_calls, content_filter,
-    function_call}, `usage` (`prompt_tokens`,
-    `completion_tokens`, `total_tokens`).
-  - Streaming: chunks are `object: "chat.completion.chunk"` with
-    `choices[].delta` (`content` string fragments) — the spec's
-    "progressive explanation render" maps directly to delta
-    accumulation; SSE framing is the standard `data: …` line protocol
-    with `data: [DONE]` terminator.
-  - The current API also supports `response_format` with `json_schema`, which
-    is preferred over prompt-only JSON for models that support it. OpenAI
-    recommends the Responses API for new OpenAI-only projects, but Oars keeps
-    Chat Completions as its cross-provider baseline and uses a provider
-    capability layer.
-  - OpenAI examples use the `developer` role. Compatible providers can differ,
-    so Oars selects `developer` or `system` from provider capability data
-    instead of assuming one role works everywhere.
-- **Compatibility boundary** — “OpenAI-compatible” is not one versioned
-  protocol with standard capability discovery. Oars treats Chat Completions as
-  a baseline route and records adapter capabilities explicitly. A successful
-  models-list request does not prove support for strict schemas, streaming, or
-  a particular instruction role.
-- **BYO-key architecture** — the client-side fetch design keeps the
-  key in the frontend→provider path only (Keychain → memory); provider
-  requests carry `Authorization: Bearer <key>` — the standard auth
-  scheme for OpenAI-compatible endpoints (API reference, auth section).
-  No proxy, no telemetry (per §2 non-goals).
-- **JSON output contract** — the previous prompt-only contract and fenced-code
-  fallback did not provide a strong parse boundary. The current OpenAI schema
-  documents strict JSON Schema output. The spec now prefers that mode and
-  refuses invalid fallback output.
-- **Context bundle** — built from the monitor cache (spec 03 §5) and a
-  light probe; the commands behind it are the verified ones from specs
-  03/04 §13 (kernel /proc docs, coreutils, findutils).
-- **CSP/connect-src** — the packaged WebView's CSP must allow
-  `connect-src https:` for the provider origin; TLS-only + per-request
-  key (no cookies held by the WebView for the provider) is the
-  documented tradeoff in §6.
+- Provider requests moved from the WebView to native Zig because OpenAI says
+  that standard API keys must not be exposed in browser or app client code.
+- OpenAI uses the Responses API with strict structured text output. Chat
+  Completions remains a separate compatibility adapter, not one generic
+  protocol for all providers.
+- The installed Native SDK has backend credential methods and an
+  `App.start_fn` injection hook, but Oars does not wire that hook today. Native
+  secure key entry is still a prerequisite.
+- The Run button alone was not an approval boundary. The corrected contract
+  uses a durable Zig proposal, revision, server identity, hash, and idempotent
+  admission.
+- Context refresh moved off the bridge thread. Threads, turns, proposals, and
+  ambiguous recovery became durable.
+- The previous checked approval and Keychain claims had no end-to-end proof.
+  This version resets every acceptance box.
 
-Sources: OpenAI API reference (chat/create), the OpenAI-compatible
-provider ecosystem (Ollama/vLLM implement the same schema),
-specs 03/04 §13.
+Repository and installed-source evidence:
+
+- Spec status, cursor streams, secrets, cancellation, and threading:
+  `docs/specs/README.md:1-10`, `docs/specs/README.md:52-91`.
+- Current AI scaffold and gaps: `src/ai.zig:1-679`,
+  `src/bridge.zig:12513-12730`, `src/integration_ai.zig:1-207`,
+  `frontend/src/AiTab.tsx:1-130`, `frontend/src/types.ts:856-941`, and
+  `frontend/index.html:5-8`.
+- Native SDK credential service and injection hook:
+  `@native-sdk/cli/src/runtime/system_services.zig:89-108`,
+  `@native-sdk/cli/src/runtime/core.zig:754-769`,
+  `@native-sdk/cli/src/runtime/api.zig:410-447`,
+  `@native-sdk/cli/src/runtime/flow.zig:227-240`, and
+  `@native-sdk/cli/src/platform/types.zig:239-241`,
+  `@native-sdk/cli/src/platform/types.zig:2401-2403`,
+  `@native-sdk/cli/src/platform/types.zig:2902-2914`. `build.zig:35` selects
+  the installed package root.
+- Current runtime ownership: `src/main.zig:167-204`,
+  `src/main.zig:216-236`, and `src/runner.zig:470-521`.
+
+External primary sources:
+
+- [OpenAI API authentication](https://developers.openai.com/api/reference/overview)
+  defines server-side key handling, request IDs, and compatibility policy.
+- [OpenAI Responses create](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)
+  defines `stream`, `store`, output items, the
+  `reasoning.encrypted_content` include value, tools, and terminal response
+  state.
+- [OpenAI Chat Completions create](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+  defines the separate Chat Completions request and streaming contract.
+- [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
+  defines strict Responses `text.format` JSON Schema output.
+- [OpenAI streaming responses](https://developers.openai.com/api/docs/guides/streaming-responses)
+  defines typed Responses stream events.
+- [OpenAI function calling](https://developers.openai.com/api/docs/guides/function-calling)
+  defines `call_id`, strict tool schemas, tool outputs, and
+  `parallel_tool_calls:false` for future tool work.
+- [OpenAI conversation state](https://developers.openai.com/api/docs/guides/conversation-state)
+  defines local `store:false` continuation with all required output items.
+- [OpenAI data controls](https://developers.openai.com/api/docs/guides/your-data)
+  defines Responses retention, Zero Data Retention, and background-mode limits.
+- [OpenAI agent safety](https://developers.openai.com/api/docs/guides/agent-builder-safety)
+  defines prompt-injection, structured-output, and approval guidance.
+- [WHATWG server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html)
+  defines UTF-8 SSE line and multi-line data parsing.
+- [Ollama OpenAI compatibility](https://docs.ollama.com/api/openai-compatibility)
+  and [vLLM OpenAI-compatible server](https://docs.vllm.ai/en/latest/serving/openai_compatible_server/)
+  document explicit routes and compatibility limits. They support a separate,
+  tested compatibility adapter instead of a generic capability claim.

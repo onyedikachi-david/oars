@@ -62,6 +62,12 @@ fn lockSpin(m: *std.atomic.Mutex) void {
     while (!m.tryLock()) std.atomic.spinLoopHint();
 }
 
+fn secureFreeBytes(allocator: std.mem.Allocator, bytes: []u8) void {
+    if (bytes.len == 0) return;
+    std.crypto.secureZero(u8, bytes);
+    allocator.rawFree(bytes, .fromByteUnits(@alignOf(u8)), @returnAddress());
+}
+
 pub const Status = enum(u8) {
     connecting,
     needs_trust,
@@ -249,6 +255,12 @@ pub const ChannelEntry = struct {
     access_exec_outcome: ?*AccessExecOutcome = null,
     access_exec_timeout_ns: i128 = 0,
     access_exec_cap: usize = 0,
+    /// Spec 10: bounded backup execs and streamed manual runs use dedicated
+    /// outcomes so the coordinator can observe worker-owned libssh2 work.
+    backup_outcome: ?*BackupOutcome = null,
+    backup_timeout_ns: i128 = 0,
+    backup_cap: usize = 0,
+    backup_process: ?*BackupProcess = null,
 
     /// Frees the command text and the optional history strings. Every
     /// path that drops an entry (eviction, close, teardown) must call
@@ -265,7 +277,7 @@ pub const ChannelEntry = struct {
 
     fn clearStdin(self: *ChannelEntry, allocator: std.mem.Allocator) void {
         if (self.stdin_queue.items.len > 0) std.crypto.secureZero(u8, self.stdin_queue.items);
-        self.stdin_queue.deinit(allocator);
+        if (self.stdin_queue.capacity > 0) allocator.rawFree(self.stdin_queue.allocatedSlice(), .fromByteUnits(@alignOf(u8)), @returnAddress());
         self.stdin_queue = .empty;
         self.stdin_eof_pending = false;
     }
@@ -394,6 +406,18 @@ const Op = union(enum) {
         timeout_ns: i128,
         cap: usize,
         outcome: *AccessExecOutcome,
+    },
+    /// Spec 10: all backup exec/SFTP calls remain on the owning worker.
+    backup: struct {
+        request: BackupRequest,
+        outcome: *BackupOutcome,
+    },
+    /// A long-lived rclone channel. The worker appends stream bytes and owns
+    /// channel close; cancellation is performed by separate bounded execs.
+    backup_run: struct {
+        command: []const u8,
+        stdin_data: ?[]u8,
+        process: *BackupProcess,
     },
 };
 
@@ -577,6 +601,322 @@ pub const ClearOutcome = struct {
             if (std.Io.Timestamp.now(io, .real).nanoseconds >= deadline_ns) return;
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch return;
         }
+    }
+};
+
+/// Spec 09: inline exec for fleet scans — one internal `exec` per phase
+/// step. Mirrors `syntax_check` / `preflight_probe`: owning handler
+/// enqueues the command, worker opens an internal channel, and the
+/// bridge consumes the outcome on the next poll. Outcome heap +
+/// `abandon()` protocol matches every other worker outcome (session 30).
+pub const BackupOutcomeCode = enum {
+    ok,
+    timeout,
+    disconnected,
+    not_found,
+    permission_denied,
+    too_large,
+    conflict,
+    transport,
+    unsupported,
+    internal,
+};
+
+/// Coordinator-facing result for one bounded backup request. The requester
+/// destroys a completed outcome; `abandon` transfers destruction to the worker.
+pub const BackupOutcome = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+    done: bool = false,
+    abandoned: bool = false,
+    code: BackupOutcomeCode = .internal,
+    exit: ?i32 = null,
+    fx: i64 = fx_unknown,
+    overflow: bool = false,
+    sensitive_result: bool = false,
+    msg_buf: [256]u8 = undefined,
+    msg_len: usize = 0,
+    data: std.ArrayList(u8) = .empty,
+
+    pub fn deinitData(self: *BackupOutcome) void {
+        if (self.sensitive_result and self.data.items.len > 0) std.crypto.secureZero(u8, self.data.items);
+        self.data.deinit(self.allocator);
+    }
+
+    pub const Result = struct {
+        code: BackupOutcomeCode,
+        exit: ?i32,
+        fx: i64,
+        overflow: bool,
+        message: []u8,
+        data: []u8,
+
+        pub fn deinit(self: *Result, allocator: std.mem.Allocator, sensitive: bool) void {
+            allocator.free(self.message);
+            if (sensitive) {
+                secureFreeBytes(allocator, self.data);
+            } else {
+                allocator.free(self.data);
+            }
+        }
+    };
+
+    pub fn set(self: *BackupOutcome, code: BackupOutcomeCode, exit: ?i32, fx: i64, overflow: bool, data: []const u8, message: []const u8) void {
+        lockSpin(&self.mutex);
+        if (data.len > 0) self.data.appendSlice(self.allocator, data) catch {
+            self.code = .internal;
+            self.exit = null;
+            self.fx = fx_unknown;
+            self.overflow = false;
+            const fallback = "out of memory copying backup outcome";
+            @memcpy(self.msg_buf[0..fallback.len], fallback);
+            self.msg_len = fallback.len;
+            self.done = true;
+            const free = self.abandoned;
+            self.mutex.unlock();
+            if (free) {
+                self.deinitData();
+                self.allocator.destroy(self);
+            }
+            return;
+        };
+        self.code = code;
+        self.exit = exit;
+        self.fx = fx;
+        self.overflow = overflow;
+        const n = @min(message.len, self.msg_buf.len - 1);
+        @memcpy(self.msg_buf[0..n], message[0..n]);
+        self.msg_len = n;
+        self.done = true;
+        const free = self.abandoned;
+        self.mutex.unlock();
+        if (free) {
+            self.deinitData();
+            self.allocator.destroy(self);
+        }
+    }
+
+    pub fn isDone(self: *BackupOutcome) bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.done;
+    }
+
+    pub fn abandon(self: *BackupOutcome) bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.done) return true;
+        self.abandoned = true;
+        return false;
+    }
+
+    pub fn copyResult(self: *BackupOutcome, allocator: std.mem.Allocator) !Result {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        if (!self.done) return error.NotDone;
+        const message = try allocator.dupe(u8, self.msg_buf[0..self.msg_len]);
+        errdefer allocator.free(message);
+        const data = try allocator.dupe(u8, self.data.items);
+        return .{
+            .code = self.code,
+            .exit = self.exit,
+            .fx = self.fx,
+            .overflow = self.overflow,
+            .message = message,
+            .data = data,
+        };
+    }
+};
+
+pub const BackupRequest = union(enum) {
+    exec: struct {
+        command: []const u8,
+        stdin_data: ?[]const u8 = null,
+        timeout_ns: i128,
+        cap: usize,
+        history_command: []const u8,
+        sensitive_stdin: bool = false,
+    },
+    sftp_stat: struct { path: []const u8 },
+    sftp_list: struct { path: []const u8 },
+    sftp_read: struct { path: []const u8, max: usize },
+    sftp_write: struct { path: []const u8, data: []const u8, sensitive: bool = false },
+    sftp_mkdir: struct { path: []const u8 },
+    sftp_chmod: struct { path: []const u8, mode: u32 },
+    sftp_remove: struct { path: []const u8 },
+    sftp_rename: struct { from: []const u8, to: []const u8 },
+};
+
+/// Stream retained for one manual backup process. Cursors are absolute and
+/// non-destructive; overflow drops only the oldest retained bytes.
+fn cloneBackupRequest(allocator: std.mem.Allocator, request: BackupRequest) !BackupRequest {
+    return switch (request) {
+        .exec => |value| blk: {
+            const command = try allocator.dupe(u8, value.command);
+            errdefer allocator.free(command);
+            const stdin_data: ?[]u8 = if (value.stdin_data) |input| try allocator.dupe(u8, input) else null;
+            errdefer {
+                if (stdin_data) |input| {
+                    if (value.sensitive_stdin) {
+                        secureFreeBytes(allocator, input);
+                    } else {
+                        allocator.free(input);
+                    }
+                }
+            }
+            const history_command = try allocator.dupe(u8, value.history_command);
+            break :blk .{ .exec = .{
+                .command = command,
+                .stdin_data = stdin_data,
+                .timeout_ns = value.timeout_ns,
+                .cap = value.cap,
+                .history_command = history_command,
+                .sensitive_stdin = value.sensitive_stdin,
+            } };
+        },
+        .sftp_stat => |value| .{ .sftp_stat = .{ .path = try allocator.dupe(u8, value.path) } },
+        .sftp_list => |value| .{ .sftp_list = .{ .path = try allocator.dupe(u8, value.path) } },
+        .sftp_read => |value| .{ .sftp_read = .{ .path = try allocator.dupe(u8, value.path), .max = value.max } },
+        .sftp_write => |value| blk: {
+            const path = try allocator.dupe(u8, value.path);
+            errdefer allocator.free(path);
+            const data = try allocator.dupe(u8, value.data);
+            break :blk .{ .sftp_write = .{ .path = path, .data = data, .sensitive = value.sensitive } };
+        },
+        .sftp_mkdir => |value| .{ .sftp_mkdir = .{ .path = try allocator.dupe(u8, value.path) } },
+        .sftp_chmod => |value| .{ .sftp_chmod = .{ .path = try allocator.dupe(u8, value.path), .mode = value.mode } },
+        .sftp_remove => |value| .{ .sftp_remove = .{ .path = try allocator.dupe(u8, value.path) } },
+        .sftp_rename => |value| blk: {
+            const from = try allocator.dupe(u8, value.from);
+            errdefer allocator.free(from);
+            const to = try allocator.dupe(u8, value.to);
+            break :blk .{ .sftp_rename = .{ .from = from, .to = to } };
+        },
+    };
+}
+
+fn freeBackupRequest(allocator: std.mem.Allocator, request: BackupRequest) void {
+    switch (request) {
+        .exec => |value| {
+            allocator.free(value.command);
+            if (value.stdin_data) |input| {
+                if (value.sensitive_stdin) {
+                    secureFreeBytes(allocator, @constCast(input));
+                } else {
+                    allocator.free(input);
+                }
+            }
+            allocator.free(value.history_command);
+        },
+        .sftp_stat => |value| allocator.free(value.path),
+        .sftp_list => |value| allocator.free(value.path),
+        .sftp_read => |value| allocator.free(value.path),
+        .sftp_write => |value| {
+            allocator.free(value.path);
+            if (value.sensitive) {
+                secureFreeBytes(allocator, @constCast(value.data));
+            } else {
+                allocator.free(value.data);
+            }
+        },
+        .sftp_mkdir => |value| allocator.free(value.path),
+        .sftp_chmod => |value| allocator.free(value.path),
+        .sftp_remove => |value| allocator.free(value.path),
+        .sftp_rename => |value| {
+            allocator.free(value.from);
+            allocator.free(value.to);
+        },
+    }
+}
+
+pub const BackupProcess = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+    done: bool = false,
+    abandoned: bool = false,
+    exit: ?i32 = null,
+    disconnected: bool = false,
+    start_pos: u64 = 0,
+    data: std.ArrayList(u8) = .empty,
+    msg_buf: [256]u8 = undefined,
+    msg_len: usize = 0,
+
+    pub const Snapshot = struct {
+        done: bool,
+        exit: ?i32,
+        disconnected: bool,
+        cursor: u64,
+        dropped: u64,
+        data: []u8,
+        message: []u8,
+
+        pub fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
+            allocator.free(self.data);
+            allocator.free(self.message);
+        }
+    };
+
+    fn append(self: *BackupProcess, bytes: []const u8) void {
+        const cap = 4 * 1024 * 1024;
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        if (bytes.len >= cap) {
+            self.start_pos += self.data.items.len + bytes.len - cap;
+            self.data.clearRetainingCapacity();
+            self.data.appendSlice(self.allocator, bytes[bytes.len - cap ..]) catch {};
+            return;
+        }
+        const excess = self.data.items.len + bytes.len -| cap;
+        if (excess > 0) {
+            std.mem.copyForwards(u8, self.data.items[0 .. self.data.items.len - excess], self.data.items[excess..]);
+            self.data.items.len -= excess;
+            self.start_pos += excess;
+        }
+        self.data.appendSlice(self.allocator, bytes) catch {};
+    }
+
+    pub fn complete(self: *BackupProcess, exit: ?i32, disconnected: bool, message: []const u8) void {
+        lockSpin(&self.mutex);
+        self.exit = exit;
+        self.disconnected = disconnected;
+        const n = @min(message.len, self.msg_buf.len - 1);
+        @memcpy(self.msg_buf[0..n], message[0..n]);
+        self.msg_len = n;
+        self.done = true;
+        const free = self.abandoned;
+        self.mutex.unlock();
+        if (free) {
+            self.data.deinit(self.allocator);
+            self.allocator.destroy(self);
+        }
+    }
+
+    pub fn snapshot(self: *BackupProcess, allocator: std.mem.Allocator, cursor: u64, max: usize) !Snapshot {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const effective = @max(cursor, self.start_pos);
+        const offset: usize = @intCast(@min(effective - self.start_pos, self.data.items.len));
+        const len = @min(max, self.data.items.len - offset);
+        const data = try allocator.dupe(u8, self.data.items[offset .. offset + len]);
+        errdefer allocator.free(data);
+        const message = try allocator.dupe(u8, self.msg_buf[0..self.msg_len]);
+        return .{
+            .done = self.done,
+            .exit = self.exit,
+            .disconnected = self.disconnected,
+            .cursor = effective + len,
+            .dropped = effective - cursor,
+            .data = data,
+            .message = message,
+        };
+    }
+
+    pub fn abandon(self: *BackupProcess) bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.done) return true;
+        self.abandoned = true;
+        return false;
     }
 };
 
@@ -947,6 +1287,16 @@ pub const Session = struct {
     error_len: usize = 0,
     trust: TrustState = .{},
     stop_flag: std.atomic.Value(bool) = .init(false),
+    /// Set before a requested disconnect calls the backup lifecycle hook.
+    /// Normal backup admission is rejected while cleanup/signaling requests
+    /// remain available on the still-live worker transport.
+    backup_admission_closed: std.atomic.Value(bool) = .init(false),
+    /// Claimed by `requestDisconnect` before it allocates the detached-thread
+    /// context.  This keeps duplicate bridge requests from racing each other;
+    /// an admission failure rolls it back together with the normal-admission
+    /// gate while the session is still otherwise live.
+    disconnect_admitted: std.atomic.Value(bool) = .init(false),
+    disconnect_started: std.atomic.Value(bool) = .init(false),
     /// Set by sessionDone inside its final ops_mutex section, after every
     /// list has been torn down. Op-enqueue paths check it under ops_mutex,
     /// so an op racing the worker's exit is either drained by sessionDone
@@ -1050,6 +1400,11 @@ pub const Session = struct {
 };
 
 pub const Manager = struct {
+    pub const BackupDisconnectHook = struct {
+        context: *anyopaque,
+        prepare_fn: *const fn (context: *anyopaque, server_id: []const u8) bool,
+    };
+
     allocator: std.mem.Allocator,
     store: *servers.Store,
     audit: *history.AuditStore,
@@ -1079,6 +1434,9 @@ pub const Manager = struct {
     /// One-click preflights (spec 07 §5): memory-only, bounded, expiring,
     /// capped at 32 — bridge handlers drive; worker owns probe channels.
     preflights: preflight.Preflights = .{},
+    backup_disconnect_hook: ?BackupDisconnectHook = null,
+    pending_disconnects: std.atomic.Value(u32) = .init(0),
+    shutting_down: std.atomic.Value(bool) = .init(false),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, store: *servers.Store, audit_store: *history.AuditStore, history_store: *history.HistoryStore, home: ?[]const u8) Manager {
         var self: Manager = .{
@@ -1098,6 +1456,8 @@ pub const Manager = struct {
     }
 
     pub fn deinit(self: *Manager) void {
+        self.shutting_down.store(true, .release);
+        self.drainBackupDisconnects();
         self.shutdownAll();
         self.sessions.deinit();
         self.broadcasts.deinit();
@@ -1110,6 +1470,34 @@ pub const Manager = struct {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
         return self.sessions.get(server_id);
+    }
+
+    pub fn setBackupDisconnectHook(self: *Manager, hook: BackupDisconnectHook) void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        self.backup_disconnect_hook = hook;
+    }
+
+    pub fn clearBackupDisconnectHook(self: *Manager, context: *anyopaque) void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.backup_disconnect_hook) |hook| {
+            if (hook.context == context) self.backup_disconnect_hook = null;
+        }
+    }
+
+    /// Prevents any newly admitted disconnect from borrowing `context`, then
+    /// waits until every thread admitted before the clear has released it.
+    /// Registry teardown uses this before freeing coordinator state.
+    pub fn detachBackupDisconnectHook(self: *Manager, context: *anyopaque) void {
+        self.clearBackupDisconnectHook(context);
+        self.drainBackupDisconnects();
+    }
+
+    pub fn drainBackupDisconnects(self: *Manager) void {
+        while (self.pending_disconnects.load(.acquire) != 0) {
+            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+        }
     }
 
     /// Starts a connection for `server`. `password`/`passphrase` are
@@ -1192,14 +1580,93 @@ pub const Manager = struct {
             self.mutex.unlock();
             return;
         };
-        const key = entry.key_ptr.*;
         const session = entry.value_ptr.*;
+        if (session.disconnect_started.swap(true, .acq_rel)) {
+            self.mutex.unlock();
+            return;
+        }
+        session.backup_admission_closed.store(true, .release);
+        const hook = self.backup_disconnect_hook;
+        self.mutex.unlock();
+
+        // The hook is bounded. It requests TERM/KILL and verifies absence
+        // while the worker still owns a usable SSH transport. A false result
+        // means the registry retained interrupted/recovery evidence.
+        if (hook) |value| _ = value.prepare_fn(value.context, server_id);
+
+        lockSpin(&self.mutex);
+        const current = self.sessions.getEntry(server_id) orelse {
+            self.mutex.unlock();
+            return;
+        };
+        if (current.value_ptr.* != session) {
+            self.mutex.unlock();
+            return;
+        }
+        const key = current.key_ptr.*;
         session.stop_flag.store(true, .release);
         session.transport.cancelConnect(session.io);
         _ = self.sessions.remove(server_id);
         self.mutex.unlock();
 
         self.teardown(key, session);
+    }
+
+    const AsyncDisconnect = struct {
+        manager: *Manager,
+        server_id: []u8,
+
+        fn run(self: *AsyncDisconnect) void {
+            defer {
+                self.manager.allocator.free(self.server_id);
+                const manager = self.manager;
+                manager.allocator.destroy(self);
+                _ = manager.pending_disconnects.fetchSub(1, .acq_rel);
+            }
+            self.manager.disconnect(self.server_id);
+        }
+    };
+
+    /// Bridge-facing disconnect admission. It closes normal backup admission
+    /// before returning, then runs the bounded backup hook and worker teardown
+    /// on a detached thread. Manager.deinit waits for all admitted disconnects.
+    pub fn requestDisconnect(self: *Manager, server_id: []const u8) !void {
+        if (self.shutting_down.load(.acquire)) return error.ManagerShuttingDown;
+        lockSpin(&self.mutex);
+        const session = self.sessions.get(server_id) orelse {
+            self.mutex.unlock();
+            return;
+        };
+        if (session.disconnect_admitted.swap(true, .acq_rel) or session.disconnect_started.load(.acquire)) {
+            self.mutex.unlock();
+            return;
+        }
+        session.backup_admission_closed.store(true, .release);
+        self.mutex.unlock();
+
+        var admitted = false;
+        defer if (!admitted) {
+            lockSpin(&self.mutex);
+            if (self.sessions.get(server_id)) |current| {
+                if (current == session and !session.disconnect_started.load(.acquire)) {
+                    session.disconnect_admitted.store(false, .release);
+                    session.backup_admission_closed.store(false, .release);
+                }
+            }
+            self.mutex.unlock();
+        };
+
+        const context = try self.allocator.create(AsyncDisconnect);
+        errdefer self.allocator.destroy(context);
+        context.* = .{ .manager = self, .server_id = try self.allocator.dupe(u8, server_id) };
+        errdefer self.allocator.free(context.server_id);
+        _ = self.pending_disconnects.fetchAdd(1, .acq_rel);
+        const thread = std.Thread.spawn(.{}, AsyncDisconnect.run, .{context}) catch |err| {
+            _ = self.pending_disconnects.fetchSub(1, .acq_rel);
+            return err;
+        };
+        admitted = true;
+        thread.detach();
     }
 
     /// Joins the worker and frees all session memory. The map entry must
@@ -2050,6 +2517,63 @@ pub const Manager = struct {
         try session.ops.append(self.allocator, .{ .access_exec = .{ .command = owned, .timeout_ns = timeout_ns, .cap = cap, .outcome = outcome } });
     }
 
+    /// Fast preflight before copying a backup payload. The session is not
+    /// borrowed beyond the manager lock; publishBackupOp resolves it again.
+    fn ensureBackupSessionReadyMode(self: *Manager, server_id: []const u8, cleanup: bool) !void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const session = self.sessions.get(server_id) orelse return error.NoSession;
+        if (session.status.load(.acquire) != .ready) return error.NotReady;
+        if (!cleanup and session.backup_admission_closed.load(.acquire)) return error.NotReady;
+    }
+
+    /// Publishes an already-owned backup op while the manager still owns the
+    /// session map entry. disconnect removes entries under the same mutex, so
+    /// it cannot join and destroy this session before the op is queued. Payload
+    /// allocation and all worker work stay outside the manager critical section.
+    fn publishBackupOpMode(self: *Manager, server_id: []const u8, op: Op, cleanup: bool) !void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const session = self.sessions.get(server_id) orelse return error.NoSession;
+        if (session.status.load(.acquire) != .ready) return error.NotReady;
+        if (!cleanup and session.backup_admission_closed.load(.acquire)) return error.NotReady;
+        lockSpin(&session.ops_mutex);
+        defer session.ops_mutex.unlock();
+        if (session.worker_done.load(.acquire)) return error.NotReady;
+        try session.ops.append(self.allocator, op);
+    }
+
+    /// Queues one bounded backup request. Payloads are copied before return;
+    /// secret stdin/SFTP data is securely cleared on every worker/drain path.
+    pub fn enqueueBackup(self: *Manager, server_id: []const u8, request: BackupRequest, outcome: *BackupOutcome) !void {
+        try self.ensureBackupSessionReadyMode(server_id, false);
+        const owned = try cloneBackupRequest(self.allocator, request);
+        errdefer freeBackupRequest(self.allocator, owned);
+        try self.publishBackupOpMode(server_id, .{ .backup = .{ .request = owned, .outcome = outcome } }, false);
+    }
+
+    /// Cleanup requests are the only backup work accepted after disconnect
+    /// begins. They let the registry signal and verify a tracked process group
+    /// before Manager tears down the worker transport.
+    pub fn enqueueBackupCleanup(self: *Manager, server_id: []const u8, request: BackupRequest, outcome: *BackupOutcome) !void {
+        try self.ensureBackupSessionReadyMode(server_id, true);
+        const owned = try cloneBackupRequest(self.allocator, request);
+        errdefer freeBackupRequest(self.allocator, owned);
+        try self.publishBackupOpMode(server_id, .{ .backup = .{ .request = owned, .outcome = outcome } }, true);
+    }
+
+    /// Starts a streamed backup process on the session worker. The command and
+    /// optional stdin are copied; the caller owns `process` until completion or
+    /// transfers ownership with `BackupProcess.abandon`.
+    pub fn startBackupProcess(self: *Manager, server_id: []const u8, command: []const u8, stdin_data: ?[]const u8, process: *BackupProcess) !void {
+        try self.ensureBackupSessionReadyMode(server_id, false);
+        const owned_command = try self.allocator.dupe(u8, command);
+        errdefer self.allocator.free(owned_command);
+        const owned_stdin: ?[]u8 = if (stdin_data) |stdin_bytes| try self.allocator.dupe(u8, stdin_bytes) else null;
+        errdefer if (owned_stdin) |stdin_bytes| secureFreeBytes(self.allocator, stdin_bytes);
+        try self.publishBackupOpMode(server_id, .{ .backup_run = .{ .command = owned_command, .stdin_data = owned_stdin, .process = process } }, false);
+    }
+
     /// Spec 07: queues a read-only preflight probe on the session worker.
     /// Each probe is a single exec whose exit/output land in the outcome.
     pub fn enqueuePreflightProbe(self: *Manager, server_id: []const u8, id: []const u8, command: []const u8, timeout_ns: i128, outcome: *preflight.ProbeOutcome) !void {
@@ -2550,6 +3074,18 @@ fn workerMain(session: *Session) void {
                 if (!dropEntryAt(session, i, entry)) i += 1;
                 continue;
             }
+            if (entry.backup_outcome != null and entry.backup_timeout_ns > 0 and
+                std.Io.Timestamp.now(io, .real).nanoseconds - entry.started_ns >= entry.backup_timeout_ns)
+            {
+                entry.raw.sendEof();
+                entry.raw.close(session.io);
+                entry.raw_closed = true;
+                entry.backup_outcome.?.set(.timeout, null, fx_unknown, false, "", "backup exec timed out");
+                entry.backup_outcome = null;
+                entry.backup_timeout_ns = 0;
+                if (!dropEntryAt(session, i, entry)) i += 1;
+                continue;
+            }
             if (entry.preflight_probe != null and entry.preflight_timeout_ns > 0 and
                 std.Io.Timestamp.now(io, .real).nanoseconds - entry.started_ns >= entry.preflight_timeout_ns)
             {
@@ -2593,6 +3129,15 @@ fn workerMain(session: *Session) void {
                                 entry.access_exec_outcome = null;
                                 entry.access_exec_timeout_ns = 0;
                                 recordExecHistory(session, entry);
+                            } else if (entry.backup_outcome != null) {
+                                drainBackupExec(session, entry);
+                                entry.backup_outcome = null;
+                                entry.backup_timeout_ns = 0;
+                                recordExecHistory(session, entry);
+                            } else if (entry.backup_process) |process| {
+                                process.complete(entry.stream.exit_status, false, "process exited");
+                                entry.backup_process = null;
+                                recordExecHistory(session, entry);
                             } else {
                                 drainProbe(session, entry);
                                 session.monitor_probe_active.store(false, .release);
@@ -2616,6 +3161,7 @@ fn workerMain(session: *Session) void {
                 },
                 .data => |n| {
                     entry.stream.append(read_buf[0..n]) catch {};
+                    if (entry.backup_process) |process| process.append(read_buf[0..n]);
                     i += 1;
                 },
                 .again => i += 1,
@@ -3004,6 +3550,234 @@ fn drainAccessExec(session: *Session, entry: *ChannelEntry) void {
     out.set(exit, total.items, msg);
 }
 
+fn drainBackupExec(session: *Session, entry: *ChannelEntry) void {
+    const outcome = entry.backup_outcome orelse return;
+    var total: std.ArrayList(u8) = .empty;
+    defer total.deinit(session.allocator);
+    var buf: [4096]u8 = undefined;
+    var cursor = entry.stream.start();
+    const overflow = cursor > 0;
+    while (true) {
+        const n = entry.stream.readAt(cursor, &buf);
+        if (n == 0) break;
+        if (total.items.len + n > entry.backup_cap) {
+            outcome.set(.too_large, entry.stream.exit_status, fx_unknown, true, total.items, "backup exec output exceeded its cap");
+            return;
+        }
+        total.appendSlice(session.allocator, buf[0..n]) catch {
+            outcome.set(.internal, null, fx_unknown, false, "", "out of memory capturing backup output");
+            return;
+        };
+        cursor += n;
+    }
+    if (overflow) {
+        outcome.set(.too_large, entry.stream.exit_status, fx_unknown, true, total.items, "backup exec output exceeded its cap");
+        return;
+    }
+    outcome.set(.ok, entry.stream.exit_status, fx_unknown, false, total.items, if (entry.stream.exit_status == 0) "ok" else "backup command failed");
+}
+
+fn backupExecOp(
+    session: *Session,
+    command: []const u8,
+    stdin_data: ?[]const u8,
+    timeout_ns: i128,
+    cap: usize,
+    history_command_owned: []const u8,
+    outcome: *BackupOutcome,
+) void {
+    const allocator = session.allocator;
+    const raw = session.transport.openChannel(session.io) catch {
+        allocator.free(command);
+        if (stdin_data) |input| secureFreeBytes(allocator, @constCast(input));
+        allocator.free(history_command_owned);
+        outcome.set(.transport, null, fx_unknown, false, "", "could not open a channel for backup exec");
+        return;
+    };
+    raw.exec(session.io, command) catch {
+        raw.close(session.io);
+        allocator.free(command);
+        if (stdin_data) |input| secureFreeBytes(allocator, @constCast(input));
+        allocator.free(history_command_owned);
+        outcome.set(.transport, null, fx_unknown, false, "", "backup exec could not start");
+        return;
+    };
+    const stream = allocator.create(Stream) catch {
+        raw.close(session.io);
+        allocator.free(command);
+        if (stdin_data) |input| secureFreeBytes(allocator, @constCast(input));
+        allocator.free(history_command_owned);
+        outcome.set(.internal, null, fx_unknown, false, "", "out of memory");
+        return;
+    };
+    stream.* = Stream.init(allocator);
+    stream.max_bytes = @max(cap, 16 * 1024);
+    const entry = allocator.create(ChannelEntry) catch {
+        allocator.destroy(stream);
+        raw.close(session.io);
+        allocator.free(command);
+        if (stdin_data) |input| secureFreeBytes(allocator, @constCast(input));
+        allocator.free(history_command_owned);
+        outcome.set(.internal, null, fx_unknown, false, "", "out of memory");
+        return;
+    };
+    const history_kind = allocator.dupe(u8, "backup") catch {
+        allocator.destroy(entry);
+        allocator.destroy(stream);
+        raw.close(session.io);
+        allocator.free(command);
+        if (stdin_data) |input| secureFreeBytes(allocator, @constCast(input));
+        allocator.free(history_command_owned);
+        outcome.set(.internal, null, fx_unknown, false, "", "out of memory");
+        return;
+    };
+    entry.* = .{
+        .id = session.next_channel_id.fetchAdd(1, .monotonic),
+        .kind = .exec,
+        .command = command,
+        .history_kind = history_kind,
+        .history_command = history_command_owned,
+        .started_ns = std.Io.Timestamp.now(session.io, .real).nanoseconds,
+        .stream = stream,
+        .raw = raw,
+        .stdin_queue = if (stdin_data) |input| .{ .items = @constCast(input), .capacity = input.len } else .empty,
+        .stdin_eof_pending = stdin_data != null,
+        .internal = true,
+        .backup_outcome = outcome,
+        .backup_timeout_ns = timeout_ns,
+        .backup_cap = cap,
+    };
+    lockSpin(&session.channels_mutex);
+    session.channels.append(allocator, entry) catch {
+        session.channels_mutex.unlock();
+        entry.clearStdin(allocator);
+        entry.freeCommandText(allocator);
+        allocator.destroy(entry);
+        allocator.destroy(stream);
+        raw.close(session.io);
+        outcome.set(.internal, null, fx_unknown, false, "", "out of memory");
+        return;
+    };
+    session.channels_mutex.unlock();
+}
+
+fn backupOutcomeCode(ok: bool, fx: i64, message: []const u8) BackupOutcomeCode {
+    if (ok) return .ok;
+    if (fx == ssh.c.LIBSSH2_FX_NO_SUCH_FILE) return .not_found;
+    if (fx == ssh.c.LIBSSH2_FX_PERMISSION_DENIED) return .permission_denied;
+    if (std.mem.indexOf(u8, message, "conflict") != null) return .conflict;
+    if (std.mem.indexOf(u8, message, "timed out") != null) return .timeout;
+    if (std.mem.indexOf(u8, message, "unsupported") != null) return .unsupported;
+    return .transport;
+}
+
+fn backupSftpFinish(outcome: *BackupOutcome, compat: *SftpOutcome) void {
+    const message = compat.msg_buf[0..compat.msg_len];
+    const payload = compat.json orelse "";
+    outcome.set(backupOutcomeCode(compat.ok, compat.fx, message), null, compat.fx, false, payload, message);
+    if (compat.json) |json_bytes| compat.allocator.free(json_bytes);
+}
+
+fn backupRequestOp(session: *Session, request: BackupRequest, outcome: *BackupOutcome) void {
+    switch (request) {
+        .exec => |value| backupExecOp(session, value.command, value.stdin_data, value.timeout_ns, value.cap, value.history_command, outcome),
+        else => {
+            var compat = SftpOutcome{ .allocator = session.allocator };
+            switch (request) {
+                .sftp_stat => |value| sftpOpStat(session, value.path, &compat),
+                .sftp_list => |value| sftpOpLs(session, value.path, &compat),
+                .sftp_read => |value| sftpOpRead(session, value.path, 0, value.max, &compat),
+                .sftp_write => |value| sftpOpSave(session, value.path, value.data, null, &compat),
+                .sftp_mkdir => |value| sftpOpMkdir(session, value.path, &compat),
+                .sftp_chmod => |value| sftpOpChmod(session, value.path, value.mode, &compat),
+                .sftp_remove => |value| sftpOpRm(session, value.path, false, 0, &compat),
+                .sftp_rename => |value| sftpOpRename(session, value.from, value.to, &compat),
+                .exec => unreachable,
+            }
+            backupSftpFinish(outcome, &compat);
+        },
+    }
+}
+
+fn backupRunOp(session: *Session, command: []const u8, stdin_data: ?[]u8, process: *BackupProcess) void {
+    const allocator = session.allocator;
+    const raw = session.transport.openChannel(session.io) catch {
+        allocator.free(command);
+        if (stdin_data) |input| secureFreeBytes(allocator, input);
+        process.complete(null, false, "could not open the backup process channel");
+        return;
+    };
+    raw.exec(session.io, command) catch {
+        raw.close(session.io);
+        allocator.free(command);
+        if (stdin_data) |input| secureFreeBytes(allocator, input);
+        process.complete(null, false, "backup process could not start");
+        return;
+    };
+    const stream = allocator.create(Stream) catch {
+        raw.close(session.io);
+        allocator.free(command);
+        if (stdin_data) |input| secureFreeBytes(allocator, input);
+        process.complete(null, false, "out of memory");
+        return;
+    };
+    stream.* = Stream.init(allocator);
+    stream.max_bytes = 4 * 1024 * 1024;
+    const entry = allocator.create(ChannelEntry) catch {
+        allocator.destroy(stream);
+        raw.close(session.io);
+        allocator.free(command);
+        if (stdin_data) |input| secureFreeBytes(allocator, input);
+        process.complete(null, false, "out of memory");
+        return;
+    };
+    const history_kind = allocator.dupe(u8, "backup") catch {
+        allocator.destroy(entry);
+        allocator.destroy(stream);
+        raw.close(session.io);
+        allocator.free(command);
+        if (stdin_data) |input| secureFreeBytes(allocator, input);
+        process.complete(null, false, "out of memory");
+        return;
+    };
+    const history_command = allocator.dupe(u8, "rclone backup run") catch {
+        allocator.free(history_kind);
+        allocator.destroy(entry);
+        allocator.destroy(stream);
+        raw.close(session.io);
+        allocator.free(command);
+        if (stdin_data) |input| secureFreeBytes(allocator, input);
+        process.complete(null, false, "out of memory");
+        return;
+    };
+    entry.* = .{
+        .id = session.next_channel_id.fetchAdd(1, .monotonic),
+        .kind = .exec,
+        .command = command,
+        .history_kind = history_kind,
+        .history_command = history_command,
+        .started_ns = std.Io.Timestamp.now(session.io, .real).nanoseconds,
+        .stream = stream,
+        .raw = raw,
+        .stdin_queue = if (stdin_data) |input| .{ .items = input, .capacity = input.len } else .empty,
+        .stdin_eof_pending = stdin_data != null,
+        .internal = true,
+        .backup_process = process,
+    };
+    lockSpin(&session.channels_mutex);
+    session.channels.append(allocator, entry) catch {
+        session.channels_mutex.unlock();
+        entry.clearStdin(allocator);
+        entry.freeCommandText(allocator);
+        allocator.destroy(entry);
+        allocator.destroy(stream);
+        raw.close(session.io);
+        process.complete(null, false, "out of memory");
+        return;
+    };
+    session.channels_mutex.unlock();
+}
+
 fn accessExecOp(session: *Session, ae: anytype) void {
     const allocator = session.allocator;
     const raw = session.transport.openChannel(session.io) catch {
@@ -3208,6 +3982,8 @@ fn processOps(session: *Session) void {
             .syntax_check => |sc| syntaxCheckOp(session, sc),
             .preflight_probe => |pp| preflightProbeOp(session, pp),
             .access_exec => |ae| accessExecOp(session, ae),
+            .backup => |value| backupRequestOp(session, value.request, value.outcome),
+            .backup_run => |value| backupRunOp(session, value.command, value.stdin_data, value.process),
         }
     }
 }
@@ -3224,7 +4000,6 @@ fn driveExecStdin(session: *Session) void {
             const old_len = entry.stdin_queue.items.len;
             const written = entry.raw.write(entry.stdin_queue.items);
             if (written > 0) {
-                std.crypto.secureZero(u8, entry.stdin_queue.items[0..written]);
                 std.mem.copyForwards(u8, entry.stdin_queue.items[0 .. old_len - written], entry.stdin_queue.items[written..old_len]);
                 std.crypto.secureZero(u8, entry.stdin_queue.items[old_len - written .. old_len]);
                 entry.stdin_queue.items.len -= written;
@@ -4782,7 +5557,7 @@ fn sftpOpSave(
 ) void {
     const allocator = session.allocator;
     defer allocator.free(path);
-    defer allocator.free(data);
+    defer secureFreeBytes(allocator, @constCast(data));
     defer if (expected) |identity| if (identity.sha256) |sha| allocator.free(sha);
     const sftp = sftpSessionHandle(session, outcome) orelse return;
     const deadline = sftpDeadline(session);
@@ -4794,7 +5569,10 @@ fn sftpOpSave(
         return;
     }
 
-    const tmp = std.fmt.allocPrint(allocator, "{s}.oars-tmp-{d}", .{ path, session.next_channel_id.fetchAdd(1, .monotonic) }) catch return outcome.set(false, "out of memory");
+    var random_bytes: [16]u8 = undefined;
+    std.Io.randomSecure(session.io, &random_bytes) catch return outcome.set(false, "secure random unavailable");
+    const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
+    const tmp = std.fmt.allocPrint(allocator, "{s}.oars-tmp-{s}", .{ path, random_hex }) catch return outcome.set(false, "out of memory");
     defer allocator.free(tmp);
     const tmp_z = allocator.dupeZ(u8, tmp) catch return outcome.set(false, "out of memory");
     defer allocator.free(tmp_z);
@@ -5009,7 +5787,7 @@ fn sftpOpRm(session: *Session, path: []const u8, recursive: bool, transfer_id: u
         var attrs: ssh.c.LIBSSH2_SFTP_ATTRIBUTES = undefined;
         if (!sftpLstat(session, sftp, path_z, &attrs, deadline)) {
             var msg_buf: [256]u8 = undefined;
-            out.set(false, sftpFail(session, "stat failed", &msg_buf));
+            out.setFx(false, sftpFail(session, "stat failed", &msg_buf), sftpLastFx(sftp));
             return;
         }
         const kind = attrs.permissions & ssh.c.LIBSSH2_SFTP_S_IFMT;
@@ -5840,6 +6618,12 @@ fn sessionDone(session: *Session) void {
         if (entry.access_exec_outcome) |oc| {
             oc.set(null, "", "session disconnected");
         }
+        if (entry.backup_outcome) |oc| {
+            oc.set(.disconnected, null, fx_unknown, false, "", "session disconnected");
+        }
+        if (entry.backup_process) |process| {
+            process.complete(null, true, "session disconnected");
+        }
         if (entry.preflight_probe) |pp| {
             pp.set(null, "", "session disconnected");
         }
@@ -5935,6 +6719,15 @@ fn sessionDone(session: *Session) void {
             .access_exec => |ae| {
                 session.allocator.free(ae.command);
                 ae.outcome.set(null, "", "session disconnected");
+            },
+            .backup => |value| {
+                freeBackupRequest(session.allocator, value.request);
+                value.outcome.set(.disconnected, null, fx_unknown, false, "", "session disconnected");
+            },
+            .backup_run => |value| {
+                session.allocator.free(value.command);
+                if (value.stdin_data) |input| secureFreeBytes(session.allocator, input);
+                value.process.complete(null, true, "session disconnected");
             },
             .clear => |cl| {
                 session.allocator.free(cl.path);
@@ -6041,6 +6834,386 @@ fn workerStop(ctx: ?*anyopaque) bool {
 }
 
 // --- tests ---------------------------------------------------------------
+
+const ZeroCheckAllocator = struct {
+    backing: std.mem.Allocator,
+    watch_alloc_index: usize,
+    alloc_index: usize = 0,
+    watched_ptr: ?[*]u8 = null,
+    watched_frees: usize = 0,
+    dirty_frees: usize = 0,
+
+    fn allocator(self: *ZeroCheckAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        const self: *ZeroCheckAllocator = @ptrCast(@alignCast(ctx));
+        const result = self.backing.rawAlloc(len, alignment, return_address) orelse return null;
+        if (self.alloc_index == self.watch_alloc_index) self.watched_ptr = result;
+        self.alloc_index += 1;
+        return result;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) bool {
+        const self: *ZeroCheckAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.rawResize(memory, alignment, new_len, return_address);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+        const self: *ZeroCheckAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.rawRemap(memory, alignment, new_len, return_address);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        const self: *ZeroCheckAllocator = @ptrCast(@alignCast(ctx));
+        if (self.watched_ptr) |watched| {
+            if (memory.ptr == watched) {
+                self.watched_frees += 1;
+                for (memory) |byte| {
+                    if (byte != 0) {
+                        self.dirty_frees += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        self.backing.rawFree(memory, alignment, return_address);
+    }
+};
+
+fn cloneBackupRequestsAllocationTest(allocator: std.mem.Allocator) !void {
+    const exec = try cloneBackupRequest(allocator, .{ .exec = .{
+        .command = "run-backup",
+        .stdin_data = "sensitive backup stdin",
+        .timeout_ns = std.time.ns_per_s,
+        .cap = 4096,
+        .history_command = "backup command",
+        .sensitive_stdin = true,
+    } });
+    defer freeBackupRequest(allocator, exec);
+
+    const write = try cloneBackupRequest(allocator, .{ .sftp_write = .{
+        .path = "/remote/config",
+        .data = "sensitive sftp payload",
+        .sensitive = true,
+    } });
+    defer freeBackupRequest(allocator, write);
+
+    const rename = try cloneBackupRequest(allocator, .{ .sftp_rename = .{
+        .from = "/remote/from",
+        .to = "/remote/to",
+    } });
+    defer freeBackupRequest(allocator, rename);
+}
+
+fn copyBackupOutcomeAllocationTest(allocator: std.mem.Allocator) !void {
+    var outcome = BackupOutcome{ .allocator = std.testing.allocator, .done = true, .code = .ok };
+    defer outcome.data.deinit(std.testing.allocator);
+    const message = "backup complete";
+    @memcpy(outcome.msg_buf[0..message.len], message);
+    outcome.msg_len = message.len;
+    try outcome.data.appendSlice(std.testing.allocator, "backup result payload");
+
+    var result = try outcome.copyResult(allocator);
+    defer result.deinit(allocator, false);
+}
+
+fn snapshotBackupProcessAllocationTest(allocator: std.mem.Allocator) !void {
+    var process = BackupProcess{ .allocator = std.testing.allocator, .done = true, .exit = 0 };
+    defer process.data.deinit(std.testing.allocator);
+    const message = "process complete";
+    @memcpy(process.msg_buf[0..message.len], message);
+    process.msg_len = message.len;
+    try process.data.appendSlice(std.testing.allocator, "streamed backup output");
+
+    var snapshot = try process.snapshot(allocator, 0, 4096);
+    defer snapshot.deinit(allocator);
+}
+
+const BackupAdmissionTestMode = enum { request, process };
+
+const BackupAdmissionTestContext = struct {
+    manager: *Manager,
+    server_id: []const u8,
+    mode: BackupAdmissionTestMode,
+    outcome: *BackupOutcome,
+    process: *BackupProcess,
+    err: ?anyerror = null,
+
+    fn run(self: *BackupAdmissionTestContext) void {
+        switch (self.mode) {
+            .request => self.manager.enqueueBackup(self.server_id, .{ .sftp_write = .{
+                .path = "/remote/backup-config",
+                .data = "secret request admitted during disconnect",
+                .sensitive = true,
+            } }, self.outcome) catch |err| {
+                self.err = err;
+            },
+            .process => self.manager.startBackupProcess(self.server_id, "rclone backup", "secret process admitted during disconnect", self.process) catch |err| {
+                self.err = err;
+            },
+        }
+    }
+};
+
+fn backupAdmissionTestWorker(session: *Session) void {
+    while (!session.stop_flag.load(.acquire)) std.atomic.spinLoopHint();
+    sessionDone(session);
+}
+
+fn backupAdmissionTestDisconnect(manager: *Manager, server_id: []const u8) void {
+    manager.disconnect(server_id);
+}
+
+const BackupDisconnectOrderProbe = struct {
+    manager: *Manager,
+    outcome: *BackupOutcome,
+    called: bool = false,
+    stop_was_clear: bool = false,
+    normal_rejected: bool = false,
+    cleanup_admitted: bool = false,
+
+    fn prepare(context: *anyopaque, server_id: []const u8) bool {
+        const self: *BackupDisconnectOrderProbe = @ptrCast(@alignCast(context));
+        self.called = true;
+        const session = self.manager.get(server_id) orelse return false;
+        self.stop_was_clear = !session.stop_flag.load(.acquire);
+        var process = BackupProcess{ .allocator = self.manager.allocator };
+        defer process.data.deinit(self.manager.allocator);
+        self.normal_rejected = if (self.manager.startBackupProcess(server_id, "must reject", null, &process)) |_| false else |err| err == error.NotReady;
+        self.manager.enqueueBackupCleanup(server_id, .{ .sftp_stat = .{ .path = "/tmp/exact" } }, self.outcome) catch return false;
+        self.cleanup_admitted = true;
+        return true;
+    }
+};
+
+test "backup disconnect hook runs before transport stop and admits cleanup only" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var store: servers.Store = .{ .allocator = allocator, .path = "/tmp/oars-backup-disconnect-order-servers.json" };
+    var audit: history.AuditStore = .{ .allocator = allocator, .path = "/tmp/oars-backup-disconnect-order-audit.jsonl" };
+    var history_store: history.HistoryStore = .{ .allocator = allocator, .path = "/tmp/oars-backup-disconnect-order-history.jsonl" };
+    var manager = Manager.init(allocator, io, &store, &audit, &history_store, null);
+    defer manager.deinit();
+
+    const session = try allocator.create(Session);
+    session.* = .{
+        .id = 102,
+        .server = try (servers.Server{ .id = "disconnect-order", .name = "backup", .host = "host", .user = "user" }).copy(allocator),
+        .allocator = allocator,
+        .threaded = std.Io.Threaded.init(allocator, .{}),
+        .io = undefined,
+        .transport = try ssh.Session.init(allocator),
+        .store = &store,
+        .audit = &audit,
+        .history = &history_store,
+        .owner = &manager,
+        .started_at_ns = std.Io.Timestamp.now(io, .real).nanoseconds,
+    };
+    session.io = session.threaded.io();
+    session.status.store(.ready, .release);
+    const key = try allocator.dupe(u8, session.server.id);
+    lockSpin(&manager.mutex);
+    try manager.sessions.put(key, session);
+    manager.mutex.unlock();
+    session.worker = try std.Thread.spawn(.{}, backupAdmissionTestWorker, .{session});
+
+    var outcome = BackupOutcome{ .allocator = allocator };
+    defer outcome.data.deinit(allocator);
+    var probe = BackupDisconnectOrderProbe{ .manager = &manager, .outcome = &outcome };
+    manager.setBackupDisconnectHook(.{ .context = &probe, .prepare_fn = BackupDisconnectOrderProbe.prepare });
+    manager.disconnect(session.server.id);
+    try std.testing.expect(probe.called);
+    try std.testing.expect(probe.stop_was_clear);
+    try std.testing.expect(probe.normal_rejected);
+    try std.testing.expect(probe.cleanup_admitted);
+    try std.testing.expect(outcome.isDone());
+    try std.testing.expectEqual(BackupOutcomeCode.disconnected, outcome.code);
+}
+
+fn backupAdmissionLifecycleTest(mode: BackupAdmissionTestMode) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const server_id = switch (mode) {
+        .request => "backup-admission-request",
+        .process => "backup-admission-process",
+    };
+    var store: servers.Store = .{ .allocator = allocator, .path = "/tmp/oars-backup-admission-servers.json" };
+    var audit: history.AuditStore = .{ .allocator = allocator, .path = "/tmp/oars-backup-admission-audit.jsonl" };
+    var history_store: history.HistoryStore = .{ .allocator = allocator, .path = "/tmp/oars-backup-admission-history.jsonl" };
+    var manager = Manager.init(allocator, io, &store, &audit, &history_store, null);
+    defer manager.deinit();
+
+    const session = try allocator.create(Session);
+    session.* = .{
+        .id = 101,
+        .server = try (servers.Server{ .id = server_id, .name = "backup", .host = "host", .user = "user" }).copy(allocator),
+        .allocator = allocator,
+        .threaded = std.Io.Threaded.init(allocator, .{}),
+        .io = undefined,
+        .transport = try ssh.Session.init(allocator),
+        .store = &store,
+        .audit = &audit,
+        .history = &history_store,
+        .owner = &manager,
+        .started_at_ns = std.Io.Timestamp.now(io, .real).nanoseconds,
+    };
+    session.io = session.threaded.io();
+    session.status.store(.ready, .release);
+    const key = try allocator.dupe(u8, server_id);
+    lockSpin(&manager.mutex);
+    try manager.sessions.put(key, session);
+    manager.mutex.unlock();
+    session.worker = try std.Thread.spawn(.{}, backupAdmissionTestWorker, .{session});
+
+    var outcome = BackupOutcome{ .allocator = allocator };
+    defer outcome.data.deinit(allocator);
+    var process = BackupProcess{ .allocator = allocator };
+    defer process.data.deinit(allocator);
+    var context = BackupAdmissionTestContext{
+        .manager = &manager,
+        .server_id = server_id,
+        .mode = mode,
+        .outcome = &outcome,
+        .process = &process,
+    };
+
+    lockSpin(&session.ops_mutex);
+    var ops_locked = true;
+    var admission_thread: ?std.Thread = try std.Thread.spawn(.{}, BackupAdmissionTestContext.run, .{&context});
+    defer if (admission_thread) |thread| thread.join();
+    defer if (ops_locked) session.ops_mutex.unlock();
+
+    // Let admission finish cloning and block at publication. The manager lock
+    // must remain held while it waits for ops_mutex, otherwise disconnect can
+    // remove, join, and destroy the borrowed session.
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(20), .awake) catch {};
+    var publication_protected = false;
+    const deadline = std.Io.Timestamp.now(io, .real).nanoseconds + std.time.ns_per_s;
+    while (std.Io.Timestamp.now(io, .real).nanoseconds < deadline) {
+        if (!manager.mutex.tryLock()) {
+            publication_protected = true;
+            break;
+        }
+        manager.mutex.unlock();
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expect(publication_protected);
+
+    var disconnect_thread: ?std.Thread = try std.Thread.spawn(.{}, backupAdmissionTestDisconnect, .{ &manager, server_id });
+    defer if (disconnect_thread) |thread| thread.join();
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+    try std.testing.expect(!session.stop_flag.load(.acquire));
+
+    session.ops_mutex.unlock();
+    ops_locked = false;
+    admission_thread.?.join();
+    admission_thread = null;
+    disconnect_thread.?.join();
+    disconnect_thread = null;
+
+    try std.testing.expect(context.err == null);
+    switch (mode) {
+        .request => {
+            try std.testing.expect(outcome.isDone());
+            try std.testing.expectEqual(BackupOutcomeCode.disconnected, outcome.code);
+        },
+        .process => {
+            var snapshot = try process.snapshot(allocator, 0, 1024);
+            defer snapshot.deinit(allocator);
+            try std.testing.expect(snapshot.done);
+            try std.testing.expect(snapshot.disconnected);
+        },
+    }
+}
+
+test "backup allocation failures roll back all owned memory" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneBackupRequestsAllocationTest, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, copyBackupOutcomeAllocationTest, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, snapshotBackupProcessAllocationTest, .{});
+}
+
+test "backup clone scrubs sensitive partial and completed payloads exactly once" {
+    const exec_secret = "partial-allocation-sensitive-stdin-payload-unique";
+    var exec_tracker = ZeroCheckAllocator{ .backing = std.testing.allocator, .watch_alloc_index = 1 };
+    var failing = std.testing.FailingAllocator.init(exec_tracker.allocator(), .{ .fail_index = 2 });
+    try std.testing.expectError(error.OutOfMemory, cloneBackupRequest(failing.allocator(), .{ .exec = .{
+        .command = "backup",
+        .stdin_data = exec_secret,
+        .timeout_ns = std.time.ns_per_s,
+        .cap = 4096,
+        .history_command = "history allocation fails",
+        .sensitive_stdin = true,
+    } }));
+    try std.testing.expectEqual(@as(usize, 1), exec_tracker.watched_frees);
+    try std.testing.expectEqual(@as(usize, 0), exec_tracker.dirty_frees);
+
+    const write_secret = "completed-sensitive-sftp-write-payload-with-unique-size";
+    var write_tracker = ZeroCheckAllocator{ .backing = std.testing.allocator, .watch_alloc_index = 1 };
+    const cloned = try cloneBackupRequest(write_tracker.allocator(), .{ .sftp_write = .{
+        .path = "/remote/secret",
+        .data = write_secret,
+        .sensitive = true,
+    } });
+    freeBackupRequest(write_tracker.allocator(), cloned);
+    try std.testing.expectEqual(@as(usize, 1), write_tracker.watched_frees);
+    try std.testing.expectEqual(@as(usize, 0), write_tracker.dirty_frees);
+}
+
+test "backup admission remains live through concurrent disconnect" {
+    try backupAdmissionLifecycleTest(.request);
+    try backupAdmissionLifecycleTest(.process);
+}
+
+test "backup outcome and process abandonment free exactly once" {
+    const allocator = std.testing.allocator;
+
+    const completed_outcome = try allocator.create(BackupOutcome);
+    completed_outcome.* = .{ .allocator = allocator };
+    completed_outcome.set(.ok, 0, fx_unknown, false, "result", "ok");
+    try std.testing.expect(completed_outcome.abandon());
+    try std.testing.expect(!completed_outcome.abandoned);
+    completed_outcome.data.deinit(allocator);
+    allocator.destroy(completed_outcome);
+
+    const abandoned_outcome = try allocator.create(BackupOutcome);
+    abandoned_outcome.* = .{ .allocator = allocator };
+    try std.testing.expect(!abandoned_outcome.abandon());
+    abandoned_outcome.set(.disconnected, null, fx_unknown, false, "late result", "disconnected");
+
+    const completed_process = try allocator.create(BackupProcess);
+    completed_process.* = .{ .allocator = allocator };
+    try completed_process.data.appendSlice(allocator, "output");
+    completed_process.complete(0, false, "done");
+    try std.testing.expect(completed_process.abandon());
+    try std.testing.expect(!completed_process.abandoned);
+    completed_process.data.deinit(allocator);
+    allocator.destroy(completed_process);
+
+    const abandoned_process = try allocator.create(BackupProcess);
+    abandoned_process.* = .{ .allocator = allocator };
+    try abandoned_process.data.appendSlice(allocator, "late output");
+    try std.testing.expect(!abandoned_process.abandon());
+    abandoned_process.complete(null, true, "disconnected");
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    const failing_allocator = failing.allocator();
+    const oom_outcome = try failing_allocator.create(BackupOutcome);
+    oom_outcome.* = .{ .allocator = failing_allocator };
+    try std.testing.expect(!oom_outcome.abandon());
+    oom_outcome.set(.ok, 0, fx_unknown, false, "allocation must fail", "ignored");
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
 
 test "stream overflow drops oldest and tracks absolute positions" {
     const allocator = std.testing.allocator;
@@ -6279,6 +7452,17 @@ test "sessionDone completes queued op outcomes honestly" {
     const abandoned = try allocator.create(ClearOutcome);
     abandoned.* = .{ .allocator = allocator };
     try std.testing.expect(!abandoned.abandon());
+    // Backup outcomes exercise both ownership sides during the same queued-op
+    // disconnect drain: one remains handler-owned, the others were abandoned.
+    const backup_waited = try allocator.create(BackupOutcome);
+    backup_waited.* = .{ .allocator = allocator };
+    const backup_abandoned = try allocator.create(BackupOutcome);
+    backup_abandoned.* = .{ .allocator = allocator };
+    try std.testing.expect(!backup_abandoned.abandon());
+    const process_abandoned = try allocator.create(BackupProcess);
+    process_abandoned.* = .{ .allocator = allocator };
+    try process_abandoned.data.appendSlice(allocator, "buffered process output");
+    try std.testing.expect(!process_abandoned.abandon());
     {
         lockSpin(&session.ops_mutex);
         defer session.ops_mutex.unlock();
@@ -6291,6 +7475,30 @@ test "sessionDone completes queued op outcomes honestly" {
             .expected = .{ .size = 1, .mtime = 2, .mode = 0o644 },
             .outcome = abandoned,
         } });
+        try session.ops.append(allocator, .{ .backup = .{
+            .request = try cloneBackupRequest(allocator, .{ .exec = .{
+                .command = "backup-check",
+                .stdin_data = "secret stdin queued before disconnect",
+                .timeout_ns = std.time.ns_per_s,
+                .cap = 4096,
+                .history_command = "backup-check",
+                .sensitive_stdin = true,
+            } }),
+            .outcome = backup_waited,
+        } });
+        try session.ops.append(allocator, .{ .backup = .{
+            .request = try cloneBackupRequest(allocator, .{ .sftp_write = .{
+                .path = "/remote/config",
+                .data = "secret write queued before disconnect",
+                .sensitive = true,
+            } }),
+            .outcome = backup_abandoned,
+        } });
+        try session.ops.append(allocator, .{ .backup_run = .{
+            .command = try allocator.dupe(u8, "rclone run"),
+            .stdin_data = try allocator.dupe(u8, "secret process stdin"),
+            .process = process_abandoned,
+        } });
     }
 
     sessionDone(session);
@@ -6301,6 +7509,10 @@ test "sessionDone completes queued op outcomes honestly" {
     try std.testing.expect(!waited.ok);
     try std.testing.expectEqualStrings("session disconnected", waited.message());
     allocator.destroy(waited);
+    try std.testing.expect(backup_waited.isDone());
+    try std.testing.expectEqual(BackupOutcomeCode.disconnected, backup_waited.code);
+    backup_waited.data.deinit(allocator);
+    allocator.destroy(backup_waited);
     try std.testing.expect(session.worker_done.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), session.ops.items.len);
 }
