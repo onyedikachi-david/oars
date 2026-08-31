@@ -56,6 +56,7 @@ export interface ChannelInfo {
 export interface PollResult {
   ok: boolean;
   status: SessionStatus;
+  connection_id?: number | null;
   error?: string;
   trust?: { pending: boolean; algorithm?: string; fingerprint?: string };
   channels: ChannelInfo[];
@@ -871,28 +872,49 @@ export interface BackupInstallPlanResult {
 // Spec 11: AI Terminal (oars.ai.*)
 // ============================================================================
 
-export type AiAdapter = "openai_compatible" | "custom";
+export type AiAdapter = "openai_responses" | "openai_chat_completions";
 export type AiInstructionRole = "developer" | "system";
-
-export interface AiCapabilities {
-  instruction_role: AiInstructionRole;
-  streaming: boolean;
-  structured_output: boolean;
-}
+export type AiStructuredOutput = "json_schema" | "json_object";
+export type AiProviderTestStatus = "untested" | "passed" | "failed" | "stale";
+export type AiCredentialStatus = "configured" | "missing" | "denied" | "unavailable";
+export type AiCredentialConfigureStatus = "configured" | "canceled" | "denied" | "unavailable";
+export type AiErrorCode =
+  | "invalid_argument"
+  | "not_found"
+  | "conflict"
+  | "stale_revision"
+  | "not_connected"
+  | "credential_missing"
+  | "provider_untested"
+  | "busy"
+  | "limit_exceeded"
+  | "provider_auth"
+  | "provider_rate_limited"
+  | "provider_timeout"
+  | "provider_protocol"
+  | "recovery_required";
 
 export interface AiProvider {
+  id: string;
+  name: string;
   adapter: AiAdapter;
   base_url: string;
   model: string;
-  capabilities: AiCapabilities;
-  updated_at_ns: number;
+  instruction_role: AiInstructionRole | null;
+  structured_output: AiStructuredOutput | null;
+  revision: number;
+  tested_at_ms: number | null;
+  test_status: AiProviderTestStatus;
 }
 
-export interface AiProviderInput {
+export interface AiProviderDraft {
+  id?: string;
+  name: string;
   adapter: AiAdapter;
   base_url: string;
   model: string;
-  capabilities?: Partial<AiCapabilities>;
+  instruction_role?: AiInstructionRole;
+  structured_output?: AiStructuredOutput;
 }
 
 export interface AiLogInfo {
@@ -900,60 +922,208 @@ export interface AiLogInfo {
   last_write: number;
 }
 
-export interface AiContextBundle {
-  ok: boolean;
+export interface AiContextIssue {
+  code: string;
+  error: string;
+}
+
+export interface AiContextSnapshot {
+  server_id: string;
   os: string;
   hostname: string;
-  uptime_sec: number;
-  load: {
-    utilization_pct: number | null;
-    load_1: number;
-    load_5: number;
-    load_15: number;
-    cores: number;
-  };
-  mem: {
-    used_bytes: number;
-    total_bytes: number;
-    available_bytes: number;
-    swap_used_bytes: number;
-    swap_total_bytes: number;
-  } | null;
-  disk: {
-    used_bytes: number;
-    total_bytes: number;
-    available_bytes: number;
-  } | null;
-  top_processes: Array<{
-    pid: number;
-    name: string;
-    cpu: number | null;
-    mem: number | null;
-  }>;
+  monitor: MonitorSnapshot;
   active_logs: AiLogInfo[];
-  probe_error: string | null;
+  partial: boolean;
+  errors: AiContextIssue[];
+  updated_at_ms: number;
 }
 
-export interface AiHistoryEntry {
-  ts: number;
-  action: string;
-  detail: string;
+export type AiContextGetResult =
+  | { ok: true; state: "missing"; context: null; stale: true }
+  | { ok: true; state: "ready"; context: AiContextSnapshot; stale: boolean; updated_at_ms: number };
+
+export interface AiOperationAdmission<State extends string> {
+  ok: true;
+  operation_id: string;
+  state: State;
 }
 
-export interface AiHistoryResult {
-  ok: boolean;
-  runs: AiHistoryEntry[];
+export interface AiVersionedEvent<Type extends string = string, Payload = Record<string, unknown>> {
+  version: 1;
+  sequence: number;
+  stream_id: string;
+  type: Type;
+  payload: Payload;
 }
 
-export interface AiProviderGetResult {
-  ok: boolean;
-  provider: AiProvider | null;
+export type AiContextEvent =
+  | AiVersionedEvent<"context.refresh_started", { state: "running"; started_at_ms: number }>
+  | AiVersionedEvent<"context.ready", { state: "ready"; partial: boolean; updated_at_ms: number }>
+  | AiVersionedEvent<"context.failed", { code: AiErrorCode; error: string; finished_at_ms: number }>
+  | AiVersionedEvent<"context.cancel_requested", { state: "cancel_requested"; requested_at_ms: number }>
+  | AiVersionedEvent<"context.canceled", { state: "canceled"; finished_at_ms: number }>;
+
+export interface AiEventPoll<Event extends AiVersionedEvent = AiVersionedEvent> {
+  ok: true;
+  stream_id: string;
+  cursor: number;
+  dropped: number;
+  finished: boolean;
+  state: string;
+  events: Event[];
 }
 
-export interface AiProviderSetResult {
-  ok: boolean;
+export interface AiProviderListResult {
+  ok: true;
+  providers: AiProvider[];
+}
+
+export interface AiProviderSaveResult {
+  ok: true;
   provider: AiProvider;
 }
+
+export interface AiCredentialStatusResult<Status extends string = AiCredentialStatus> {
+  ok: true;
+  status: Status;
+}
+
+export type AiProviderTestOperationState = "queued" | "running" | "cancel_requested" | "passed" | "failed" | "canceled";
+
+export type AiProviderTestEvent =
+  | AiVersionedEvent<"provider.test_started", { state: "running" }>
+  | AiVersionedEvent<"provider.test_succeeded", { state: "passed"; provider_request_id: string; tested_at_ms: number }>
+  | AiVersionedEvent<"provider.test_failed", { state: "failed"; code: AiErrorCode; error: string }>
+  | AiVersionedEvent<"provider.test_canceled", { state: "canceled" }>;
+
+export type AiContextOperationState = "queued" | "running" | "cancel_requested" | "ready" | "failed" | "canceled";
+
+export interface AiProposal {
+  id: string;
+  turn_id: string;
+  revision: number;
+  server_id: string;
+  provider_id: string;
+  provider_revision: number;
+  context_hash: string;
+  command: string;
+  command_sha256: string;
+  explanation: string;
+  model_destructive: boolean;
+  local_destructive: boolean;
+  needs_sudo: boolean;
+  created_at_ms: number;
+  expires_at_ms: number;
+  state: "awaiting_approval" | "approved" | "executing" | "completed" | "failed" | "canceled" | "expired" | "recovery_required";
+}
+
+export type AiTurnState =
+  | "queued"
+  | "collecting_context"
+  | "requesting"
+  | "streaming"
+  | "validating"
+  | "awaiting_approval"
+  | "approved"
+  | "executing"
+  | "summarizing"
+  | "completed"
+  | "failed"
+  | "cancel_requested"
+  | "canceled"
+  | "interrupted"
+  | "recovery_required";
+
+export interface AiThreadSummary {
+  id: string;
+  revision: number;
+  server_id: string;
+  provider_id: string;
+  model: string;
+  title: string;
+  state: AiTurnState;
+  turn_count: number;
+  updated_at_ms: number;
+}
+
+export interface AiThreadDetail {
+  id: string;
+  revision: number;
+  server_id: string;
+  provider_id: string;
+  adapter: AiAdapter;
+  model: string;
+  title: string;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface AiTurnSnapshot {
+  id: string;
+  operation_id: string;
+  state: AiTurnState;
+  message: string;
+  context_hash: string;
+  provider_revision: number;
+  connection_id: number;
+  execution_id: string | null;
+  channel: number | null;
+  execution_cursor: number;
+  exit_status: number | null;
+  proposal: AiProposal | null;
+  assistant_message: string | null;
+  question: string | null;
+  question_explanation: string | null;
+}
+
+export interface AiThreadGetResult {
+  ok: true;
+  thread: AiThreadDetail;
+  turns: AiTurnSnapshot[];
+  turns_start: number;
+  turn_count: number;
+  active_proposal: AiProposal | null;
+}
+
+export interface AiThreadListResult {
+  ok: true;
+  threads: AiThreadSummary[];
+}
+
+export interface AiTurnAdmission {
+  ok: true;
+  thread_id: string;
+  turn_id: string;
+  state: AiTurnState;
+}
+
+export interface AiExecutionAdmission {
+  ok: true;
+  execution_id: string;
+  connection_id: number;
+  channel: number;
+  state: AiTurnState;
+}
+
+export type AiTurnEvent =
+  | AiVersionedEvent<"turn.started", { state: "queued" | "interrupted"; recovered?: boolean }>
+  | AiVersionedEvent<"context.ready", { context_hash: string; bytes: number; raw_log_persisted: false }>
+  | AiVersionedEvent<"context.failed", { code: AiErrorCode; error: string }>
+  | AiVersionedEvent<"provider.request_started", { client_request_id: string; provider_id?: string; provider_revision?: number; state?: "requesting" }>
+  | AiVersionedEvent<"provider.response_created", { provider_request_id: string | null }>
+  | AiVersionedEvent<"provider.progress", { phase: string; received_bytes: number }>
+  | AiVersionedEvent<"proposal.ready", { proposal: AiProposal }>
+  | AiVersionedEvent<"assistant.message", { message: string; explanation: string }>
+  | AiVersionedEvent<"question.ready", { question: string; explanation: string }>
+  | AiVersionedEvent<"provider.refusal", { state?: "failed"; reason?: string; finished_at_ms?: number }>
+  | AiVersionedEvent<"turn.incomplete", { state?: "failed"; code: AiErrorCode; error: string; retry: "explicit" | "never"; finished_at_ms?: number }>
+  | AiVersionedEvent<"turn.failed", { state?: "failed" | "interrupted" | "recovery_required"; code: AiErrorCode; error: string; retry?: "explicit" | "never" }>
+  | AiVersionedEvent<"turn.cancel_requested", { state: "cancel_requested"; requested_at_ms?: number; provider_may_have_received_request?: boolean; remote_termination_pending?: boolean }>
+  | AiVersionedEvent<"turn.canceled", { state: "canceled"; finished_at_ms?: number; provider_may_have_received_request?: boolean; remote_command_started?: boolean }>
+  | AiVersionedEvent<"turn.completed", { state: "completed"; finished_at_ms?: number }>
+  | AiVersionedEvent<"turn.approved", { state: "approved" }>
+  | AiVersionedEvent<"execution.started", { state: "executing"; channel: number; connection_id: number }>
+  | AiVersionedEvent<"execution.output_gap", { dropped: number }>;
 
 // ============================================================================
 // Spec 15: Command History & Audit Journal (oars.history.*, oars.audit.*)

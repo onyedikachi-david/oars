@@ -37,13 +37,13 @@ pub const mask = "\u{2022}\u{2022}\u{2022}\u{2022}";
 /// Named fields whose value is a secret (spec 15 §8: narrow, named — the
 /// list must not grow a blanket `-p`).
 const secret_names = [_][]const u8{
-    "password",       "passwd",       "pwd",           "passphrase",
-    "token",          "secret",       "api-key",       "apikey",
-    "api_key",        "access-key",   "access_key",    "secret-key",
-    "secret_key",     "auth-token",   "auth_token",    "session-token",
-    "session_token",  "client-secret", "client_secret", "private-key",
-    "private_key",    "consumer-secret", "consumer_secret",
-    "signing-key",    "signing_key",  "encryption-key", "encryption_key",
+    "password",      "passwd",          "pwd",             "passphrase",
+    "token",         "secret",          "api-key",         "apikey",
+    "api_key",       "access-key",      "access_key",      "secret-key",
+    "secret_key",    "auth-token",      "auth_token",      "session-token",
+    "session_token", "client-secret",   "client_secret",   "private-key",
+    "private_key",   "consumer-secret", "consumer_secret", "signing-key",
+    "signing_key",   "encryption-key",  "encryption_key",
 };
 
 fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -581,6 +581,49 @@ fn writeAuditLine(w: *std.Io.Writer, e: *const AuditEntry) !void {
     try w.writeAll("}\n");
 }
 
+fn allocAuditLine(allocator: std.mem.Allocator, entry: *const AuditEntry) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try writeAuditLine(&output.writer, entry);
+    return output.toOwnedSlice();
+}
+
+fn cloneAuditEntry(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    operation_id: []const u8,
+    timestamp: i64,
+    action_type: []const u8,
+    target: []const u8,
+    commands: []const u8,
+    result: []const u8,
+    detail: []const u8,
+) !AuditEntry {
+    const owned_id = try allocator.dupe(u8, id);
+    errdefer allocator.free(owned_id);
+    const owned_operation_id = try allocator.dupe(u8, operation_id);
+    errdefer allocator.free(owned_operation_id);
+    const owned_type = try allocator.dupe(u8, action_type);
+    errdefer allocator.free(owned_type);
+    const owned_target = try allocator.dupe(u8, target);
+    errdefer allocator.free(owned_target);
+    const owned_commands = try allocator.dupe(u8, commands);
+    errdefer allocator.free(owned_commands);
+    const owned_result = try allocator.dupe(u8, result);
+    errdefer allocator.free(owned_result);
+    const owned_detail = try allocator.dupe(u8, detail);
+    return .{
+        .id = owned_id,
+        .operation_id = owned_operation_id,
+        .ts = timestamp,
+        .type = owned_type,
+        .target = owned_target,
+        .commands = owned_commands,
+        .result = owned_result,
+        .detail = owned_detail,
+    };
+}
+
 /// Disk shape for reads: the pre-spec-15 `action`/`server_id` field names
 /// are accepted so journals written by earlier builds still load.
 const DiskAudit = struct {
@@ -632,23 +675,14 @@ pub const AuditStore = struct {
         try self.ensureLoadedLocked(io);
         var id_buf: [64]u8 = undefined;
         const id = std.fmt.bufPrint(&id_buf, "aud-{d}", .{self.next_id}) catch unreachable;
-        self.next_id += 1;
-        var entry = AuditEntry{
-            .id = try self.allocator.dupe(u8, id),
-            .operation_id = try self.allocator.dupe(u8, operation_id),
-            .ts = @intCast(std.Io.Timestamp.now(io, .real).nanoseconds),
-            .type = try self.allocator.dupe(u8, action_type),
-            .target = try self.allocator.dupe(u8, target),
-            .commands = try self.allocator.dupe(u8, commands),
-            .result = try self.allocator.dupe(u8, result),
-            .detail = try self.allocator.dupe(u8, detail),
-        };
+        var entry = try cloneAuditEntry(self.allocator, id, operation_id, @intCast(std.Io.Timestamp.now(io, .real).nanoseconds), action_type, target, commands, result, detail);
         errdefer entry.deinit(self.allocator);
-        try self.entries.append(self.allocator, entry);
-        var line_buf: [16 * 1024]u8 = undefined;
-        var w = std.Io.Writer.fixed(&line_buf);
-        try writeAuditLine(&w, &entry);
-        appendLine(io, self.path, w.buffered()) catch {};
+        try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        const line = try allocAuditLine(self.allocator, &entry);
+        defer self.allocator.free(line);
+        try appendLine(io, self.path, line);
+        self.entries.appendAssumeCapacity(entry);
+        self.next_id += 1;
         self.compactLocked(io);
     }
 
@@ -661,10 +695,7 @@ pub const AuditStore = struct {
         var lines: std.ArrayList([]const u8) = .empty;
         defer lines.deinit(self.allocator);
         for (self.entries.items) |*e| {
-            var buf: [16 * 1024]u8 = undefined;
-            var w = std.Io.Writer.fixed(&buf);
-            writeAuditLine(&w, e) catch return;
-            const owned = self.allocator.dupe(u8, w.buffered()) catch return;
+            const owned = allocAuditLine(self.allocator, e) catch return;
             lines.append(self.allocator, owned) catch {
                 self.allocator.free(owned);
                 return;
@@ -1049,6 +1080,23 @@ test "audit append, read filter, list filter, and clear" {
     const content = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024));
     defer allocator.free(content);
     try std.testing.expectEqual(@as(usize, 0), content.len);
+}
+
+test "audit accepts the full AI command bound without truncation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var path_buf: [512]u8 = undefined;
+    const path = try testPath("audit-ai-command-bound", &path_buf);
+    defer testCleanup(path);
+    var store = AuditStore{ .allocator = allocator, .path = path };
+    defer store.deinit();
+    const command = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(command);
+    @memset(command, 'x');
+    try store.appendFull(io, "ai-operation", "ai.approved", "server-1", command, "approved", "exact command approved");
+    const content = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(256 * 1024));
+    defer allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, command) != null);
 }
 
 test "audit loads pre-spec-15 action/server_id journal lines" {

@@ -34,7 +34,7 @@ const ssh = @import("ssh.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 127;
+const handler_count = 146;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -65,6 +65,17 @@ pub const Context = struct {
         });
         self.manager.setBackupDisconnectHook(.{ .context = self.backup, .prepare_fn = backupPrepareDisconnect });
         try self.backup.ensureStarted(self.io);
+    }
+
+    pub fn startAiCoordinator(self: *Context) void {
+        if (self.ai.turns) |*turns| {
+            turns.collector = .{ .context = self, .collect_fn = aiCollectSelectedContext };
+            turns.executor = .{ .context = self, .identity_fn = aiExecutionIdentity, .poll_fn = aiExecutionPoll, .cancel_fn = aiExecutionCancel };
+            const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_ms));
+            turns.recover(now_ms) catch {
+                turns.accepting = false;
+            };
+        }
     }
 
     pub fn dispatcher(self: *Context) native_sdk.BridgeDispatcher {
@@ -177,10 +188,29 @@ pub const Context = struct {
             .{ .name = "oars.backup.history", .context = self, .invoke_fn = handleBackupHistory },
             .{ .name = "oars.backup.historyLog", .context = self, .invoke_fn = handleBackupHistoryLog },
             .{ .name = "oars.backup.install", .context = self, .invoke_fn = handleBackupInstall },
-            .{ .name = "oars.ai.context", .context = self, .invoke_fn = handleAiContext },
-            .{ .name = "oars.ai.provider.get", .context = self, .invoke_fn = handleAiProviderGet },
-            .{ .name = "oars.ai.provider.set", .context = self, .invoke_fn = handleAiProviderSet },
-            .{ .name = "oars.ai.history", .context = self, .invoke_fn = handleAiHistory },
+            .{ .name = "oars.ai.provider.list", .context = self, .invoke_fn = handleAiProviderList },
+            .{ .name = "oars.ai.provider.save", .context = self, .invoke_fn = handleAiProviderSave },
+            .{ .name = "oars.ai.provider.delete", .context = self, .invoke_fn = handleAiProviderDelete },
+            .{ .name = "oars.ai.provider.test", .context = self, .invoke_fn = handleAiProviderTest },
+            .{ .name = "oars.ai.provider.testPoll", .context = self, .invoke_fn = handleAiProviderTestPoll },
+            .{ .name = "oars.ai.provider.testCancel", .context = self, .invoke_fn = handleAiProviderTestCancel },
+            .{ .name = "oars.ai.credential.configure", .context = self, .invoke_fn = handleAiCredentialConfigure },
+            .{ .name = "oars.ai.credential.status", .context = self, .invoke_fn = handleAiCredentialStatus },
+            .{ .name = "oars.ai.credential.delete", .context = self, .invoke_fn = handleAiCredentialDelete },
+            .{ .name = "oars.ai.context.get", .context = self, .invoke_fn = handleAiContextGet },
+            .{ .name = "oars.ai.context.refresh", .context = self, .invoke_fn = handleAiContextRefresh },
+            .{ .name = "oars.ai.context.poll", .context = self, .invoke_fn = handleAiContextPoll },
+            .{ .name = "oars.ai.context.cancel", .context = self, .invoke_fn = handleAiContextCancel },
+            .{ .name = "oars.ai.thread.list", .context = self, .invoke_fn = handleAiThreadList },
+            .{ .name = "oars.ai.thread.get", .context = self, .invoke_fn = handleAiThreadGet },
+            .{ .name = "oars.ai.thread.delete", .context = self, .invoke_fn = handleAiThreadDelete },
+            .{ .name = "oars.ai.turn.start", .context = self, .invoke_fn = handleAiTurnStart },
+            .{ .name = "oars.ai.turn.poll", .context = self, .invoke_fn = handleAiTurnPoll },
+            .{ .name = "oars.ai.turn.cancel", .context = self, .invoke_fn = handleAiTurnCancel },
+            .{ .name = "oars.ai.turn.summarize", .context = self, .invoke_fn = handleAiTurnSummarize },
+            .{ .name = "oars.ai.proposal.edit", .context = self, .invoke_fn = handleAiProposalEdit },
+            .{ .name = "oars.ai.proposal.run", .context = self, .invoke_fn = handleAiProposalRun },
+            .{ .name = "oars.ai.proposal.cancel", .context = self, .invoke_fn = handleAiProposalCancel },
             .{ .name = "oars.vnc.start", .context = self, .invoke_fn = handleVncStart },
             .{ .name = "oars.vnc.stop", .context = self, .invoke_fn = handleVncStop },
             .{ .name = "oars.vnc.probe", .context = self, .invoke_fn = handleVncProbe },
@@ -306,10 +336,29 @@ pub const Context = struct {
             .{ .name = "oars.backup.history", .origins = &allowed_origins },
             .{ .name = "oars.backup.historyLog", .origins = &allowed_origins },
             .{ .name = "oars.backup.install", .origins = &allowed_origins },
-            .{ .name = "oars.ai.context", .origins = &allowed_origins },
-            .{ .name = "oars.ai.provider.get", .origins = &allowed_origins },
-            .{ .name = "oars.ai.provider.set", .origins = &allowed_origins },
-            .{ .name = "oars.ai.history", .origins = &allowed_origins },
+            .{ .name = "oars.ai.provider.list", .origins = &allowed_origins },
+            .{ .name = "oars.ai.provider.save", .origins = &allowed_origins },
+            .{ .name = "oars.ai.provider.delete", .origins = &allowed_origins },
+            .{ .name = "oars.ai.provider.test", .origins = &allowed_origins },
+            .{ .name = "oars.ai.provider.testPoll", .origins = &allowed_origins },
+            .{ .name = "oars.ai.provider.testCancel", .origins = &allowed_origins },
+            .{ .name = "oars.ai.credential.configure", .origins = &allowed_origins },
+            .{ .name = "oars.ai.credential.status", .origins = &allowed_origins },
+            .{ .name = "oars.ai.credential.delete", .origins = &allowed_origins },
+            .{ .name = "oars.ai.context.get", .origins = &allowed_origins },
+            .{ .name = "oars.ai.context.refresh", .origins = &allowed_origins },
+            .{ .name = "oars.ai.context.poll", .origins = &allowed_origins },
+            .{ .name = "oars.ai.context.cancel", .origins = &allowed_origins },
+            .{ .name = "oars.ai.thread.list", .origins = &allowed_origins },
+            .{ .name = "oars.ai.thread.get", .origins = &allowed_origins },
+            .{ .name = "oars.ai.thread.delete", .origins = &allowed_origins },
+            .{ .name = "oars.ai.turn.start", .origins = &allowed_origins },
+            .{ .name = "oars.ai.turn.poll", .origins = &allowed_origins },
+            .{ .name = "oars.ai.turn.cancel", .origins = &allowed_origins },
+            .{ .name = "oars.ai.turn.summarize", .origins = &allowed_origins },
+            .{ .name = "oars.ai.proposal.edit", .origins = &allowed_origins },
+            .{ .name = "oars.ai.proposal.run", .origins = &allowed_origins },
+            .{ .name = "oars.ai.proposal.cancel", .origins = &allowed_origins },
             .{ .name = "oars.vnc.start", .origins = &allowed_origins },
             .{ .name = "oars.vnc.stop", .origins = &allowed_origins },
             .{ .name = "oars.vnc.probe", .origins = &allowed_origins },
@@ -822,7 +871,7 @@ fn handleSshPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
     defer parsed.deinit();
 
     const info = self.manager.sessionSnapshot(parsed.value.server_id) catch {
-        return "{\"ok\":true,\"status\":\"closed\",\"error\":\"\",\"trust\":{\"pending\":false},\"channels\":[]}";
+        return "{\"ok\":true,\"status\":\"closed\",\"connection_id\":null,\"error\":\"\",\"trust\":{\"pending\":false},\"channels\":[]}";
     };
 
     // The requesting tab's cursors: channel id -> absolute position.
@@ -841,7 +890,7 @@ fn handleSshPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
         poll_data_budget,
         poll_channel_budget,
     ) catch {
-        return "{\"ok\":true,\"status\":\"closed\",\"error\":\"\",\"trust\":{\"pending\":false},\"channels\":[]}";
+        return "{\"ok\":true,\"status\":\"closed\",\"connection_id\":null,\"error\":\"\",\"trust\":{\"pending\":false},\"channels\":[]}";
     };
     defer {
         for (polls) |*p| p.deinit(self.allocator);
@@ -851,6 +900,10 @@ fn handleSshPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":true,\"status\":") catch return output[0..0];
     json.writeJsonString(&writer, info.status.jsonName()) catch return output[0..0];
+    writer.writeAll(",\"connection_id\":") catch return output[0..0];
+    if (self.manager.connectionIdentity(parsed.value.server_id) catch null) |connection_id| {
+        writer.print("{d}", .{connection_id}) catch return output[0..0];
+    } else writer.writeAll("null") catch return output[0..0];
     writer.writeAll(",\"error\":") catch return output[0..0];
     json.writeJsonString(&writer, info.@"error") catch return output[0..0];
     writer.writeAll(",\"trust\":{") catch return output[0..0];
@@ -12575,183 +12628,122 @@ test "backup audit observer reports success only after a durable append" {
 
 // --- AI terminal (spec 11) ------------------------------------------------
 //
-// The AI call itself is frontend-side (spec 11 §6). Zig adds: the
-// context bundle (monitor cache + one light probe, cached ≤ 5 s), the
-// provider config store (ai.json — the key stays in the frontend
-// Keychain under `ai:<base_url>`), and audit-filtered run history.
+// The native coordinator owns provider calls, credentials, durable turns,
+// proposal approval, and tracked SSH execution. The WebView receives only
+// typed bridge snapshots and bounded event streams.
 
 const ai_exec_cap: usize = 256 * 1024;
 const ai_exec_timeout_ns = 20 * std.time.ns_per_s;
 
-const AiContextPayloadIn = struct { server_id: []const u8 };
-const AiProviderGetPayload = struct {};
-const AiProviderSetPayload = struct { provider: ai.ProviderInput };
-const AiHistoryPayload = struct {
+const AiProviderListPayload = struct {};
+const AiProviderSavePayload = struct {
+    operation_id: []const u8,
+    provider: ai.provider_domain.Draft,
+    expected_revision: ?u64 = null,
+};
+const AiProviderDeletePayload = struct {
+    operation_id: []const u8,
+    provider_id: []const u8,
+    expected_revision: u64,
+};
+const AiProviderTestPayload = struct { operation_id: []const u8, provider_id: []const u8, expected_revision: u64 };
+const AiProviderTestPollPayload = struct { operation_id: []const u8, cursor: u64 = 0, rewind: bool = false };
+const AiProviderTestCancelPayload = struct { operation_id: []const u8 };
+const AiCredentialConfigurePayload = struct { operation_id: []const u8, provider_id: []const u8 };
+const AiCredentialStatusPayload = struct { provider_id: []const u8 };
+const AiCredentialDeletePayload = struct { operation_id: []const u8, provider_id: []const u8 };
+const AiContextGetPayload = struct { server_id: []const u8 };
+const AiContextRefreshPayload = struct { operation_id: []const u8, server_id: []const u8 };
+const AiContextPollPayload = struct { operation_id: []const u8, cursor: u64 = 0, rewind: bool = false };
+const AiContextCancelPayload = struct { operation_id: []const u8 };
+const AiThreadListPayload = struct { server_id: ?[]const u8 = null, limit: usize = 20 };
+const AiThreadGetPayload = struct { thread_id: []const u8 };
+const AiThreadDeletePayload = struct { operation_id: []const u8, thread_id: []const u8, expected_revision: u64 };
+const AiContextLogSelection = struct { source_id: []const u8, tail_bytes: usize };
+const AiContextSelection = struct { os: bool, monitor: bool, log: ?AiContextLogSelection = null };
+const AiTurnStartPayload = struct {
+    operation_id: []const u8,
+    thread_id: ?[]const u8 = null,
     server_id: []const u8,
-    limit: ?usize = null,
+    provider_id: []const u8,
+    expected_provider_revision: u64,
+    message: []const u8,
+    context_selection: AiContextSelection,
 };
-
-const AiHistoryEntry = struct {
-    ts: i64,
-    action: []const u8,
-    detail: []const u8 = "",
+const AiTurnPollPayload = struct { turn_id: []const u8, cursor: u64 = 0, rewind: bool = false };
+const AiTurnCancelPayload = struct { turn_id: []const u8 };
+const AiTurnSummarizePayload = struct {
+    operation_id: []const u8,
+    thread_id: []const u8,
+    execution_id: []const u8,
+    output_selection: struct { start_cursor: u64, end_cursor: u64 },
 };
+const AiProposalEditPayload = struct { operation_id: []const u8, proposal_id: []const u8, expected_revision: u64, command: []const u8 };
+const AiProposalRunPayload = struct { operation_id: []const u8, proposal_id: []const u8, expected_revision: u64, command_sha256: []const u8, destructive_warning_ack: bool };
+const AiProposalCancelPayload = struct { operation_id: []const u8, proposal_id: []const u8, expected_revision: u64 };
 
-/// Honest "no sample yet" state for the monitor part of the bundle.
-const ai_empty_snapshot = monitor.Snapshot{ .probe_error = "no sample yet" };
-
-const AiContextBundle = struct {
-    ok: bool = true,
-    os: []const u8,
-    hostname: []const u8,
-    uptime_sec: u64,
-    load: struct {
-        utilization_pct: ?f32,
-        load_1: f32,
-        load_5: f32,
-        load_15: f32,
-        cores: u32,
-    },
-    mem: monitor.MemInfo,
-    disk: monitor.DiskInfo,
-    top_processes: []monitor.Process,
-    active_logs: []ai.LogInfo,
-    probe_error: ?[]const u8 = null,
-};
-
-/// Runs the light context probe (OS, hostname, log mtimes), caches the
-/// result ≤ 5 s, and returns the cache entry (owned by the cache).
-fn aiProbeOrCache(self: *Context, server_id: []const u8, now_ns: i128) ?*ai.ContextCache.CacheEntry {
-    if (self.ai.cache.fresh(server_id, now_ns)) |entry| return entry;
-
-    const paths = self.logs.pathsFor(self.io, server_id) catch return null;
-    defer {
-        for (paths) |p| self.allocator.free(p);
-        self.allocator.free(paths);
-    }
-    const cmd = ai.buildProbeCommand(self.allocator, paths) catch return null;
-    defer self.allocator.free(cmd);
-    var outcome = self.manager.execWait(server_id, cmd, ai_exec_cap, ai_exec_timeout_ns) catch return null;
-    defer outcome.output.deinit(self.allocator);
-    const parsed = ai.parseProbeOutput(self.allocator, outcome.output.items) catch return null;
-    defer self.allocator.free(parsed.logs);
-    const active_logs = ai.buildActiveLogs(self.allocator, parsed.logs, paths, ai.max_active_logs) catch return null;
-    errdefer {
-        for (active_logs) |*l| l.deinit(self.allocator);
-        self.allocator.free(active_logs);
-    }
-    const sid_owned = self.allocator.dupe(u8, server_id) catch return null;
-    errdefer self.allocator.free(sid_owned);
-    const os_owned = if (parsed.os.len == 0) "" else (self.allocator.dupe(u8, parsed.os) catch return null);
-    errdefer if (os_owned.len > 0) self.allocator.free(os_owned);
-    const host_owned = if (parsed.hostname.len == 0) "" else (self.allocator.dupe(u8, parsed.hostname) catch return null);
-    errdefer if (host_owned.len > 0) self.allocator.free(host_owned);
-    var entry = ai.ContextCache.CacheEntry{
-        .server_id = sid_owned,
-        .os = os_owned,
-        .hostname = host_owned,
-        .active_logs = active_logs,
-        .ts_ns = now_ns,
-    };
-    self.ai.cache.put(entry) catch {
-        entry.deinit(self.allocator);
-        return null;
-    };
-    return self.ai.cache.fresh(server_id, now_ns) orelse unreachable;
-}
-
-/// The context bundle (spec 11 §5): monitor cache snapshot + one light
-/// probe (OS/hostname/log mtimes), the probe part cached ≤ 5 s.
-fn handleAiContext(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(AiContextPayloadIn, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
-    defer parsed.deinit();
-    const server_id = parsed.value.server_id;
-
-    const session = self.manager.get(server_id) orelse return respondError(output, "not connected");
-    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
-
-    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
-    const probe = aiProbeOrCache(self, server_id, now) orelse return respondError(output, "context probe failed");
-
-    session.monitor_cache.lock();
-    defer session.monitor_cache.unlock();
-    const snap = session.monitor_cache.current() orelse &ai_empty_snapshot;
-    // Refresh-if-stale: enqueue one monitor probe when the cache is
-    // stale and none is running (same contract as oars.monitor.poll).
-    const monitor_now = sessions.monitorTimeNs(now);
-    if (monitor_now - session.monitor_last_probe_ns.load(.acquire) >= session.monitor_interval_ns and
-        !session.monitor_probe_active.load(.acquire))
-    {
-        session.monitor_force.store(true, .release);
-    }
-
+fn aiTypedError(output: []u8, code: ai.types.ErrorCode, message: []const u8) []const u8 {
     var writer = std.Io.Writer.fixed(output);
-    const bundle = AiContextBundle{
-        .os = probe.os,
-        .hostname = probe.hostname,
-        .uptime_sec = snap.cpu.uptime_sec,
-        .load = .{
-            .utilization_pct = snap.cpu.utilization_pct,
-            .load_1 = snap.cpu.load_1,
-            .load_5 = snap.cpu.load_5,
-            .load_15 = snap.cpu.load_15,
-            .cores = snap.cpu.cores,
-        },
-        .mem = snap.mem,
-        .disk = snap.disk,
-        .top_processes = snap.processes,
-        .active_logs = probe.active_logs,
-        .probe_error = snap.probe_error,
-    };
-    std.json.Stringify.value(bundle, .{}, &writer) catch return output[0..0];
-    return writer.buffered();
-}
-
-fn handleAiProviderGet(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(AiProviderGetPayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
-    defer parsed.deinit();
-    const provider = self.ai.provider.get(self.io) catch return respondError(output, "provider config is unreadable");
-    defer if (provider) |p| {
-        var owned = p;
-        owned.deinit(self.allocator);
-    };
-    var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,\"provider\":") catch return output[0..0];
-    if (provider) |p| {
-        std.json.Stringify.value(p, .{}, &writer) catch return output[0..0];
-    } else {
-        writer.writeAll("null") catch return output[0..0];
-    }
+    writer.writeAll("{\"ok\":false,\"code\":") catch return output[0..0];
+    json.writeJsonString(&writer, @tagName(code)) catch return output[0..0];
+    writer.writeAll(",\"error\":") catch return output[0..0];
+    json.writeJsonString(&writer, message) catch return output[0..0];
     writer.writeAll("}") catch return output[0..0];
     return writer.buffered();
 }
 
-fn handleAiProviderSet(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+fn aiProviderError(output: []u8, err: ai.provider_domain.Error) []const u8 {
+    return switch (err) {
+        error.InvalidOperationId,
+        error.InvalidId,
+        error.InvalidName,
+        error.InvalidBaseUrl,
+        error.InvalidModel,
+        error.InvalidCompatibility,
+        error.InvalidTestStatus,
+        => aiTypedError(output, .invalid_argument, switch (err) {
+            error.InvalidOperationId => "operation_id is invalid",
+            error.InvalidId => "provider ID is invalid",
+            error.InvalidName => "provider name is invalid",
+            error.InvalidBaseUrl => "provider base URL is invalid",
+            error.InvalidModel => "provider model is invalid",
+            error.InvalidCompatibility => "adapter compatibility settings are invalid",
+            error.InvalidTestStatus => "provider test status is invalid",
+            else => unreachable,
+        }),
+        error.NotFound => aiTypedError(output, .not_found, "provider was not found"),
+        error.StaleRevision => aiTypedError(output, .stale_revision, "provider revision is stale; refresh and retry"),
+        error.OperationConflict => aiTypedError(output, .conflict, "operation_id was already used for a different provider mutation"),
+        error.LimitExceeded => aiTypedError(output, .limit_exceeded, "the 16-provider limit is reached"),
+        error.StoreCorrupt => aiTypedError(output, .recovery_required, "provider metadata was corrupt and was quarantined"),
+        error.StoreQuarantineFailed => aiTypedError(output, .recovery_required, "provider metadata is corrupt and could not be quarantined"),
+        error.StoreAccess => aiTypedError(output, .recovery_required, "provider metadata is unavailable"),
+        error.SerializeFailed, error.OutOfMemory => aiTypedError(output, .recovery_required, "provider metadata could not be saved"),
+    };
+}
+
+fn handleAiProviderList(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
-    var parsed = parsePayload(AiProviderSetPayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
+    var parsed = parsePayload(AiProviderListPayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
     defer parsed.deinit();
-    const now = @as(i64, @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds));
-    var saved = self.ai.provider.set(self.io, parsed.value.provider, now) catch |err| {
-        return respondError(output, switch (err) {
-            error.InvalidAdapter => "unsupported adapter",
-            error.InvalidBaseUrl => "the base URL must be https:// (http:// is allowed only for localhost providers)",
-            error.InvalidModel => "invalid model name",
-            error.InvalidCapabilities => "invalid capabilities",
-            else => "provider config is unreadable",
-        });
-    };
+    const providers = self.ai.providers.list(self.io) catch |err| return aiProviderError(output, err);
+    defer ai.provider_domain.deinitList(self.allocator, providers);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"providers\":") catch return output[0..0];
+    std.json.Stringify.value(providers, .{}, &writer) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleAiProviderSave(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiProviderSavePayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    var saved = self.ai.providers.save(self.io, parsed.value.operation_id, parsed.value.provider, parsed.value.expected_revision) catch |err| return aiProviderError(output, err);
     defer saved.deinit(self.allocator);
-    var detail_buf: [128]u8 = undefined;
-    const detail = std.fmt.bufPrint(&detail_buf, "adapter={s} model={s}", .{ saved.adapter.jsonName(), saved.model }) catch "ai.provider.set";
-    sshkeysAudit(self, "ai.provider.set", "-", detail);
+    var detail_buf: [256]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "provider={s} adapter={s} model={s} revision={d}", .{ saved.id, @tagName(saved.adapter), saved.model, saved.revision }) catch "provider saved";
+    self.audit.appendFull(self.io, parsed.value.operation_id, "ai.provider.save", saved.id, "", "saved", detail) catch {};
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":true,\"provider\":") catch return output[0..0];
     std.json.Stringify.value(saved, .{}, &writer) catch return output[0..0];
@@ -12759,36 +12751,793 @@ fn handleAiProviderSet(context: *anyopaque, invocation: native_sdk.bridge.Invoca
     return writer.buffered();
 }
 
-/// Approved-run history: the audit-filtered `ssh.exec` entries for the
-/// server, newest first (spec 11 §5; full history is spec 15).
-fn handleAiHistory(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+fn handleAiProviderDelete(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
-    var parsed = parsePayload(AiHistoryPayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
+    var parsed = parsePayload(AiProviderDeletePayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
     defer parsed.deinit();
-    const payload = parsed.value;
-    const limit = @min(payload.limit orelse ai.history_default_limit, ai.history_max_limit);
-    const entries = self.audit.read(self.io, payload.server_id, "ssh.exec", limit) catch {
-        return respondError(output, "audit log is unreadable");
+    self.ai.providers.delete(self.io, parsed.value.operation_id, parsed.value.provider_id, parsed.value.expected_revision) catch |err| return aiProviderError(output, err);
+    self.audit.appendFull(self.io, parsed.value.operation_id, "ai.provider.delete", parsed.value.provider_id, "", "deleted", "provider metadata deleted; credential and threads are unchanged") catch {};
+    return ok_json;
+}
+
+fn aiProviderTestError(output: []u8, err: ai.provider_test.Error) []const u8 {
+    return switch (err) {
+        error.InvalidOperationId, error.InvalidProviderId => aiTypedError(output, .invalid_argument, "provider test input is invalid"),
+        error.OperationConflict => aiTypedError(output, .conflict, "operation_id was already used for a different provider test"),
+        error.StaleRevision => aiTypedError(output, .stale_revision, "provider revision is stale; refresh and retry"),
+        error.Busy => aiTypedError(output, .busy, "two provider requests are already active"),
+        error.LimitExceeded => aiTypedError(output, .limit_exceeded, "the provider test operation limit is reached"),
+        error.NotFound => aiTypedError(output, .not_found, "provider test operation was not found"),
+        error.OutOfMemory => aiTypedError(output, .recovery_required, "provider test state could not be retained"),
     };
-    defer {
-        for (entries) |*e| e.deinit(self.allocator);
-        self.allocator.free(entries);
+}
+
+fn writeAiProviderTestAdmission(output: []u8, operation_id: []const u8, state: ai.provider_test.State) []const u8 {
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"operation_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, operation_id) catch return output[0..0];
+    writer.writeAll(",\"state\":") catch return output[0..0];
+    json.writeJsonString(&writer, @tagName(state)) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleAiProviderTest(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiProviderTestPayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    const tests = if (self.ai.provider_tests) |*value| value else return aiTypedError(output, .recovery_required, "provider coordinator is not available");
+    if (tests.lookup(parsed.value.operation_id, parsed.value.provider_id, parsed.value.expected_revision) catch |err| return aiProviderTestError(output, err)) |state| {
+        return writeAiProviderTestAdmission(output, parsed.value.operation_id, state);
+    }
+    tests.checkCapacity() catch |err| return aiProviderTestError(output, err);
+    var selected = self.ai.providers.get(self.io, parsed.value.provider_id) catch |err| return aiProviderError(output, err);
+    var selected_owned = true;
+    defer if (selected_owned) selected.deinit(self.allocator);
+    if (selected.revision != parsed.value.expected_revision) return aiTypedError(output, .stale_revision, "provider revision is stale; refresh and retry");
+    const generation = (self.ai.providers.credentialGeneration(self.io, selected.id, selected.base_url) catch |err| return aiProviderError(output, err)) orelse
+        return aiTypedError(output, .credential_missing, "configure a credential for this provider origin before testing");
+    var secret = self.ai.credential_facade.copySecret(selected.id) catch |err| return switch (err) {
+        error.CredentialMissing, error.Denied, error.Unavailable, error.NotInstalled => aiTypedError(output, .credential_missing, "the provider credential is unavailable"),
+        error.WrongThread => aiTypedError(output, .recovery_required, "credential access was attempted from the wrong runtime thread"),
+        else => aiTypedError(output, .recovery_required, "the provider credential could not be copied"),
+    };
+    var secret_owned = true;
+    defer if (secret_owned) secret.clear();
+    const state = tests.admitOwned(parsed.value.operation_id, selected, generation, secret) catch |err| return aiProviderTestError(output, err);
+    selected_owned = false;
+    secret_owned = false;
+    self.audit.appendFull(self.io, parsed.value.operation_id, "ai.provider.test", parsed.value.provider_id, "", "admitted", "provider test admitted; one provider request can consume quota") catch {};
+    return writeAiProviderTestAdmission(output, parsed.value.operation_id, state);
+}
+
+fn handleAiProviderTestPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiProviderTestPollPayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    const tests = if (self.ai.provider_tests) |*value| value else return aiTypedError(output, .recovery_required, "provider coordinator is not available");
+    var polled = tests.poll(parsed.value.operation_id, parsed.value.cursor, parsed.value.rewind) catch |err| return aiProviderTestError(output, err);
+    defer polled.poll.deinit(self.allocator);
+    var writer = std.Io.Writer.fixed(output);
+    writeAiEventPoll(&writer, &polled.poll, polled.state) catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleAiProviderTestCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiProviderTestCancelPayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    const tests = if (self.ai.provider_tests) |*value| value else return aiTypedError(output, .recovery_required, "provider coordinator is not available");
+    const state = tests.cancel(parsed.value.operation_id) catch |err| return aiProviderTestError(output, err);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"state\":") catch return output[0..0];
+    json.writeJsonString(&writer, @tagName(state)) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn writeAiCredentialStatus(output: []u8, status: anytype) []const u8 {
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"status\":") catch return output[0..0];
+    json.writeJsonString(&writer, @tagName(status)) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn aiCredentialError(output: []u8, err: ai.credentials.Error) []const u8 {
+    return switch (err) {
+        error.InvalidProviderId => aiTypedError(output, .invalid_argument, "provider ID is invalid"),
+        error.InvalidPromptText => aiTypedError(output, .recovery_required, "native credential prompt metadata is invalid"),
+        error.InvalidSecret => aiTypedError(output, .invalid_argument, "the credential is empty or invalid"),
+        error.SecretTooLarge => aiTypedError(output, .invalid_argument, "the credential exceeds 4096 bytes"),
+        error.CredentialMissing => aiTypedError(output, .credential_missing, "the provider credential is missing"),
+        error.NotInstalled, error.Unavailable => writeAiCredentialStatus(output, ai.credentials.Status.unavailable),
+        error.Denied => writeAiCredentialStatus(output, ai.credentials.Status.denied),
+        error.WrongThread => aiTypedError(output, .recovery_required, "credential access was attempted from the wrong runtime thread"),
+    };
+}
+
+fn handleAiCredentialConfigure(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiCredentialConfigurePayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    if (!ai.types.validOperationId(parsed.value.operation_id)) return aiTypedError(output, .invalid_argument, "operation_id is invalid");
+    var provider = self.ai.providers.get(self.io, parsed.value.provider_id) catch |err| return aiProviderError(output, err);
+    defer provider.deinit(self.allocator);
+    var title_buffer: [ai.credentials.max_prompt_title_bytes]u8 = undefined;
+    const title = std.fmt.bufPrint(&title_buffer, "API key for {s}", .{provider.name}) catch return aiTypedError(output, .recovery_required, "credential prompt could not be prepared");
+    var message_buffer: [ai.credentials.max_prompt_message_bytes]u8 = undefined;
+    const message = std.fmt.bufPrint(&message_buffer, "Enter the API key for the reviewed origin {s}. Oars stores it in the operating-system credential store.", .{provider.base_url}) catch return aiTypedError(output, .recovery_required, "credential prompt could not be prepared");
+    const status = self.ai.credential_facade.configure(ai.credentials.Prompt.native(), provider.id, title, message) catch |err| return aiCredentialError(output, err);
+    if (status == .configured) {
+        self.ai.providers.bindCredential(self.io, provider.id, provider.base_url) catch |err| return aiProviderError(output, err);
+        self.audit.appendFull(self.io, parsed.value.operation_id, "ai.credential.configure", provider.id, "", "configured", "provider credential configured through native secure entry") catch {};
+    }
+    return writeAiCredentialStatus(output, status);
+}
+
+fn handleAiCredentialStatus(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiCredentialStatusPayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    var provider = self.ai.providers.get(self.io, parsed.value.provider_id) catch |err| return aiProviderError(output, err);
+    defer provider.deinit(self.allocator);
+    if (!(self.ai.providers.credentialBound(self.io, provider.id, provider.base_url) catch |err| return aiProviderError(output, err))) return writeAiCredentialStatus(output, ai.credentials.Status.missing);
+    const status = self.ai.credential_facade.status(provider.id) catch |err| return aiCredentialError(output, err);
+    return writeAiCredentialStatus(output, status);
+}
+
+fn handleAiCredentialDelete(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiCredentialDeletePayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    if (!ai.types.validOperationId(parsed.value.operation_id)) return aiTypedError(output, .invalid_argument, "operation_id is invalid");
+    var provider = self.ai.providers.get(self.io, parsed.value.provider_id) catch |err| return aiProviderError(output, err);
+    defer provider.deinit(self.allocator);
+    const status = self.ai.credential_facade.delete(provider.id) catch |err| return aiCredentialError(output, err);
+    if (status == .missing) {
+        self.ai.providers.unbindCredential(self.io, provider.id) catch |err| return aiProviderError(output, err);
+        self.audit.appendFull(self.io, parsed.value.operation_id, "ai.credential.delete", provider.id, "", "deleted", "provider credential deleted; metadata and threads are unchanged") catch {};
+    }
+    return writeAiCredentialStatus(output, status);
+}
+
+fn aiContextError(output: []u8, err: ai.context.Error) []const u8 {
+    return switch (err) {
+        error.InvalidOperationId, error.InvalidServerId => aiTypedError(output, .invalid_argument, "context operation input is invalid"),
+        error.OperationConflict => aiTypedError(output, .conflict, "operation_id was already used for another context refresh"),
+        error.Busy => aiTypedError(output, .busy, "a context refresh is already active for this server"),
+        error.LimitExceeded => aiTypedError(output, .limit_exceeded, "the context operation limit is reached"),
+        error.NotFound => aiTypedError(output, .not_found, "context operation was not found"),
+        error.OutOfMemory => aiTypedError(output, .recovery_required, "context operation could not be retained"),
+    };
+}
+
+fn aiCoordinatorError(output: []u8, err: ai.coordinator.Error) []const u8 {
+    return switch (err) {
+        error.InvalidOperationId, error.InvalidId, error.InvalidMessage, error.InvalidContext, error.WarningAcknowledgementRequired, error.InteractiveSudoUnsupported => aiTypedError(output, .invalid_argument, switch (err) {
+            error.WarningAcknowledgementRequired => "confirm the destructive warning for this proposal revision",
+            error.InteractiveSudoUnsupported => "interactive sudo is unavailable in the AI panel; use the terminal",
+            else => "AI turn input is invalid",
+        }),
+        error.OperationConflict, error.ThreadMismatch, error.InvalidState => aiTypedError(output, .conflict, switch (err) {
+            error.OperationConflict => "operation_id was already used for a different AI mutation",
+            error.ThreadMismatch => "the thread is bound to a different server, provider, adapter, or model",
+            error.InvalidState => "the AI operation is not valid in its current state",
+            else => unreachable,
+        }),
+        error.ProviderUntested => aiTypedError(output, .provider_untested, "test this provider successfully before Ask"),
+        error.StaleRevision => aiTypedError(output, .stale_revision, "provider or proposal revision is stale"),
+        error.Busy => aiTypedError(output, .busy, "the thread or provider request quota is busy"),
+        error.LimitExceeded => aiTypedError(output, .limit_exceeded, "the AI thread or turn limit is reached"),
+        error.NotFound => aiTypedError(output, .not_found, "AI thread, turn, or proposal was not found"),
+        error.JournalUnavailable => aiTypedError(output, .recovery_required, "the AI journal is unavailable for mutation"),
+        error.OutOfMemory => aiTypedError(output, .recovery_required, "AI operation state could not be retained"),
+    };
+}
+
+fn handleAiContextGet(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiContextGetPayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    if (parsed.value.server_id.len == 0) return aiTypedError(output, .invalid_argument, "server_id is required");
+    const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_ms));
+    var cached = self.ai.context_ops.get(parsed.value.server_id, now_ms) catch |err| return aiContextError(output, err);
+    defer if (cached) |*result| result.snapshot.deinit(self.allocator);
+    var writer = std.Io.Writer.fixed(output);
+    if (cached) |result| {
+        writer.writeAll("{\"ok\":true,\"state\":\"ready\",\"context\":") catch return output[0..0];
+        writer.writeAll(result.snapshot.context_json) catch return output[0..0];
+        writer.print(",\"stale\":{s},\"updated_at_ms\":{d}}}", .{ if (result.stale) "true" else "false", result.snapshot.updated_at_ms }) catch return output[0..0];
+    } else {
+        writer.writeAll("{\"ok\":true,\"state\":\"missing\",\"context\":null,\"stale\":true}") catch return output[0..0];
+    }
+    return writer.buffered();
+}
+
+fn handleAiContextRefresh(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiContextRefreshPayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    const outcome = self.allocator.create(sessions.AiContextOutcome) catch return aiTypedError(output, .recovery_required, "context operation could not be allocated");
+    outcome.* = .{ .allocator = self.allocator };
+    const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_ms));
+    const admission = self.ai.context_ops.admit(parsed.value.operation_id, parsed.value.server_id, outcome, now_ms) catch |err| {
+        self.allocator.destroy(outcome);
+        return aiContextError(output, err);
+    };
+    if (!admission.admitted) {
+        self.allocator.destroy(outcome);
+    } else {
+        const paths = self.logs.pathsFor(self.io, parsed.value.server_id) catch {
+            self.ai.context_ops.failAdmission(parsed.value.operation_id, .conflict, "log source metadata is unavailable", now_ms);
+            return aiTypedError(output, .conflict, "log source metadata is unavailable");
+        };
+        defer {
+            for (paths) |path| self.allocator.free(path);
+            self.allocator.free(paths);
+        }
+        const command = ai.buildProbeCommand(self.allocator, paths) catch {
+            self.ai.context_ops.failAdmission(parsed.value.operation_id, .recovery_required, "context command could not be built", now_ms);
+            return aiTypedError(output, .recovery_required, "context command could not be built");
+        };
+        defer self.allocator.free(command);
+        self.manager.enqueueAiContext(parsed.value.server_id, parsed.value.operation_id, command, ai_exec_timeout_ns, ai_exec_cap, outcome) catch {
+            self.ai.context_ops.failAdmission(parsed.value.operation_id, .not_connected, "server is not connected", now_ms);
+            return aiTypedError(output, .not_connected, "server is not connected");
+        };
     }
     var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,\"runs\":[") catch return output[0..0];
-    var first = true;
-    for (entries) |*e| {
-        if (!first) writer.writeAll(",") catch return output[0..0];
-        first = false;
-        writer.print("{{\"ts\":{d},\"action\":", .{e.ts}) catch return output[0..0];
-        json.writeJsonString(&writer, e.type) catch return output[0..0];
-        writer.writeAll(",\"detail\":") catch return output[0..0];
-        json.writeJsonString(&writer, e.detail) catch return output[0..0];
-        writer.writeAll("}") catch return output[0..0];
+    writer.writeAll("{\"ok\":true,\"operation_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, parsed.value.operation_id) catch return output[0..0];
+    writer.writeAll(",\"state\":") catch return output[0..0];
+    json.writeJsonString(&writer, @tagName(admission.state)) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+const AiContextIssue = struct { code: []const u8, @"error": []const u8 };
+const AiContextSnapshotV1 = struct {
+    server_id: []const u8,
+    os: []const u8,
+    hostname: []const u8,
+    monitor: monitor.Snapshot,
+    active_logs: []const ai.LogInfo,
+    partial: bool,
+    errors: []const AiContextIssue,
+    updated_at_ms: i64,
+};
+
+fn buildAiContextSnapshot(self: *Context, server_id: []const u8, probe_output: []const u8, now_ms: i64) !struct { json: []u8, partial: bool } {
+    const parsed = try ai.parseProbeOutput(self.allocator, probe_output);
+    defer self.allocator.free(parsed.logs);
+    const paths = try self.logs.pathsFor(self.io, server_id);
+    defer {
+        for (paths) |path| self.allocator.free(path);
+        self.allocator.free(paths);
     }
-    writer.writeAll("]}") catch return output[0..0];
+    const active_logs = try ai.buildActiveLogs(self.allocator, parsed.logs, paths, ai.max_active_logs);
+    defer {
+        for (active_logs) |*log| log.deinit(self.allocator);
+        self.allocator.free(active_logs);
+    }
+    var issues: [2]AiContextIssue = undefined;
+    var issue_count: usize = 0;
+    const session = self.manager.get(server_id);
+    var previous_cpu: ?monitor.CpuSample = null;
+    if (session) |live| {
+        live.monitor_cache.lock();
+        previous_cpu = live.monitor_cache.previous_cpu;
+        live.monitor_cache.unlock();
+    } else {
+        issues[issue_count] = .{ .code = "monitor_unavailable", .@"error" = "server disconnected after the context probe" };
+        issue_count += 1;
+    }
+
+    var monitor_result = monitor.parseProbeOutput(self.allocator, probe_output, previous_cpu);
+    defer monitor_result.snapshot.deinit(self.allocator);
+    monitor_result.snapshot.ts = now_ms * std.time.ns_per_ms;
+    if (monitor_result.snapshot.probe_error) |probe_error| {
+        issues[issue_count] = .{ .code = "monitor_partial", .@"error" = probe_error };
+        issue_count += 1;
+    }
+
+    const partial = parsed.os.len == 0 or parsed.hostname.len == 0 or issue_count > 0;
+    var out: std.Io.Writer.Allocating = .init(self.allocator);
+    errdefer out.deinit();
+    try std.json.Stringify.value(AiContextSnapshotV1{
+        .server_id = server_id,
+        .os = parsed.os,
+        .hostname = parsed.hostname,
+        .monitor = monitor_result.snapshot,
+        .active_logs = active_logs,
+        .partial = partial,
+        .errors = issues[0..issue_count],
+        .updated_at_ms = now_ms,
+    }, .{}, &out.writer);
+    return .{ .json = try out.toOwnedSlice(), .partial = partial };
+}
+
+fn writeAiEventPoll(writer: *std.Io.Writer, poll_result: *const ai.events.Poll, state: anytype) !void {
+    try writer.writeAll("{\"ok\":true,\"stream_id\":");
+    try json.writeJsonString(writer, poll_result.stream_id);
+    try writer.print(",\"cursor\":{d},\"dropped\":{d},\"finished\":{s},\"state\":", .{ poll_result.cursor, poll_result.dropped, if (state.terminal()) "true" else "false" });
+    try json.writeJsonString(writer, @tagName(state));
+    try writer.writeAll(",\"events\":[");
+    for (poll_result.events, 0..) |event, index| {
+        if (index > 0) try writer.writeByte(',');
+        try writer.print("{{\"version\":{d},\"sequence\":{d},\"stream_id\":", .{ event.version, event.sequence });
+        try json.writeJsonString(writer, event.stream_id);
+        try writer.writeAll(",\"type\":");
+        try json.writeJsonString(writer, event.type);
+        try writer.writeAll(",\"payload\":");
+        try writer.writeAll(event.payload_json);
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("]}");
+}
+
+fn handleAiContextPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiContextPollPayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    var outcome = self.ai.context_ops.outcomeSnapshot(parsed.value.operation_id) catch |err| return aiContextError(output, err);
+    defer if (outcome) |*snapshot| snapshot.deinit(self.allocator);
+    if (outcome) |worker| {
+        if (worker.done) {
+            const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_ms));
+            if (worker.canceled) {
+                _ = self.ai.context_ops.finalize(parsed.value.operation_id, null, false, null, "", now_ms) catch |err| return aiContextError(output, err);
+            } else if (worker.exit != null and worker.exit.? == 0 and !worker.disconnected) {
+                const selected = self.ai.context_ops.serverId(parsed.value.operation_id) catch |err| return aiContextError(output, err);
+                defer self.allocator.free(selected);
+                const built = buildAiContextSnapshot(self, selected, worker.data, now_ms) catch {
+                    _ = self.ai.context_ops.finalize(parsed.value.operation_id, null, false, .conflict, "context probe output was invalid", now_ms) catch {};
+                    return aiTypedError(output, .conflict, "context probe output was invalid");
+                };
+                defer self.allocator.free(built.json);
+                _ = self.ai.context_ops.finalize(parsed.value.operation_id, built.json, built.partial, null, "", now_ms) catch |err| return aiContextError(output, err);
+            } else {
+                _ = self.ai.context_ops.finalize(parsed.value.operation_id, null, false, if (worker.disconnected) .not_connected else .conflict, worker.message, now_ms) catch |err| return aiContextError(output, err);
+            }
+        }
+    }
+    var polled = self.ai.context_ops.poll(parsed.value.operation_id, parsed.value.cursor, parsed.value.rewind) catch |err| return aiContextError(output, err);
+    defer polled.poll.deinit(self.allocator);
+    var writer = std.Io.Writer.fixed(output);
+    writeAiEventPoll(&writer, &polled.poll, polled.state) catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleAiContextCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiContextCancelPayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_ms));
+    const cancellation = self.ai.context_ops.requestCancel(parsed.value.operation_id, now_ms) catch |err| return aiContextError(output, err);
+    defer self.allocator.free(cancellation.server_id);
+    if (cancellation.queue) self.manager.cancelAiContext(cancellation.server_id, parsed.value.operation_id) catch {};
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"state\":") catch return output[0..0];
+    json.writeJsonString(&writer, @tagName(cancellation.state)) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+const AiCollectedLog = struct { source_id: []const u8, tail_bytes: usize };
+const AiCollectionSpec = struct { context: std.json.Value, log: ?AiCollectedLog = null };
+
+fn buildAiTurnContextSpec(self: *Context, snapshot_json: []const u8, selection: AiContextSelection) ![]u8 {
+    if (!selection.os and !selection.monitor and selection.log == null) return error.InvalidSelection;
+    var snapshot = try std.json.parseFromSlice(AiContextSnapshotV1, self.allocator, snapshot_json, .{ .allocate = .alloc_always });
+    defer snapshot.deinit();
+    if (selection.log) |selected_log| {
+        if (selected_log.tail_bytes == 0 or selected_log.tail_bytes > ai.types.max_log_tail_bytes) return error.InvalidSelection;
+        var found = false;
+        for (snapshot.value.active_logs) |active| if (std.mem.eql(u8, active.path, selected_log.source_id)) {
+            found = true;
+            break;
+        };
+        if (!found) return error.InvalidSelection;
+    }
+    var writer: std.Io.Writer.Allocating = .init(self.allocator);
+    errdefer writer.deinit();
+    writer.writer.writeAll("{\"context\":{\"server_id\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(snapshot.value.server_id, .{}, &writer.writer) catch return error.OutOfMemory;
+    writer.writer.writeAll(",\"os\":") catch return error.OutOfMemory;
+    if (selection.os) std.json.Stringify.value(snapshot.value.os, .{}, &writer.writer) catch return error.OutOfMemory else writer.writer.writeAll("null") catch return error.OutOfMemory;
+    writer.writer.writeAll(",\"monitor\":") catch return error.OutOfMemory;
+    if (selection.monitor) std.json.Stringify.value(snapshot.value.monitor, .{}, &writer.writer) catch return error.OutOfMemory else writer.writer.writeAll("null") catch return error.OutOfMemory;
+    writer.writer.writeAll("},\"log\":") catch return error.OutOfMemory;
+    if (selection.log) |selected_log| {
+        writer.writer.writeAll("{\"source_id\":") catch return error.OutOfMemory;
+        std.json.Stringify.value(selected_log.source_id, .{}, &writer.writer) catch return error.OutOfMemory;
+        writer.writer.print(",\"tail_bytes\":{d}}}", .{selected_log.tail_bytes}) catch return error.OutOfMemory;
+    } else writer.writer.writeAll("null") catch return error.OutOfMemory;
+    writer.writer.writeAll("}") catch return error.OutOfMemory;
+    return writer.toOwnedSlice() catch error.OutOfMemory;
+}
+
+fn aiCollectSelectedContext(context: ?*anyopaque, allocator: std.mem.Allocator, io: std.Io, server_id: []const u8, spec_json: []const u8, cancellation: *ai.transport.Cancellation) anyerror![]u8 {
+    const self: *Context = @ptrCast(@alignCast(context.?));
+    var parsed = try std.json.parseFromSlice(AiCollectionSpec, allocator, spec_json, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    writer.writer.writeAll("{\"context\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(parsed.value.context, .{}, &writer.writer) catch return error.OutOfMemory;
+    writer.writer.writeAll(",\"selected_log\":") catch return error.OutOfMemory;
+    if (parsed.value.log) |selected_log| {
+        if (selected_log.tail_bytes == 0 or selected_log.tail_bytes > ai.types.max_log_tail_bytes) return error.InvalidSelection;
+        try logs.validatePath(selected_log.source_id);
+        var command_buffer: [1024]u8 = undefined;
+        const head = try std.fmt.bufPrint(&command_buffer, "tail -c {d} ", .{selected_log.tail_bytes});
+        const quoted_len = shellquote.quotedLen(selected_log.source_id);
+        if (head.len + quoted_len > command_buffer.len) return error.InvalidSelection;
+        const quoted = shellquote.quoteAppend(command_buffer[head.len..], selected_log.source_id);
+        var outcome = try self.manager.execWaitCancelable(server_id, command_buffer[0 .. head.len + quoted.len], selected_log.tail_bytes + 1, logs_read_timeout_ns, .{ .context = cancellation, .is_canceled_fn = aiTurnCanceled });
+        defer outcome.output.deinit(allocator);
+        if (outcome.exit != 0 or outcome.limited or outcome.output.items.len > selected_log.tail_bytes or logs.isBinaryContent(outcome.output.items)) return error.InvalidLogTail;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(outcome.output.items, &digest, .{});
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        writer.writer.writeAll("{\"source_id\":") catch return error.OutOfMemory;
+        std.json.Stringify.value(selected_log.source_id, .{}, &writer.writer) catch return error.OutOfMemory;
+        writer.writer.print(",\"tail_bytes\":{d},\"actual_bytes\":{d},\"sha256\":", .{ selected_log.tail_bytes, outcome.output.items.len }) catch return error.OutOfMemory;
+        std.json.Stringify.value(&hex, .{}, &writer.writer) catch return error.OutOfMemory;
+        writer.writer.writeAll(",\"content\":") catch return error.OutOfMemory;
+        std.json.Stringify.value(outcome.output.items, .{}, &writer.writer) catch return error.OutOfMemory;
+        writer.writer.writeAll("}") catch return error.OutOfMemory;
+    } else writer.writer.writeAll("null") catch return error.OutOfMemory;
+    writer.writer.writeAll("}") catch return error.OutOfMemory;
+    _ = io;
+    return writer.toOwnedSlice() catch error.OutOfMemory;
+}
+
+fn aiTurnCanceled(context: ?*anyopaque) bool {
+    const cancellation: *ai.transport.Cancellation = @ptrCast(@alignCast(context.?));
+    return cancellation.isCanceled();
+}
+
+fn aiExecutionPoll(context: ?*anyopaque, allocator: std.mem.Allocator, server_id: []const u8, channel: u32, cursor: u64) anyerror!ai.coordinator.ExecutionPoll {
+    const self: *Context = @ptrCast(@alignCast(context.?));
+    const polls = try self.manager.pollChannels(server_id, &.{.{ .id = channel, .pos = cursor }}, false, 64 * 1024, 64 * 1024);
+    defer {
+        for (polls) |*poll| poll.deinit(allocator);
+        allocator.free(polls);
+    }
+    for (polls) |poll| {
+        if (poll.id != channel) continue;
+        return .{ .found = true, .cursor = poll.cursor, .gap = poll.gap, .eof = poll.eof, .exit_status = poll.exit_status };
+    }
+    return .{ .found = false, .cursor = cursor, .gap = 0, .eof = false, .exit_status = null };
+}
+
+fn aiExecutionIdentity(context: ?*anyopaque, server_id: []const u8) anyerror!u64 {
+    const self: *Context = @ptrCast(@alignCast(context.?));
+    return self.manager.connectionIdentity(server_id);
+}
+
+fn aiExecutionCancel(context: ?*anyopaque, _: std.mem.Allocator, server_id: []const u8, channel: u32) anyerror!bool {
+    const self: *Context = @ptrCast(@alignCast(context.?));
+    var pgid_buffer: [20]u8 = undefined;
+    var attempts: usize = 0;
+    var pgid: ?[]const u8 = null;
+    while (attempts < 80) : (attempts += 1) {
+        pgid = self.manager.aiProcessGroup(server_id, channel, &pgid_buffer) catch return false;
+        if (pgid != null) break;
+        std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(25), .awake) catch return false;
+    }
+    const process_group = pgid orelse return false;
+    if (!aiValidProcessGroup(process_group)) return false;
+    _ = aiSignalProcessGroup(self, server_id, process_group, "TERM");
+    if (!aiWaitProcessGroupAbsent(self, server_id, process_group, 2 * std.time.ns_per_s)) {
+        _ = aiSignalProcessGroup(self, server_id, process_group, "KILL");
+        if (!aiWaitProcessGroupAbsent(self, server_id, process_group, 2 * std.time.ns_per_s)) return false;
+    }
+    self.manager.closeChannel(server_id, channel) catch {};
+    return true;
+}
+
+fn aiSignalProcessGroup(self: *Context, server_id: []const u8, pgid: []const u8, signal: []const u8) bool {
+    var command_buffer: [96]u8 = undefined;
+    const command = std.fmt.bufPrint(&command_buffer, "kill -{s} -{s}", .{ signal, pgid }) catch return false;
+    var result = self.manager.execWait(server_id, command, 64 * 1024, 1 * std.time.ns_per_s) catch return false;
+    defer result.output.deinit(self.allocator);
+    return !result.limited and result.exit == 0;
+}
+
+fn aiWaitProcessGroupAbsent(self: *Context, server_id: []const u8, pgid: []const u8, timeout_ns: i128) bool {
+    const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + timeout_ns;
+    while (true) {
+        var command_buffer: [512]u8 = undefined;
+        const command = std.fmt.bufPrint(&command_buffer, "groups=$(ps -eo pgid= 2>/dev/null) || exit 2; for g in $groups; do [ \"$g\" = '{s}' ] && exit 1; done; exit 0", .{pgid}) catch return false;
+        var result = self.manager.execWait(server_id, command, 64 * 1024, 1 * std.time.ns_per_s) catch return false;
+        const absent = !result.limited and result.exit == 0;
+        result.output.deinit(self.allocator);
+        if (absent) return true;
+        if (std.Io.Timestamp.now(self.io, .real).nanoseconds >= deadline) return false;
+        std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(50), .awake) catch return false;
+    }
+}
+
+fn aiValidProcessGroup(value: []const u8) bool {
+    if (value.len == 0 or value.len > 20) return false;
+    for (value) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
+}
+
+fn aiExecutionCommand(allocator: std.mem.Allocator, command: []const u8) ![]u8 {
+    const quoted_command = try shellquote.quote(allocator, command);
+    defer allocator.free(quoted_command);
+    const inner = try std.fmt.allocPrint(allocator, "printf '__OARS_AI_PGID__%s\\n' \"$$\"; exec /bin/sh -c {s}", .{quoted_command});
+    defer allocator.free(inner);
+    const quoted_inner = try shellquote.quote(allocator, inner);
+    defer allocator.free(quoted_inner);
+    return std.fmt.allocPrint(allocator, "exec setsid /bin/sh -c {s}", .{quoted_inner});
+}
+
+fn handleAiThreadList(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiThreadListPayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    if (parsed.value.limit == 0 or parsed.value.limit > ai.types.max_threads) return aiTypedError(output, .invalid_argument, "limit must be 1 to 100");
+    const turns = if (self.ai.turns) |*value| value else return aiTypedError(output, .recovery_required, "AI coordinator is unavailable");
+    const summaries = turns.list(parsed.value.server_id, parsed.value.limit) catch |err| return aiCoordinatorError(output, err);
+    defer ai.coordinator.Registry.deinitList(self.allocator, summaries);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"threads\":") catch return output[0..0];
+    std.json.Stringify.value(summaries, .{}, &writer) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleAiThreadGet(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiThreadGetPayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    const turns = if (self.ai.turns) |*value| value else return aiTypedError(output, .recovery_required, "AI coordinator is unavailable");
+    const detail_limit = if (output.len > 32) output.len - 32 else 0;
+    const detail = turns.threadDetailJson(parsed.value.thread_id, detail_limit) catch |err| return aiCoordinatorError(output, err);
+    defer self.allocator.free(detail);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,") catch return output[0..0];
+    if (detail.len < 2 or detail[0] != '{') return output[0..0];
+    writer.writeAll(detail[1..]) catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleAiThreadDelete(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiThreadDeletePayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    const turns = if (self.ai.turns) |*value| value else return aiTypedError(output, .recovery_required, "AI coordinator is unavailable");
+    const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_ms));
+    turns.deleteThread(parsed.value.operation_id, parsed.value.thread_id, parsed.value.expected_revision, now_ms) catch |err| return aiCoordinatorError(output, err);
+    self.audit.appendFull(self.io, parsed.value.operation_id, "ai.thread.delete", parsed.value.thread_id, "", "deleted", "local AI conversation and continuation data deleted") catch return aiTypedError(output, .recovery_required, "the thread was deleted but its audit record could not be saved");
+    return ok_json;
+}
+
+fn handleAiTurnStart(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiTurnStartPayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    const payload = parsed.value;
+    const turns = if (self.ai.turns) |*value| value else return aiTypedError(output, .recovery_required, "AI coordinator is unavailable");
+    if (turns.lookupOperation(payload.operation_id, payload.server_id, payload.provider_id, payload.expected_provider_revision, payload.message) catch |err| return aiCoordinatorError(output, err)) |replay| {
+        var writer = std.Io.Writer.fixed(output);
+        writer.writeAll("{\"ok\":true,\"thread_id\":") catch return output[0..0];
+        json.writeJsonString(&writer, replay.thread_id) catch return output[0..0];
+        writer.writeAll(",\"turn_id\":") catch return output[0..0];
+        json.writeJsonString(&writer, replay.turn_id) catch return output[0..0];
+        writer.writeAll(",\"state\":") catch return output[0..0];
+        json.writeJsonString(&writer, @tagName(replay.state)) catch return output[0..0];
+        writer.writeAll("}") catch return output[0..0];
+        return writer.buffered();
+    }
+    const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_ms));
+    var cached = self.ai.context_ops.get(payload.server_id, now_ms) catch |err| return aiContextError(output, err);
+    defer if (cached) |*value| value.snapshot.deinit(self.allocator);
+    if (cached == null or cached.?.stale) return aiTypedError(output, .conflict, "refresh and review current server context before Ask");
+    const context_spec = buildAiTurnContextSpec(self, cached.?.snapshot.context_json, payload.context_selection) catch return aiTypedError(output, .invalid_argument, "context selection is invalid or no longer available");
+    defer self.allocator.free(context_spec);
+    const connection_id = self.manager.connectionIdentity(payload.server_id) catch return aiTypedError(output, .not_connected, "server is not connected");
+    var selected = self.ai.providers.get(self.io, payload.provider_id) catch |err| return aiProviderError(output, err);
+    var selected_owned = true;
+    defer if (selected_owned) selected.deinit(self.allocator);
+    if (selected.revision != payload.expected_provider_revision) return aiTypedError(output, .stale_revision, "provider revision is stale");
+    if (selected.test_status != .passed) return aiTypedError(output, .provider_untested, "test this provider successfully before Ask");
+    const generation = (self.ai.providers.credentialGeneration(self.io, selected.id, selected.base_url) catch |err| return aiProviderError(output, err)) orelse return aiTypedError(output, .credential_missing, "configure a credential for this provider origin before Ask");
+    var secret = self.ai.credential_facade.copySecret(selected.id) catch return aiTypedError(output, .credential_missing, "the provider credential is unavailable");
+    var secret_owned = true;
+    defer if (secret_owned) secret.clear();
+    const admission = turns.admitOwned(payload.operation_id, payload.thread_id, payload.server_id, selected, generation, connection_id, payload.message, context_spec, now_ms) catch |err| return aiCoordinatorError(output, err);
+    selected_owned = false;
+    turns.setSecretAndStart(admission.turn_id, secret) catch |err| return aiCoordinatorError(output, err);
+    secret_owned = false;
+    self.audit.appendFull(self.io, payload.operation_id, "ai.turn.start", payload.server_id, "", "admitted", "AI provider request admitted after explicit context selection") catch {};
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"thread_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, admission.thread_id) catch return output[0..0];
+    writer.writeAll(",\"turn_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, admission.turn_id) catch return output[0..0];
+    writer.writeAll(",\"state\":") catch return output[0..0];
+    json.writeJsonString(&writer, @tagName(admission.state)) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleAiTurnPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiTurnPollPayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    const turns = if (self.ai.turns) |*value| value else return aiTypedError(output, .recovery_required, "AI coordinator is unavailable");
+    var polled = turns.poll(parsed.value.turn_id, parsed.value.cursor, parsed.value.rewind) catch |err| return aiCoordinatorError(output, err);
+    defer polled.poll.deinit(self.allocator);
+    var writer = std.Io.Writer.fixed(output);
+    writeAiEventPoll(&writer, &polled.poll, polled.state) catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleAiTurnCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiTurnCancelPayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    const turns = if (self.ai.turns) |*value| value else return aiTypedError(output, .recovery_required, "AI coordinator is unavailable");
+    const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_ms));
+    const state = turns.cancel(parsed.value.turn_id, now_ms) catch |err| return aiCoordinatorError(output, err);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"state\":") catch return output[0..0];
+    json.writeJsonString(&writer, @tagName(state)) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleAiTurnSummarize(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiTurnSummarizePayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (payload.output_selection.end_cursor <= payload.output_selection.start_cursor or payload.output_selection.end_cursor - payload.output_selection.start_cursor > ai.types.max_log_tail_bytes) return aiTypedError(output, .invalid_argument, "output selection must contain 1 to 65536 retained bytes");
+    const turns = if (self.ai.turns) |*value| value else return aiTypedError(output, .recovery_required, "AI coordinator is unavailable");
+    var source = turns.summarySource(payload.thread_id, payload.execution_id) catch |err| return aiCoordinatorError(output, err);
+    defer source.deinit(self.allocator);
+    const output_bytes = (self.manager.readChannelRange(source.server_id, source.channel, payload.output_selection.start_cursor, payload.output_selection.end_cursor) catch |err| switch (err) {
+        error.NoSession => return aiTypedError(output, .not_connected, "the command output channel is unavailable"),
+        error.OutputNotRetained => return aiTypedError(output, .conflict, "the selected command output range is no longer retained"),
+        else => return aiTypedError(output, .recovery_required, "the selected command output could not be read"),
+    }) orelse return aiTypedError(output, .not_found, "the command output channel was not found");
+    defer self.allocator.free(output_bytes);
+    if (!std.unicode.utf8ValidateSlice(output_bytes) or std.mem.indexOfScalar(u8, output_bytes, 0) != null) return aiTypedError(output, .invalid_argument, "the selected command output is not valid text");
+    const context_spec = buildAiSummaryContext(self.allocator, payload.execution_id, payload.output_selection.start_cursor, payload.output_selection.end_cursor, output_bytes) catch return aiTypedError(output, .recovery_required, "the summary context could not be retained");
+    defer self.allocator.free(context_spec);
+    const message = std.fmt.allocPrint(self.allocator, "Summarize the selected output for execution {s}, bytes {d} through {d}.", .{ payload.execution_id, payload.output_selection.start_cursor, payload.output_selection.end_cursor }) catch return aiTypedError(output, .recovery_required, "the summary request could not be retained");
+    defer self.allocator.free(message);
+    var selected = self.ai.providers.get(self.io, source.provider_id) catch |err| return aiProviderError(output, err);
+    var selected_owned = true;
+    defer if (selected_owned) selected.deinit(self.allocator);
+    if (turns.lookupOperation(payload.operation_id, source.server_id, source.provider_id, selected.revision, message) catch |err| return aiCoordinatorError(output, err)) |replay| return writeAiTurnAdmission(output, replay);
+    const connection_id = self.manager.connectionIdentity(source.server_id) catch return aiTypedError(output, .not_connected, "server is not connected");
+    if (selected.test_status != .passed) return aiTypedError(output, .provider_untested, "test this provider successfully before summarizing output");
+    const generation = (self.ai.providers.credentialGeneration(self.io, selected.id, selected.base_url) catch |err| return aiProviderError(output, err)) orelse return aiTypedError(output, .credential_missing, "configure a credential for this provider before summarizing output");
+    var secret = self.ai.credential_facade.copySecret(selected.id) catch return aiTypedError(output, .credential_missing, "the provider credential is unavailable");
+    var secret_owned = true;
+    defer if (secret_owned) secret.clear();
+    const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_ms));
+    const admission = turns.admitOwned(payload.operation_id, payload.thread_id, source.server_id, selected, generation, connection_id, message, context_spec, now_ms) catch |err| return aiCoordinatorError(output, err);
+    selected_owned = false;
+    turns.setSecretAndStart(admission.turn_id, secret) catch |err| return aiCoordinatorError(output, err);
+    secret_owned = false;
+    self.audit.appendFull(self.io, payload.operation_id, "ai.turn.summarize", source.server_id, "", "admitted", "bounded command output admitted as untrusted provider context") catch {};
+    return writeAiTurnAdmission(output, admission);
+}
+
+fn buildAiSummaryContext(allocator: std.mem.Allocator, execution_id: []const u8, start_cursor: u64, end_cursor: u64, output: []const u8) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    writer.writer.writeAll("{\"context\":{\"kind\":\"command_output\",\"execution_id\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(execution_id, .{}, &writer.writer) catch return error.OutOfMemory;
+    writer.writer.print(",\"start_cursor\":{d},\"end_cursor\":{d},\"content\":", .{ start_cursor, end_cursor }) catch return error.OutOfMemory;
+    std.json.Stringify.value(output, .{}, &writer.writer) catch return error.OutOfMemory;
+    writer.writer.writeAll("},\"log\":null}") catch return error.OutOfMemory;
+    return writer.toOwnedSlice() catch error.OutOfMemory;
+}
+
+fn writeAiTurnAdmission(output: []u8, admission: ai.coordinator.Admission) []const u8 {
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"thread_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, admission.thread_id) catch return output[0..0];
+    writer.writeAll(",\"turn_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, admission.turn_id) catch return output[0..0];
+    writer.writeAll(",\"state\":") catch return output[0..0];
+    json.writeJsonString(&writer, @tagName(admission.state)) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn writeAiProposal(output: []u8, proposal: *const ai.coordinator.FrozenProposal) []const u8 {
+    const payload = ai.coordinator.serializeProposal(std.heap.page_allocator, proposal) catch return output[0..0];
+    defer std.heap.page_allocator.free(payload);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"proposal\":") catch return output[0..0];
+    writer.writeAll(payload) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleAiProposalEdit(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiProposalEditPayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    const turns = if (self.ai.turns) |*value| value else return aiTypedError(output, .recovery_required, "AI coordinator is unavailable");
+    const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_ms));
+    var proposal = turns.editProposal(parsed.value.operation_id, parsed.value.proposal_id, parsed.value.expected_revision, parsed.value.command, now_ms) catch |err| return aiCoordinatorError(output, err);
+    defer proposal.deinit(self.allocator);
+    return writeAiProposal(output, &proposal);
+}
+
+fn handleAiProposalRun(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiProposalRunPayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    const turns = if (self.ai.turns) |*value| value else return aiTypedError(output, .recovery_required, "AI coordinator is unavailable");
+    var proposal = turns.proposalSnapshot(parsed.value.proposal_id) catch |err| return aiCoordinatorError(output, err);
+    defer proposal.deinit(self.allocator);
+    const connection_id = self.manager.connectionIdentity(proposal.server_id) catch return aiTypedError(output, .not_connected, "the proposal server is not connected");
+    const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_ms));
+    var approval = turns.approveProposal(parsed.value.operation_id, parsed.value.proposal_id, parsed.value.expected_revision, parsed.value.command_sha256, parsed.value.destructive_warning_ack, connection_id, now_ms) catch |err| return aiCoordinatorError(output, err);
+    defer approval.deinit(self.allocator);
+    if (!approval.newly_approved) {
+        if (approval.channel) |channel| return writeAiExecutionAdmission(output, approval.execution_id, connection_id, channel, approval.state);
+        turns.markApprovalFailed(approval.execution_id, now_ms, "approved execution was retried without a durable channel identity");
+        return aiTypedError(output, .recovery_required, "the approved execution has no durable channel identity and will not be repeated");
+    }
+
+    self.audit.appendFull(self.io, approval.operation_id, "ai.approved", approval.server_id, approval.command, "approved", "exact AI proposal revision and command hash approved") catch {
+        turns.markApprovalFailed(approval.execution_id, now_ms, "approval audit could not be saved; SSH execution was blocked");
+        return aiTypedError(output, .recovery_required, "approval audit could not be saved; the command was not run");
+    };
+    const wrapped = aiExecutionCommand(self.allocator, approval.command) catch {
+        turns.markApprovalFailed(approval.execution_id, now_ms, "the process-group execution wrapper could not be built");
+        return aiTypedError(output, .recovery_required, "the command could not be prepared and was not run");
+    };
+    defer self.allocator.free(wrapped);
+    const channel = self.manager.execAiTracked(approval.server_id, wrapped, approval.command, approval.operation_id) catch |err| {
+        turns.markApprovalFailed(approval.execution_id, now_ms, "the selected session did not accept the approved command");
+        return aiTypedError(output, switch (err) {
+            error.NoSession, error.NotReady => .not_connected,
+            else => .recovery_required,
+        }, "the selected session did not accept the approved command");
+    };
+    turns.recordExecutionAdmitted(approval.operation_id, approval.execution_id, channel, now_ms) catch |err| {
+        _ = aiExecutionCancel(self, self.allocator, approval.server_id, channel) catch false;
+        turns.markApprovalFailed(approval.execution_id, now_ms, "the SSH channel was accepted but its durable identity could not be saved");
+        return aiCoordinatorError(output, err);
+    };
+    return writeAiExecutionAdmission(output, approval.execution_id, connection_id, channel, .executing);
+}
+
+fn writeAiExecutionAdmission(output: []u8, execution_id: []const u8, connection_id: u64, channel: u32, state: ai.types.TurnState) []const u8 {
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"execution_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, execution_id) catch return output[0..0];
+    writer.print(",\"connection_id\":{d},\"channel\":{d},\"state\":", .{ connection_id, channel }) catch return output[0..0];
+    json.writeJsonString(&writer, @tagName(state)) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleAiProposalCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(AiProposalCancelPayload, self.allocator, invocation.request.payload) catch return aiTypedError(output, .invalid_argument, "invalid payload");
+    defer parsed.deinit();
+    const turns = if (self.ai.turns) |*value| value else return aiTypedError(output, .recovery_required, "AI coordinator is unavailable");
+    const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_ms));
+    const state = turns.cancelProposal(parsed.value.operation_id, parsed.value.proposal_id, parsed.value.expected_revision, now_ms) catch |err| return aiCoordinatorError(output, err);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"state\":") catch return output[0..0];
+    json.writeJsonString(&writer, @tagName(state)) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
     return writer.buffered();
 }
 
@@ -13045,7 +13794,7 @@ fn vaultAllSections(self: *Context, buf: []vault.Section) usize {
     n += 1;
     buf[n] = .{ .name = "backup_runs", .path = self.backup.history.path, .jsonl = false };
     n += 1;
-    buf[n] = .{ .name = "ai_provider", .path = self.ai.provider.path, .jsonl = false };
+    buf[n] = .{ .name = "ai_provider", .path = self.ai.providers.path, .jsonl = false };
     n += 1;
     buf[n] = .{ .name = "history", .path = self.history.path, .jsonl = true };
     n += 1;

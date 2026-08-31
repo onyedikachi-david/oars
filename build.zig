@@ -208,6 +208,7 @@ pub fn build(b: *std.Build) void {
     const app_mod = localModule(b, target, optimize, "src/main.zig");
     app_mod.addImport("native_sdk", native_sdk_mod);
     app_mod.addImport("runner", runner_mod);
+    app_mod.addImport("build_options", options_mod);
     const vendored = buildVendoredLibraries(b, target);
     linkSshStack(b, app_mod, vendored);
     const exe = b.addExecutable(.{
@@ -271,6 +272,7 @@ pub fn build(b: *std.Build) void {
         const package_app_mod = localModule(b, target, package_optimize, "src/main.zig");
         package_app_mod.addImport("native_sdk", package_sdk_mod);
         package_app_mod.addImport("runner", package_runner_mod);
+        package_app_mod.addImport("build_options", options_mod);
         linkSshStack(b, package_app_mod, vendored);
         const built = b.addExecutable(.{
             .name = app_exe_name,
@@ -443,6 +445,10 @@ fn externalModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
 
 fn linkPlatform(b: *std.Build, target: std.Build.ResolvedTarget, app_mod: *std.Build.Module, exe: *std.Build.Step.Compile, platform: PlatformOption, web_engine: WebEngineOption, web_layer: bool, native_sdk_path: []const u8, cef_dir: []const u8, cef_auto_install: bool) void {
     if (platform == .macos) {
+        const secure_entry_sdk_include = if (b.sysroot) |sysroot| b.fmt("-I{s}/usr/include", .{sysroot}) else "";
+        const secure_entry_flags: []const []const u8 = if (b.sysroot) |sysroot| &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=11.0", "-isysroot", sysroot, secure_entry_sdk_include } else &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=11.0" };
+        app_mod.addIncludePath(b.path("src/c"));
+        app_mod.addCSourceFile(.{ .file = b.path("src/c/ai_secure_entry_macos.m"), .flags = secure_entry_flags });
         switch (web_engine) {
             .system => {
                 const sdk_include = if (b.sysroot) |sysroot| b.fmt("-I{s}/usr/include", .{sysroot}) else "";
@@ -488,6 +494,8 @@ fn linkPlatform(b: *std.Build, target: std.Build.ResolvedTarget, app_mod: *std.B
         app_mod.linkSystemLibrary("c", .{});
         if (web_engine == .chromium) app_mod.linkSystemLibrary("c++", .{});
     } else if (platform == .linux) {
+        app_mod.addIncludePath(b.path("src/c"));
+        app_mod.addCSourceFile(.{ .file = b.path("src/c/ai_secure_entry_linux.c"), .flags = &.{} });
         switch (web_engine) {
             .system => if (web_layer) {
                 app_mod.addCSourceFile(.{ .file = nativeSdkPath(b, native_sdk_path, "src/platform/linux/gtk_host.c"), .flags = &.{} });
@@ -533,6 +541,8 @@ fn linkPlatform(b: *std.Build, target: std.Build.ResolvedTarget, app_mod: *std.B
         app_mod.linkSystemLibrary("c", .{});
         if (web_engine == .chromium) app_mod.linkSystemLibrary("stdc++", .{});
     } else if (platform == .windows) {
+        app_mod.addIncludePath(b.path("src/c"));
+        app_mod.addCSourceFile(.{ .file = b.path("src/c/ai_secure_entry_windows.c"), .flags = &.{} });
         switch (web_engine) {
             .system => if (web_layer) {
                 // The vendored WebView2 SDK header (third_party/webview2)
@@ -588,6 +598,7 @@ fn linkPlatform(b: *std.Build, target: std.Build.ResolvedTarget, app_mod: *std.B
         app_mod.linkSystemLibrary("ole32", .{});
         app_mod.linkSystemLibrary("oleacc", .{});
         app_mod.linkSystemLibrary("shell32", .{});
+        app_mod.linkSystemLibrary("credui", .{});
         // The audio backend: Media Foundation (session + source resolver
         // + streaming audio renderer) and WinHTTP (the cache fill).
         app_mod.linkSystemLibrary("mf", .{});

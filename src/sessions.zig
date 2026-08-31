@@ -220,9 +220,13 @@ pub const ChannelEntry = struct {
     /// Optional pre-redacted command text to record (the executed command
     /// is recorded when null). Owned by the entry.
     history_command: ?[]const u8 = null,
+    history_command_redacted: bool = true,
     /// Known secret values (owned array of owned strings) — the command
     /// and the output snippet are masked with them at capture.
     history_secrets: ?[][]const u8 = null,
+    /// Stable feature operation ID used by AI approval/history recovery.
+    /// When null, ordinary execs keep the session-local `exec-N` identity.
+    history_operation_id: ?[]const u8 = null,
     /// Monotonic time the channel opened (duration for history).
     started_ns: i128 = 0,
     stream: *Stream,
@@ -255,12 +259,26 @@ pub const ChannelEntry = struct {
     access_exec_outcome: ?*AccessExecOutcome = null,
     access_exec_timeout_ns: i128 = 0,
     access_exec_cap: usize = 0,
+    /// Spec 11: asynchronous AI context probe. It is an untracked,
+    /// read-only internal channel with an operation ID for cancellation.
+    ai_context_outcome: ?*AiContextOutcome = null,
+    ai_context_operation_id: ?[]const u8 = null,
+    ai_context_timeout_ns: i128 = 0,
+    ai_context_cap: usize = 0,
     /// Spec 10: bounded backup execs and streamed manual runs use dedicated
     /// outcomes so the coordinator can observe worker-owned libssh2 work.
     backup_outcome: ?*BackupOutcome = null,
     backup_timeout_ns: i128 = 0,
     backup_cap: usize = 0,
     backup_process: ?*BackupProcess = null,
+    /// AI commands start in a dedicated remote process group. The worker
+    /// consumes the private first-line marker and does not publish it as
+    /// command output.
+    ai_marker_pending: bool = false,
+    ai_marker: [64]u8 = undefined,
+    ai_marker_len: usize = 0,
+    ai_pgid: [20]u8 = undefined,
+    ai_pgid_len: usize = 0,
 
     /// Frees the command text and the optional history strings. Every
     /// path that drops an entry (eviction, close, teardown) must call
@@ -269,10 +287,12 @@ pub const ChannelEntry = struct {
         allocator.free(self.command);
         if (self.history_kind) |hk| allocator.free(hk);
         if (self.history_command) |hc| allocator.free(hc);
+        if (self.history_operation_id) |operation_id| allocator.free(operation_id);
         if (self.history_secrets) |hs| {
             for (hs) |s| allocator.free(s);
             allocator.free(hs);
         }
+        if (self.ai_context_operation_id) |operation_id| allocator.free(operation_id);
     }
 
     fn clearStdin(self: *ChannelEntry, allocator: std.mem.Allocator) void {
@@ -295,10 +315,13 @@ const Op = union(enum) {
         /// entry takes them over (or frees them) when the op runs.
         history_kind: ?[]const u8 = null,
         history_command: ?[]const u8 = null,
+        history_command_redacted: bool = true,
         /// Known secret values of the operation (spec 15: the stored
         /// command AND the output snippet are masked with them). Owned
         /// array of owned strings.
         history_secrets: ?[][]const u8 = null,
+        history_operation_id: ?[]const u8 = null,
+        ai_execution: bool = false,
     },
     follow: struct { id: u32, command: []const u8 },
     resize: struct { cols: c_int, rows: c_int },
@@ -407,6 +430,16 @@ const Op = union(enum) {
         cap: usize,
         outcome: *AccessExecOutcome,
     },
+    /// Spec 11: context probes are queued and drained on the owning SSH
+    /// worker. The bridge only admits and polls this operation.
+    ai_context: struct {
+        operation_id: []const u8,
+        command: []const u8,
+        timeout_ns: i128,
+        cap: usize,
+        outcome: *AiContextOutcome,
+    },
+    ai_context_cancel: struct { operation_id: []const u8 },
     /// Spec 10: all backup exec/SFTP calls remain on the owning worker.
     backup: struct {
         request: BackupRequest,
@@ -964,6 +997,77 @@ pub const AccessExecOutcome = struct {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
         return self.msg_buf[0..self.msg_len];
+    }
+};
+
+/// Spec 11 context-probe completion. The SSH worker owns completion; the AI
+/// operation registry owns the heap record until it calls `abandon`. A late
+/// worker completion frees an abandoned record exactly once.
+pub const AiContextOutcome = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+    done: bool = false,
+    abandoned: bool = false,
+    canceled: bool = false,
+    disconnected: bool = false,
+    exit: ?i32 = null,
+    message_buf: [256]u8 = undefined,
+    message_len: usize = 0,
+    data: std.ArrayList(u8) = .empty,
+
+    pub const Snapshot = struct {
+        done: bool,
+        canceled: bool,
+        disconnected: bool,
+        exit: ?i32,
+        message: []u8,
+        data: []u8,
+
+        pub fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
+            allocator.free(self.message);
+            allocator.free(self.data);
+        }
+    };
+
+    pub fn complete(self: *AiContextOutcome, exit: ?i32, data: []const u8, message: []const u8, canceled: bool, disconnected: bool) void {
+        lockSpin(&self.mutex);
+        if (data.len > 0) self.data.appendSlice(self.allocator, data) catch {};
+        const len = @min(message.len, self.message_buf.len);
+        @memcpy(self.message_buf[0..len], message[0..len]);
+        self.message_len = len;
+        self.exit = exit;
+        self.canceled = canceled;
+        self.disconnected = disconnected;
+        self.done = true;
+        const free = self.abandoned;
+        self.mutex.unlock();
+        if (free) {
+            self.data.deinit(self.allocator);
+            self.allocator.destroy(self);
+        }
+    }
+
+    pub fn snapshot(self: *AiContextOutcome, allocator: std.mem.Allocator) !Snapshot {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const message = try allocator.dupe(u8, self.message_buf[0..self.message_len]);
+        errdefer allocator.free(message);
+        const data = try allocator.dupe(u8, self.data.items);
+        return .{
+            .done = self.done,
+            .canceled = self.canceled,
+            .disconnected = self.disconnected,
+            .exit = self.exit,
+            .message = message,
+            .data = data,
+        };
+    }
+
+    pub fn abandon(self: *AiContextOutcome) bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        self.abandoned = true;
+        return self.done;
     }
 };
 
@@ -1811,6 +1915,37 @@ pub const Manager = struct {
         return id;
     }
 
+    /// Dedicated Spec 11 execution admission. The command was already
+    /// frozen and approved by the AI coordinator. This entry point retains
+    /// its stable operation ID and enables the private process-group marker
+    /// filter used for verified cancellation.
+    pub fn execAiTracked(self: *Manager, server_id: []const u8, command: []const u8, history_command: []const u8, operation_id: []const u8) !u32 {
+        const session = self.get(server_id) orelse return error.NoSession;
+        if (session.status.load(.acquire) != .ready) return error.NotReady;
+        const id = session.next_channel_id.fetchAdd(1, .monotonic);
+        const owned = try self.allocator.dupe(u8, command);
+        errdefer self.allocator.free(owned);
+        const owned_kind = try self.allocator.dupe(u8, "ai");
+        errdefer self.allocator.free(owned_kind);
+        const owned_operation_id = try self.allocator.dupe(u8, operation_id);
+        errdefer self.allocator.free(owned_operation_id);
+        const owned_history_command = try self.allocator.dupe(u8, history_command);
+        errdefer self.allocator.free(owned_history_command);
+        lockSpin(&session.ops_mutex);
+        defer session.ops_mutex.unlock();
+        if (session.worker_done.load(.acquire)) return error.NotReady;
+        try session.ops.append(self.allocator, .{ .exec = .{
+            .id = id,
+            .command = owned,
+            .history_kind = owned_kind,
+            .history_command = owned_history_command,
+            .history_command_redacted = false,
+            .history_operation_id = owned_operation_id,
+            .ai_execution = true,
+        } });
+        return id;
+    }
+
     /// Queues a tracked exec with bounded stdin. The stdin bytes are never
     /// included in command history and are securely cleared by the worker.
     pub fn execTrackedWithInput(
@@ -2203,7 +2338,15 @@ pub const Manager = struct {
     /// scan/read). The output is owned by the caller.
     pub fn execWait(self: *Manager, server_id: []const u8, command: []const u8, max_bytes: usize, timeout_ns: i128) !ExecOutcome {
         const channel = try self.exec(server_id, command);
-        return self.waitExec(server_id, channel, max_bytes, timeout_ns);
+        return self.waitExec(server_id, channel, max_bytes, timeout_ns, .{});
+    }
+
+    /// Runs an exec to completion while a non-UI owner can request an early
+    /// stop. Cancellation queues channel cleanup on the owning session
+    /// worker; this thread never calls libssh2 directly.
+    pub fn execWaitCancelable(self: *Manager, server_id: []const u8, command: []const u8, max_bytes: usize, timeout_ns: i128, cancellation: WaitCancellation) !ExecOutcome {
+        const channel = try self.exec(server_id, command);
+        return self.waitExec(server_id, channel, max_bytes, timeout_ns, cancellation);
     }
 
     /// Runs a tracked exec to completion from a non-UI coordinator thread.
@@ -2218,14 +2361,14 @@ pub const Manager = struct {
         timeout_ns: i128,
     ) !ExecOutcome {
         const channel = try self.execTracked(server_id, command, history_kind, history_command, history_secrets);
-        return self.waitExec(server_id, channel, max_bytes, timeout_ns);
+        return self.waitExec(server_id, channel, max_bytes, timeout_ns, .{});
     }
 
     /// Runs a bounded exec with stdin to completion. Secret input is never
     /// part of the command text or command history.
     pub fn execWaitWithInput(self: *Manager, server_id: []const u8, command: []const u8, stdin_data: []const u8, max_bytes: usize, timeout_ns: i128) !ExecOutcome {
         const channel = try self.execWithInput(server_id, command, stdin_data);
-        return self.waitExec(server_id, channel, max_bytes, timeout_ns);
+        return self.waitExec(server_id, channel, max_bytes, timeout_ns, .{});
     }
 
     /// Runs a tracked exec with stdin to completion from a non-UI coordinator
@@ -2242,15 +2385,19 @@ pub const Manager = struct {
         timeout_ns: i128,
     ) !ExecOutcome {
         const channel = try self.execTrackedWithInput(server_id, command, stdin_data, history_kind, history_command, history_secrets);
-        return self.waitExec(server_id, channel, max_bytes, timeout_ns);
+        return self.waitExec(server_id, channel, max_bytes, timeout_ns, .{});
     }
 
-    fn waitExec(self: *Manager, server_id: []const u8, channel: u32, max_bytes: usize, timeout_ns: i128) !ExecOutcome {
+    fn waitExec(self: *Manager, server_id: []const u8, channel: u32, max_bytes: usize, timeout_ns: i128, cancellation: WaitCancellation) !ExecOutcome {
         const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + timeout_ns;
         var out = ExecOutcome{ .output = .empty };
         errdefer out.deinit(self.allocator);
         var cursor: u64 = 0;
         while (true) {
+            if (cancellation.isCanceled()) {
+                self.closeChannel(server_id, channel) catch {};
+                return error.Canceled;
+            }
             const polls = try self.pollChannels(server_id, &.{.{ .id = channel, .pos = cursor }}, false, 64 * 1024, 64 * 1024);
             for (polls) |*poll| {
                 if (poll.id != channel) continue;
@@ -2402,6 +2549,45 @@ pub const Manager = struct {
         return out.toOwnedSlice(allocator);
     }
 
+    /// Copies one exact retained channel range. This is separate from the
+    /// multi-channel poll budget because callers such as AI summaries must
+    /// not let unrelated shell or exec output consume the selected range.
+    pub fn readChannelRange(self: *Manager, server_id: []const u8, channel_id: u32, start: u64, end: u64) !?[]u8 {
+        if (end < start) return error.InvalidRange;
+        const range_len: usize = std.math.cast(usize, end - start) orelse return error.InvalidRange;
+        const session = self.get(server_id) orelse return error.NoSession;
+        lockSpin(&session.channels_mutex);
+        defer session.channels_mutex.unlock();
+        for (session.channels.items) |entry| {
+            if (entry.id != channel_id or entry.internal) continue;
+            lockSpin(&entry.stream.mutex);
+            defer entry.stream.mutex.unlock();
+            if (start < entry.stream.start_abs or end > entry.stream.end_abs) return error.OutputNotRetained;
+            const offset: usize = @intCast(start - entry.stream.start_abs);
+            const selected = try self.allocator.alloc(u8, range_len);
+            @memcpy(selected, entry.stream.data.items[offset .. offset + range_len]);
+            return selected;
+        }
+        return null;
+    }
+
+    /// Copies the verified AI process-group marker for one tracked channel.
+    /// A null result means the channel exists but its private marker has not
+    /// arrived. The marker is never exposed through `ssh.poll` output.
+    pub fn aiProcessGroup(self: *Manager, server_id: []const u8, channel_id: u32, output: []u8) !?[]const u8 {
+        const session = self.get(server_id) orelse return error.NoSession;
+        lockSpin(&session.channels_mutex);
+        defer session.channels_mutex.unlock();
+        for (session.channels.items) |entry| {
+            if (entry.id != channel_id) continue;
+            if (entry.ai_pgid_len == 0) return null;
+            if (entry.ai_pgid_len > output.len) return error.NoSpaceLeft;
+            @memcpy(output[0..entry.ai_pgid_len], entry.ai_pgid[0..entry.ai_pgid_len]);
+            return output[0..entry.ai_pgid_len];
+        }
+        return error.InvalidChannel;
+    }
+
     fn cursorFor(cursors: []const Cursor, id: u32) ?u64 {
         for (cursors) |c| {
             if (c.id == id) return c.pos;
@@ -2419,6 +2605,14 @@ pub const Manager = struct {
             .trust_fingerprint = session.trustFingerprint(),
             .trust_algorithm = session.trustAlgorithm(),
         };
+    }
+
+    /// Stable identity for one live connection generation. A reconnect gets
+    /// a new value, so an approval cannot cross session replacement.
+    pub fn connectionIdentity(self: *Manager, server_id: []const u8) !u64 {
+        const session = self.get(server_id) orelse return error.NoSession;
+        if (session.status.load(.acquire) != .ready) return error.NotReady;
+        return session.id;
     }
 
     /// Marks monitor poll activity: the worker probes only while polls are
@@ -2517,6 +2711,39 @@ pub const Manager = struct {
         try session.ops.append(self.allocator, .{ .access_exec = .{ .command = owned, .timeout_ns = timeout_ns, .cap = cap, .outcome = outcome } });
     }
 
+    /// Admits a bounded, untracked AI context probe to the selected session
+    /// worker. No SSH work occurs on the calling bridge thread.
+    pub fn enqueueAiContext(self: *Manager, server_id: []const u8, operation_id: []const u8, command: []const u8, timeout_ns: i128, cap: usize, outcome: *AiContextOutcome) !void {
+        const session = self.get(server_id) orelse return error.NoSession;
+        if (session.status.load(.acquire) != .ready) return error.NotReady;
+        const operation_owned = try self.allocator.dupe(u8, operation_id);
+        errdefer self.allocator.free(operation_owned);
+        const command_owned = try self.allocator.dupe(u8, command);
+        errdefer self.allocator.free(command_owned);
+        lockSpin(&session.ops_mutex);
+        defer session.ops_mutex.unlock();
+        if (session.worker_done.load(.acquire)) return error.NotReady;
+        try session.ops.append(self.allocator, .{ .ai_context = .{
+            .operation_id = operation_owned,
+            .command = command_owned,
+            .timeout_ns = timeout_ns,
+            .cap = cap,
+            .outcome = outcome,
+        } });
+    }
+
+    /// Queues idempotent cancellation on the same worker that owns the SSH
+    /// channel. A cancel racing completion reports the observed final state.
+    pub fn cancelAiContext(self: *Manager, server_id: []const u8, operation_id: []const u8) !void {
+        const session = self.get(server_id) orelse return error.NoSession;
+        const operation_owned = try self.allocator.dupe(u8, operation_id);
+        errdefer self.allocator.free(operation_owned);
+        lockSpin(&session.ops_mutex);
+        defer session.ops_mutex.unlock();
+        if (session.worker_done.load(.acquire)) return error.NotReady;
+        try session.ops.append(self.allocator, .{ .ai_context_cancel = .{ .operation_id = operation_owned } });
+    }
+
     /// Fast preflight before copying a backup payload. The session is not
     /// borrowed beyond the manager lock; publishBackupOp resolves it again.
     fn ensureBackupSessionReadyMode(self: *Manager, server_id: []const u8, cleanup: bool) !void {
@@ -2598,6 +2825,19 @@ pub const Manager = struct {
 pub const Cursor = struct {
     id: u32,
     pos: u64,
+};
+
+pub const WaitCancellation = struct {
+    context: ?*anyopaque = null,
+    is_canceled_fn: *const fn (?*anyopaque) bool = neverCanceled,
+
+    pub fn isCanceled(self: WaitCancellation) bool {
+        return self.is_canceled_fn(self.context);
+    }
+
+    fn neverCanceled(_: ?*anyopaque) bool {
+        return false;
+    }
 };
 
 /// Bounded synchronous exec result (spec 04 read/scan).
@@ -3055,6 +3295,17 @@ fn workerMain(session: *Session) void {
                 if (!dropEntryAt(session, i, entry)) i += 1;
                 continue;
             }
+            if (entry.ai_context_outcome != null and entry.ai_context_timeout_ns > 0 and
+                std.Io.Timestamp.now(io, .real).nanoseconds - entry.started_ns >= entry.ai_context_timeout_ns)
+            {
+                entry.raw.sendEof();
+                entry.raw.close(session.io);
+                entry.raw_closed = true;
+                entry.ai_context_outcome.?.complete(null, "", "context probe timed out", false, false);
+                entry.ai_context_outcome = null;
+                if (!dropEntryAt(session, i, entry)) i += 1;
+                continue;
+            }
             // Spec 07: a preflight probe that outlives its deadline is closed
             // and completed honestly (read-only — no rollback needed).
             if (entry.access_exec_outcome != null and entry.access_exec_timeout_ns > 0 and
@@ -3116,6 +3367,9 @@ fn workerMain(session: *Session) void {
                             if (entry.check_outcome) |oc| {
                                 drainSyntaxCheck(session, entry, oc);
                                 entry.check_outcome = null;
+                            } else if (entry.ai_context_outcome != null) {
+                                drainAiContext(session, entry);
+                                entry.ai_context_outcome = null;
                             } else if (entry.preflight_probe) |_| {
                                 drainPreflightProbe(session, entry);
                                 if (entry.preflight_id) |pid| {
@@ -3160,7 +3414,7 @@ fn workerMain(session: *Session) void {
                     i += 1;
                 },
                 .data => |n| {
-                    entry.stream.append(read_buf[0..n]) catch {};
+                    appendChannelData(entry, read_buf[0..n]);
                     if (entry.backup_process) |process| process.append(read_buf[0..n]);
                     i += 1;
                 },
@@ -3273,8 +3527,11 @@ fn recordExecHistory(session: *Session, entry: *ChannelEntry) void {
     }
     defer allocator.free(snippet_owned);
     var op_buf: [64]u8 = undefined;
-    const op_id = std.fmt.bufPrint(&op_buf, "exec-{d}", .{session.history_seq}) catch return;
-    session.history_seq += 1;
+    const op_id = entry.history_operation_id orelse blk: {
+        const generated = std.fmt.bufPrint(&op_buf, "exec-{d}", .{session.history_seq}) catch return;
+        session.history_seq += 1;
+        break :blk generated;
+    };
     session.history.record(session.io, .{
         .id = "",
         .operation_id = op_id,
@@ -3285,8 +3542,71 @@ fn recordExecHistory(session: *Session, entry: *ChannelEntry) void {
         .exit = entry.stream.exit_status,
         .duration_ms = duration_ms,
         .output_snippet = snippet_owned,
-        .redacted = redacted.redacted or entry.history_command != null or snippet_redacted,
+        .redacted = redacted.redacted or (entry.history_command != null and entry.history_command_redacted) or snippet_redacted,
     }) catch {};
+}
+
+const ai_pgid_prefix = "__OARS_AI_PGID__";
+
+fn appendChannelData(entry: *ChannelEntry, bytes: []const u8) void {
+    if (!entry.ai_marker_pending) {
+        entry.stream.append(bytes) catch {};
+        return;
+    }
+    const newline = std.mem.indexOfScalar(u8, bytes, '\n');
+    const marker_part = if (newline) |index| bytes[0..index] else bytes;
+    if (entry.ai_marker_len + marker_part.len > entry.ai_marker.len) {
+        entry.ai_marker_pending = false;
+        entry.stream.append(entry.ai_marker[0..entry.ai_marker_len]) catch {};
+        entry.stream.append(bytes) catch {};
+        return;
+    }
+    @memcpy(entry.ai_marker[entry.ai_marker_len .. entry.ai_marker_len + marker_part.len], marker_part);
+    entry.ai_marker_len += marker_part.len;
+    if (newline == null) return;
+    const marker = entry.ai_marker[0..entry.ai_marker_len];
+    if (std.mem.startsWith(u8, marker, ai_pgid_prefix)) {
+        const pgid = marker[ai_pgid_prefix.len..];
+        if (validDecimalProcessGroup(pgid)) {
+            @memcpy(entry.ai_pgid[0..pgid.len], pgid);
+            entry.ai_pgid_len = pgid.len;
+        } else {
+            entry.stream.append(marker) catch {};
+            entry.stream.append("\n") catch {};
+        }
+    } else {
+        entry.stream.append(marker) catch {};
+        entry.stream.append("\n") catch {};
+    }
+    entry.ai_marker_pending = false;
+    const remaining = bytes[newline.? + 1 ..];
+    if (remaining.len > 0) entry.stream.append(remaining) catch {};
+}
+
+fn validDecimalProcessGroup(value: []const u8) bool {
+    if (value.len == 0 or value.len > 20) return false;
+    for (value) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
+}
+
+test "AI execution marker is fragmented safely and hidden from output" {
+    const allocator = std.testing.allocator;
+    var stream = Stream.init(allocator);
+    defer stream.deinit(allocator);
+    var entry = ChannelEntry{
+        .id = 7,
+        .kind = .exec,
+        .stream = &stream,
+        .raw = undefined,
+        .ai_marker_pending = true,
+    };
+    appendChannelData(&entry, "__OARS_AI_");
+    appendChannelData(&entry, "PGID__12345\nhello ");
+    appendChannelData(&entry, "world\n");
+    try std.testing.expectEqualStrings("12345", entry.ai_pgid[0..entry.ai_pgid_len]);
+    var output: [64]u8 = undefined;
+    const read = stream.readAt(0, &output);
+    try std.testing.expectEqualStrings("hello world\n", output[0..read]);
 }
 
 /// Copies the first two lines of the stream into `buf`, trimmed of
@@ -3850,6 +4170,114 @@ fn accessExecOp(session: *Session, ae: anytype) void {
     session.channels_mutex.unlock();
 }
 
+fn drainAiContext(session: *Session, entry: *ChannelEntry) void {
+    const outcome = entry.ai_context_outcome orelse return;
+    var total: std.ArrayList(u8) = .empty;
+    defer total.deinit(session.allocator);
+    var buffer: [4096]u8 = undefined;
+    var cursor = entry.stream.start();
+    const overflow = cursor > 0;
+    while (true) {
+        const count = entry.stream.readAt(cursor, &buffer);
+        if (count == 0) break;
+        if (total.items.len + count > entry.ai_context_cap) break;
+        total.appendSlice(session.allocator, buffer[0..count]) catch {
+            outcome.complete(null, "", "out of memory capturing context", false, false);
+            return;
+        };
+        cursor += count;
+    }
+    const exit = entry.stream.exit_status;
+    if (overflow or total.items.len > entry.ai_context_cap) {
+        outcome.complete(exit, total.items, "context probe output exceeded its cap", false, false);
+    } else if (exit != null and exit.? == 0) {
+        outcome.complete(exit, total.items, "ok", false, false);
+    } else {
+        outcome.complete(exit, total.items, "context probe failed", false, false);
+    }
+}
+
+fn aiContextOp(session: *Session, probe: anytype) void {
+    const allocator = session.allocator;
+    const raw = session.transport.openChannel(session.io) catch {
+        allocator.free(probe.operation_id);
+        allocator.free(probe.command);
+        probe.outcome.complete(null, "", "could not open a channel for the context probe", false, false);
+        return;
+    };
+    raw.exec(session.io, probe.command) catch {
+        raw.close(session.io);
+        allocator.free(probe.operation_id);
+        allocator.free(probe.command);
+        probe.outcome.complete(null, "", "context probe could not start", false, false);
+        return;
+    };
+    const stream = allocator.create(Stream) catch {
+        raw.close(session.io);
+        allocator.free(probe.operation_id);
+        allocator.free(probe.command);
+        probe.outcome.complete(null, "", "out of memory", false, false);
+        return;
+    };
+    stream.* = Stream.init(allocator);
+    stream.max_bytes = probe.cap;
+    const entry = allocator.create(ChannelEntry) catch {
+        allocator.destroy(stream);
+        raw.close(session.io);
+        allocator.free(probe.operation_id);
+        allocator.free(probe.command);
+        probe.outcome.complete(null, "", "out of memory", false, false);
+        return;
+    };
+    entry.* = .{
+        .id = session.next_channel_id.fetchAdd(1, .monotonic),
+        .kind = .exec,
+        .command = probe.command,
+        .stream = stream,
+        .raw = raw,
+        .internal = true,
+        .ai_context_outcome = probe.outcome,
+        .ai_context_operation_id = probe.operation_id,
+        .ai_context_timeout_ns = probe.timeout_ns,
+        .ai_context_cap = probe.cap,
+        .started_ns = std.Io.Timestamp.now(session.io, .real).nanoseconds,
+    };
+    lockSpin(&session.channels_mutex);
+    session.channels.append(allocator, entry) catch {
+        session.channels_mutex.unlock();
+        entry.freeCommandText(allocator);
+        allocator.destroy(entry);
+        allocator.destroy(stream);
+        raw.close(session.io);
+        probe.outcome.complete(null, "", "out of memory", false, false);
+        return;
+    };
+    session.channels_mutex.unlock();
+}
+
+fn aiContextCancelOp(session: *Session, operation_id: []const u8) void {
+    defer session.allocator.free(operation_id);
+    var found_index: ?usize = null;
+    var found_entry: ?*ChannelEntry = null;
+    lockSpin(&session.channels_mutex);
+    for (session.channels.items, 0..) |entry, index| {
+        const current = entry.ai_context_operation_id orelse continue;
+        if (std.mem.eql(u8, current, operation_id)) {
+            found_index = index;
+            found_entry = entry;
+            break;
+        }
+    }
+    session.channels_mutex.unlock();
+    const entry = found_entry orelse return;
+    entry.raw.sendEof();
+    entry.raw.close(session.io);
+    entry.raw_closed = true;
+    if (entry.ai_context_outcome) |outcome| outcome.complete(null, "", "context refresh canceled", true, false);
+    entry.ai_context_outcome = null;
+    _ = dropEntryAt(session, found_index.?, entry);
+}
+
 fn preflightProbeOp(session: *Session, pp: anytype) void {
     const allocator = session.allocator;
     const raw = session.transport.openChannel(session.io) catch {
@@ -3958,8 +4386,8 @@ fn processOps(session: *Session) void {
                 allocator.destroy(entry.stream);
                 allocator.destroy(entry);
             },
-            .exec => |e| tryOpenChannel(session, e.id, .exec, e.command, e.stdin_data, e.history_kind, e.history_command, e.history_secrets),
-            .follow => |f| tryOpenChannel(session, f.id, .log, f.command, null, null, null, null),
+            .exec => |e| tryOpenChannel(session, e.id, .exec, e.command, e.stdin_data, e.history_kind, e.history_command, e.history_command_redacted, e.history_secrets, e.history_operation_id, e.ai_execution),
+            .follow => |f| tryOpenChannel(session, f.id, .log, f.command, null, null, null, false, null, null, false),
             .clear => |cl| clearLogFile(session, cl.path, cl.expected, cl.outcome),
             .sftp_ls => |so| sftpOpLs(session, so.path, so.outcome),
             .sftp_stat => |so| sftpOpStat(session, so.path, so.outcome),
@@ -3982,6 +4410,8 @@ fn processOps(session: *Session) void {
             .syntax_check => |sc| syntaxCheckOp(session, sc),
             .preflight_probe => |pp| preflightProbeOp(session, pp),
             .access_exec => |ae| accessExecOp(session, ae),
+            .ai_context => |probe| aiContextOp(session, probe),
+            .ai_context_cancel => |cancel| aiContextCancelOp(session, cancel.operation_id),
             .backup => |value| backupRequestOp(session, value.request, value.outcome),
             .backup_run => |value| backupRunOp(session, value.command, value.stdin_data, value.process),
         }
@@ -4864,27 +5294,27 @@ fn handshakeErrorText(err: wsmod.HandshakeError) []const u8 {
 /// the optional history strings, and the optional secret values on every
 /// path: the entry frees them at eviction/close/teardown, the failure
 /// paths free them here.
-fn tryOpenChannel(session: *Session, id: u32, kind: ChannelKind, command: []const u8, stdin_data: ?[]u8, history_kind: ?[]const u8, history_command: ?[]const u8, history_secrets: ?[][]const u8) void {
+fn tryOpenChannel(session: *Session, id: u32, kind: ChannelKind, command: []const u8, stdin_data: ?[]u8, history_kind: ?[]const u8, history_command: ?[]const u8, history_command_redacted: bool, history_secrets: ?[][]const u8, history_operation_id: ?[]const u8, ai_execution: bool) void {
     const allocator = session.allocator;
     const raw = session.transport.openChannel(session.io) catch {
-        freeChannelPayload(allocator, command, stdin_data, history_kind, history_command, history_secrets);
+        freeChannelPayload(allocator, command, stdin_data, history_kind, history_command, history_secrets, history_operation_id);
         return;
     };
     raw.exec(session.io, command) catch {
         raw.close(session.io);
-        freeChannelPayload(allocator, command, stdin_data, history_kind, history_command, history_secrets);
+        freeChannelPayload(allocator, command, stdin_data, history_kind, history_command, history_secrets, history_operation_id);
         return;
     };
     const stream = allocator.create(Stream) catch {
         raw.close(session.io);
-        freeChannelPayload(allocator, command, stdin_data, history_kind, history_command, history_secrets);
+        freeChannelPayload(allocator, command, stdin_data, history_kind, history_command, history_secrets, history_operation_id);
         return;
     };
     stream.* = Stream.init(allocator);
     const entry = allocator.create(ChannelEntry) catch {
         allocator.destroy(stream);
         raw.close(session.io);
-        freeChannelPayload(allocator, command, stdin_data, history_kind, history_command, history_secrets);
+        freeChannelPayload(allocator, command, stdin_data, history_kind, history_command, history_secrets, history_operation_id);
         return;
     };
     entry.* = .{
@@ -4893,7 +5323,10 @@ fn tryOpenChannel(session: *Session, id: u32, kind: ChannelKind, command: []cons
         .command = command,
         .history_kind = history_kind,
         .history_command = history_command,
+        .history_command_redacted = history_command_redacted,
         .history_secrets = history_secrets,
+        .history_operation_id = history_operation_id,
+        .ai_marker_pending = ai_execution,
         .started_ns = std.Io.Timestamp.now(session.io, .real).nanoseconds,
         .stream = stream,
         .raw = raw,
@@ -4914,7 +5347,7 @@ fn tryOpenChannel(session: *Session, id: u32, kind: ChannelKind, command: []cons
 }
 
 /// Frees the channel-op payload strings on a failed open.
-fn freeChannelPayload(allocator: std.mem.Allocator, command: []const u8, stdin_data: ?[]u8, history_kind: ?[]const u8, history_command: ?[]const u8, history_secrets: ?[][]const u8) void {
+fn freeChannelPayload(allocator: std.mem.Allocator, command: []const u8, stdin_data: ?[]u8, history_kind: ?[]const u8, history_command: ?[]const u8, history_secrets: ?[][]const u8, history_operation_id: ?[]const u8) void {
     allocator.free(command);
     if (stdin_data) |input| {
         std.crypto.secureZero(u8, input);
@@ -4922,6 +5355,7 @@ fn freeChannelPayload(allocator: std.mem.Allocator, command: []const u8, stdin_d
     }
     if (history_kind) |hk| allocator.free(hk);
     if (history_command) |hc| allocator.free(hc);
+    if (history_operation_id) |operation_id| allocator.free(operation_id);
     if (history_secrets) |hs| {
         for (hs) |s| allocator.free(s);
         allocator.free(hs);
@@ -6615,6 +7049,9 @@ fn sessionDone(session: *Session) void {
         if (entry.check_outcome) |oc| {
             oc.set(null, "session disconnected");
         }
+        if (entry.ai_context_outcome) |outcome| {
+            outcome.complete(null, "", "session disconnected", false, true);
+        }
         if (entry.access_exec_outcome) |oc| {
             oc.set(null, "", "session disconnected");
         }
@@ -6706,6 +7143,7 @@ fn sessionDone(session: *Session) void {
                 }
                 if (e.history_kind) |hk| session.allocator.free(hk);
                 if (e.history_command) |hc| session.allocator.free(hc);
+                if (e.history_operation_id) |operation_id| session.allocator.free(operation_id);
                 if (e.history_secrets) |hs| {
                     for (hs) |s| session.allocator.free(s);
                     session.allocator.free(hs);
@@ -6720,6 +7158,12 @@ fn sessionDone(session: *Session) void {
                 session.allocator.free(ae.command);
                 ae.outcome.set(null, "", "session disconnected");
             },
+            .ai_context => |probe| {
+                session.allocator.free(probe.operation_id);
+                session.allocator.free(probe.command);
+                probe.outcome.complete(null, "", "session disconnected", false, true);
+            },
+            .ai_context_cancel => |cancel| session.allocator.free(cancel.operation_id),
             .backup => |value| {
                 freeBackupRequest(session.allocator, value.request);
                 value.outcome.set(.disconnected, null, fx_unknown, false, "", "session disconnected");
@@ -7252,6 +7696,45 @@ test "stream reads are non-destructive: two consumers read the same bytes" {
     try std.testing.expectEqualStrings("def", a[0..3]);
     // Reading past the end yields nothing, never an error.
     try std.testing.expectEqual(@as(usize, 0), stream.readAt(99, &a));
+}
+
+test "exact channel range ignores unrelated poll output" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var store: servers.Store = .{ .allocator = allocator, .path = "/tmp/oars-range-test-servers.json" };
+    var audit: history.AuditStore = .{ .allocator = allocator, .path = "/tmp/oars-range-test-audit.jsonl" };
+    var history_store: history.HistoryStore = .{ .allocator = allocator, .path = "/tmp/oars-range-test-history.jsonl" };
+    var manager = Manager.init(allocator, io, &store, &audit, &history_store, null);
+    defer manager.deinit();
+
+    var shell_stream = Stream.init(allocator);
+    defer shell_stream.deinit(allocator);
+    try shell_stream.append("shell");
+    var result_stream = Stream.init(allocator);
+    defer result_stream.deinit(allocator);
+    try result_stream.append("result");
+    var shell_entry = ChannelEntry{ .id = 0, .kind = .shell, .stream = &shell_stream, .raw = undefined };
+    var result_entry = ChannelEntry{ .id = 6, .kind = .exec, .stream = &result_stream, .raw = undefined };
+    var session = Session{
+        .id = 1,
+        .server = .{ .id = "range-test", .name = "range-test", .host = "127.0.0.1", .user = "tester" },
+        .allocator = allocator,
+        .threaded = undefined,
+        .io = io,
+        .transport = undefined,
+        .store = &store,
+        .audit = &audit,
+        .history = &history_store,
+    };
+    defer session.channels.deinit(allocator);
+    try session.channels.append(allocator, &shell_entry);
+    try session.channels.append(allocator, &result_entry);
+    try manager.sessions.put("range-test", &session);
+    defer _ = manager.sessions.remove("range-test");
+
+    const selected = (try manager.readChannelRange("range-test", 6, 0, 6)).?;
+    defer allocator.free(selected);
+    try std.testing.expectEqualStrings("result", selected);
 }
 
 test "stream view reports each consumer's own gap and pending" {

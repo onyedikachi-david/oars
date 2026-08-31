@@ -128,6 +128,25 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("Scripts workspace", () => {
+  it("opens an AI command as an exact unsaved script draft", async () => {
+    const consumed = vi.fn();
+    render(
+      <ScriptsTab
+        serverId={server.id}
+        servers={[server]}
+        connected
+        statuses={new Map([[server.id, "ready"]])}
+        initialDraft={{ name: "", description: "Drafted from AI.", tags: ["destructive"], color: "", body: "rm -rf /tmp/fixture\n", variables: [] }}
+        onInitialDraftConsumed={consumed}
+      />
+    );
+    const dialog = await screen.findByRole("dialog", { name: "New script" });
+    expect((within(dialog).getByLabelText(/Command body/) as HTMLTextAreaElement).value).toBe("rm -rf /tmp/fixture\n");
+    expect((within(dialog).getByLabelText("Tags") as HTMLInputElement).value).toBe("destructive");
+    expect(bridgeMocks.save).not.toHaveBeenCalled();
+    expect(consumed).toHaveBeenCalledOnce();
+  });
+
   it("loads the library without changing hook order", async () => {
     renderScripts();
     expect(await screen.findAllByText("Tail logs")).toHaveLength(2);
@@ -187,7 +206,7 @@ describe("Scripts workspace", () => {
     renderScripts();
     await screen.findByText(/Read the current service log/);
     await user.click(screen.getByLabelText("Filter scripts by tag"));
-    await user.click(screen.getByRole("option", { name: "logs" }));
+    await user.click(await screen.findByRole("option", { name: "logs" }));
     await user.type(screen.getByLabelText("Search scripts"), "deploy");
     expect(await screen.findByRole("heading", { name: "No matching scripts" })).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Clear filters" }));

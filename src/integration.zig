@@ -111,6 +111,7 @@ pub const TestRig = struct {
     backup_jobs_path_buf: [512]u8 = undefined,
     backup_runs_path_buf: [512]u8 = undefined,
     ai_path_buf: [512]u8 = undefined,
+    ai_journal_path_buf: [512]u8 = undefined,
     dir_name: []const u8,
     store: servers.Store,
     audit_store: history.AuditStore,
@@ -142,6 +143,7 @@ pub const TestRig = struct {
         const backup_jobs_path = try std.fmt.bufPrint(&self.backup_jobs_path_buf, "/tmp/{s}/backups.json", .{self.dir_name});
         const backup_runs_path = try std.fmt.bufPrint(&self.backup_runs_path_buf, "/tmp/{s}/backup_runs.json", .{self.dir_name});
         const ai_path = try std.fmt.bufPrint(&self.ai_path_buf, "/tmp/{s}/ai.json", .{self.dir_name});
+        const ai_journal_path = try std.fmt.bufPrint(&self.ai_journal_path_buf, "/tmp/{s}/ai_journal.jsonl", .{self.dir_name});
         self.store = .{ .allocator = std.testing.allocator, .path = store_path };
         self.audit_store = .{ .allocator = std.testing.allocator, .path = audit_path };
         self.history_store = .{ .allocator = std.testing.allocator, .path = history_path };
@@ -151,9 +153,11 @@ pub const TestRig = struct {
         self.deploy_history_store = .{ .allocator = std.testing.allocator, .path = deploy_history_path };
         self.access_registry = access.Registry.init(std.testing.allocator, access_path);
         self.backup_registry = backup.Registry.init(std.testing.allocator, backup_jobs_path, backup_runs_path);
-        self.ai_registry = ai.Registry.init(std.testing.allocator, ai_path);
+        self.ai_registry = ai.Registry.init(std.testing.allocator, ai_path, ai_journal_path);
+        self.ai_registry.startProviderTests(io);
         self.manager = sessions.Manager.init(std.testing.allocator, io, &self.store, &self.audit_store, &self.history_store, null);
         self.ctx = .{ .allocator = std.testing.allocator, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .history = &self.history_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store, .access = &self.access_registry, .keys = keyjobs.Registry.init(std.testing.allocator), .backup = &self.backup_registry, .ai = &self.ai_registry };
+        self.ctx.startAiCoordinator();
         self.dispatcher = self.ctx.dispatcher();
     }
 

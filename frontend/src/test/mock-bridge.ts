@@ -414,12 +414,86 @@ export class MockBridge {
         }
       }
       return {
+        ok: true,
+        status: "ready",
+        connection_id: 1,
         channels: responses,
-        closed: [],
       };
     });
 
-    // 6. oars.monitor
+    // 6. oars.ai — production wire shapes with no browser-side credential value.
+    const aiProvider = {
+      id: "aip-0123456789abcdef",
+      name: "Mock provider",
+      adapter: "openai_responses" as const,
+      base_url: "https://api.openai.com/v1",
+      model: "gpt-test",
+      instruction_role: null,
+      structured_output: null,
+      revision: 1,
+      tested_at_ms: null,
+      test_status: "untested" as const,
+    };
+    const aiProposal = {
+      id: "aiprop-0123456789abcdef",
+      turn_id: "air-0123456789abcdef",
+      revision: 1,
+      server_id: this.state.servers[0].id,
+      provider_id: aiProvider.id,
+      provider_revision: 1,
+      context_hash: "a".repeat(64),
+      command: "uptime",
+      command_sha256: "b".repeat(64),
+      explanation: "Read the current uptime.",
+      model_destructive: false,
+      local_destructive: false,
+      needs_sudo: false,
+      created_at_ms: 1700000000000,
+      expires_at_ms: 1700000600000,
+      state: "awaiting_approval" as const,
+    };
+    this.setHandler("oars.ai.provider.list", () => ({ ok: true, providers: [] }));
+    this.setHandler("oars.ai.provider.save", () => ({ ok: true, provider: aiProvider }));
+    this.setHandler("oars.ai.provider.delete", () => ({ ok: true }));
+    this.setHandler("oars.ai.provider.test", (p: { operation_id: string }) => ({ ok: true, operation_id: p.operation_id, state: "queued" }));
+    this.setHandler("oars.ai.provider.testPoll", (p: { operation_id: string }) => ({ ok: true, stream_id: p.operation_id, cursor: 0, dropped: 0, finished: true, state: "passed", events: [] }));
+    this.setHandler("oars.ai.provider.testCancel", () => ({ ok: true, state: "canceled" }));
+    this.setHandler("oars.ai.credential.configure", () => ({ ok: true, status: "configured" }));
+    this.setHandler("oars.ai.credential.status", () => ({ ok: true, status: "missing" }));
+    this.setHandler("oars.ai.credential.delete", () => ({ ok: true, status: "missing" }));
+    this.setHandler("oars.ai.context.get", () => ({ ok: true, state: "missing", context: null, stale: true }));
+    this.setHandler("oars.ai.context.refresh", (p: { operation_id: string }) => ({ ok: true, operation_id: p.operation_id, state: "queued" }));
+    this.setHandler("oars.ai.context.poll", (p: { operation_id: string }) => ({ ok: true, stream_id: p.operation_id, cursor: 0, dropped: 0, finished: true, state: "ready", events: [] }));
+    this.setHandler("oars.ai.context.cancel", () => ({ ok: true, state: "canceled" }));
+    this.setHandler("oars.ai.thread.list", () => ({ ok: true, threads: [] }));
+    this.setHandler("oars.ai.thread.get", (p: { thread_id: string }) => ({
+      ok: true,
+      thread: {
+        id: p.thread_id,
+        revision: 1,
+        server_id: this.state.servers[0].id,
+        provider_id: aiProvider.id,
+        adapter: aiProvider.adapter,
+        model: aiProvider.model,
+        title: "Mock AI thread",
+        created_at_ms: 1700000000000,
+        updated_at_ms: 1700000000000,
+      },
+      turns: [],
+      turns_start: 0,
+      turn_count: 0,
+      active_proposal: null,
+    }));
+    this.setHandler("oars.ai.thread.delete", () => ({ ok: true }));
+    this.setHandler("oars.ai.turn.start", () => ({ ok: true, thread_id: "ait-0123456789abcdef", turn_id: "air-0123456789abcdef", state: "queued" }));
+    this.setHandler("oars.ai.turn.poll", (p: { turn_id: string }) => ({ ok: true, stream_id: p.turn_id, cursor: 0, dropped: 0, finished: true, state: "completed", events: [] }));
+    this.setHandler("oars.ai.turn.cancel", () => ({ ok: true, state: "canceled" }));
+    this.setHandler("oars.ai.turn.summarize", () => ({ ok: true, thread_id: "ait-0123456789abcdef", turn_id: "air-summary-00000001", state: "queued" }));
+    this.setHandler("oars.ai.proposal.edit", (p: { command: string; expected_revision: number }) => ({ ok: true, proposal: { ...aiProposal, command: p.command, revision: p.expected_revision + 1 } }));
+    this.setHandler("oars.ai.proposal.run", () => ({ ok: true, execution_id: "aiexec-0123456789abcdef", connection_id: 1, channel: ++this.nextChannelId, state: "executing" }));
+    this.setHandler("oars.ai.proposal.cancel", () => ({ ok: true, state: "canceled" }));
+
+    // 7. oars.monitor
     this.setHandler("oars.monitor.poll", () => ({
       timestamp: Date.now(),
       cpu: { user: 10, system: 5, idle: 85, count: 4, model: "AMD EPYC" },
@@ -896,10 +970,22 @@ export class MockBridge {
     this.setHandler("oars.backup.install", () => ({ ok: true, operation_id: "backup-install-1" }));
 
     // 14. oars.ai
-    this.setHandler("oars.ai.context", () => ({ server_id: "srv-prod", system_info: "Ubuntu 22.04" }));
-    this.setHandler("oars.ai.provider.get", () => ({ provider: { provider: "openai", model: "gpt-4o" } }));
-    this.setHandler("oars.ai.provider.set", () => ({ ok: true }));
-    this.setHandler("oars.ai.history", () => ({ entries: [] }));
+    this.setHandler("oars.ai.provider.list", () => ({ ok: true, providers: [] }));
+    this.setHandler("oars.ai.provider.save", ({ provider }) => ({
+      ok: true,
+      provider: { ...(provider as Record<string, unknown>), id: "aip-fixture", revision: 1, tested_at_ms: null, test_status: "untested", instruction_role: null, structured_output: null },
+    }));
+    this.setHandler("oars.ai.provider.delete", () => ({ ok: true }));
+    this.setHandler("oars.ai.provider.test", ({ operation_id }) => ({ ok: true, operation_id, state: "queued" }));
+    this.setHandler("oars.ai.provider.testPoll", ({ operation_id, cursor = 0 }) => ({ ok: true, stream_id: operation_id, cursor, dropped: 0, finished: true, state: "passed", events: [] }));
+    this.setHandler("oars.ai.provider.testCancel", () => ({ ok: true, state: "canceled" }));
+    this.setHandler("oars.ai.credential.configure", () => ({ ok: true, status: "configured" }));
+    this.setHandler("oars.ai.credential.status", () => ({ ok: true, status: "missing" }));
+    this.setHandler("oars.ai.credential.delete", () => ({ ok: true, status: "missing" }));
+    this.setHandler("oars.ai.context.get", () => ({ ok: true, state: "missing", context: null, stale: true }));
+    this.setHandler("oars.ai.context.refresh", ({ operation_id }) => ({ ok: true, operation_id, state: "running" }));
+    this.setHandler("oars.ai.context.poll", ({ operation_id, cursor = 0 }) => ({ ok: true, stream_id: operation_id, cursor, dropped: 0, finished: true, state: "ready", events: [] }));
+    this.setHandler("oars.ai.context.cancel", () => ({ ok: true, state: "canceled" }));
 
     // 15. oars.vnc
     this.setHandler("oars.vnc.start", () => ({ ok: true, tunnel_id: 1, port: 5900, local_port: 59000, websocket_port: 6080 }));

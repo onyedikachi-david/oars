@@ -43,7 +43,7 @@ import { OarsLoadingState, OarsRefreshStatus } from "./components/OarsLoadingSta
 import { WorkspaceLayoutPicker } from "./components/WorkspaceLayoutPicker";
 import { ApplicationNotice } from "./components/ApplicationPortal";
 import { api, BridgeError } from "./bridge";
-import type { Server as OarsServer, SessionStatus, Script, DeployApp } from "./types";
+import type { Server as OarsServer, SessionStatus, Script, ScriptDraft, DeployApp } from "./types";
 import { TerminalTab } from "./TerminalTab";
 import { ServerModal } from "./ServerModal";
 import { MonitorTab } from "./MonitorTab";
@@ -56,6 +56,7 @@ import { KeysTab } from "./KeysTab";
 import { AccessTab } from "./AccessTab";
 import { BackupsTab } from "./BackupsTab";
 import { readBackupPreviewMode } from "./backup-preview";
+import { readAiPreviewMode } from "./ai-preview";
 import { AiTab } from "./AiTab";
 import { HistoryTab } from "./HistoryTab";
 import { VaultTab } from "./VaultTab";
@@ -469,6 +470,7 @@ function ServersView({
 // ---------------------------------------------------------------------------
 export default function App() {
   const [backupPreviewMode] = useState(readBackupPreviewMode);
+  const [aiPreviewMode] = useState(readAiPreviewMode);
   const [servers, setServers] = useState<OarsServer[]>([]);
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
@@ -489,7 +491,7 @@ export default function App() {
   const fleetCountRef = useRef(0);
   const [collapsedFleetGroups, setCollapsedFleetGroups] = useState<Set<string>>(new Set());
   const [serverMenuId, setServerMenuId] = useState<string | null>(null);
-  const [activeSection, setActiveSection] = useState<Section>(() => backupPreviewMode === null ? "Overview" : "Backups");
+  const [activeSection, setActiveSection] = useState<Section>(() => aiPreviewMode !== null ? "AI Context" : backupPreviewMode === null ? "Overview" : "Backups");
   const [mobileNav, setMobileNav] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try {
@@ -615,6 +617,7 @@ export default function App() {
   }, []);
 
   const [pendingScriptId, setPendingScriptId] = useState<string | null>(null);
+  const [pendingScriptDraft, setPendingScriptDraft] = useState<{ tabKey: string; draft: ScriptDraft } | null>(null);
   const [scriptsForPalette, setScriptsForPalette] = useState<Script[]>([]);
   useEffect(() => {
     api.scripts.list().then((r) => setScriptsForPalette(r.scripts)).catch(() => {});
@@ -668,6 +671,13 @@ export default function App() {
       return [...prev, tab];
     });
   }, [showPaneLimit]);
+
+  const aiPreviewOpened = useRef(false);
+  useEffect(() => {
+    if (aiPreviewMode === null || aiPreviewOpened.current || serversLoading || servers.length === 0) return;
+    aiPreviewOpened.current = true;
+    openServerView(servers[0], "ai");
+  }, [aiPreviewMode, openServerView, servers, serversLoading]);
 
   const openMirrored = useCallback((server: OarsServer, view: View = "terminal") => {
     setTabs((prev) => {
@@ -1005,7 +1015,7 @@ export default function App() {
               ) : tab.view === "monitor" ? <MonitorTab key={tab.key} server={tab.server} />
                 : tab.view === "logs" ? <LogsTab key={tab.key} server={tab.server} />
                 : tab.view === "files" ? <FilesTab key={tab.key} serverId={tab.server.id} onNavigateToDeploy={() => setViewForKey(tab.key, "deploy")} />
-                : tab.view === "scripts" ? <ScriptsTab key={tab.key} serverId={tab.server.id} servers={servers} statuses={statuses} connected={status === "ready"} initialScriptId={pendingScriptId} />
+                : tab.view === "scripts" ? <ScriptsTab key={tab.key} serverId={tab.server.id} servers={servers} statuses={statuses} connected={status === "ready"} initialScriptId={pendingScriptId} initialDraft={pendingScriptDraft?.tabKey === tab.key ? pendingScriptDraft.draft : null} onInitialDraftConsumed={() => setPendingScriptDraft((current) => current?.tabKey === tab.key ? null : current)} />
                 : tab.view === "deploy" ? (
                   <DeployTab
                     key={tab.key}
@@ -1017,7 +1027,10 @@ export default function App() {
                 )
                 : tab.view === "keys" ? <KeysTab key={tab.key} serverId={tab.server.id} />
                 : tab.view === "backups" ? <BackupsTab key={tab.key} serverId={tab.server.id} connected={statuses.get(tab.server.id) === "ready"} />
-                : tab.view === "ai" ? <AiTab key={tab.key} serverId={tab.server.id} />
+                : tab.view === "ai" ? <AiTab key={tab.key} serverId={tab.server.id} onOpenScriptDraft={(command, destructive) => {
+                  setPendingScriptDraft({ tabKey: tab.key, draft: { name: "", description: "Drafted from an approved AI Terminal proposal. Review the command, variables, and destructive state before saving.", tags: destructive ? ["destructive"] : [], color: "", body: command, variables: [] } });
+                  setViewForKey(tab.key, "scripts");
+                }} />
                 : tab.view === "vnc" ? (
                   <Suspense fallback={<OarsLoadingState title="Loading remote desktop" detail="Oars is preparing the secure VNC client." />}>
                     <VncTab key={tab.key} serverId={tab.server.id} />
@@ -1293,7 +1306,9 @@ export default function App() {
           ) : (
             <div className="content-stack">
               <SectionTitle eyebrow="Remote access & AI" title="AI Context" description="Local provider configuration and the context available to your assistant."/>
-              {servers[0] ? <div className="panel" style={{ padding: 0, overflow: "hidden" }}><AiTab serverId={servers[0].id} /></div> : <div className="panel muted" style={{ padding: 22 }}>Add a server to see AI context.</div>}
+              <div className="panel muted" style={{ padding: 22 }}>
+                Open a server from the Fleet, then choose its AI tab. Oars will not select a server for an AI request automatically.
+              </div>
             </div>
           )}
           {loadError && <div className="form-error" style={{ marginTop: 14 }}>{loadError}</div>}

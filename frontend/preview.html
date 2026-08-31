@@ -27,6 +27,16 @@
         const deployMode = new URLSearchParams(window.location.search).get("deploy") || "populated";
         const accessMode = new URLSearchParams(window.location.search).get("access") || "populated";
         const keysMode = new URLSearchParams(window.location.search).get("keys") || "populated";
+        // Keep this list byte-for-byte aligned with frontend/src/ai-preview.ts.
+        const AI_PREVIEW_MODES = new Set([
+          "no-server", "no-provider", "credential-missing", "context-disclosure",
+          "provider-test-running", "provider-auth-failed", "assistant-message", "streaming", "question",
+          "refusal", "proposal-safe", "proposal-destructive", "proposal-edited",
+          "execution-running", "cancel-requested", "recovery-required",
+          "summary-disclosure", "long-command",
+        ]);
+        const requestedAiMode = new URLSearchParams(window.location.search).get("ai");
+        const aiMode = requestedAiMode && AI_PREVIEW_MODES.has(requestedAiMode) ? requestedAiMode : null;
         const backupsMode = (() => {
           const requested = new URLSearchParams(window.location.search).get("backups") || "populated";
           const supported = new Set([
@@ -190,9 +200,258 @@
             updated_at: now,
           },
         ];
+        if (aiMode === "no-server") servers.splice(0);
         const calls = [];
         const polls = new Map();
         const previewSecrets = new Map();
+        // ── AI Terminal fixtures (spec 11) ───────────────────────────
+        // These values use a fixed clock and the production oars.ai.* wire
+        // contract. Credentials are represented only by status; no key value
+        // exists in this document or crosses the preview bridge.
+        const AI_FIXED_NOW = 1788134400000;
+        const AI_PROVIDER_ID = "aip-0123456789abcdef";
+        const AI_THREAD_ID = "ait-0123456789abcdef";
+        const AI_TURN_ID = "air-0123456789abcdef";
+        const AI_PROPOSAL_ID = "aiprop-0123456789abcdef";
+        const AI_EXECUTION_ID = "aiexec-0123456789abcdef";
+        const AI_EXECUTION_CHANNEL = 901;
+        const AI_CONNECTION_ID = 7001;
+        const AI_CONTEXT_HASH = "c".repeat(64);
+        const AI_COMMAND_HASH = "d".repeat(64);
+        const aiBaseProvider = {
+          id: AI_PROVIDER_ID,
+          name: "Primary OpenAI",
+          adapter: "openai_responses",
+          base_url: "https://api.openai.com/v1",
+          model: "gpt-5.4",
+          instruction_role: null,
+          structured_output: null,
+          revision: 3,
+          tested_at_ms: AI_FIXED_NOW - 60000,
+          test_status: "passed",
+        };
+        let aiProviders = aiMode === "no-provider" ? [] : [{
+          ...aiBaseProvider,
+          ...(aiMode === "provider-test-running" || aiMode === "provider-auth-failed"
+            ? { tested_at_ms: null, test_status: "untested" }
+            : {}),
+        }];
+        let aiCredentialStatus = aiMode === "credential-missing" ? "missing" : "configured";
+        const aiContext = {
+          server_id: "prod-api",
+          os: "Ubuntu 24.04 LTS",
+          hostname: "api.internal.example",
+          monitor: {
+            ts: AI_FIXED_NOW * 1000000,
+            cpu: { utilization_pct: 31.4, cpu_warming: false, load_1: 0.42, load_5: 0.31, load_15: 0.22, uptime_sec: 277200, cores: 4 },
+            mem: { used_bytes: 4509715660, total_bytes: 8375186227, available_bytes: 3328599654, swap_used_bytes: 214748364, swap_total_bytes: 2147483648 },
+            disk: { used_bytes: 16106127360, total_bytes: 31138512896, available_bytes: 15032385536 },
+            processes: [{ pid: 1842, name: "node api.js", cpu: 4.2, mem: 3.1 }],
+            probe_error: null,
+          },
+          active_logs: [
+            { path: "/var/log/nginx/error.log", last_write: AI_FIXED_NOW - 15000 },
+            { path: "/var/log/auth.log", last_write: AI_FIXED_NOW - 45000 },
+          ],
+          partial: false,
+          errors: [],
+          updated_at_ms: AI_FIXED_NOW,
+        };
+        const aiThreadModes = new Set([
+          "assistant-message", "streaming", "question", "refusal", "proposal-safe", "proposal-destructive",
+          "proposal-edited", "execution-running", "cancel-requested", "recovery-required",
+          "summary-disclosure", "long-command",
+        ]);
+        const aiLongCommand = "printf '%s\\n' '" + "x".repeat((64 * 1024) - 32) + "'";
+        let aiTurnPollCount = 0;
+        let aiProviderTestPollCount = 0;
+        let aiExecutionPollCount = 0;
+        let aiManualTurn = false;
+        let aiDeleted = false;
+
+        function aiStateForMode() {
+          if (aiMode === "streaming" || aiMode === "refusal") return aiMode === "streaming" ? "streaming" : "requesting";
+          if (aiMode === "assistant-message" || aiMode === "question" || aiMode === "summary-disclosure") return "completed";
+          if (aiMode === "execution-running") return "executing";
+          if (aiMode === "cancel-requested") return "cancel_requested";
+          if (aiMode === "recovery-required") return "recovery_required";
+          if (aiMode && aiMode.startsWith("proposal-") || aiMode === "long-command") return "awaiting_approval";
+          return "queued";
+        }
+
+        function aiProposalForMode() {
+          if (!(aiMode && (aiMode.startsWith("proposal-") || aiMode === "long-command" || aiMode === "execution-running" || aiMode === "cancel-requested" || aiMode === "summary-disclosure")) && !aiManualTurn) return null;
+          const edited = aiMode === "proposal-edited";
+          const destructive = aiMode === "proposal-destructive";
+          const command = aiMode === "long-command"
+            ? aiLongCommand
+            : destructive
+              ? "rm -rf /var/cache/oars-preview"
+              : edited
+                ? "journalctl --unit api.service --since '30 minutes ago' --no-pager"
+                : "systemctl status api.service --no-pager";
+          return {
+            id: AI_PROPOSAL_ID,
+            turn_id: AI_TURN_ID,
+            revision: edited ? 2 : 1,
+            server_id: "prod-api",
+            provider_id: AI_PROVIDER_ID,
+            provider_revision: 3,
+            context_hash: AI_CONTEXT_HASH,
+            command,
+            command_sha256: AI_COMMAND_HASH,
+            explanation: destructive
+              ? "Remove the selected cache directory and all content below it."
+              : edited
+                ? "Show recent service journal entries without changing the server."
+                : aiMode === "long-command"
+                  ? "Exercise the maximum command display bound without hiding or truncating command bytes."
+                  : "Inspect the service state without changing the server.",
+            model_destructive: destructive,
+            local_destructive: destructive,
+            needs_sudo: false,
+            created_at_ms: AI_FIXED_NOW - 30000,
+            expires_at_ms: AI_FIXED_NOW + 570000,
+            state: aiMode === "summary-disclosure" ? "completed" : aiMode === "execution-running" || aiMode === "cancel-requested" ? "executing" : "awaiting_approval",
+          };
+        }
+
+        function aiThreadSummary() {
+          return {
+            id: AI_THREAD_ID,
+            revision: 2,
+            server_id: "prod-api",
+            provider_id: AI_PROVIDER_ID,
+            model: aiBaseProvider.model,
+            title: "Investigate the API service",
+            state: aiStateForMode(),
+            turn_count: 1,
+            updated_at_ms: AI_FIXED_NOW,
+          };
+        }
+
+        function aiThreadDetail() {
+          const state = aiStateForMode();
+          const hasExecution = aiMode === "execution-running" || aiMode === "cancel-requested" || aiMode === "summary-disclosure";
+          return {
+            ok: true,
+            thread: {
+              id: AI_THREAD_ID,
+              revision: 2,
+              server_id: "prod-api",
+              provider_id: AI_PROVIDER_ID,
+              adapter: "openai_responses",
+              model: aiBaseProvider.model,
+              title: "Investigate the API service",
+              created_at_ms: AI_FIXED_NOW - 120000,
+              updated_at_ms: AI_FIXED_NOW,
+            },
+            turns: [{
+              id: AI_TURN_ID,
+              operation_id: "ai-turn-preview",
+              state,
+              message: "Why is the API service unhealthy?",
+              context_hash: AI_CONTEXT_HASH,
+              provider_revision: 3,
+              connection_id: AI_CONNECTION_ID,
+              execution_id: hasExecution ? AI_EXECUTION_ID : null,
+              channel: hasExecution ? AI_EXECUTION_CHANNEL : null,
+              execution_cursor: hasExecution ? 112 : 0,
+              exit_status: aiMode === "summary-disclosure" ? 0 : null,
+              proposal: aiProposalForMode(),
+              assistant_message: aiMode === "assistant-message"
+                ? "The API service is responding, but its recent restarts and rising memory use suggest a worker leak. I would inspect the service journal before changing anything."
+                : null,
+              question: aiMode === "question" ? "Which deployment introduced the first unhealthy response?" : null,
+              question_explanation: aiMode === "question" ? "The current context has no deployment timestamp." : null,
+            }],
+            turns_start: 0,
+            turn_count: 1,
+            active_proposal: ["awaiting_approval", "approved", "executing"].includes(aiProposalForMode()?.state) ? aiProposalForMode() : null,
+          };
+        }
+
+        function aiEvent(streamId, sequence, type, payload) {
+          return { version: 1, sequence, stream_id: streamId, type, payload };
+        }
+
+        function aiTurnPoll(payload) {
+          aiTurnPollCount += 1;
+          const streamId = String(payload.turn_id || AI_TURN_ID);
+          const cursor = Number(payload.cursor || 0);
+          if (aiMode === "streaming") {
+            const sequence = aiTurnPollCount - 1;
+            const type = sequence === 0 ? "provider.request_started" : sequence === 1 ? "provider.response_created" : "provider.progress";
+            const eventPayload = type === "provider.request_started"
+              ? { client_request_id: "client-preview", provider_id: AI_PROVIDER_ID, provider_revision: 3, state: "requesting" }
+              : type === "provider.response_created"
+                ? { provider_request_id: "resp_preview_001" }
+                : { phase: "Receiving structured response", received_bytes: 1024 + sequence * 256 };
+            return { ok: true, stream_id: streamId, cursor: cursor + 1, dropped: 0, finished: false, state: "streaming", events: [aiEvent(streamId, sequence, type, eventPayload)] };
+          }
+          if (aiMode === "refusal") {
+            return { ok: true, stream_id: streamId, cursor: 1, dropped: 0, finished: true, state: "failed", events: cursor === 0 ? [aiEvent(streamId, 0, "provider.refusal", { state: "failed", reason: "The provider declined to create a command for this request.", finished_at_ms: AI_FIXED_NOW })] : [] };
+          }
+          if (aiMode === "cancel-requested") {
+            return { ok: true, stream_id: streamId, cursor: 1, dropped: 0, finished: false, state: "cancel_requested", events: cursor === 0 ? [aiEvent(streamId, 0, "turn.cancel_requested", { state: "cancel_requested", requested_at_ms: AI_FIXED_NOW - 2000, remote_termination_pending: true })] : [] };
+          }
+          if (aiManualTurn) {
+            const proposal = aiProposalForMode();
+            return { ok: true, stream_id: streamId, cursor: 1, dropped: 0, finished: false, state: "awaiting_approval", events: cursor === 0 && proposal ? [aiEvent(streamId, 0, "proposal.ready", { proposal })] : [] };
+          }
+          return { ok: true, stream_id: streamId, cursor: 1, dropped: 0, finished: true, state: "completed", events: cursor === 0 ? [aiEvent(streamId, 0, "turn.completed", { state: "completed", finished_at_ms: AI_FIXED_NOW })] : [] };
+        }
+
+        function invokeAiFixture(command, payload) {
+          if (command === "oars.ai.provider.list") return { ok: true, providers: aiProviders };
+          if (command === "oars.ai.provider.save") {
+            const input = payload.provider || {};
+            const current = aiProviders.find((item) => item.id === input.id);
+            const provider = {
+              ...aiBaseProvider,
+              ...input,
+              id: input.id || AI_PROVIDER_ID,
+              instruction_role: input.instruction_role ?? null,
+              structured_output: input.structured_output ?? null,
+              revision: current ? current.revision + 1 : 1,
+              tested_at_ms: null,
+              test_status: "untested",
+            };
+            aiProviders = current ? aiProviders.map((item) => item.id === provider.id ? provider : item) : [...aiProviders, provider];
+            return { ok: true, provider };
+          }
+          if (command === "oars.ai.provider.delete") { aiProviders = aiProviders.filter((item) => item.id !== payload.provider_id); return { ok: true }; }
+          if (command === "oars.ai.credential.status") return { ok: true, status: aiCredentialStatus };
+          if (command === "oars.ai.credential.configure") { aiCredentialStatus = "configured"; return { ok: true, status: "configured" }; }
+          if (command === "oars.ai.credential.delete") { aiCredentialStatus = "missing"; return { ok: true, status: "missing" }; }
+          if (command === "oars.ai.provider.test") return { ok: true, operation_id: payload.operation_id, state: "queued" };
+          if (command === "oars.ai.provider.testPoll") {
+            aiProviderTestPollCount += 1;
+            if (aiMode === "provider-auth-failed") return { ok: true, stream_id: payload.operation_id, cursor: 1, dropped: 0, finished: true, state: "failed", events: Number(payload.cursor || 0) === 0 ? [aiEvent(payload.operation_id, 0, "provider.test_failed", { state: "failed", code: "provider_auth", error: "The provider rejected the configured credential." })] : [] };
+            if (aiMode === "provider-test-running") return { ok: true, stream_id: payload.operation_id, cursor: 1, dropped: 0, finished: false, state: "running", events: Number(payload.cursor || 0) === 0 ? [aiEvent(payload.operation_id, 0, "provider.test_started", { state: "running" })] : [] };
+            aiProviders = aiProviders.map((item) => item.id === payload.provider_id ? { ...item, test_status: "passed", tested_at_ms: AI_FIXED_NOW } : item);
+            return { ok: true, stream_id: payload.operation_id, cursor: 1, dropped: 0, finished: true, state: "passed", events: [aiEvent(payload.operation_id, 0, "provider.test_succeeded", { state: "passed", provider_request_id: "resp_preview_test", tested_at_ms: AI_FIXED_NOW })] };
+          }
+          if (command === "oars.ai.provider.testCancel") return { ok: true, state: "cancel_requested" };
+          if (command === "oars.ai.context.get") return { ok: true, state: "ready", context: aiContext, stale: false, updated_at_ms: AI_FIXED_NOW };
+          if (command === "oars.ai.context.refresh") return { ok: true, operation_id: payload.operation_id, state: "queued" };
+          if (command === "oars.ai.context.poll") return { ok: true, stream_id: payload.operation_id, cursor: 1, dropped: 0, finished: true, state: "ready", events: [aiEvent(payload.operation_id, 0, "context.ready", { state: "ready", partial: false, updated_at_ms: AI_FIXED_NOW })] };
+          if (command === "oars.ai.context.cancel") return { ok: true, state: "cancel_requested" };
+          if (command === "oars.ai.thread.list") return { ok: true, threads: !aiDeleted && aiMode && aiThreadModes.has(aiMode) ? [aiThreadSummary()] : [] };
+          if (command === "oars.ai.thread.get") return aiThreadDetail();
+          if (command === "oars.ai.thread.delete") { aiDeleted = true; return { ok: true }; }
+          if (command === "oars.ai.turn.start") { aiManualTurn = true; return { ok: true, thread_id: AI_THREAD_ID, turn_id: AI_TURN_ID, state: "queued" }; }
+          if (command === "oars.ai.turn.poll") return aiTurnPoll(payload);
+          if (command === "oars.ai.turn.cancel") return { ok: true, state: aiMode === "cancel-requested" ? "cancel_requested" : "canceled" };
+          if (command === "oars.ai.turn.summarize") { aiManualTurn = false; return { ok: true, thread_id: AI_THREAD_ID, turn_id: AI_TURN_ID, state: "queued" }; }
+          if (command === "oars.ai.proposal.edit") {
+            const proposal = { ...aiProposalForMode(), command: payload.command, revision: Number(payload.expected_revision) + 1, command_sha256: "e".repeat(64), local_destructive: /(^|[;&|]\s*)rm\s+-rf\b/.test(payload.command) };
+            return { ok: true, proposal };
+          }
+          if (command === "oars.ai.proposal.run") return { ok: true, execution_id: AI_EXECUTION_ID, connection_id: AI_CONNECTION_ID, channel: AI_EXECUTION_CHANNEL, state: "executing" };
+          if (command === "oars.ai.proposal.cancel") return { ok: true, state: "canceled" };
+          return { ok: false, error: "unsupported AI preview command" };
+        }
         const deployApp = {
           id: "app-storefront", server_id: "prod-api", name: "Storefront", environment: "production",
           folder: "/home/deploy/apps/storefront", repo: { url: "git@github.com:acme/storefront.git", transport: "ssh", branch: "main" },
@@ -1099,6 +1358,7 @@
               return { ok: true };
             }
             if (command.startsWith("oars.backup.")) return invokeBackupFixture(command, payload);
+            if (command.startsWith("oars.ai.")) return invokeAiFixture(command, payload);
             if (command === "oars.ssh.connect" || command === "oars.ssh.disconnect" || command === "oars.ssh.resize" || command === "oars.ssh.input" || command === "oars.ssh.trust") return { ok: true };
             if (command === "oars.ssh.retrust") {
               const server = servers.find((item) => item.id === payload.server_id);
@@ -1106,6 +1366,33 @@
               return { server };
             }
             if (command === "oars.ssh.poll") {
+              const aiCursor = payload.cursors && payload.cursors.find((item) => item.channel === AI_EXECUTION_CHANNEL);
+              if (aiMode && aiCursor) {
+                aiExecutionPollCount += 1;
+                const output = "$ systemctl status api.service --no-pager\n● api.service - Preview API\n   Active: active (running)\n";
+                const from = Number(aiCursor.cursor || 0);
+                const cursor = utf8Length(output);
+                const eof = aiMode === "summary-disclosure" || (aiMode !== "execution-running" && aiMode !== "cancel-requested" && aiExecutionPollCount >= 2);
+                return {
+                  ok: true,
+                  status: "ready",
+                  connection_id: AI_CONNECTION_ID,
+                  channels: [{
+                    id: AI_EXECUTION_CHANNEL,
+                    kind: "exec",
+                    command: "systemctl status api.service --no-pager",
+                    cursor,
+                    dropped: 0,
+                    pending: 0,
+                    eof,
+                    exit: eof ? 0 : null,
+                    data: utf8Slice(output, from),
+                  }],
+                };
+              }
+              if (aiMode && (!payload.cursors || payload.cursors.length === 0)) {
+                return { ok: true, status: "ready", connection_id: AI_CONNECTION_ID, channels: [] };
+              }
               // Script run channel (spec 06): deterministic output per
               // `scripts` mode — cumulative deltas, then EOF + exit.
               const cur = payload.cursors && payload.cursors[0];
