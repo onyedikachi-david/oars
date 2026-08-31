@@ -47,5 +47,9 @@ RUN apk add --no-cache openssh bash zip unzip git nodejs npm nginx curl shadow s
     && git -C /srv/fixture -c user.email=test@oars.dev -c user.name=oars commit -q -m init \
     && git clone -q --bare /srv/fixture /srv/fixture.git
 
+# Keep backup scheduler additions in their own layer so changes here do not
+# invalidate the much larger desktop/deploy fixture layer above.
+RUN apk add --no-cache dcron util-linux
+
 EXPOSE 22
-CMD ["/usr/sbin/sshd", "-D"]
+CMD ["/bin/sh", "-c", "/usr/sbin/crond && exec /usr/sbin/sshd -D"]

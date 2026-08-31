@@ -1,1115 +1,965 @@
 # Next Spec Implementation Guide
 
-> Source audit and external research observed **2026-08-21** at commit
-> `bc2aa83`. This guide separates code that exists in this checkout from work
-> still required for release.
-
-## Target
-
-Implement and finish **Spec 10 — Backups**. Treat
-`docs/specs/10-backups.md` as the product contract, but use the corrected
-contracts and architecture below where the current source audit or primary
-rclone/Cronie documentation disproves an existing assumption.
-
-Spec 10 is still listed as Planned in the feature index
-(`docs/specs/README.md:12-24`), although a substantial backend slice and a
-placeholder frontend already exist. Do not mark it complete merely because
-most acceptance boxes in the spec are checked. Completion requires the
-release gates in this guide, especially nonblocking handlers, truthful
-scheduled-run import, cancellation and cleanup, working Keychain flows, typed
-frontend state, deterministic previews, and a real cron integration leg.
-
-After Spec 10 is complete, the next implementation guide is **Spec 11 — AI
-Terminal**.
-
-## Files to read before editing
-
-Read these together; no one file describes the current truth:
-
-- `docs/specs/README.md:1-100` — implementation truth, stream cursors, secrets,
-  approvals, errors, shell quoting, cancellation, research, and session-worker
-  rules
-- `docs/DESIGN.md:1-25`, `docs/DESIGN.md:41-65`,
-  `docs/DESIGN.md:130-203`, and `docs/DESIGN.md:213-217` — calm operational
-  language, responsive layout, status semantics, modal requirements, and theme
-  constraints
-- `docs/specs/10-backups.md:1-250` — product scope, current bridge draft,
-  security model, tests, acceptance claims, and existing references
-- `src/backup.zig:1-276` — bounds, provider/job model, validation, and schedule
-  model
-- `src/backup.zig:278-550` — cron parsing/editing, rclone config generation,
-  destination construction, and scheduled wrapper generation
-- `src/backup.zig:552-850` — JSON-log parsing and history persistence
-- `src/backup.zig:856-1211` — job persistence, live-run registry, and registry
-  ownership
-- `src/backup.zig:1213-1624` — current unit coverage
-- backup payloads and handlers in `src/bridge.zig:11288-12124`
-- synchronous SFTP helpers currently reused by backups in
-  `src/bridge.zig:4618-4727`
-- `src/sessions.zig:1-8`, `src/sessions.zig:76-178`,
-  `src/sessions.zig:1281-1365`, `src/sessions.zig:1710-1799`, and
-  `src/sessions.zig:2016-2027` — worker ownership, non-destructive streams,
-  secret stdin, coordinator-safe waits, channel-close limitations, and the
-  asynchronous outcome pattern
-- `src/keyjobs.zig:1-30`, `src/keyjobs.zig:643-720`, and
-  `src/keyjobs.zig:800-857` — the closest existing bounded coordinator,
-  idempotency, plan, cancellation, and poll-observer design
-- `src/integration_backup.zig:1-240` and backup setup in
-  `src/integration.zig:24-45`, `src/integration.zig:67-169`
-- `scripts/dev-sshd/Dockerfile:14-35`, `scripts/dev-sshd.sh`, and
-  `scripts/integration-test.sh:1-23` — the real Alpine/MinIO harness
-- `frontend/src/BackupsTab.tsx:1-277`
-- `frontend/src/bridge.ts:90-176` and `frontend/src/bridge.ts:441-488`
-- `frontend/src/types.ts:575-708`
-- `frontend/src/App.tsx:71-104`, `frontend/src/App.tsx:1015-1025`, and
-  `frontend/src/App.tsx:1271-1293`
-- the only current focused backup-adjacent frontend assertion in
-  `frontend/src/modal-a11y-challenge.test.tsx:899-924`
-- `frontend/preview.html:13-30`, `frontend/preview.html:205-260`, and the bridge
-  fixture dispatcher beginning at `frontend/preview.html:419`; every state in
-  this guide needs a deterministic backup fixture
-
-## Verified implemented baseline
-
-This section records only code present in commit `bc2aa83`. It is not the
-remaining implementation plan.
-
-### Backend model and persistence already exist
-
-`src/backup.zig` already provides:
-
-- bounded name/source/bucket/endpoint/prefix/cron constants, 90-day history,
-  a 200 KiB stored-log cap, and a one-manual-run-per-server policy
-  (`src/backup.zig:14-29`)
-- provider, destination, transfer, schedule, job, and validation types
-  (`src/backup.zig:30-276`)
-- a five-field numeric cron parser, interval-to-cron conversion, percent
-  escaping, and marker-based crontab add/remove helpers
-  (`src/backup.zig:278-414`)
-- rclone INI section generation and section-preserving merge logic
-  (`src/backup.zig:416-505`)
-- a generated scheduled wrapper and staged status/log paths
-  (`src/backup.zig:516-550`)
-- JSON-line stats/error parsing (`src/backup.zig:552-648`)
-- local run-history persistence with quarantine, retention, idempotent run IDs,
-  and newest-first reads (`src/backup.zig:650-850`)
-- local job persistence with quarantine and CRUD (`src/backup.zig:856-1088`)
-- an in-memory live-run registry retaining 16 completed runs
-  (`src/backup.zig:1090-1211`)
-
-The unit tests cover the current validation matrix, cron syntax, marker
-round-trips, percent escaping, rclone config/merge output, log parsing, history
-retention/log trimming, job CRUD, and live-run limits
-(`src/backup.zig:1213-1624`).
-
-### Bridge and MinIO pipeline already exist
-
-The dispatcher registers nine `oars.backup.*` commands
-(`src/bridge.zig:147-157`, `src/bridge.zig:269-277`). Current handlers can:
-
-- list and persist local jobs
-- write/remove schedule artifacts and crontab blocks
-- run a real sentinel capability sequence
-- start a manual tracked rclone channel
-- expose caller-owned log cursors and progress snapshots
-- persist history
-- generate limited Alpine/Debian install commands
-- probe rclone/cron presence
-
-The current MinIO integration test creates a real job, performs the sentinel
-sequence, runs a two-file sync, verifies an unchanged run as `no_changes`,
-performs an incremental run, checks history, and verifies landed objects
-(`src/integration_backup.zig:110-240`). The harness installs rclone in the
-Alpine SSH image and supplies a separate MinIO container
-(`scripts/dev-sshd/Dockerfile:14-35`; `src/integration_backup.zig:1-19`).
-
-### Typed bridge declarations exist, but the screen does not use them
-
-`frontend/src/types.ts:575-708` defines jobs, credentials, runs, polls,
-install results, and cron status. `frontend/src/bridge.ts:441-488` wraps the
-current backend commands.
-
-`BackupsTab` is only a placeholder. It stores jobs and editor state as `any`,
-uses legacy `paths`, `retention_days`, and string `schedule` fields that do not
-exist in the backend model, sends no Keychain credentials, and turns status or
-history into transient text (`frontend/src/BackupsTab.tsx:10-59`,
-`frontend/src/BackupsTab.tsx:65-196`). Its modal exposes only name, comma-
-separated paths, hourly/daily/weekly, and retention days
-(`frontend/src/BackupsTab.tsx:210-277`). The only focused test checks modal
-focus and Escape dismissal (`frontend/src/modal-a11y-challenge.test.tsx:899-924`).
-There is no backup state module or focused backup integration test.
-
-The deterministic preview has modes for logs, VNC, files, scripts, deployment,
-access, and keys, but no `backups` mode or `oars.backup.*` fixture
-(`frontend/preview.html:13-30`, dispatcher at `frontend/preview.html:419`).
-
-### Verification status for this research pass
-
-No build or test suite was run during this documentation-only audit. The
-baseline above comes from source inspection and the checked-in test code; it is
-not a claim that those tests pass in this checkout on 2026-08-21.
-
-## Prioritized release blockers
-
-### P0 — bridge handlers block the runtime main thread
-
-Every backup probe calls `backupExec`, which calls `Manager.execWait`
-(`src/bridge.zig:11347-11360`). Schedule save/remove, staged import, connection
-test, source validation, installation, and cron status therefore wait on SSH
-from bridge handlers (`src/bridge.zig:11402-11500`,
-`src/bridge.zig:11514-11579`, `src/bridge.zig:11614-11853`,
-`src/bridge.zig:12046-12123`). Config reads/writes also reuse synchronous SFTP
-wait loops (`src/bridge.zig:4618-4727`).
-
-This violates the explicit main-thread rule in `src/bridge.zig:1-6` and
-`src/sessions.zig:1-8`. A timeout bounds the freeze; it does not make the call
-nonblocking.
-
-Move all remote backup work into a bounded backup coordinator that communicates
-with the owning session worker through queued outcomes. Bridge handlers may
-validate/copy bounded input, register plans/operations/runs, and serialize
-locked local snapshots. They must not call `execWait`, `SftpOutcome.wait`,
-`sleep`, or any network API. Poll handlers only observe copied state and never
-start, advance, finalize, import, or clean an operation.
-
-### P0 — scheduled runs cannot be imported truthfully
-
-The staged-import path is not release-ready:
-
-- the wrapper writes numeric JSON values, while `BackupStatusFile` declares all
-  fields as strings (`src/backup.zig:528-547`; `src/bridge.zig:11502-11508`)
-- import attempts to execute `<timestamp>.status` and `<timestamp>.log` as shell
-  commands instead of reading them (`src/bridge.zig:11526-11545`)
-- the scheduled invocation omits `--use-json-log`, `--stats`, and
-  `--stats-log-level`, although import parses JSON stats
-  (`src/bridge.zig:11423-11435`, `src/bridge.zig:11470-11476`)
-- the wrapper does not perform the manual path’s source-existence check
-- a failed lock exits without a status record, so overlap is invisible
-- status/log publication is not atomic, staged files are not bounded while
-  retained, and remote retention is absent
-- import and deletion use unquoted shell paths (`src/bridge.zig:11517-11578`)
-- importing is triggered synchronously by list/history calls
-  (`src/bridge.zig:11582-11611`, `src/bridge.zig:12017-12043`)
-
-Replace this with a versioned, bounded staging protocol described below and add
-a real cron-daemon integration leg in which Oars is disconnected while the job
-runs.
-
-### P0 — local and remote mutations are not transactional
-
-`jobs.save` writes `backups.json` before schedule installation; a later remote
-failure returns an error while leaving the local job committed
-(`src/bridge.zig:11614-11658`). The generated ID counter restarts at `1` and
-does not check generated IDs against persisted jobs, so a process restart can
-create duplicate `bk-1` IDs (`src/backup.zig:858-864`,
-`src/backup.zig:936-995`).
-
-`jobs.delete` deletes locally before checking the job’s server ownership or
-removing its schedule. A caller-supplied `server_id` can name a different
-server, and a disconnected scheduled job can be deleted locally while its
-cron/config/wrapper remain active remotely (`src/bridge.zig:11661-11677`). An
-edit can also change `server_id` without cleaning the former server.
-
-Use cryptographically random stable string IDs, immutable `server_id`, a
-monotonic `revision`, frozen mutation plans, whole-plan hashes, and
-frontend-generated `operation_id` idempotency. For schedule-enabled jobs,
-remote prepare/verify must succeed before the local atomic commit. Delete must
-verify job ownership, remove and read back the exact remote artifacts, then
-commit the local deletion. Partial cleanup is retained as an actionable
-operation; it is never reported as success.
-
-### P0 — cancellation and cleanup are missing or poll-driven
-
-There is no backup cancel command. Closing an SSH channel is not proof that the
-remote rclone process stopped; the repository explicitly says so
-(`docs/specs/README.md:78-81`). Manual config removal, history append, run
-finalization, and completed-run eviction happen only inside
-`handleBackupPoll` (`src/bridge.zig:11895-12003`). If the UI stops polling,
-cleanup and durable completion do not happen.
-
-The backup coordinator must own completion independently of the UI. Manual
-runs start in a tracked remote process group, record the group identity, and on
-cancel send `TERM`, wait to a bounded deadline, then send `KILL` if necessary
-and verify the process group is gone. Only then may the run become `canceled`.
-A channel close is transport cleanup after process termination, not the cancel
-mechanism. Every terminal path removes the unique temporary config; a failed
-removal produces `partial`/`cleanup_failed` with the exact leftover path.
-Disconnect without verified termination is `interrupted`, not `canceled`.
-
-### P0 — the secret flow is not wired end to end
-
-The backend comments promise `backup:<job_id>` Keychain storage, but the bridge
-cannot access Keychain and `BackupsTab` never calls it. Default form save enables
-a schedule without credentials (`frontend/src/BackupsTab.tsx:35-53`), and Run
-now also sends none (`frontend/src/BackupsTab.tsx:121-143`). Both paths fail for
-non-IAM jobs.
-
-Credential strings are not bounded or validated against INI line injection,
-backend-owned copies are not explicitly zeroed, and there is no backup-specific
-transient Keychain path. `vault.get`/`set` currently populate a process-lifetime
-cache (`frontend/src/bridge.ts:119-176`), which must not retain bucket secrets.
-
-Implement the Keychain, memory, disclosure, and cleanup rules in this guide
-before considering schedules complete.
-
-### P1 — current backend/frontend contracts disagree
-
-The frontend overload allows `api.backup.test(serverId, jobId)` and sends
-`{server_id, job_id}` (`frontend/src/bridge.ts:451-461`), but the backend accepts
-only `{job, credentials?}` (`src/bridge.zig:11309-11312`). The Test button uses
-the incompatible overload (`frontend/src/BackupsTab.tsx:147-160`).
-
-The screen reads nonexistent `j.schedule`, `j.retention_days`, `j.paths` shapes
-instead of `schedule`, `source_path`, and `destination`
-(`frontend/src/BackupsTab.tsx:111-176`). Backend timestamps are nanoseconds,
-which exceed JavaScript’s exact integer range, while frontend types use
-`number` (`src/bridge.zig:11399`; `frontend/src/types.ts:605-615`). Backend
-status includes `interrupted`; frontend includes `queued` and `canceled` but
-not `interrupted` (`src/backup.zig:652-667`; `frontend/src/types.ts:579-584`).
-
-Replace the contract on both sides at once. Send timestamps as integer
-milliseconds and remove all backup `any`/legacy fallback fields.
-
-### P1 — provider adapters and generated rclone config are inaccurate
-
-Primary rclone S3 documentation (<https://rclone.org/s3/>) requires these corrections:
-
-- AWS runtime/IAM credentials require blank key fields **and**
-  `env_auth = true`; current IAM generation merely omits keys
-  (`src/backup.zig:423-465`).
-- rclone’s S3 provider list has no `B2` provider value. Backblaze’s
-  S3-compatible endpoint must use the tested `Other` S3 adapter (or a separate
-  native B2 product, which is out of scope); current code emits `provider = B2`
-  (`src/backup.zig:54-63`).
-- R2’s documented S3 adapter is `Cloudflare`, with region `auto` and a required
-  endpoint.
-- storage classes are provider-specific. Current non-AWS adapters all expose
-  `standard`, `standard_ia`, and `onezone_ia`, although rclone documents those
-  options only for named providers and classes (`src/backup.zig:80-101`).
-- default/unsupported storage class must be omitted, not emitted universally.
-- rclone JSON logging places transfer statistics in structured records
-  (<https://rclone.org/docs/#logging>). Current parsing never reads total
-  transfer count, so `files_total` is always zero (`src/backup.zig:569-623`).
-
-Create immutable provider-adapter tables that own rclone provider value,
-required fields, fixed/default region, endpoint policy, IAM support, and exact
-storage-class options. Generate golden configs for every adapter.
-
-### P1 — Test Connection does not prove a read
-
-The current “read” step calls `rclone lsf` again, which proves listing but not
-object content read (`src/bridge.zig:11765-11780`). The cleanup verification
-also executes the same list twice (`src/bridge.zig:11784-11793`).
-
-The capability operation must list the exact prefix, write a nonce-bound
-sentinel, read its bytes back with `rclone cat` and compare the complete known
-content, delete that exact object, then prove it is absent. A sync job uses the
-same exact-object delete proof; do not use a broad delete pattern. Cleanup runs
-in a `defer`-equivalent terminal path after every post-write error. A leftover
-sentinel makes the operation `partial`, returns its exact remote object path,
-and blocks save.
-
-### P1 — interval schedules and cron management are not truthful
-
-`intervalToCronExpr` silently caps hours at 23 and days at 31 and uses field
-steps (`src/backup.zig:343-349`). Cronie's `crontab(5)` documentation
-(<https://github.com/cronie-crond/cronie/blob/master/man/crontab.5>) states that
-steps operate within
-the selected calendar field: `*/23` in hours runs at hours 0 and 23, not every
-23 elapsed hours. `0 0 */N * *` also resets within each month and is not a
-continuous N-day interval. The parser claims range-step support but checks the
-hyphen branch before the slash branch, so `1-5/2` is rejected
-(`src/backup.zig:302-340`).
-
-For interval mode, install a once-per-minute marker entry and let the generated
-wrapper compare a persisted UTC `next_due_epoch` against `date +%s`. Advance
-from the previous due time until it is in the future so delayed cron ticks do
-not drift the anchor. Define one day as 24 elapsed hours. Custom mode remains a
-validated five-field expression interpreted in the server cron daemon’s local
-timezone. The UI must state this difference and warn that local custom times
-can be skipped or repeated at daylight-saving transitions.
-
-Never interpolate a crontab into `printf`. Read the current table, retain its
-exact bytes, freeze its SHA-256 in the plan, re-read before commit, edit only the
-exact `# oars:job:<id>` two-line block, validate, install through bounded stdin,
-and read back. A duplicate/malformed marker is a conflict. Detect and use
-Cronie `crontab -T`; otherwise apply the exact internal subset and rely on
-install/readback. Every table ends with a newline.
-
-### P1 — install/status probing is guessed and not approval-safe
-
-The current code recognizes Alpine/Debian text only, assumes root, emits package
-commands immediately, checks for `crond` even on Debian, and uses `pgrep` for
-service truth (`src/bridge.zig:12046-12123`). It does not return architecture,
-package source, service manager, privilege, or a verified plan as required by
-the spec.
-
-Probe OS ID/version, architecture, package manager, service manager, privilege,
-rclone path/version, crontab implementation, daemon/service state, server
-home, timezone, `date +%s`, and process-group capability. Return a frozen plan
-with exact packages, repositories/download source, privilege, commands,
-service actions, and rollback/partial effects. Commit only a non-expired plan
-with an `operation_id`. Unknown targets return manual instructions and never
-execute a guessed command.
-
-### P1 — bounds, typed failures, and persistence need hardening
-
-Current job/history files are rewritten in place rather than sibling-temp +
-sync + rename (`src/backup.zig:760-778`, `src/backup.zig:912-925`). Job count,
-history request limit, IDs, credentials, and operation registries are not all
-bounded. Several distinct failures collapse to false/null or generic strings.
-
-Adopt the exact bounds and typed errors below. Quarantine corrupt local files,
-write local stores atomically, and expose recovery errors. Never turn denied,
-timeout, too-large, malformed, or transport failures into “missing” or an empty
-successful state.
-
-### P1 — the product screen is not an implementation of Spec 10
-
-Replace the placeholder with the product flow below. It must show runtime
-readiness, exact source/destination, transfer semantics, server timezone,
-credential mode/presence, schedule state, last run, live progress/log,
-import/cleanup warnings, and history. It must make `sync` deletion consequences
-unmistakable without turning the whole page into an alarm surface.
-
-## Corrected product flow
-
-Backups remains available both as a per-server tab and in Protection → Backups.
-Both surfaces use one controller keyed by `server_id`; they do not create
-independent pollers for the same server.
-
-1. **Initial load.** Read local jobs and cached runtime status immediately. A
-   background refresh operation probes the connected server and imports staged
-   scheduled records. Keep the last completed snapshot visible while refreshing.
-2. **Disconnected.** Jobs/history remain visible and are labeled stale. Manual
-   local metadata edits may be drafted, but remote tests, runs, schedule changes,
-   installs, and scheduled-job deletion are blocked. Never show “no jobs” because
-   a remote refresh failed.
-3. **Runtime attention.** One restrained status section names missing rclone,
-   missing/stopped cron, unsupported scheduler, stale imports, or cleanup tasks.
-   Offer one relevant action, not separate raw probe buttons.
-4. **Ready list.** Each row shows name, exact source → bucket/prefix, Copy or
-   Sync, schedule in human language, credential mode, and last run. Actions are
-   Run now, View run, Edit, and Delete. Keep seven or fewer visible columns.
-5. **Create/edit.** Use progressive sections: basics; provider/destination;
-   credentials; transfer consequence; schedule; Test Connection; review. Save is
-   disabled until required fields and a current capability proof exist.
-6. **Run.** Show current phase, bytes, files, speed, ETA, elapsed time, bounded
-   live log, cancel, and cleanup state. `No changes` is a success state. Keep the
-   last snapshot visible if polling or connection fails.
-7. **History.** Show the last 20 summaries. Load raw log chunks only when a run
-   detail opens; do not embed every log in the history list response.
-8. **Partial recovery.** A leftover sentinel/config/wrapper/crontab block is a
-   named cleanup task with exact path and Retry cleanup. Never hide it behind a
-   generic toast.
-
-### Create/edit sequence
-
-1. Build a typed draft and request `jobs.plan`. The backend normalizes it,
-   allocates a random ID for a new job, freezes the expected job revision and
-   remote mutation identities, and returns effects/disclosures.
-2. For non-IAM S3, collect access/secret keys in secret inputs. Test through
-   `test.plan` → explicit approval → `test`. The proof is bound to provider,
-   endpoint, region, bucket, prefix, transfer kind, and credential mode.
-3. Store non-IAM credentials in Keychain under `backup:<job_id>` through the
-   backup-specific no-cache method. A Keychain failure blocks save.
-4. Commit `jobs.save`. If an unattended schedule needs credentials, read them
-   transiently from Keychain and send them only in this commit after the remote-
-   secret disclosure is accepted.
-5. Poll the operation. Close/zero secret state immediately after admission.
-   Refresh local jobs only after the operation reaches `done`.
-6. On a failed new-job commit, delete the just-created Keychain entry. On edit,
-   retain the former credential until the new remote/local commit succeeds.
-
-A prior capability proof remains valid only while all bound destination/auth/
-transfer fields are unchanged and for at most 10 minutes. Source-only and
-schedule-only edits may reuse a still-valid proof.
-
-### Run and delete approvals
-
-- Copy: confirmation states that changed/new files are uploaded and destination
-  extras are retained, matching rclone's copy contract
-  (<https://rclone.org/commands/rclone_copy/>).
-- Sync: require the exact job name for every manual run because rclone sync can
-  delete destination extras (<https://rclone.org/commands/rclone_sync/>).
-  Enabling a sync schedule requires the same typed
-  confirmation and records advance approval for later cron runs.
-- Test Connection: show the exact sentinel object path and list/write/read/delete
-  operations before approval.
-- Delete: require the exact job name and show crontab block, wrapper/state path,
-  dedicated config section, staged records, local history policy, and Keychain
-  account. Do not delete destination objects.
-- Install/start: show exact package/source, privilege, service action, and target
-  before commit.
-
-## Exact backend contract
-
-### Common envelopes
-
-All user-facing failures resolve through the bridge as:
-
-```ts
-type BackupErrorCode =
-  | "invalid_payload" | "invalid_job" | "invalid_credentials"
-  | "not_connected" | "session_not_ready" | "unsupported_target"
-  | "rclone_missing" | "cron_missing" | "cron_stopped"
-  | "source_missing" | "source_unreadable" | "source_too_large"
-  | "plan_expired" | "conflict" | "busy" | "not_found"
-  | "permission_denied" | "timeout" | "transport_error"
-  | "capability_failed" | "cleanup_failed" | "store_corrupt"
-  | "canceled" | "interrupted" | "internal";
-
-type BackupFailure = {
-  ok: false;
-  code: BackupErrorCode;
-  error: string;              // human, secret-free
-  retryable: boolean;
-  detail?: { step?: string; path?: string; remote_object?: string };
-};
-```
-
-Update `invoke`/`BridgeError` so the backend `code` survives instead of becoming
-only `command_failed` (`frontend/src/bridge.ts:90-116`). Transport/framework
-rejections remain bridge exceptions.
-
-All IDs are strings. All timestamps on the wire are integer milliseconds. All
-operation IDs are frontend-generated random UUIDs and are idempotency keys.
-
-```ts
-type BackupOperationState =
-  | "queued" | "running" | "done" | "partial" | "failed" | "canceled";
-
-type BackupStepState =
-  | "pending" | "running" | "done" | "conflict" | "failed"
-  | "cancel_requested" | "canceled" | "skipped";
-
-type BackupOperation = {
-  ok: true;
-  operation_id: string;
-  kind: "refresh" | "test" | "save" | "delete" | "install" | "cleanup";
-  state: BackupOperationState;
-  steps: Array<{ id: string; state: BackupStepState; error?: BackupFailure }>;
-  started_at_ms: number;
-  finished_at_ms?: number;
-  result?: unknown;
-  error?: BackupFailure;
-};
-```
-
-### Job model
-
-```ts
-type BackupProvider = "aws" | "r2" | "b2_s3" | "wasabi" | "minio" | "spaces";
-type BackupTransfer = "copy" | "sync";
-type BackupCredentialMode = "access_key" | "aws_runtime";
-
-type BackupDestination = {
-  type: "s3";
-  provider: BackupProvider;
-  bucket: string;
-  prefix: string;
-  endpoint: string;
-  region: string;
-  credential_mode: BackupCredentialMode;
-  storage_class: string; // "" means provider default; adapter allow-list only
-};
-
-type BackupSchedule =
-  | { mode: "manual"; enabled: false }
-  | { mode: "interval"; enabled: boolean; every: number; unit: "hours" | "days";
-      anchor_epoch_sec: number }
-  | { mode: "custom"; enabled: boolean; expr: string };
-
-type BackupJob = {
-  id: string;
-  server_id: string;
-  revision: number;
-  name: string;
-  source_path: string;
-  destination: BackupDestination;
-  transfer: BackupTransfer;
-  schedule: BackupSchedule;
-  capability_proof?: { id: string; expires_at_ms: number; binding_sha256: string };
-  created_at_ms: number;
-  updated_at_ms: number;
-};
-```
-
-Local destination remains modeled only as a disabled Oars+ choice. Do not keep
-`"local"` in the shipping v1 union while execution is absent.
-
-### Read, plan, operation, and history commands
+> **Target:** Spec 11 — AI Terminal
+>
+> **Status:** 📋 Planned
+>
+> **Prepared:** 2026-08-31 against HEAD
+> `48091a9aba80a0a0cd6d3fdb151d57090093fe03` and the full working tree
+
+## Release posture
+
+Implement the target in `docs/specs/11-ai-terminal.md`. That specification is
+the product contract. This guide fixes the implementation order, ownership
+boundaries, and evidence needed to change its status.
+
+Spec 11 is not implemented. The present checkout has provider metadata
+storage, a synchronous context probe, and a generic SSH audit view. It has no
+provider request, typed provider stream, durable turn, validated proposal,
+backend approval, AI-specific execution, hard cancellation, restart recovery,
+or complete UI. Keep the status Planned and keep every gate open until the
+same checkout has all evidence in this guide.
+
+## Read before editing
+
+Read this core set before the first code change:
+
+- `docs/specs/README.md:1-100` for implementation truth, cursor streams,
+  secrets, approvals, errors, shell quoting, cancellation, and session-worker
+  ownership.
+- `docs/specs/11-ai-terminal.md` for the complete target contract.
+- `docs/research/spec-11-ai-terminal-current-state.md` for the source audit,
+  architecture corrections, and primary-source findings.
+- `docs/DESIGN.md:1-25`, `docs/DESIGN.md:109-126`, and
+  `docs/DESIGN.md:169-203` for interface language, typography, state, focus,
+  and responsive rules.
+
+Read these source groups before their named slices:
+
+- **Core and bridge:** `src/ai.zig`, the `oars.ai.*` registrations and
+  handlers in `src/bridge.zig`, `src/main.zig:145-236`, and
+  `src/runner.zig:401-575`.
+- **Worker and execution:** `src/sessions.zig:1-8`,
+  `src/sessions.zig:1651-1799`, `src/sessions.zig:3075-3185`,
+  `src/history.zig:234-330`, `src/scripts.zig`, and
+  `docs/specs/06-scripts.md:90-130`.
+- **Current tests:** `src/integration_ai.zig`, the AI dispatcher tests in
+  `src/main.zig`, `src/integration.zig`, and
+  `scripts/integration-test.sh`.
+- **Frontend:** `frontend/src/AiTab.tsx`, the AI types in
+  `frontend/src/types.ts`, the AI bridge methods in
+  `frontend/src/bridge.ts`, `frontend/src/App.tsx`,
+  `frontend/src/test/mock-bridge.ts`, and `frontend/preview.html`.
+- **Native credential boundary:** installed
+  `@native-sdk/cli/src/runtime/api.zig:410-447`,
+  `runtime/flow.zig:227-240`, `runtime/system_services.zig:89-108`,
+  `runtime/core.zig:754-769`, and
+  `platform/types.zig:239-241,2401-2403,2902-2914`. `build.zig:35`
+  selects the installed package root.
+- **Provider protocol:** read the official OpenAI Responses, streaming,
+  Structured Outputs, conversation-state, authentication, data-control, and
+  function-calling pages in the final source section before Slices 4 and 5.
+
+## Current baseline and P0 blockers
+
+The existing code is scaffolding. Preserve useful tests and migrate the stored
+metadata, but do not design the target around these limits:
+
+- `src/ai.zig` has one provider record, a prefix-based URL check, probe
+  parsing, and a five-second context cache. It has no provider transport,
+  adapter parser, event stream, journal, proposal, or coordinator.
+- `src/bridge.zig` exposes only `oars.ai.context`,
+  `oars.ai.provider.get`, `oars.ai.provider.set`, and
+  `oars.ai.history`. `aiProbeOrCache` calls `Manager.execWait` with a
+  20-second timeout from a bridge handler. This is a P0 main-thread violation.
+- `oars.ai.history` reads generic `ssh.exec` audit rows. It cannot prove AI
+  origin or user approval.
+- `frontend/src/AiTab.tsx` uses `any`, accepts raw JSON that can include an
+  API key, expects the wrong history shape, and has no turn or proposal flow.
+  `frontend/src/App.tsx` can select `servers[0]` without explicit user
+  choice.
+- `src/integration_ai.zig` proves only metadata, context, generic SSH exec,
+  and generic audit. It does not call a provider or the Native SDK credential
+  service.
+- The installed Native SDK has backend credential methods and
+  `App.start_fn(context, *Runtime)`. Oars does not set that hook. The SDK does
+  not document credential methods as safe on any thread and does not expose a
+  native secret-entry field that Oars can use today. Native secure entry is a
+  P0 implementation prerequisite.
+
+## Fixed invariants
+
+Review every slice against these rules:
+
+1. **Native provider boundary.** Provider HTTP, TLS, authorization headers,
+   server-sent event parsing, and provider retries stay in native Zig. The
+   WebView Content Security Policy stays narrow.
+2. **Native secret boundary.** A provider key enters through native secure
+   input, persists as `ai:<provider_id>`, and is returned to React only as a
+   status. It never enters bridge JSON, browser state, browser storage, or
+   frontend traces.
+3. **Runtime ownership.** `App.start_fn` installs a narrow credential facade
+   in `bridge.Context`. Only the runtime thread calls it. A worker receives a
+   bounded secret-bearing job buffer, never a raw `Runtime` pointer.
+4. **No network on the bridge thread.** Bridge handlers validate bounded
+   payloads, admit work, and copy snapshots. Provider workers own HTTP. The
+   selected SSH session worker owns all libssh2 work.
+5. **Durability before side effects.** A turn is journaled before a provider
+   POST. Approval is journaled before SSH admission. A crash never causes an
+   automatic provider retry or command execution.
+6. **The model has no authority.** V1 sends no provider tools. Only one fully
+   validated, durable proposal can reach the AI approval handler. A raw model
+   event, restored record, or public `oars.ssh.exec` call cannot approve it.
+7. **Frozen identity.** Approval binds proposal ID, revision, command SHA-256,
+   server and connection identity, provider revision, expiry, and destructive
+   acknowledgement under one lock.
+8. **Independent streams.** Provider-test, context, and turn polling use
+   absolute, non-destructive cursors. Each consumer can observe the same
+   retained events. `dropped` reports its own gap.
+9. **Honest cancellation.** Provider cancellation means that Oars stopped
+   local network work; the provider can already have received the request.
+   SSH cancellation is complete only after verified remote process-group
+   termination.
+10. **Bounded data.** Validate every identifier, request, response header, SSE
+    event, structured result, log selection, journal, and event ring before
+    unbounded allocation or persistence.
+11. **Open release state.** Mock providers, direct generic SSH execution, and
+    unit-only credential tests do not close an acceptance gate.
+
+## Required file map
+
+The public AI module remains `src/ai.zig`. Put the new implementation behind
+that facade so `bridge.zig` does not own protocol or persistence logic.
+
+| Path | Required ownership |
+|---|---|
+| `src/ai.zig` | Public domain types, bounds, coordinator facade, and re-exports. Remove old protocol assumptions after migration tests exist. |
+| `src/ai/provider.zig` | Provider IDs and revisions, URL normalization, adapter-specific settings, atomic metadata store, and legacy metadata migration. |
+| `src/ai/credentials.zig` | Runtime-thread facade, status-only results, bounded secret job buffer, and explicit overwrite. |
+| `src/ai/transport.zig` | Native HTTP client, TLS, deadlines, redirect rejection, cancellation, request IDs, byte accounting, and redacted errors. |
+| `src/ai/sse.zig` | Provider-neutral UTF-8 SSE framing with size bounds and arbitrary byte splits. |
+| `src/ai/adapters.zig`, `src/ai/responses.zig`, `src/ai/chat_completions.zig` | Adapter interface and separate OpenAI Responses and Chat Completions grammars. |
+| `src/ai/journal.zig` | Versioned append-and-sync records, replay, bounds, compaction, and recovery classification. |
+| `src/ai/coordinator.zig` | Provider queue, context and turn operations, event rings, idempotency, cancellation, and terminal cleanup. |
+| `src/ai/proposal.zig` | Strict result validation, destructive classification, edit revisions, hashes, expiry, and prepare-to-commit checks. |
+| `src/main.zig` | `App.start_fn` and `App.stop_fn` wiring. Do not add a worker-visible runtime pointer. |
+| `src/bridge.zig` | Exact bounded request parsing and response serialization for the wire contract below. No provider JSON parser or network wait. |
+| `src/sessions.zig`, `src/history.zig` | AI-specific tracked execution, stable operation identity, process-group cancellation, completion reconciliation, and `history_kind = "ai"`. |
+| `src/integration_ai.zig`, `src/integration.zig` | Native provider fixture, SSH container flow, restart, cancellation, audit, and history evidence. |
+| `fixtures/ai/destructive.json` | One shared destructive-command fixture set consumed by Zig and React tests. Add it to package paths if the build needs it. |
+| `frontend/src/features/ai/` | Typed reducer, hooks, provider setup, disclosure, thread, proposal, output, error, and recovery components. |
+| `frontend/src/AiTab.tsx` | Thin feature entry point. It must not own protocol parsing or secret state. |
+| `frontend/src/types.ts`, `frontend/src/bridge.ts` | Exact discriminated wire unions and bridge wrappers. |
+| `frontend/src/App.tsx` | Explicit active-server handoff and script-editor draft handoff. |
+| `frontend/src/test/mock-bridge.ts`, `frontend/preview.html` | Contract-accurate mocks and deterministic state fixtures. |
+
+If native secure entry requires a Native SDK change, land and version that
+dependency before Slice 3 can finish. Do not keep an untracked global SDK edit
+as release evidence. An Oars-owned native platform adapter is acceptable only
+after a separate design review and the same cross-platform tests.
+
+## Ordered implementation slices
+
+Work in this order. A slice is complete only when its completion condition is
+true. Keep later UI work behind typed mocks until the owning backend slice is
+complete.
+
+### Slice 0 — Freeze the contract and baseline
+
+1. Record `git status --short`, the HEAD commit, and every tracked and
+   untracked file. Preserve unrelated work.
+2. Build a requirement-to-test checklist from Spec 11 Sections 5 through 12.
+   Map each bridge command, state, bound, and release gate to one owning test.
+3. Replace the old AI mock shapes with failing contract fixtures for the new
+   names and tagged unions. Do not add permissive `any` fields to make the
+   fixtures compile.
+4. Run the current validation commands and record existing failures. This is a
+   baseline, not release evidence.
+
+**Complete when:** every Spec 11 requirement has one planned owner and test,
+and baseline failures are separated from changes made for Spec 11.
+
+### Slice 1 — Land domain types and durable provider metadata
+
+1. Define the shared bounds, IDs, revisions, error codes, provider types,
+   operation states, event envelope, proposal type, and turn state in Zig.
+   Mirror them as TypeScript discriminated unions.
+2. Replace the single provider object with a versioned store of at most 16
+   providers. Each provider has a stable random ID and monotonic revision.
+3. Normalize the configured API prefix. For OpenAI, the base is
+   `https://api.openai.com/v1`; adapters append `/responses` or
+   `/chat/completions`. Reject user information, fragments, query data,
+   control bytes, and non-loopback HTTP.
+4. Write metadata through a mode-0600 sibling temporary file, sync it, and
+   rename it atomically. Quarantine corrupt files without silently replacing
+   them.
+5. Migrate a valid legacy provider record once. Generate its provider ID and
+   mark its test state `stale`. Do not claim that a legacy
+   `ai:<base_url>` secret moved; the new native path requires the user to
+   configure `ai:<provider_id>`.
+6. Add idempotent `provider.list`, `provider.save`, and
+   `provider.delete` core operations with expected-revision checks. A
+   provider edit or credential change makes its test stale.
+
+**Complete when:** provider unit tests prove validation, legacy migration,
+atomic replacement, mode 0600, quarantine, revision conflicts, operation-ID
+deduplication, the 16-provider bound, and the absence of key fields.
+
+### Slice 2 — Remove the blocking context path
+
+1. Replace `oars.ai.context` with `context.get`, `context.refresh`,
+   `context.poll`, and `context.cancel`.
+2. Make `context.get` a cache snapshot only. It must not enqueue hidden work.
+3. Make `context.refresh` register a bounded operation and queue the probe on
+   the selected session worker. Use an asynchronous outcome pattern; do not
+   call `execWait` or wait for SFTP from the bridge.
+4. Publish context operation events through the common cursor ring. Preserve
+   partial monitor data and a typed probe error.
+5. Return log metadata only. Read one selected log tail during
+   `turn.start`, after disclosure and on worker-owned I/O.
+6. Add a responsiveness test that holds a context probe for 20 seconds while
+   unrelated bridge commands complete.
+
+**Complete when:** no AI bridge handler can wait on SSH, context cursors are
+independent, cancel is idempotent, and the responsiveness test passes.
+
+### Slice 3 — Establish native credential and secure-entry ownership
+
+1. Set `App.start_fn` in `src/main.zig`. It receives `*Runtime` from the
+   installed SDK and installs a narrow set/get/delete facade in
+   `bridge.Context`.
+2. Keep the facade runtime-thread-bound. The provider worker cannot hold or
+   call `*Runtime`.
+3. Add a native secure-entry sheet or land the required Native SDK service.
+   `credential.configure` returns only
+   `configured|canceled|denied|unavailable`. There is no React text field or
+   bridge payload for the key.
+4. Implement `credential.status` with a bounded native scratch buffer.
+   Return only status, then overwrite the scratch buffer.
+5. For provider admission, validate the operation first, read at most 4096 key
+   bytes into the secret-bearing request job, and queue it. The worker
+   overwrites every copy, including the authorization-header buffer, on all
+   success, error, timeout, and cancel paths.
+6. Set `App.stop_fn` to stop admission, cancel and join provider workers,
+   overwrite queued secret buffers, clear the facade, and only then let the
+   runtime stop.
+
+**Complete when:** native integration tests configure, replace, detect, use,
+and delete a key on the correct thread; shutdown order is deterministic; and a
+secret scan finds no key in React state, bridge JSON, traces, files, journals,
+audit, history, or errors.
+
+### Slice 4 — Prove the native transport and SSE parser
+
+1. Build a deterministic local HTTP/TLS fixture. It must fragment bytes at
+   arbitrary positions, delay headers and body data, return 401, 429, and 500,
+   attempt redirects, close mid-event, and observe cancel cleanup without
+   printing the key.
+2. Implement the native request state machine with 10-second connect,
+   30-second first-byte, 30-second idle, and 120-second total deadlines.
+3. Disable redirects for authenticated POST requests. Bind the credential to
+   the reviewed normalized origin. Do not retry after any request byte can
+   have reached the provider.
+4. Enforce the request, header, event, structured-output, and error-body bounds
+   in **Fixed bounds** before accumulation.
+5. Implement UTF-8 SSE framing for CRLF and LF, comments, blank-event
+   termination, multiple `data:` lines, and every possible byte split.
+6. Generate `X-Client-Request-Id` and capture `x-request-id` when present.
+   Keep prompts, context, response bodies, and authorization values out of
+   diagnostic logs.
+
+**Complete when:** transport and SSE unit tests pass, the local fixture proves
+timeouts, cancel, redirect rejection, bounds, redaction, and no automatic POST
+retry, and packaged TLS trust is exercised on each supported desktop platform.
+
+### Slice 5 — Implement explicit provider adapters and provider test
+
+1. Define the adapter interface:
+
+   ```text
+   buildRequest(turn, context, local_items) -> request
+   acceptStatus(status, headers) -> stream | typed error
+   feedBytes(bytes) -> provider events
+   finish() -> one terminal result | protocol error
+   classifyRetry(bytes_sent, response_started, error) -> never | explicit_only
+   ```
+
+2. Implement `openai_responses` first. Send `stream:true`,
+   `store:false`, `background:false`, and the strict
+   `text.format` schema in Spec 11 Section 6.3. Request
+   `reasoning.encrypted_content` in `include` so a stateless later turn can
+   replay an encrypted reasoning item when OpenAI returns one. Do not send
+   `previous_response_id`, a Conversation ID, or tools.
+3. Parse typed Responses lifecycle, output-item, text, refusal, incomplete,
+   failed, and error events. Ignore unknown bounded event types. Reject a
+   malformed known event, inconsistent item identity, duplicate terminal
+   state, or missing terminal state.
+4. Implement `openai_chat_completions` as a separate compatibility grammar.
+   It supports only an explicitly tested instruction role and
+   `json_schema|json_object` mode. It has no prompt-only JSON fallback.
+5. Keep static policy in the developer message. Put the user question and all
+   host, monitor, process, and log values in labeled user data.
+6. Implement Provider Test through the chosen route, model, stream grammar,
+   instruction role, and schema mode. Warn about quota before admission.
+   Persist the tested provider revision and result, never the key.
+7. Treat any model function call, shell call, computer call, MCP call, or
+   built-in tool call as a v1 protocol error.
+
+**Complete when:** recorded Responses fixtures cover command, question,
+refusal, incomplete, failed, error, reasoning items, and unknown events; Chat
+Completions fixtures cover each declared mode; and one pinned Ollama or vLLM
+version passes the exact compatibility test.
+
+### Slice 6 — Add the durable coordinator, journal, and turn stream
+
+1. Add bounded registries for context operations, provider tests, threads,
+   turns, and event rings. Permit two active provider requests in total and one
+   per thread.
+2. Append and sync `turn_queued` before a provider job can send. Append and
+   sync `provider_request_started` with the client request ID before the
+   first request byte.
+3. Persist the user message, validated assistant result, and adapter-owned
+   continuation items needed by `store:false`. Store returned
+   `reasoning.encrypted_content` as opaque adapter data. Persist log selection,
+   byte count, and hash, but not raw log content by default.
+4. Convert provider events to the versioned domain union below. Do not
+   send raw provider JSON to React. Coalesce progress to ten events per second.
+5. Append and sync a validated proposal before publishing `proposal.ready`.
+   Token deltas can update progress but cannot create visible assistant text
+   or a Run action.
+6. Implement thread list, get, delete, turn start, poll, and cancel. Bind an
+   existing thread to its server, provider adapter, and model.
+7. Compact through a mode-0600 sibling file, sync, and atomic rename. Preserve
+   active proposals and executions. If required continuation items exceed
+   512 KiB, require a new thread instead of removing protocol items.
+
+**Complete when:** journal replay, a truncated final record, corrupt middle
+record, compaction interruption, bounds, two independent poll consumers,
+operation-ID retry, and restart state tests pass without a duplicate POST.
+
+### Slice 7 — Freeze proposals and admit exact AI execution
+
+1. Put the exact strict proposal schema from Spec 11 in one Zig-owned
+   constant. Validate the discriminator, one non-null payload, UTF-8, NUL,
+   field bounds, one proposal-bearing message, and one structured result.
+2. Compute `command_sha256`, local destructive state, model destructive
+   state, server and connection identity, provider revision, and a ten-minute
+   expiry. Persist the proposal before the UI can render it.
+3. Make `proposal.edit` create a new revision and rerun all local checks. The
+   former revision becomes unusable.
+4. Make `proposal.run` check ID, revision, hash, expiry, server and connection
+   identity, provider revision, proposal state, and destructive
+   acknowledgement under one lock.
+5. Append and sync `approval_recorded`, then write one `ai.approved` audit
+   row, then admit the exact command to tracked SSH execution with the same
+   operation ID and `history_kind = "ai"`.
+6. Make admission idempotent. A repeated Run returns the first admission
+   result and never starts another channel. Generic `oars.ssh.exec` remains
+   outside this approval path.
+7. Record exit, duration, and a bounded redacted output sample against the
+   same operation. AI thread history must exclude generic SSH rows.
+
+**Complete when:** tests reject stale revisions, wrong hashes, server or
+connection changes, provider edits, expiry, missing destructive
+acknowledgement, interactive sudo, and duplicate Run; one approved container
+command completes with matching proposal, audit, channel, and history identity.
+
+### Slice 8 — Finish cancellation and restart recovery
+
+1. Add a tested AI execution wrapper that starts and identifies a remote
+   process group without changing the frozen user command. The wrapper is
+   fixed transport code. It passes the command through the shared shell-quote
+   path and does not rewrite it; the proposal hash and audit record identify
+   the user-visible command.
+2. On execution cancel, record `cancel_requested`, signal the group, escalate
+   within a bound when required, and verify termination, including child
+   processes. Channel close is cleanup, not proof.
+3. Resolve cancel-versus-complete races under one lock. Exactly one terminal
+   record wins and every capacity slot is released once.
+4. Apply the **Recovery matrix** during journal replay. Never restart
+   provider or SSH work. Reconcile a live tracked channel when possible and
+   mark an absent or ambiguous execution `recovery_required`.
+5. Keep terminal records and output readable through the retention bounds
+   after cancel, disconnect, and restart.
+
+**Complete when:** forced restart at every non-terminal state causes no
+duplicate POST or command, hard cancel verifies a child process is gone, and
+uncertain execution remains `cancel_requested|recovery_required`.
+
+### Slice 9 — Build the typed React workflow
+
+1. Replace the current `AiTab` data flow with a reducer over the exact tagged
+   unions. Remove AI-path `any`, raw provider JSON input, provider parsing,
+   partial-JSON rendering, and `servers[0]` fallback.
+2. Build explicit server selection, provider setup and test, credential status,
+   context selection and disclosure, thread list, composer, stream progress,
+   question/refusal/error states, proposal cards, edit, approval, output,
+   cancel, recovery, and clear-thread flows.
+3. Keep server, SSH user, provider origin, model, and credential state visible
+   above the composer and on every proposal.
+4. Poll with caller-owned cursors. Ignore stale responses by stream ID and
+   sequence. Report `dropped`; never reset a shared backend cursor.
+5. Use status text plus an icon, accessible dialogs, focus return, keyboard
+   actions, command-only monospace, light and dark themes, and narrow layouts.
+6. Add deterministic `?ai=` fixtures for: `no-server`, `no-provider`,
+   `credential-missing`, `context-disclosure`, `provider-test-running`,
+   `provider-auth-failed`, `streaming`, `question`, `refusal`,
+   `proposal-safe`, `proposal-destructive`, `proposal-edited`,
+   `execution-running`, `cancel-requested`, `recovery-required`,
+   `summary-disclosure`, and `long-command`.
+
+**Complete when:** reducer, bridge, component, accessibility, stale-poll,
+cursor-gap, explicit-server, and fixture tests pass with production wire types
+and no key value exists in frontend code or test payloads.
+
+### Slice 10 — Add summary disclosure and save as script
+
+1. Make post-run summary an explicit new provider turn. Show the exact bounded
+   command-output cursor range before admission. A failed summary does not
+   change the command result.
+2. Make **Open in script editor** pass the exact approved or edited command as
+   a draft through `App`. The user reviews name, variables, and destructive
+   state before `oars.scripts.save`.
+3. Test summary skip, cancel, provider failure, output gaps, script draft,
+   script save failure, and a successful saved-script run.
+
+**Complete when:** no command output leaves the computer without its own
+disclosure and the saved script uses the Spec 06 review and execution path.
+
+### Slice 11 — Collect release evidence
+
+1. Run every command in **Exact validation commands** on one fixed checkout.
+2. Run one current OpenAI Responses request through native credentials with
+   `store:false`, strict Structured Outputs, typed streaming, client and
+   provider request IDs, and a harmless approved container command.
+3. Run one pinned Ollama or vLLM compatibility adapter separately.
+4. Force provider cancel, verified remote process-group cancel, disconnect,
+   and restart at each non-terminal state.
+5. Inspect all deterministic UI fixtures at desktop and narrow widths in light
+   and dark themes. Record browser, viewport, date, and result.
+6. Scan application data, logs, traces, journal, audit, history, bridge
+   payloads, browser state, and error output for the test key.
+
+**Complete when:** every item in **Open release gates** has dated evidence from the
+same checkout. Only then update Spec 11, the feature index, and this guide in
+the implementation change.
+
+## Wire contract and bounds
+
+The command names below replace the current `oars.ai.context`,
+`provider.get`, `provider.set`, and generic `ai.history` scaffold. Remove
+the old commands after production callers and tests migrate. Do not keep an
+alias that preserves browser-side secrets, synchronous context work, or generic
+SSH history.
+
+### Common rules
+
+- Timestamps are integer epoch milliseconds. Do not send epoch nanoseconds as
+  a JavaScript `number`.
+- Revisions, event sequences, and cursors are integers.
+- An `operation_id` is 1 to 64 ASCII letters, digits, dots, colons,
+  underscores, or hyphens. Reuse it only to retry the same mutation.
+- A user failure is `{ok:false, code, error}`. Stable codes are
+  `invalid_argument`, `not_found`, `conflict`, `stale_revision`,
+  `not_connected`, `credential_missing`, `provider_untested`, `busy`,
+  `limit_exceeded`, `provider_auth`, `provider_rate_limited`,
+  `provider_timeout`, `provider_protocol`, and `recovery_required`.
+- Parse into bounded Zig structs before admission. TypeScript wrappers return
+  the exact result union; they do not cast through `any`.
+
+### Provider and credential commands
 
 ```text
-oars.backup.jobs.list
-  {server_id}
-  -> {ok:true, jobs:BackupJob[], recovery_error?:string}
+oars.ai.provider.list {}
+  -> {ok, providers:[ProviderPublic]}
 
-  Local-only. Never probes/imports. Sorted by updated_at_ms then stable id.
+oars.ai.provider.save {operation_id, provider, expected_revision?}
+  -> {ok, provider:ProviderPublic}
 
-oars.backup.status
-  {server_id}
-  -> {ok:true, status:BackupServerStatus|null, stale:boolean}
+oars.ai.provider.delete {operation_id, provider_id, expected_revision}
+  -> {ok}
 
-  Local cached snapshot only.
+oars.ai.provider.test {operation_id, provider_id, expected_revision}
+  -> {ok, operation_id, state}
 
-oars.backup.refresh
-  {operation_id, server_id}
-  -> {ok:true, operation_id}
+oars.ai.provider.testPoll {operation_id, cursor, rewind?}
+  -> EventPoll
 
-  Coalesces an active refresh for the server. Probes runtime and imports staged
-  records on the coordinator.
+oars.ai.provider.testCancel {operation_id}
+  -> {ok, state}
 
-oars.backup.jobs.plan
-  {job:BackupJobDraft, expected_revision?:number}
-  -> {ok:true, plan_id, expires_at_ms, job:BackupJob,
-      requires_connection_test, requires_remote_secret,
-      effects:string[], warnings:string[], schedule_preview?:{timezone, crontab_block}}
+oars.ai.credential.configure {operation_id, provider_id}
+  -> {ok, status:"configured"|"canceled"|"denied"|"unavailable"}
 
-oars.backup.jobs.save
-  {operation_id, plan_id, capability_proof_id?, schedule_credentials?,
-   approved_remote_secret:boolean}
-  -> {ok:true, operation_id, job_id}
+oars.ai.credential.status {provider_id}
+  -> {ok, status:"configured"|"missing"|"denied"|"unavailable"}
 
-oars.backup.jobs.deletePlan
-  {server_id, job_id, expected_revision}
-  -> {ok:true, plan_id, expires_at_ms, job_name, effects:string[], leftovers:string[]}
-
-oars.backup.jobs.delete
-  {operation_id, plan_id, confirm_job_name}
-  -> {ok:true, operation_id}
-
-oars.backup.operationPoll
-  {operation_id}
-  -> BackupOperation
-
-oars.backup.operationCancel
-  {operation_id}
-  -> {ok:true}
-
-oars.backup.history
-  {server_id, job_id, limit?:number}
-  -> {ok:true, runs:BackupRunSummary[]}
-
-oars.backup.historyLog
-  {server_id, run_id, cursor?:number, max?:number}
-  -> {ok:true, cursor, delta, eof, dropped}
+oars.ai.credential.delete {operation_id, provider_id}
+  -> {ok, status:"missing"}
 ```
 
-`jobs.list`, `status`, `history`, and `historyLog` verify server/job/run
-ownership. `limit` defaults to 20 and clamps to 20. `historyLog.max` defaults to
-32 KiB and clamps to 64 KiB.
-
-### Connection test
+`ProviderDraft` is:
 
 ```text
-oars.backup.test.plan
-  {job_plan_id}
-  -> {ok:true, test_plan_id, expires_at_ms, remote_object,
-      checks:["list","write","read","delete","cleanup_verify"],
-      mutates:true}
-
-oars.backup.test
-  {operation_id, test_plan_id, credentials?}
-  -> {ok:true, operation_id}
+{id?, name, adapter, base_url, model, instruction_role?, structured_output?}
 ```
 
-The terminal operation result is:
+`ProviderPublic` adds `revision`, `tested_at_ms?`, and `test_status` and
+never contains a key. `adapter` is `openai_responses` or
+`openai_chat_completions`. `test_status` is
+`untested|passed|failed|stale`. The Chat Completions adapter requires an
+explicit `developer|system` instruction role and
+`json_schema|json_object` structured-output mode. Responses does not accept
+those compatibility switches.
 
-```ts
-{
-  checks: {
-    list: "passed" | "failed";
-    write: "passed" | "failed";
-    read: "passed" | "failed";
-    delete: "passed" | "failed";
-    cleanup_verify: "passed" | "failed";
-  };
-  capability_proof?: { id: string; expires_at_ms: number; binding_sha256: string };
-  leftover_remote_object?: string;
-}
-```
-
-IAM mode sends no credentials. Access-key mode requires both non-empty fields.
-The operation always attempts exact sentinel cleanup after write admission.
-
-### Manual run
+### Context commands
 
 ```text
-oars.backup.run
-  {operation_id, server_id, job_id, expected_revision, credentials?,
-   confirm_job_name?:string}
-  -> {ok:true, run_id}
+oars.ai.context.get {server_id}
+  -> {ok, state, context?, stale, updated_at_ms?}
 
-oars.backup.poll
-  {run_id, log_cursor?:number}
-  -> {ok:true, run_id,
-      status:"queued"|"preparing"|"running"|"cancel_requested"|
-             "success"|"no_changes"|"failed"|"canceled"|"interrupted"|"partial",
-      phase, bytes_done, bytes_total, files_done, files_total,
-      speed_bps, eta_sec, started_at_ms, finished_at_ms?,
-      log_cursor, log_delta, dropped, cleanup_state, error?:BackupFailure}
+oars.ai.context.refresh {operation_id, server_id}
+  -> {ok, operation_id, state}
 
-oars.backup.cancel
-  {run_id}
-  -> {ok:true}
+oars.ai.context.poll {operation_id, cursor, rewind?}
+  -> EventPoll
+
+oars.ai.context.cancel {operation_id}
+  -> {ok, state}
 ```
 
-A repeated run `operation_id` returns the same run. `log_cursor` is caller-owned
-and non-destructive. Polling cannot start/finalize/cancel/clean the run.
-`files_total` comes from rclone `stats.totalTransfers`, while `files_done` comes
-from `stats.transfers`. Exit 0 plus zero completed transfers is `no_changes`.
-Never enable `--error-on-no-transfer`.
+`context.get` is cache-only. A context snapshot contains the selected server
+ID, OS and host data when available, the monitor snapshot, active-log
+metadata, partial status, typed errors, and `updated_at_ms`. It contains no
+log bytes. A stale snapshot never starts a hidden refresh.
 
-### Runtime/install
+### Thread, turn, and proposal commands
 
 ```text
-oars.backup.install.plan
-  {server_id, what:"rclone"|"cron"|"start_cron"}
-  -> {ok:true, plan_id, expires_at_ms, target, privilege,
-      commands:string[], effects:string[], rollback:string[], manual:boolean}
+oars.ai.thread.list {server_id?, limit}
+  -> {ok, threads:[ThreadSummary]}
 
-oars.backup.install
-  {operation_id, plan_id}
-  -> {ok:true, operation_id}
+oars.ai.thread.get {thread_id}
+  -> {ok, thread, turns, active_proposal?}
+
+oars.ai.thread.delete {operation_id, thread_id, expected_revision}
+  -> {ok}
+
+oars.ai.turn.start {
+  operation_id, thread_id?, server_id, provider_id,
+  expected_provider_revision, message,
+  context_selection:{os, monitor, log:{source_id, tail_bytes}?}
+} -> {ok, thread_id, turn_id, state}
+
+oars.ai.turn.poll {turn_id, cursor, rewind?}
+  -> EventPoll
+
+oars.ai.turn.cancel {turn_id}
+  -> {ok, state}
+
+oars.ai.turn.summarize {
+  operation_id, thread_id, execution_id,
+  output_selection:{start_cursor, end_cursor}
+} -> {ok, turn_id, state}
+
+oars.ai.proposal.edit {
+  operation_id, proposal_id, expected_revision, command
+} -> {ok, proposal:Proposal}
+
+oars.ai.proposal.run {
+  operation_id, proposal_id, expected_revision,
+  command_sha256, destructive_warning_ack
+} -> {ok, execution_id, channel, state}
+
+oars.ai.proposal.cancel {
+  operation_id, proposal_id, expected_revision
+} -> {ok, state:"canceled"}
 ```
 
-`BackupServerStatus` contains observed time, OS/arch, connected user/home,
-timezone, rclone path/version, crontab implementation, cron installed/running,
-service manager, scheduler support, and import/cleanup warnings. Replace the old
-synchronous `cronStatus` endpoint with `status` + `refresh`; do not keep two
-probing paths.
+`ThreadSummary` is `{id, revision, server_id, provider_id, model, title,
+state, turn_count, updated_at_ms}`. A thread stores the provider adapter and
+model snapshot used for continuation. A mismatch requires a new thread.
 
-## Core architecture and worker rules
-
-### Registry and coordinator
-
-Evolve `backup.Registry` into the single owner of plans, operations, runs,
-cached server status, jobs, and history. Follow the bounded pattern in
-`src/keyjobs.zig:643-720`:
-
-- one coordinator thread advances short backup state machines
-- long rclone transfers remain channels owned/pumped by the per-session worker;
-  the coordinator samples their streams and finalizes them
-- feature-specific bounded exec/SFTP outcomes are queued through
-  `sessions.Manager`; no libssh2 call leaves the owning session worker
-- no registry/store lock is held while waiting on an outcome or writing a file
-- active records are never evicted
-- coordinator shutdown requests cancellation, joins, marks unverified remote
-  work `interrupted`, clears secrets, and preserves cleanup records
-- operation/run poll serializers copy under a short lock and serialize after
-  unlocking
-
-Use `execTrackedWithInput` semantics for generated config/crontab bytes so
-secret/config content never enters command text or history
-(`src/sessions.zig:1323-1365`). Add a backup-specific queued outcome like the
-nonblocking access operation (`src/sessions.zig:2016-2027`) rather than calling
-handler-side waits.
-
-### Provider adapters and rclone command construction
-
-A provider adapter owns:
-
-- product ID and rclone `provider` value
-- required/optional/fixed endpoint and region fields
-- whether AWS runtime/IAM is allowed
-- exact storage classes exposed by that provider; empty means default
-- config additions such as `env_auth = true` or R2 `region = auto`
-- endpoint security policy and UI help
-
-Minimum mappings:
-
-- `aws` → `provider = AWS`; runtime/IAM allowed; region required; endpoint
-  optional; official AWS class allow-list
-- `r2` → `provider = Cloudflare`; endpoint required; region fixed to `auto`;
-  runtime/IAM disabled; default class only
-- `b2_s3` → `provider = Other`; S3-compatible endpoint required; runtime/IAM
-  disabled; default class only
-- `wasabi` → `provider = Wasabi`; tested endpoint/region pair; default class
-  unless the adapter has direct documented and integration evidence
-- `minio` → `provider = Minio`; endpoint required; explicit region when the
-  target requires it; default class only
-- `spaces` → `provider = DigitalOcean`; endpoint required; runtime/IAM disabled;
-  default class only
-
-Generated commands use fixed executable/subcommand/flag tokens. Every source,
-config path, remote destination, state path, process identifier path, and other
-variable shell word passes through `shellquote.quote`
-(`src/shellquote.zig:1-48`). Secrets never become argv, environment values,
-remote names, file names, audit details, or history commands.
-
-Use:
+`TurnState` is:
 
 ```text
-rclone copy|sync <quoted-source> <quoted-remote> --config <quoted-config>
-  --use-json-log --stats 1s --stats-log-level NOTICE --ask-password=false
+queued | collecting_context | requesting | streaming | validating |
+awaiting_approval | approved | executing | summarizing | completed | failed |
+cancel_requested | canceled | interrupted | recovery_required
 ```
 
-Do not parse the human progress line. Do not use `--error-on-no-transfer`.
-Capture rclone path/version during refresh and freeze the absolute path in a
-mutation plan so cron does not depend on a restricted `PATH`.
-
-### Manual run and hard cancellation
-
-Preparation is an explicit state machine:
-
-1. verify job revision/server ownership and one active manual run per server
-2. verify rclone capability and readable source (`missing` and `denied` differ)
-3. create a random per-run remote state directory mode 0700
-4. upload a unique config mode 0600; IAM config contains `env_auth = true` and
-   no keys
-5. start a generated run wrapper in a new, probed process group and capture its
-   group identity before reporting `running`
-6. stream JSON logs through the session stream; parse snapshots in coordinator
-7. finalize from EOF/exit independent of frontend polling
-8. terminate/verify on cancel; remove temp config/state; append atomic history;
-   audit terminal result
-
-The process group and cleanup paths are generated from random validated IDs,
-not user text. If process-group setup is unavailable on a target, manual run is
-blocked with `unsupported_target`; do not offer unverifiable cancellation.
-
-### Scheduled wrapper and staging protocol
-
-Resolve the connected user’s absolute home once. Store Oars-owned schedule
-artifacts under:
+`Proposal` is:
 
 ```text
-<home>/.config/oars/rclone.conf                    mode 0600
-<home>/.local/state/oars/backups/<job-id>/run.sh  mode 0700
-<home>/.local/state/oars/backups/<job-id>/meta.json mode 0600
-<home>/.local/state/oars/backups/<job-id>/runs/    mode 0700
+{id, turn_id, revision, server_id, provider_id, provider_revision,
+ context_hash, command, command_sha256, explanation,
+ model_destructive, local_destructive, needs_sudo,
+ created_at_ms, expires_at_ms, state}
 ```
 
-`meta.json` is versioned and contains no secret: job ID/revision, schedule,
-normalized source/destination label, config section name, wrapper hash,
-crontab-block hash, next due epoch, and retention limits.
+Use the strict JSON Schema in `docs/specs/11-ai-terminal.md:350-375` as the
+single model-output schema. The Zig validator is authoritative. A question has
+one non-null question and a null command. A command has one non-null command
+and a null question. Refusal, incomplete output, an extra schema field,
+multiple proposal-bearing messages, multiple structured results, or invalid
+UTF-8 cannot create a proposal.
 
-The wrapper:
+### Versioned event contract
 
-- uses only fixed code plus prequoted frozen values
-- obtains an atomic per-job lock; overlap writes a terminal `skipped_overlap`
-  status instead of disappearing
-- applies interval `next_due_epoch` gating or the custom cron expression
-- verifies the source immediately before rclone
-- runs the absolute rclone binary with JSON logs and bounded built-in log
-  rotation
-- writes a numeric, versioned status record with run ID, job revision, UTC epoch
-  times, exit code, status, cleanup state, and summary
-- publishes status via sibling temporary file + sync + rename only after the log
-  is closed
-- prunes to at most 20 staged terminal runs and bounded log bytes without
-  deleting an unimported active record
-- never includes credentials in status/log output
-
-Refresh imports with SFTP/stat/read operations, not `ls`, `cat`, or `rm` shell
-strings. Validate names, versions, job/server/revision binding, file sizes, and
-JSON before append. Append local history idempotently, then remove the exact
-staged pair and verify absence. Unknown/corrupt/too-large records remain visible
-as warnings and are not executed or silently deleted.
-
-### Crontab mutation
-
-A schedule plan freezes:
-
-- current crontab bytes and SHA-256
-- exact existing marker block, if any
-- exact replacement block
-- server timezone and implementation capability
-
-Commit re-reads and compares the SHA-256. On match, replace/remove exactly one
-marker block, validate, install bytes via stdin, then read back and compare the
-expected block. On mismatch, return `conflict` without merging unseen edits.
-No command contains crontab content. Saving an existing marker updates it;
-`crontabAdd`’s current marker-present no-op is insufficient
-(`src/backup.zig:370-387`).
-
-### Local stores
-
-Keep jobs and run history secret-free. Add schema versions and migrations.
-Write both stores with sibling temp, mode 0600, file sync, atomic rename, and
-parent-directory sync where available. Preserve quarantine behavior and return
-the quarantined path as `recovery_error`.
-
-Do not store capability-test sentinel contents, credentials, raw config, process
-secret input, or full bridge payloads. Run summaries store normalized stats and
-at most 200 KiB of secret-scrubbed log. List responses omit logs.
-
-## Secret, mutation, quoting, and bounds requirements
-
-### Secrets
-
-- Keychain service remains `dev.native_sdk.oars`; account is
-  `backup:<job_id>`.
-- Store one versioned JSON string containing access and secret key. It never
-  appears in `backups.json`, `backup_runs.json`, preview fixtures, audit,
-  command history, error details, analytics, or console output.
-- Add backup-specific `set`, transient `get`, and delete methods that bypass
-  `secretCache`. Do not call the generic cached `vault.get`/`set` path.
-- Secret inputs exist only while the create/test/run dialog requires them.
-  Clear React state on success, cancel, server change, tab change, and unmount.
-- Copy request secrets into owned mutable Zig buffers, validate, use, securely
-  zero, then free on every path. Register backup credential payloads as
-  sensitive in bridge diagnostics. The immutable framework request buffer must
-  never be logged.
-- Access/secret keys are each non-empty in access-key mode, at most 4 KiB, and
-  reject NUL/CR/LF to prevent INI injection. IAM mode rejects supplied keys.
-- Temporary configs are random, mode 0600, verified after write, and removed on
-  every terminal path. Cleanup failure is explicit.
-- Scheduled configs are an approved remote secret copy. Show that rclone
-  obscuring is reversible and not encryption
-  (<https://rclone.org/commands/rclone_obscure/>). IAM avoids this copy.
-
-### Mutation and audit
-
-- Test, Run now, schedule enable/change/disable, install/start, cleanup, and
-  delete are approval-gated.
-- Sync run/schedule and job deletion require exact-name confirmation.
-- Every mutation takes an `operation_id`; retrying it returns the retained
-  operation and never repeats remote work.
-- Audit admission once and terminal outcome once. Include server/job/run IDs,
-  plan hash, operation kind, and secret-free result. Imported scheduled runs
-  produce one imported-result audit row.
-- Record executed remote commands through tracked history with a redacted
-  semantic command when paths should not be exposed. Never pass secret values
-  into history merely to mask an unsafe command; keep them out of the command.
-
-### Exact bounds
-
-Enforce at bridge admission and in deserialization:
-
-- server/job/operation/plan/run ID: 1–128 bytes; generated job/run IDs are
-  random and path-safe
-- job name: 1–80 Unicode bytes after trim; no controls
-- source path: 1–1024 bytes, absolute POSIX path, no NUL/CR/LF
-- bucket: 1–255 bytes; provider adapter validation
-- prefix: 0–512 bytes; no NUL/CR/LF; normalize leading/trailing `/` once
-- endpoint: 0–512 bytes; adapter-owned requirement; HTTPS by default. Plain HTTP
-  requires an explicit insecure-endpoint approval and is allowed only for a
-  user-entered private/test adapter such as MinIO
-- region/storage class: 0–64 bytes and adapter allow-list
-- custom cron expression: 1–128 ASCII bytes, exactly five fields in the
-  supported grammar
-- interval: 1–168 hours or 1–365 days
-- credentials: 1–4096 bytes each, no NUL/CR/LF
-- jobs: at most 128 per server
-- retained plans: 32; retained operations: 64; active records never evicted
-- one active mutating backup operation and one active manual run per server;
-  status refresh coalesces
-- short remote outcome: 256 KiB; live stream uses the existing 4 MiB retained
-  stream cap (`src/sessions.zig:81-120`)
-- local history: 200 records total, 90 days, 200 KiB log each
-- staged scheduled records: 20 per job, at most 1 MiB log each
-- poll delta: 256 KiB; history-log delta: 64 KiB; history list: 20 summaries
-
-Oversize input is `invalid_payload`; oversize remote data is typed
-`source_too_large`/`cleanup_failed` as appropriate, never truncated into a
-false success.
-
-## Frontend implementation
-
-Create a typed feature controller rather than expanding the current component:
+`EventPoll` is:
 
 ```text
-frontend/src/backup-state.ts
-frontend/src/backup-state.test.ts
-frontend/src/BackupsTab.integration.test.tsx
+{ok, stream_id, cursor, dropped, finished, state, events:[
+  {version:1, sequence, stream_id, type, payload}
+]}
 ```
 
-`BackupsTab` may be split into `frontend/src/features/backups/` components and
-hooks if useful. Keep one controller with:
+For cursor `C`, return retained events with `sequence >= C`. The response
+cursor is one past the last returned sequence. If `C` is before the retained
+start, begin at retained start and set `dropped` to the gap. `rewind:true`
+begins at retained start. Polling never removes events.
 
-- local jobs/status/history state
-- one refresh-operation poller
-- one active mutation-operation poller
-- one active run poller with a caller-owned log cursor
-- abort/generation guards so stale responses from a former `serverId` cannot
-  overwrite current state
-- timer cleanup on server/tab change and unmount
-- last-good-state preservation on refresh/poll failure
-- no `any`, legacy `paths`, `retention_days`, response aliases, or swallowed
-  catch blocks
+Provider-test event types are:
 
-Use `docs/DESIGN.md`:
+```text
+provider.test_started
+provider.test_succeeded
+provider.test_failed
+provider.test_canceled
+```
 
-- one obvious primary action, **Create job**
-- status text plus icon/dot; never color alone
-- human labels (`Last backup`, `Needs attention`, `No changes`)
-- restrained runtime attention area instead of raw JSON/toasts
-- technical paths/IDs/logs in Geist Mono only
-- dialogs with title, one-sentence consequence, affected server/job/path, and
-  primary/cancel actions
-- responsive rows/dialogs with no hidden destructive consequence, credential
-  disclosure, or cancel action
-- 150–220 ms restrained motion and reduced-motion compliance
+Context event types are:
 
-The Protection workspace currently pairs Vault and the first server’s backups
-in a fixed two-column layout (`frontend/src/App.tsx:1279-1293`). Make server
-selection explicit there and stack at narrow widths; do not silently operate on
-`servers[0]`.
+```text
+context.refresh_started
+context.ready
+context.failed
+context.canceled
+```
 
-## Deterministic preview fixtures
+Turn event types are:
 
-Add `backupsMode` beside the existing mode query parameters in
-`frontend/preview.html:13-30`. Implement every `oars.backup.*` command above,
-record payloads in `calls`, use fixed IDs/timestamps/paths, and make polling
-advance by deterministic call count rather than wall-clock races.
+```text
+turn.started
+context.ready | context.failed
+provider.request_started
+provider.response_created
+provider.progress
+proposal.ready
+question.ready
+provider.refusal
+turn.incomplete
+turn.failed
+turn.cancel_requested
+turn.canceled
+turn.completed
+```
 
-Required `?backups=` fixtures:
+Required payload fields are:
 
-- `populated` — Copy and Sync jobs with successful/no-change history
-- `empty`
-- `refreshing` — last-good jobs/status remain visible
-- `disconnected` — stale jobs/history and blocked remote actions
-- `rclone-missing`
-- `cron-stopped`
-- `partial-import` — corrupt/too-large staged record warning
-- `editor-aws-key`
-- `editor-aws-iam`
-- `editor-r2`
-- `editor-minio-http-warning`
-- `test-plan`
-- `test-running`
-- `test-cleanup-failed` — exact leftover object path
-- `schedule-secret-disclosure`
-- `schedule-conflict`
-- `run-copy`
-- `run-sync-confirm`
-- `run-no-changes`
-- `run-failed`
-- `run-cancel-requested`
-- `run-interrupted`
-- `delete-partial-cleanup`
-- `install-plan`
-- `unsupported-target`
+- `provider.request_started`: `{client_request_id}`.
+- `provider.response_created`: `{provider_request_id?}`.
+- `provider.progress`: `{phase, received_bytes}`; no partial proposal text.
+- `proposal.ready`: `{proposal}`.
+- `question.ready`: `{question, explanation}`.
+- `provider.refusal`: `{reason?}`, with the reason bounded and treated as
+  untrusted text.
+- `turn.incomplete|turn.failed`: `{code, error, retry:"explicit"|"never"}`.
+- Terminal cancellation and completion events carry the final state and
+  timestamp.
 
-Inspect each relevant fixture at desktop and narrow widths. Verify no console
-errors, clipped dialogs, document-level overflow, hidden actions, status by
-color alone, or secret values in recorded preview calls after dialog cleanup.
+Provider SSE names and raw JSON stop inside the adapter. Command output remains
+in `oars.ssh.poll`; the AI event ring does not duplicate terminal bytes.
 
-## Required tests
+### Fixed bounds
 
-### Zig unit tests
+Enforce these before allocation, network use, or persistence:
 
-Add or correct tests for:
+| Item | Bound |
+|---|---:|
+| Providers | 16 |
+| Threads | 100 |
+| Turns per thread | 50 |
+| User message | 16 KiB |
+| Command | 64 KiB |
+| Explanation or question | 8 KiB |
+| Selected log tail | 64 KiB |
+| Provider request body | 128 KiB |
+| Response headers | 64 KiB |
+| One SSE event | 256 KiB |
+| Accumulated structured output | 128 KiB |
+| Retained provider error body before redaction | 8 KiB |
+| Domain events per turn | 1024 |
+| Domain event bytes per turn | 1 MiB |
+| Adapter continuation items per thread | 512 KiB |
+| Active provider requests | 2 total, 1 per thread |
+| Credential secret | 4096 bytes, from the Native SDK bound |
 
-- random ID uniqueness across registry reload and persisted-ID collision checks
-- immutable server ownership and optimistic job revision conflicts
-- provider adapter matrix and golden config for all six providers
-- AWS runtime config emits `env_auth = true` and no key fields
-- B2 S3 emits `provider = Other`; R2 emits `Cloudflare` + `region = auto`
-- unsupported/default storage class omission
-- credential CR/LF/NUL rejection and secure-zero paths
-- exact cron grammar including lists, wildcard steps, range steps, invalid
-  bounds, duplicate fields, tabs, `%`, and final newline
-- interval due-time arithmetic without calendar-field drift
-- crontab block insert/update/remove, duplicate-marker conflict, whole-table
-  hash conflict, and unrelated-byte preservation
-- versioned wrapper golden output: absolute rclone, source check, JSON stats,
-  lock result, numeric atomic status, retention, and no secrets
-- status parser with numeric fields, wrong version/job/revision, partial file,
-  too-large log, malformed JSON, and unknown files
-- rclone nested stats including `totalTransfers`, zero-transfer success, error
-  lines, malformed lines, and partial line boundaries across stream chunks
-- atomic jobs/history save, quarantine, schema migration, retention, and
-  secret-absence scans
-- operation idempotency, limits, expiry, cancellation states, disconnect, and
-  cleanup-failed retention
-- caller-owned log cursors with two independent consumers and dropped gaps
+Whichever event-ring bound is reached first controls retention. Compaction
+removes the oldest terminal turns first and never removes an active proposal
+or execution.
 
-### Container integration
+## Native and worker boundaries
 
-Extend `src/integration_backup.zig` and the Alpine/MinIO harness to prove:
+### Runtime credential flow
 
-- bridge handlers return promptly while a deliberately delayed remote backup
-  operation continues on workers
-- create plan → real list/write/**content read**/delete/absence test → save
-- sentinel cleanup after failures at every post-write step; forced cleanup
-  failure reports the exact leftover
-- secret material is absent from bridge responses, jobs/history JSON, command
-  history, audit, process argv, logs, status, and preview artifacts
-- temporary config mode 0600 and removal after success, failure, cancellation,
-  timeout, disconnect reconciliation, and coordinator shutdown
-- copy leaves a destination-only object; sync deletes it only after typed
-  confirmation
-- full run, incremental run, unchanged run, existing empty directory, missing
-  source, and unreadable source as distinct outcomes
-- hard cancellation: TERM reaches the active process group, KILL follows after
-  the bounded grace period, the operation reaches one terminal state, and the
-  temporary config and sentinel are removed
-- disconnect and coordinator shutdown use the same bounded cancellation and
-  cleanup path rather than leaving rclone, SFTP work, or secrets behind
-- crontab install/readback/remove under a real cron implementation, including
-  hash conflict detection and byte-for-byte preservation of unrelated entries
-- a real scheduled run while Oars is disconnected, followed by reconnect and
-  import of the exact numeric status and retained JSON log
-- overlap produces the documented busy/skipped status and does not overwrite a
-  still-running attempt's staged files
-- malformed, partial, stale-revision, oversized, and unknown staged records are
-  quarantined or reported without blocking valid imports
-- AWS IAM mode succeeds only through the remote process environment and never
-  writes credential fields to the generated config
-- install-plan detection remains read-only; an unsupported or unverified target
-  returns the manual-fallback contract rather than executing guessed package
-  manager commands
-- every admitted mutation and every terminal operation result writes exactly
-  one audit event, including conflict, cancellation, interruption, timeout, and
-  cleanup failure
+1. The runtime constructs `App` and calls `App.start_fn(context, *Runtime)`
+   during `app_start`.
+2. Oars stores a narrow facade in `bridge.Context`. The facade exposes only
+   set, get, and delete for the fixed service and account naming rules.
+3. Native secure entry sends the secret directly to
+   `Runtime.setCredential`. React sees only the terminal status.
+4. A provider admission handler calls `Runtime.getCredential` on the runtime
+   thread into a fixed request-job buffer. It queues the job and returns.
+5. The provider worker creates the authorization header, sends the request,
+   and overwrites all secret-bearing buffers on every exit.
+6. `App.stop_fn` stops new admission, cancels and joins workers, overwrites
+   queued buffers, and clears the facade before runtime teardown.
 
-The current integration entry point is `src/integration_backup.zig:1-209`,
-registered by `src/integration.zig:15-19`. Extend the existing container rather
-than replacing its SSH/MinIO assertions. The current harness installs rclone in
-`scripts/dev-sshd/Dockerfile:1-45` and runs the Zig integration executable from
-`scripts/integration-test.sh:1-142`; add cron coverage explicitly and make a
-missing daemon/tool an asserted skip or failure, never an accidental pass.
+`credential.status` may use `getCredential` with a scratch buffer only to
+distinguish configured from missing. It must overwrite the buffer and return
+no length, prefix, or secret value.
 
-### Frontend contract, state, and component tests
+### Provider worker flow
 
-Replace the legacy mock surface and add tests at the narrowest owning layer:
+The bridge thread owns payload admission only. The coordinator worker owns
+journal writes, provider queues, and published operation state. A provider
+worker owns one HTTP client and adapter parser for the request. No worker calls
+the Native SDK runtime.
 
-- `frontend/src/bridge.test.ts`: exact method names and payload envelopes for
-  plan, test, save, delete, run, cancel, operation polling, log reads, history,
-  schedule diagnostics, and install planning; reject the old flat Test payload
-- `frontend/src/types.test.ts` or compile-time fixtures: every bridge response
-  uses the discriminated unions and millisecond timestamp strings/numbers
-  defined in this guide; no `any`, guessed optional field, or nanosecond JS
-  number is accepted
-- the backup state tests: preserve last-good jobs/history during refresh and
-  recoverable errors, keep list/history/log cursors independent, deduplicate
-  terminal reconciliation, ignore stale poll responses, and stop all timers on
-  unmount, server switch, disconnect, and terminal completion
-- Keychain tests: secrets enter the draft only from an explicit reveal, are
-  cleared after plan/test/save/cancel/unmount, never enter generic bridge caches
-  or persisted app state, and a missing/locked key produces a typed prompt
-- `frontend/src/BackupsTab.test.tsx`: provider-specific fields and defaults,
-  IAM-versus-key modes, HTTP endpoint warning, plan-before-save review, changed
-  plan invalidation, content-read test progress, exact cleanup-failure path,
-  Copy versus typed Sync confirmation, cancellation phases, stale/partial
-  import warnings, destructive delete confirmation, and conflict recovery
-- app-level tests around `frontend/src/App.tsx:1279-1293`: explicit server
-  selection, no implicit `servers[0]`, disconnected behavior, and independent
-  Vault/Backups loading and error boundaries
-- accessibility assertions: focus return, Escape only when safe, labelled
-  progress, live status text without color-only meaning, keyboard-reachable
-  confirmations, and narrow-width dialogs without document overflow
-- deterministic preview tests: every `?backups=` fixture listed above resolves
-  without live time/network dependencies and records no secret-bearing payload
+The configured base URL is an API prefix. Normalize it once and retain its
+origin and path prefix separately. The adapter appends `/responses` or
+`/chat/completions`. Revalidate the effective URL before send. Authenticated
+POST requests do not follow redirects.
 
-The existing backup assertions in
-`frontend/src/modal-a11y-challenge.test.tsx:899-924` cover only modal focus and
-Escape behavior. Keep those assertions, but do not treat them as bridge,
-workflow, cancellation, or responsive coverage. The implementation is complete
-only when tests use the production types from `frontend/src/types.ts`, not
-parallel permissive mock shapes.
+After any request byte can reach a provider, network failure is ambiguous.
+Publish an explicit retry action that creates a new operation. Do not retry in
+the transport or coordinator.
+
+### SSH worker flow
+
+Context probes, selected log reads, command admission, output, process-group
+signals, and termination checks stay on the selected session worker. The AI
+coordinator receives copied outcomes. Bridge polling only reads published
+state.
+
+The AI approval handler calls a dedicated internal execution entry point. It
+does not invoke the public bridge command `oars.ssh.exec`. The internal entry
+point receives the already frozen command and the stable AI operation
+identity.
+
+### Provider tools
+
+Spec 11 v1 sends no `tools` field. A returned function, shell, computer, MCP,
+web-search, file-search, or code-interpreter call is a protocol error. Keep
+future `call_id`, tool-output, and parallel-call work outside this
+implementation.
+
+## Journal, recovery, and cancellation
+
+### Local files
+
+- `<data>/ai.json` stores versioned provider metadata only.
+- `<data>/ai_journal.jsonl` stores thread, turn, proposal, approval,
+  execution, and recovery transitions.
+- The operating-system credential store holds `ai:<provider_id>`.
+- Command history and audit remain in the Spec 15 stores. The AI journal
+  references their stable operation ID; it does not copy their byte streams.
+
+Both AI files use mode 0600. Provider metadata and journal compaction use a
+sibling temporary file, file sync, and atomic rename. The journal append path
+syncs each state transition before the related side effect can start.
+
+### Record envelope and write order
+
+Use one versioned envelope:
+
+```text
+{version:1, sequence, timestamp_ms, kind, operation_id?,
+ thread_id?, turn_id?, proposal_id?, execution_id?, payload}
+```
+
+Record only state transitions and durable continuation data. Do not append each
+token delta. Required record kinds are:
+
+```text
+thread_created | thread_deleted
+turn_queued | context_collected
+provider_request_started | provider_result | provider_interrupted
+proposal_ready | proposal_edited | proposal_canceled
+approval_recorded | execution_admitted | execution_finished
+turn_terminal | recovery_marked
+```
+
+The ordering rules are:
+
+1. `turn_queued` is durable before provider job admission.
+2. `provider_request_started`, including the client request ID, is durable
+   before the first request byte.
+3. `provider_result` and all adapter continuation items are durable before a
+   question or proposal event.
+4. `proposal_ready|proposal_edited` is durable before React can approve its
+   revision.
+5. `approval_recorded` is durable before audit and SSH admission.
+6. `execution_admitted` records the channel identity immediately after the
+   session worker accepts it.
+7. `execution_finished` and `turn_terminal` close the same operation.
+
+A truncated final JSON line is recoverable: keep the valid prefix, quarantine
+the tail, and publish a recovery warning. A corrupt complete record in the
+middle makes the journal unavailable for mutation. Quarantine it and require
+user-visible recovery; do not infer state or execute anything.
+
+### Recovery matrix
+
+| State found on startup | Required result |
+|---|---|
+| `queued` or `collecting_context` | Mark `interrupted`. Do not restart. |
+| `requesting`, `streaming`, or `validating` | Mark `interrupted`. A retry is a new provider operation because the first request can have been received or billed. |
+| `awaiting_approval` | Restore the exact proposal only when it is unexpired and all bound identities still match. Otherwise expire it. |
+| `approved` without `execution_admitted` | Mark `recovery_required`. Do not execute. |
+| `executing` with a live tracked channel | Reattach observation to that channel. Do not create a second channel. |
+| `executing` without a live tracked channel | Mark `recovery_required`. Do not rerun. |
+| `summarizing` | Mark the summary `interrupted`; keep the command result terminal. |
+| Terminal state | Keep it terminal and idempotent. |
+
+Thread deletion removes local conversation and adapter continuation items. It
+does not erase audit or command history. Provider deletion and credential
+deletion remain separate actions.
+
+### Cancellation matrix
+
+| Stage | Cancel action | Honest result |
+|---|---|---|
+| Queued context or provider job | Remove it before worker admission and append terminal cancellation. | `canceled`; no network side effect started. |
+| Active provider request | Set the cancel flag and close the local request/stream. Resolve a completion race under the coordinator lock. | `canceled` means local work stopped. The UI still states that the provider can have received and billed it. |
+| Awaiting approval | Mark the proposal unusable and append `proposal_canceled`. | `canceled`; no remote command exists. |
+| Active SSH execution | Append `cancel_requested`, signal the tracked process group, escalate when required, verify group and children, then close the channel. | `canceled` only after verification. Otherwise remain `cancel_requested` or become `recovery_required`. |
+| Disconnect during execution | Preserve channel and operation evidence, then reconcile on reconnect or restart. | Never infer success, failure, or cancellation from disconnect alone. |
+
+Poll calls observe this state. They do not advance cancellation, start cleanup,
+or finalize a job. Worker completion must release request, operation, and
+session capacity exactly once even when the frontend stops polling.
+
+## Frontend state and fixtures
+
+The AI feature reducer owns one explicit state for each of these groups:
+
+- **Target:** no server, selected server, disconnected server, and server
+  changed while a proposal is visible.
+- **Provider:** none, untested, test quota warning, testing, passed, stale,
+  authentication failed, rate limited, protocol mismatch, canceled, missing
+  key, denied key access, and credential service unavailable.
+- **Context:** cache missing, loading, fresh, stale, partial, failed, selection
+  changed, and disclosure required.
+- **Turn:** queued, collecting context, requesting, streaming, validating,
+  question, refusal, incomplete, retryable failure, terminal failure,
+  cancel requested, canceled, interrupted, and recovery required.
+- **Proposal:** ready, edited, stale, expired, destructive, needs sudo,
+  approving, executing, used, and canceled.
+- **Execution:** running, output gap, exit success, exit failure, connection
+  lost, cancel requested, canceled, and recovery required.
+- **Follow-up:** summary disclosure, running, skipped, failed, and completed;
+  script draft, saved, and save failed.
+
+The reducer accepts domain events only when `stream_id` matches and
+`sequence` is newer than the last applied event. A delayed poll response
+cannot move state backward. An event gap is visible and triggers a snapshot
+refresh; it does not reset the backend cursor.
+
+React never owns a provider parser, command hash, destructive authority,
+credential value, or execution admission decision. The proposal card renders
+the backend proposal verbatim. Edit sends a new command to Zig and waits for a
+new revision.
+
+The deterministic preview must cover every `?ai=` fixture named in Slice 9.
+Each fixture uses a fixed clock and contract-accurate bridge responses. Add
+tests that fail when the mock omits a required union member or returns a legacy
+`entries`, `openai_compatible`, or raw-config shape.
+
+## Verification matrix
+
+### Zig unit and contract tests
+
+| Area | Required cases |
+|---|---|
+| Provider metadata | Stable random IDs, revision conflicts, idempotent mutations, legacy migration, no secret migration claim, atomic write, mode 0600, quarantine, and 16-provider bound. |
+| URL and transport policy | HTTPS, approved IPv4 and IPv6 loopback HTTP, user information, fragment, query, path-prefix joining, redirect rejection, DNS, TLS, timeouts, request byte accounting, no retry, and redacted error bodies. |
+| SSE | Every byte split, CRLF and LF, comments, multiple data lines, invalid UTF-8, oversized line and event, cancel during a partial event, and terminal framing. |
+| Responses adapter | Command, question, reasoning item, refusal, incomplete, failed, error, unknown bounded event, malformed known event, inconsistent item identity, duplicate terminal, missing terminal, and strict schema. |
+| Chat adapter | Each declared instruction role and structured mode, fragmented chunks, terminal marker, invalid JSON, unsupported mode, and explicit-only retry. |
+| Events | Independent cursors, rewind, gap count, byte and count retention, stale consumer, coalesced progress, unknown frontend event rejection, and terminal snapshot. |
+| Proposal | Discriminator, field bounds, NUL, multiple results, hash, expiry, destructive fixtures, edit reclassification, wrong server or connection, provider revision, warning acknowledgement, interactive sudo, and double Run. |
+| Journal | Write-before-side-effect order, sync failures, replay, truncated tail, corrupt middle, compaction crash, retention, operation idempotency, and every recovery row. |
+| Cancellation | Before-send cancel, active HTTP cancel, completion race, proposal cancel, process-group signal and escalation, verified child exit, uncertain result, and exactly-once slot release. |
+
+### Native credential integration
+
+Test the real installed platform service, not an in-memory substitute:
+
+- `App.start_fn` installs the facade before bridge use and `stop_fn` clears
+  it after workers stop.
+- Configure, replace, status, get, and delete work through native entry.
+- Missing, denied, unavailable, oversized, and shutdown-race cases are typed.
+- Runtime calls stay on the permitted thread.
+- Request and authorization-header buffers are overwritten after success,
+  error, timeout, cancel, and shutdown.
+- A test key is absent from bridge inspectors, React, browser storage, app
+  data, journal, audit, history, logs, traces, crash output, and error text.
+
+### Local provider integration
+
+The deterministic fixture must:
+
+- receive the exact Responses and Chat routes
+- verify that authorization is present without writing its value
+- verify `store:false`, `background:false`, strict `text.format`, and no
+  tools for Responses
+- fragment SSE across every parser boundary used by the test
+- exercise question, refusal, incomplete, invalid schema, 401, 429, 500,
+  redirect, idle timeout, body drop, and cancel
+- prove that no POST is retried after send
+- return fixed request IDs for audit assertions
+
+### SSH container integration
+
+Extend `src/integration_ai.zig` and the real
+`scripts/integration-test.sh` harness to prove:
+
+1. Explicit server and provider selection.
+2. Worker-owned context refresh and bounded selected log disclosure.
+3. Fixture ask, full stream validation, and durable proposal.
+4. Edit before Run, destructive reclassification, wrong hash, stale revision,
+   server switch, provider edit, expiry, and double Run.
+5. Exact approved command, `history_kind = "ai"`, `ai.approved` audit,
+   streamed output, real exit, and no generic SSH row in AI thread history.
+6. Provider cancel, verified remote process-group cancel with a child process,
+   disconnect, and restart at every non-terminal state.
+7. No duplicate provider request or remote command after recovery.
+8. Summary disclosure and save-as-script round trip.
+
+### React and manual verification
+
+Add focused reducer, bridge, component, and app-level tests for every state in
+the frontend section. Include cursor gaps, stale responses, target changes,
+long values, focus return, Escape behavior, keyboard actions, screen-reader
+labels, and status that is understandable without color.
+
+Inspect every deterministic fixture at a desktop viewport and a narrow
+viewport in light and dark themes. Record the browser, exact viewport, date,
+and result. Check long command wrapping, long host and model names, output
+gaps, reduced motion, and recovery after reload.
 
 ## Exact validation commands
 
-Run from the repository root after implementation. The first command formats
-exactly the changed Zig files discovered by Git; if there are no changed Zig
-files, omit it rather than invoking `zig fmt` with an empty argument list.
+Run from the repository root on the same checkout used for live evidence.
+Format only changed Zig files. If the first query returns no files, omit the
+`zig fmt` command instead of running it with an empty argument list.
 
 ```sh
-git diff --name-only --diff-filter=ACMR -- '*.zig' | xargs zig fmt --check
+git diff --name-only --diff-filter=ACMR HEAD -- '*.zig'
+git diff --name-only --diff-filter=ACMR HEAD -- '*.zig' | xargs zig fmt --check
+zig build
 zig build test
 scripts/integration-test.sh
 npm --prefix frontend test
@@ -1118,117 +968,152 @@ frontend/node_modules/.bin/tsc -p frontend/tsconfig.json --noEmit
 git diff --check
 ```
 
-Also run the deterministic preview matrix manually at desktop and narrow widths,
-including at least `populated`, `editor-aws-key`, `test-running`,
-`test-cleanup-failed`, `schedule-secret-disclosure`, `schedule-conflict`,
-`run-sync-confirm`, `run-cancel-requested`, `partial-import`, and
-`unsupported-target`. Record the tested browser, viewport sizes, and result in
-the implementation PR.
+The automated suite is necessary but not sufficient. Record these external
+results on the same checkout:
 
-These are implementation validation requirements, not observations about the
-2026-08-21 baseline. This guide was produced from source inspection; it does not
-claim that any command above currently passes.
+- one real OpenAI Responses stream with a current model, native credential
+  configuration, `store:false`, strict Structured Outputs, request IDs, one
+  harmless approved container command, and a complete secret scan
+- one separately pinned Ollama or vLLM Chat Completions adapter test
+- verified process-group cancellation, including a child process
+- restart recovery at every non-terminal turn state
+- the complete deterministic preview matrix at desktop and narrow widths in
+  both themes
 
-## Acceptance gates
+Do not put an API key, prompt body, server context, or model response in the
+evidence log. Record redacted request shape, provider and client request IDs,
+terminal event type, proposal identity, command hash, execution identity, and
+test result.
 
-Spec 10 is releasable only when all of the following are true:
+## Open release gates
 
-1. **Contracts agree.** `src/bridge.zig`, `src/backup.zig`, frontend bridge
-   methods, production TypeScript types, mocks, tests, and deterministic
-   previews implement the same versioned request/response/error contracts in
-   this guide. There are no legacy fields or `any` escape hatches in the backup
-   path.
-2. **The runtime remains responsive.** No backup bridge handler performs
-   `execWait`, SFTP waits, filesystem persistence, staged import, or rclone work
-   on the runtime main thread. Admission is bounded; workers own blocking work;
-   coordinator messages own published state.
-3. **Secrets have one controlled lifetime.** Key material comes from Keychain
-   only for the admitted operation, is passed through a mode-0600 temporary
-   config rather than argv/environment/JSON, is zeroed and removed on every
-   terminal path, and is absent from all enumerated persistence and telemetry
-   surfaces. AWS IAM mode emits `env_auth = true` and no static credentials.
-4. **Testing proves actual access.** Test Connection lists, writes a unique
-   sentinel, reads its exact content with `rclone cat`, removes it, and verifies
-   absence. A failed cleanup returns the exact leftover object and blocks Save.
-5. **Mutations are transactional and conflict-safe.** Save/delete use plan,
-   expected revision, crontab whole-table hash/readback, atomic local
-   persistence, rollback/reconciliation, immutable server ownership, and
-   exactly-once audit outcomes. Restart cannot reuse an existing ID.
-6. **Scheduling works without Oars.** A real cron invocation completes while
-   the app is closed/disconnected; reconnect imports the versioned numeric
-   status and bounded JSON log exactly once. Unrelated crontab bytes survive,
-   secrets never enter cron, interval gating honors elapsed intervals, and
-   overlap is explicit.
-7. **Cancellation and cleanup are hard guarantees.** Cancel/timeout/disconnect
-   signal the process group, escalate after a bound, finalize without frontend
-   polling, retain cleanup-failed evidence, and release worker/operation slots
-   exactly once.
-8. **Copy and Sync are truthful.** Copy preserves destination-only data; Sync
-   can delete it and therefore requires the typed destructive confirmation.
-   Full, incremental, unchanged, empty, missing, unreadable, cancelled,
-   interrupted, and failed outcomes are distinguishable.
-9. **Bounds and parsing are enforced.** Request sizes, identifiers, paths,
-   schedule grammar, stream lines, logs, histories, staged records, operation
-   counts, and retention are bounded before allocation or execution. Remote
-   text is data, never shell syntax; quoting is centralized and `%`, CR/LF,
-   NUL, control bytes, traversal, and marker injection are rejected where
-   specified.
-10. **The UI exposes real state.** Explicit server selection, stale-state
-    preservation, operation phases, independent cursors, typed errors, cleanup
-    actions, schedule diagnostics, installation fallback, responsive layouts,
-    and accessible keyboard/focus/status behavior all have component tests and
-    deterministic fixtures.
-11. **Validation passes.** Every command in the validation section passes, the
-    preview matrix is inspected, and the container test includes the closed-Oars
-    scheduled-run/import scenario. Any platform adapter not exercised is
-    reported as unsupported/manual, not inferred working.
-12. **Documentation agrees.** On completion, update the Spec 10 status and any
-    affected design/spec text in the implementation change so they describe the
-    shipped contracts rather than the 2026-08-21 baseline.
+Every gate remains open while Spec 11 is Planned:
+
+- [ ] **Main-thread gate:** a slow 20-second context probe and a slow provider
+  stream do not delay unrelated bridge calls. No AI handler waits on network
+  work.
+- [ ] **Native credential gate:** native secure entry, `App.start_fn`
+  injection, status, use, replacement, deletion, overwrite, and shutdown pass
+  without a key entering React or persistent app data.
+- [ ] **Real OpenAI gate:** a current model completes one native Responses
+  `store:false` stream with strict `text.format`, request IDs, a validated
+  proposal, and no secret leak.
+- [ ] **Compatibility gate:** one pinned Ollama or vLLM version passes the
+  separate `openai_chat_completions` adapter. A failed or stale test blocks
+  Ask.
+- [ ] **Disclosure gate:** the user reviews the exact selected context and log
+  bound. A log prompt-injection fixture cannot change policy, approve, or call
+  SSH.
+- [ ] **Proposal gate:** no runnable card exists before full stream and local
+  validation. Refusal, incomplete output, schema failure, malformed known
+  events, timeout, and multiple results fail closed.
+- [ ] **Approval identity gate:** Run commits the exact durable revision for
+  the visible server and connection. Edit, target change, provider change,
+  expiry, hash mismatch, and a second click reject or deduplicate as specified.
+- [ ] **Destructive gate:** the shared Zig and React fixture set agrees, edited
+  commands are reclassified, and the backend requires the warning
+  acknowledgement.
+- [ ] **Execution and audit gate:** one harmless approved container command
+  uses `history_kind = "ai"`, streams through independent cursors, and
+  finishes the same operation in AI history and audit. Generic SSH rows stay
+  out.
+- [ ] **Cancellation gate:** provider cancel has honest semantics. SSH cancel
+  stops and verifies the remote process group and child. An uncertain stop
+  remains `cancel_requested|recovery_required`.
+- [ ] **Recovery gate:** forced restart at every non-terminal state produces no
+  duplicate provider POST and no duplicate SSH command. An unexpired proposal
+  restores exactly.
+- [ ] **Conversation gate:** local `store:false` continuation replays every
+  required adapter item, including returned encrypted reasoning items,
+  without a server Conversation, background mode, or `previous_response_id`.
+  Clear Thread removes local conversation data.
+- [ ] **Save-as-script gate:** the exact proposal opens as a reviewed script
+  draft and the saved script runs through Spec 06.
+- [ ] **UI gate:** all typed states pass desktop, narrow, keyboard, focus,
+  screen-reader, light-theme, and dark-theme review with target and provider
+  identity always visible.
+- [ ] **Repository gate:** every validation command and external evidence item
+  above passes on the same checkout.
+
+Only after all gates close may the implementation change update Spec 11 and
+`docs/specs/README.md` from Planned. Update this guide at the same time with
+dated evidence. A partial backend, a polished mock UI, or a successful generic
+`oars.ssh.exec` call does not justify Partial or Complete status.
 
 ## Non-goals
 
-Do not expand this implementation into:
+Keep this implementation out of:
 
-- restore workflows or disaster-recovery orchestration
-- retention-policy management of user backup objects
-- database-native snapshots, dumps, or application-consistent quiescing
-- destinations beyond the six S3-compatible v1 adapters in this guide
-- cloud account creation, IAM policy brokerage, credential rotation, or a new
-  cross-platform secret manager
-- a long-running rclone RC service or exposing rclone's remote-control API
-- arbitrary user-authored rclone flags, shell snippets, cron expressions, or
-  destination paths
-- a broad scheduler abstraction beyond the explicitly tested cron adapters;
-  unsupported systems receive diagnostics and a manual fallback
-- redesign of unrelated Vault, server, or session workflows
+- autonomous execution or approval by the model
+- OpenAI built-in shell, computer, web, file, code-interpreter, or MCP tools
+- native Anthropic, Gemini, or other provider protocols
+- a cloud proxy, account brokerage, telemetry, or shared prompt service
+- browser-side provider HTTP, permissive `connect-src https:`, or CORS-based
+  provider support
+- automatic retry after an ambiguous POST
+- server-side OpenAI Conversations, `previous_response_id`, or background
+  Responses jobs
+- raw-log retention by default
+- cross-server chat or fleet command execution
+- changes to unrelated terminal, deployment, backup, or vault workflows
 
-## Primary-source references
+## Primary sources
 
-Repository observations above are fixed to commit `bc2aa83` on 2026-08-21 and
-cite the owning paths/symbols/line ranges inline. External behavior must be
-implemented against these official primary sources:
+### Repository and installed source
 
-- rclone S3 backend/provider options, credential modes, endpoints, and storage
-  classes: <https://rclone.org/s3/>
-- rclone global logging, including JSON log output:
-  <https://rclone.org/docs/#logging>
-- rclone process exit-code meanings:
-  <https://rclone.org/docs/#exit-code>
-- `rclone copy` source/destination and non-deletion semantics:
-  <https://rclone.org/commands/rclone_copy/>
-- `rclone sync` destination-matching and deletion semantics:
-  <https://rclone.org/commands/rclone_sync/>
-- rclone config-file discovery and override behavior:
-  <https://rclone.org/commands/rclone_config_file/>
-- rclone `obscure` warning: obscuring is reversible and is not encryption:
-  <https://rclone.org/commands/rclone_obscure/>
-- Cronie `crontab(1)` install/list/remove interface and temporary-file behavior:
-  <https://github.com/cronie-crond/cronie/blob/master/man/crontab.1>
-- Cronie `crontab(5)` grammar, step semantics, environment, and `%` handling:
-  <https://github.com/cronie-crond/cronie/blob/master/man/crontab.5>
+- Target product contract: `docs/specs/11-ai-terminal.md`.
+- Current-state audit and architecture research:
+  `docs/research/spec-11-ai-terminal-current-state.md`.
+- Cross-cutting cursor, secret, approval, cancellation, and threading rules:
+  `docs/specs/README.md:52-91`.
+- UI rules: `docs/DESIGN.md:109-126` and
+  `docs/DESIGN.md:169-203`.
+- Current AI backend: `src/ai.zig`, AI registrations and handlers in
+  `src/bridge.zig`, and `src/integration_ai.zig`.
+- Current frontend: `frontend/src/AiTab.tsx`,
+  `frontend/src/types.ts`, `frontend/src/bridge.ts`,
+  `frontend/src/App.tsx`, `frontend/src/test/mock-bridge.ts`, and
+  `frontend/index.html`.
+- Runtime ownership: `src/main.zig:145-236` and
+  `src/runner.zig:401-575`.
+- Native credential and injection APIs: installed
+  `@native-sdk/cli/src/runtime/system_services.zig:89-108`,
+  `runtime/core.zig:754-769`, `runtime/api.zig:410-447`,
+  `runtime/flow.zig:227-240`, and
+  `platform/types.zig:239-241,2401-2403,2902-2914`.
+- Installed Zig HTTP client:
+  `/opt/homebrew/Cellar/zig/0.16.0_1/lib/zig/std/http/Client.zig`.
 
-Do not generalize from one distro's package manager, daemon name, crontab path,
-or service manager. Verify any added platform adapter against that platform's
-official documentation and exercise it in the integration matrix before calling
-it supported.
+### External primary documentation
+
+- [OpenAI API authentication](https://developers.openai.com/api/reference/overview)
+  defines server-side key handling, request IDs, and compatibility policy.
+- [OpenAI Responses create](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)
+  defines `stream`, `store`, output items, the
+  `reasoning.encrypted_content` include value, tools, and response state.
+- [OpenAI Chat Completions create](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+  defines the separate compatibility request and streaming contract.
+- [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
+  defines strict Responses `text.format` JSON Schema output.
+- [OpenAI streaming responses](https://developers.openai.com/api/docs/guides/streaming-responses)
+  defines typed Responses stream events.
+- [OpenAI function calling](https://developers.openai.com/api/docs/guides/function-calling)
+  defines `call_id`, strict schemas, tool results, and
+  `parallel_tool_calls:false` for later tool work.
+- [OpenAI conversation state](https://developers.openai.com/api/docs/guides/conversation-state)
+  defines local `store:false` continuation with all required response output
+  items, including reasoning items.
+- [OpenAI data controls](https://developers.openai.com/api/docs/guides/your-data)
+  defines Responses application-state retention, Zero Data Retention, and
+  background-mode limits.
+- [OpenAI agent safety](https://developers.openai.com/api/docs/guides/agent-builder-safety)
+  defines prompt-injection, structured-output, and approval guidance.
+- [OpenAI safety best practices](https://developers.openai.com/api/docs/guides/safety-best-practices)
+  defines adversarial testing, human review for code, and input/output bounds.
+- [WHATWG server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html)
+  defines UTF-8 SSE lines, comments, multiple data lines, and event
+  termination.
+- [Ollama OpenAI compatibility](https://docs.ollama.com/api/openai-compatibility)
+  and [vLLM OpenAI-compatible server](https://docs.vllm.ai/en/latest/serving/openai_compatible_server/)
+  document explicit routes and compatibility limits. They require a tested
+  adapter instead of a generic compatibility claim.

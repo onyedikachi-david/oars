@@ -52,6 +52,29 @@ describe("Oars select system", () => {
     expect(onValueChange).toHaveBeenCalledWith("development");
   });
 
+  it("reserves the indicator column for every option so labels keep the menu width", async () => {
+    const user = userEvent.setup();
+    render(
+      <OarsSelect
+        aria-label="Backup server"
+        value="production"
+        onValueChange={vi.fn()}
+        options={[
+          { value: "production", label: "Production API — api.internal.example · Connected" },
+          { value: "staging", label: "Staging Web — 10.24.8.17 · Connected" },
+          { value: "database", label: "Legacy Database — db-01.internal.example · Connected" },
+        ]}
+      />,
+    );
+
+    await user.click(screen.getByRole("combobox", { name: "Backup server" }));
+
+    for (const option of screen.getAllByRole("option", { hidden: true })) {
+      expect(option.querySelector(".oars-select-item-indicator")).not.toBeNull();
+      expect(option.querySelector(".oars-select-item-text")?.textContent).not.toMatch(/…$/);
+    }
+  });
+
   it("supports keyboard selection and disabled triggers", async () => {
     const user = userEvent.setup();
     const onValueChange = vi.fn();

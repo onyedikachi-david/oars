@@ -53,20 +53,20 @@ const scriptWithVars: Script = {
 beforeEach(() => {
   vi.clearAllMocks();
   window.zero = {
-    invoke: mockZeroInvoke.mockImplementation(async (method: string, params: any) => {
+    invoke: mockZeroInvoke.mockImplementation(async (method: string, params: Record<string, unknown>) => {
       if (method === "native-sdk.credentials.get") return null;
       if (method === "native-sdk.credentials.set") return {};
       if (method === "native-sdk.credentials.delete") return {};
-      if (method === "oars.scripts.list" || method === "scripts.list") {
+      if (method === "oars.scripts.list") {
         return { scripts: [scriptWithVars], recovery_error: null };
       }
-      if (method === "oars.backup.jobs.list" || method === "backup.list") {
-        return { jobs: [], backups: [] };
+      if (method === "oars.backup.jobs.list") {
+        return { ok: true, jobs: [] };
       }
-      if (method === "oars.servers.list" || method === "servers.list") {
+      if (method === "oars.servers.list") {
         return { servers: [sampleServer] };
       }
-      if (method === "oars.servers.save" || method === "servers.save") {
+      if (method === "oars.servers.save") {
         return { server: params };
       }
       return {};

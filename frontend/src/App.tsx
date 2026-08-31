@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Activity,
   Archive,
@@ -38,6 +38,7 @@ import {
 } from "lucide-react";
 import { Mosaic, MosaicWindow, type MosaicNode, type MosaicPath } from "react-mosaic-component";
 import { Button } from "./components/ui/button";
+import { OarsSelect } from "./components/ui/select";
 import { OarsLoadingState, OarsRefreshStatus } from "./components/OarsLoadingState";
 import { WorkspaceLayoutPicker } from "./components/WorkspaceLayoutPicker";
 import { ApplicationNotice } from "./components/ApplicationPortal";
@@ -54,6 +55,7 @@ import { DeployTab } from "./DeployTab";
 import { KeysTab } from "./KeysTab";
 import { AccessTab } from "./AccessTab";
 import { BackupsTab } from "./BackupsTab";
+import { readBackupPreviewMode } from "./backup-preview";
 import { AiTab } from "./AiTab";
 import { HistoryTab } from "./HistoryTab";
 import { VaultTab } from "./VaultTab";
@@ -466,6 +468,7 @@ function ServersView({
 // Root
 // ---------------------------------------------------------------------------
 export default function App() {
+  const [backupPreviewMode] = useState(readBackupPreviewMode);
   const [servers, setServers] = useState<OarsServer[]>([]);
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
@@ -486,7 +489,7 @@ export default function App() {
   const fleetCountRef = useRef(0);
   const [collapsedFleetGroups, setCollapsedFleetGroups] = useState<Set<string>>(new Set());
   const [serverMenuId, setServerMenuId] = useState<string | null>(null);
-  const [activeSection, setActiveSection] = useState<Section>("Overview");
+  const [activeSection, setActiveSection] = useState<Section>(() => backupPreviewMode === null ? "Overview" : "Backups");
   const [mobileNav, setMobileNav] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try {
@@ -1013,7 +1016,7 @@ export default function App() {
                   />
                 )
                 : tab.view === "keys" ? <KeysTab key={tab.key} serverId={tab.server.id} />
-                : tab.view === "backups" ? <BackupsTab key={tab.key} serverId={tab.server.id} />
+                : tab.view === "backups" ? <BackupsTab key={tab.key} serverId={tab.server.id} connected={statuses.get(tab.server.id) === "ready"} />
                 : tab.view === "ai" ? <AiTab key={tab.key} serverId={tab.server.id} />
                 : tab.view === "vnc" ? (
                   <Suspense fallback={<OarsLoadingState title="Loading remote desktop" detail="Oars is preparing the secure VNC client." />}>
@@ -1280,14 +1283,12 @@ export default function App() {
           ) : activeSection === "Backups" ? (
             <div className="content-stack">
               <SectionTitle eyebrow="Data protection" title="Backups" description="Encrypted jobs, vault portability, and restore history without cloud sync."/>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }} className="protection-grid">
+              <ProtectionGrid>
                 <div className="panel" style={{ padding: 0, overflow: "hidden" }}><VaultTab /></div>
                 <div className="panel" style={{ padding: 0, overflow: "hidden", minHeight: 320 }}>
-                  {servers.length === 0 ? <div style={{ padding: 22 }} className="muted">Add a server to configure backups.</div> : (
-                    <ProtectionBackupsPanel servers={servers} />
-                  )}
+                  <ProtectionBackupsPanel servers={servers} statuses={statuses} />
                 </div>
-              </div>
+              </ProtectionGrid>
             </div>
           ) : (
             <div className="content-stack">
@@ -1314,22 +1315,70 @@ export default function App() {
   );
 }
 
-function ProtectionBackupsPanel({ servers }: { servers: OarsServer[] }) {
-  const [activeId, setActiveId] = useState<string>(() => servers[0]?.id ?? "");
-  useEffect(() => {
-    if (!activeId && servers[0]) setActiveId(servers[0].id);
-    if (activeId && !servers.find((s) => s.id === activeId) && servers[0]) setActiveId(servers[0].id);
-  }, [servers, activeId]);
-  if (!activeId) return <div style={{ padding: 22 }} className="muted">Select a server.</div>;
+export function ProtectionGrid({ children }: { children: ReactNode }) {
   return (
-    <div style={{ display: "flex", flexDirection: "column", minHeight: 320 }}>
-      <div style={{ display: "flex", gap: 8, padding: "8px 10px", borderBottom: "1px solid var(--border)", alignItems: "center", flexWrap: "wrap" }}>
-        <span className="muted" style={{ fontSize: 11 }}>Server</span>
-        <select value={activeId} onChange={(e) => setActiveId(e.target.value)} style={{ fontSize: 12, padding: "4px 6px", borderRadius: 6, border: "1px solid var(--border)" }}>
-          {servers.map((s) => <option key={s.id} value={s.id}>{s.name} — {s.host}</option>)}
-        </select>
+    <div
+      className="protection-grid"
+      style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 14 }}
+    >
+      {children}
+    </div>
+  );
+}
+
+export function ProtectionBackupsPanel({ servers, statuses }: { servers: OarsServer[]; statuses: Map<string, SessionStatus> }) {
+  const previewMode = readBackupPreviewMode();
+  const [activeId, setActiveId] = useState(() => previewMode === null ? "" : servers[0]?.id ?? "");
+  useEffect(() => {
+    if (previewMode !== null && activeId === "" && servers[0] !== undefined) {
+      setActiveId(servers[0].id);
+      return;
+    }
+    if (activeId !== "" && !servers.some((server) => server.id === activeId)) setActiveId("");
+  }, [activeId, previewMode, servers]);
+
+  const activeServer = servers.find((server) => server.id === activeId) ?? null;
+  const connected = activeServer !== null
+    && (previewMode === "disconnected" ? false : previewMode !== null || statuses.get(activeServer.id) === "ready");
+  const previewStatus: SessionStatus | null = previewMode === null
+    ? null
+    : previewMode === "disconnected" ? "closed" : "ready";
+  const options = servers.map((server) => ({
+    value: server.id,
+    label: `${server.name} — ${server.host} · ${fleetLabel(previewStatus ?? statuses.get(server.id))}`,
+  }));
+
+  return (
+    <div className="protection-backups-panel">
+      <div className="protection-backups-picker">
+        <div>
+          <label htmlFor="protection-backup-server">Backup server</label>
+          <span>Choose the server whose local jobs and runtime state you want to manage.</span>
+        </div>
+        <OarsSelect
+          id="protection-backup-server"
+          value={activeId === "" ? null : activeId}
+          onValueChange={setActiveId}
+          options={options}
+          placeholder={servers.length === 0 ? "No servers available" : "Select a server"}
+          disabled={servers.length === 0}
+        />
       </div>
-      <BackupsTab serverId={activeId} />
+      {servers.length === 0 ? (
+        <div className="backups-empty backups-empty-compact">
+          <Server aria-hidden />
+          <h3>No servers available</h3>
+          <p>Add a server before configuring backup jobs.</p>
+        </div>
+      ) : activeServer === null ? (
+        <div className="backups-empty backups-empty-compact">
+          <Archive aria-hidden />
+          <h3>Select a server</h3>
+          <p>Oars will not choose a server or start a remote operation implicitly.</p>
+        </div>
+      ) : (
+        <BackupsTab key={activeServer.id} serverId={activeServer.id} connected={connected} previewMode={previewMode} />
+      )}
     </div>
   );
 }

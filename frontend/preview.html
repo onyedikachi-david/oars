@@ -27,6 +27,17 @@
         const deployMode = new URLSearchParams(window.location.search).get("deploy") || "populated";
         const accessMode = new URLSearchParams(window.location.search).get("access") || "populated";
         const keysMode = new URLSearchParams(window.location.search).get("keys") || "populated";
+        const backupsMode = (() => {
+          const requested = new URLSearchParams(window.location.search).get("backups") || "populated";
+          const supported = new Set([
+            "populated", "empty", "refreshing", "disconnected", "rclone-missing", "cron-stopped", "partial-import",
+            "editor-aws-key", "editor-aws-iam", "editor-r2", "editor-minio-http-warning",
+            "test-plan", "test-running", "test-cleanup-failed", "schedule-secret-disclosure", "schedule-conflict",
+            "run-copy", "run-sync-confirm", "run-no-changes", "run-failed", "run-cancel-requested", "run-interrupted",
+            "delete-partial-cleanup", "install-plan", "unsupported-target",
+          ]);
+          return supported.has(requested) ? requested : "populated";
+        })();
         let nextDiagnosticChannel = 900;
         // Logs fixtures (spec 04): deterministic sources, lines with
         // repeatable search matches, one very long line, a follow channel
@@ -292,8 +303,650 @@
           const rows = empty || scanning ? [] : [{ identity_id: "identity-ada", name: "Ada Lovelace", fingerprints: [accessFingerprint], grants: [accessGrant] }];
           return { ok: true, scan_id: "scan-preview", state: scanning ? "scanning" : "done", scope: accessScanScope, created_at_ms: now - 1200, ...(scanning ? {} : { finished_at_ms: now }), servers: [server], people_page: { offset: 0, limit: 100, total: rows.length, rows, has_more: false }, unassigned_page: { offset: 0, limit: 100, total: 0, rows: [], has_more: false }, metrics: { people: rows.length, distinct_fingerprints: rows.length, completed_servers: scanning ? 0 : 1, target_servers: 1, observed_grants: rows.length }, coverage: partial ? "partial" : "complete", sync_errors: partial ? [{ server_id: "staging-web", reason: "not connected" }] : [], source_warnings: partial ? [{ server_id: "prod-api", reason: "AuthorizedKeysCommand is dynamic and cannot be inventoried" }] : [] };
         }
+        // ── Backup fixtures (NEXT-SPEC): fixed wire data and call-count polling ──
+        const BACKUP_FIXTURE_TIME = 1786147200000;
+        const BACKUP_SERVER_ID = "prod-api";
+        const BACKUP_JOB_PLAN_ID = "backup-plan-job-001";
+        const BACKUP_TEST_PLAN_ID = "backup-plan-test-001";
+        const BACKUP_DELETE_PLAN_ID = "backup-plan-delete-001";
+        const BACKUP_INSTALL_PLAN_IDS = {
+          rclone: "backup-plan-install-rclone-001",
+          cron: "backup-plan-install-cron-001",
+          start_cron: "backup-plan-install-start-cron-001",
+        };
+
+        const BACKUP_SENTINEL_OBJECT = "s3://oars-preview-backups/production/documents/.oars-test/00000000-0000-4000-8000-000000000201.sentinel";
+        const BACKUP_STATE_ROOT = "/home/deploy/.local/state/oars/backups/backup-copy-documents";
+        const BACKUP_WRAPPER_PATH = BACKUP_STATE_ROOT + "/run.sh";
+        const BACKUP_META_PATH = BACKUP_STATE_ROOT + "/meta.json";
+        const BACKUP_STAGED_RECORD_PATH = BACKUP_STATE_ROOT + "/runs/run-corrupt-preview.json";
+        const BACKUP_CONFIG_PATH = "/home/deploy/.config/oars/rclone.conf";
+        const cloneBackupFixture = (value) => JSON.parse(JSON.stringify(value));
+        const backupFailure = (code, error, retryable, detail) => ({
+          ok: false,
+          code,
+          error,
+          retryable,
+          ...(detail ? { detail } : {}),
+        });
+        const backupCopyJob = {
+          id: "backup-copy-documents",
+          server_id: BACKUP_SERVER_ID,
+          revision: 3,
+          name: "Nightly documents",
+          source_path: "/home/deploy/documents",
+          destination: {
+            type: "s3",
+            provider: "aws",
+            bucket: "oars-preview-backups",
+            prefix: "production/documents",
+            endpoint: "",
+            region: "us-east-1",
+            credential_mode: "access_key",
+            storage_class: "STANDARD",
+          },
+          transfer: "copy",
+          schedule: { mode: "interval", enabled: true, every: 24, unit: "hours", anchor_epoch_sec: 1786147200 },
+          capability_proof: { id: "backup-proof-copy-001", expires_at_ms: BACKUP_FIXTURE_TIME + 600000, binding_sha256: "0".repeat(64) },
+          created_at_ms: BACKUP_FIXTURE_TIME - 30 * 86400000,
+          updated_at_ms: BACKUP_FIXTURE_TIME - 1800000,
+        };
+        const backupSyncJob = {
+          id: "backup-sync-assets",
+          server_id: BACKUP_SERVER_ID,
+          revision: 5,
+          name: "Assets mirror",
+          source_path: "/srv/assets",
+          destination: {
+            type: "s3",
+            provider: "r2",
+            bucket: "oars-preview-assets",
+            prefix: "mirror",
+            endpoint: "https://r2.preview.invalid",
+            region: "auto",
+            credential_mode: "access_key",
+            storage_class: "",
+          },
+          transfer: "sync",
+          schedule: { mode: "manual", enabled: false },
+          capability_proof: { id: "backup-proof-sync-001", expires_at_ms: BACKUP_FIXTURE_TIME + 600000, binding_sha256: "1".repeat(64) },
+          created_at_ms: BACKUP_FIXTURE_TIME - 20 * 86400000,
+          updated_at_ms: BACKUP_FIXTURE_TIME - 3600000,
+        };
+        const backupEditorModes = new Set(["editor-aws-key", "editor-aws-iam", "editor-r2", "editor-minio-http-warning"]);
+        let backupJobs = backupsMode === "empty" || backupEditorModes.has(backupsMode)
+          ? []
+          : [cloneBackupFixture(backupCopyJob), cloneBackupFixture(backupSyncJob)];
+        const backupRuntime = {
+          rcloneInstalled: backupsMode !== "rclone-missing",
+          cronInstalled: true,
+          cronRunning: backupsMode !== "cron-stopped",
+        };
+        const backupJobPlans = new Map();
+        const backupDeletePlans = new Map();
+        const backupTestPlans = new Map();
+        const backupInstallPlans = new Map();
+        const backupOperations = new Map();
+        const backupRuns = new Map();
+        const backupRunsByOperation = new Map();
+        const backupHistoryLogs = new Map([
+          ["backup-history-copy-success", "Preparing source /home/deploy/documents\nTransferred 48 files (157286400 bytes)\nCleanup complete\n"],
+          ["backup-history-sync-no-changes", "Preparing source /srv/assets\nNo files required transfer\nCleanup complete\n"],
+        ]);
+        const backupHistory = [
+          {
+            run_id: "backup-history-copy-success",
+            server_id: BACKUP_SERVER_ID,
+            job_id: backupCopyJob.id,
+            source: "manual",
+            status: "success",
+            bytes_done: 157286400,
+            bytes_total: 157286400,
+            files_done: 48,
+            files_total: 48,
+            started_at_ms: BACKUP_FIXTURE_TIME - 7200000,
+            finished_at_ms: BACKUP_FIXTURE_TIME - 7080000,
+          },
+          {
+            run_id: "backup-history-sync-no-changes",
+            server_id: BACKUP_SERVER_ID,
+            job_id: backupSyncJob.id,
+            source: "scheduled",
+            status: "no_changes",
+            bytes_done: 0,
+            bytes_total: 0,
+            files_done: 0,
+            files_total: 0,
+            started_at_ms: BACKUP_FIXTURE_TIME - 86400000,
+            finished_at_ms: BACKUP_FIXTURE_TIME - 86370000,
+          },
+        ];
+        function backupStatusPayload() {
+          const warnings = [];
+          if (backupsMode === "partial-import") {
+            warnings.push(`Corrupt staged record remains at ${BACKUP_STAGED_RECORD_PATH}.`);
+            warnings.push(`Staged record ${BACKUP_STATE_ROOT}/runs/run-too-large-preview.json exceeds the import size limit and remains in place.`);
+          }
+          if (backupsMode === "delete-partial-cleanup") warnings.push(`Scheduled wrapper remains at ${BACKUP_WRAPPER_PATH}.`);
+          const unsupported = backupsMode === "unsupported-target";
+          return {
+            observed_at_ms: backupsMode === "disconnected" ? BACKUP_FIXTURE_TIME - 3600000 : BACKUP_FIXTURE_TIME,
+            os: "Linux",
+            arch: unsupported ? "aarch64" : "x86_64",
+            user: "deploy",
+            home: "/home/deploy",
+            timezone: "UTC",
+            rclone_path: backupRuntime.rcloneInstalled ? "/usr/bin/rclone" : "",
+            rclone_version: backupRuntime.rcloneInstalled ? "rclone v1.70.3" : "",
+            crontab_implementation: backupRuntime.cronInstalled ? "crontab" : "missing",
+            cron_installed: backupRuntime.cronInstalled,
+            cron_running: backupRuntime.cronRunning,
+            service_manager: unsupported ? "none" : "systemd",
+            scheduler_supported: backupRuntime.cronInstalled && backupRuntime.rcloneInstalled,
+            process_groups: !unsupported,
+            target: unsupported ? "unknown" : "ubuntu",
+            privilege: unsupported ? "none" : "sudo",
+            warnings,
+          };
+        }
+        function backupRecoveryError() {
+          if (backupsMode !== "partial-import") return undefined;
+          return `Import left a corrupt staged record at ${BACKUP_STAGED_RECORD_PATH} and a too-large staged record at ${BACKUP_STATE_ROOT}/runs/run-too-large-preview.json; both remain available for cleanup.`;
+        }
+        function backupRemoteBlocker(requireProcessGroups = false) {
+          if (backupsMode === "disconnected") return backupFailure("not_connected", "The server is disconnected. Cached backup data remains available.", true);
+          if (!backupRuntime.rcloneInstalled) return backupFailure("rclone_missing", "rclone is not installed on this server.", true, { path: "/usr/bin/rclone" });
+          if (requireProcessGroups && backupsMode === "unsupported-target") return backupFailure("unsupported_target", "This target cannot provide verifiable process-group cancellation.", false, { step: "process_group_probe" });
+          return null;
+        }
+        function backupPlannedJob(payload) {
+          const draft = payload.job || {};
+          const destinationInput = draft.destination || {};
+          const existing = backupJobs.find((job) => job.id === draft.id);
+          const provider = backupsMode === "editor-r2"
+            ? "r2"
+            : backupsMode === "editor-minio-http-warning"
+              ? "minio"
+              : backupsMode === "editor-aws-key" || backupsMode === "editor-aws-iam"
+                ? "aws"
+                : destinationInput.provider || "aws";
+          const credentialMode = backupsMode === "editor-aws-iam" || backupsMode === "schedule-conflict" ? "aws_runtime" : destinationInput.credential_mode || "access_key";
+          const endpoint = backupsMode === "editor-r2"
+            ? "https://r2.preview.invalid"
+            : backupsMode === "editor-minio-http-warning"
+              ? "http://minio.preview.invalid:9000"
+              : typeof destinationInput.endpoint === "string" ? destinationInput.endpoint : "";
+          const region = provider === "r2" ? "auto" : destinationInput.region || "us-east-1";
+          const scheduleInput = draft.schedule || {};
+          const forceScheduled = backupsMode === "schedule-secret-disclosure" || backupsMode === "schedule-conflict";
+          const scheduleMode = forceScheduled ? "interval" : scheduleInput.mode || "manual";
+          let schedule;
+          if (scheduleMode === "interval") {
+            schedule = {
+              mode: "interval",
+              enabled: forceScheduled ? true : scheduleInput.enabled !== false,
+              every: Number(scheduleInput.every) > 0 ? Number(scheduleInput.every) : 24,
+              unit: scheduleInput.unit === "days" ? "days" : "hours",
+              anchor_epoch_sec: Number.isInteger(scheduleInput.anchor_epoch_sec) ? scheduleInput.anchor_epoch_sec : 1786147200,
+            };
+          } else if (scheduleMode === "custom") {
+            schedule = { mode: "custom", enabled: scheduleInput.enabled !== false, expr: scheduleInput.expr || "17 2 * * *" };
+          } else {
+            schedule = { mode: "manual", enabled: false };
+          }
+          const names = {
+            "editor-aws-key": "AWS access-key backup",
+            "editor-aws-iam": "AWS runtime backup",
+            "editor-r2": "R2 documents backup",
+            "editor-minio-http-warning": "MinIO documents backup",
+            "schedule-secret-disclosure": "Scheduled documents backup",
+            "schedule-conflict": "Scheduled documents backup",
+          };
+          return {
+            id: draft.id || "backup-job-planned",
+            server_id: draft.server_id || BACKUP_SERVER_ID,
+            revision: existing ? existing.revision + 1 : 1,
+            name: String(draft.name || names[backupsMode] || "Documents backup"),
+            source_path: String(draft.source_path || "/home/deploy/documents"),
+            destination: {
+              type: "s3",
+              provider,
+              bucket: String(destinationInput.bucket || "oars-preview-backups"),
+              prefix: String(destinationInput.prefix || "production/documents"),
+              endpoint,
+              region,
+              credential_mode: credentialMode,
+              storage_class: provider === "aws" ? String(destinationInput.storage_class || "STANDARD") : "",
+            },
+            transfer: draft.transfer === "sync" ? "sync" : "copy",
+            schedule,
+            created_at_ms: existing ? existing.created_at_ms : BACKUP_FIXTURE_TIME,
+            updated_at_ms: BACKUP_FIXTURE_TIME,
+          };
+        }
+        function backupJobPlanPayload(payload) {
+          const job = backupPlannedJob(payload);
+          const scheduledSecret = job.schedule.enabled && job.destination.credential_mode === "access_key";
+          const warnings = [];
+          if (backupsMode === "editor-minio-http-warning") warnings.push("The MinIO endpoint uses cleartext HTTP. Credentials and backup data would cross the network without TLS.");
+          if (backupsMode === "schedule-secret-disclosure") warnings.push("An unattended schedule requires sending credentials to this server to write a mode 0600 rclone config. Approve this disclosure before Save.");
+          if (backupsMode === "schedule-conflict") warnings.push("The current crontab hash is frozen in this plan. Save stops without merging if the crontab changes.");
+          const effects = ["persist local backup job"];
+          if (job.schedule.enabled) effects.push("write verified remote config/wrapper/metadata", "replace exact Oars crontab block");
+          const schedulePreview = job.schedule.enabled ? {
+            timezone: "UTC",
+            crontab_block: `# oars:backup=${job.id} schema=1\n17 * * * * ${BACKUP_WRAPPER_PATH}\n# oars:end`,
+          } : undefined;
+          const plan = {
+            ok: true,
+            plan_id: BACKUP_JOB_PLAN_ID,
+            expires_at_ms: BACKUP_FIXTURE_TIME + 600000,
+            job,
+            requires_connection_test: !job.capability_proof,
+            requires_remote_secret: scheduledSecret,
+            effects,
+            warnings,
+            ...(schedulePreview ? { schedule_preview: schedulePreview } : {}),
+          };
+          backupJobPlans.set(plan.plan_id, cloneBackupFixture(plan));
+          return plan;
+        }
+        function backupOperationSteps(kind) {
+          return {
+            refresh: ["probe_runtime", "import_staged_records", "verify_cleanup"],
+            test: ["list", "write", "read", "delete", "cleanup_verify"],
+            save: ["write_remote_config", "write_wrapper", "install_schedule", "write_local_job"],
+            delete: ["remove_schedule", "remove_wrapper", "remove_config_section", "remove_local_job"],
+            install: ["verify_target", "install", "verify"],
+            cleanup: ["remove_leftover", "verify_absent"],
+          }[kind] || ["work"];
+        }
+        function startBackupOperation(kind, payload, extra = {}) {
+          const operationId = payload.operation_id;
+          const prior = backupOperations.get(operationId);
+          if (prior) return prior;
+          const operation = {
+            operationId,
+            kind,
+            polls: 0,
+            canceled: false,
+            terminal: false,
+            applied: false,
+            ...extra,
+          };
+          backupOperations.set(operationId, operation);
+          return operation;
+        }
+        function runningBackupOperation(operation) {
+          operation.polls += 1;
+          const longRunning = (operation.kind === "refresh" && backupsMode === "refreshing") || (operation.kind === "test" && backupsMode === "test-running");
+          const terminalAt = longRunning ? 6 : 2;
+          const ids = backupOperationSteps(operation.kind);
+          if (operation.canceled) {
+            operation.terminal = true;
+            return {
+              ok: true,
+              operation_id: operation.operationId,
+              kind: operation.kind,
+              state: "canceled",
+              steps: ids.map((id, index) => ({ id, state: index === 0 ? "canceled" : "skipped" })),
+              started_at_ms: BACKUP_FIXTURE_TIME + 10000,
+              finished_at_ms: BACKUP_FIXTURE_TIME + 20000,
+              error: backupFailure("canceled", "The operation was canceled.", false),
+            };
+          }
+          if (operation.polls < terminalAt) {
+            const queued = operation.polls === 1 && longRunning;
+            const activeIndex = Math.min(Math.max(operation.polls - (longRunning ? 2 : 1), 0), ids.length - 1);
+            return {
+              ok: true,
+              operation_id: operation.operationId,
+              kind: operation.kind,
+              state: queued ? "queued" : "running",
+              steps: ids.map((id, index) => ({ id, state: queued ? "pending" : index < activeIndex ? "done" : index === activeIndex ? "running" : "pending" })),
+              started_at_ms: BACKUP_FIXTURE_TIME + 10000,
+            };
+          }
+          operation.terminal = true;
+          const doneSteps = ids.map((id) => ({ id, state: "done" }));
+          let state = "done";
+          let result;
+          let error;
+          let steps = doneSteps;
+          if (operation.kind === "test") {
+            if (backupsMode === "test-cleanup-failed") {
+              error = backupFailure("cleanup_failed", "The test object could not be removed; Save remains blocked.", true, { step: "cleanup_verify", remote_object: BACKUP_SENTINEL_OBJECT });
+              state = "partial";
+              steps = ids.map((id) => ({ id, state: id === "delete" || id === "cleanup_verify" ? "failed" : "done", ...(id === "cleanup_verify" ? { error } : {}) }));
+              result = {
+                cleanup: "required",
+                retry_action: "operationCancel",
+                needs_credentials: true,
+                job_id: "backup-job-planned",
+              };
+              operation.cleanupRequired = true;
+              operation.cleanupNeedsCredentials = true;
+              operation.cleanupRemoteObject = BACKUP_SENTINEL_OBJECT;
+            } else {
+              result = {
+                checks: { list: "passed", write: "passed", read: "passed", delete: "passed", cleanup_verify: "passed" },
+                capability_proof: { id: "backup-proof-test-001", expires_at_ms: BACKUP_FIXTURE_TIME + 600000, binding_sha256: "2".repeat(64) },
+              };
+            }
+          } else if (operation.kind === "save") {
+            if (backupsMode === "schedule-conflict") {
+              error = backupFailure("conflict", "The crontab changed after planning; no unseen edits were merged.", true, { step: "install_schedule" });
+              state = "partial";
+              steps = ids.map((id) => ({ id, state: id === "install_schedule" ? "conflict" : id === "write_local_job" ? "skipped" : "done", ...(id === "install_schedule" ? { error } : {}) }));
+              result = { cleanup: "required", retry_action: "operationCancel", needs_credentials: false, job_id: operation.job.id };
+              operation.cleanupRequired = true;
+              operation.cleanupNeedsCredentials = false;
+            } else {
+              result = { job_id: operation.job.id };
+            }
+          } else if (operation.kind === "delete") {
+            if (backupsMode === "delete-partial-cleanup") {
+              error = backupFailure("cleanup_failed", "The scheduled wrapper remains and requires cleanup.", true, { step: "remove_wrapper", path: BACKUP_WRAPPER_PATH });
+              state = "partial";
+              steps = ids.map((id) => ({ id, state: id === "remove_wrapper" ? "failed" : id === "remove_local_job" ? "skipped" : "done", ...(id === "remove_wrapper" ? { error } : {}) }));
+              result = { cleanup: "required", retry_action: "operationCancel", needs_credentials: false, job_id: operation.job.id };
+              operation.cleanupRequired = true;
+              operation.cleanupNeedsCredentials = false;
+            } else {
+              result = { job_id: operation.job.id, leftovers: [] };
+            }
+          } else if (operation.kind === "refresh") {
+            const status = backupStatusPayload();
+            result = { status, imported: 0, warnings: status.warnings.length };
+          } else if (operation.kind === "install") {
+            if (operation.plan.manual) {
+              error = backupFailure("unsupported_target", "Automatic installation is unsupported for this unverified target; use the manual plan.", false, { step: "install" });
+              state = "failed";
+              steps = ids.map((id) => ({ id, state: id === "install" ? "failed" : id === "verify" ? "skipped" : "done", ...(id === "install" ? { error } : {}) }));
+            } else {
+              result = { target: operation.plan.target, what: operation.plan.what, partial_effects: false };
+            }
+          } else if (operation.kind === "cleanup") {
+            result = { cleanup: "complete", ...(operation.cleanupRemoteObject ? { remote_object: operation.cleanupRemoteObject } : {}) };
+          }
+          if (!operation.applied && state === "done") {
+            operation.applied = true;
+            if (operation.kind === "save") {
+              const at = backupJobs.findIndex((job) => job.id === operation.job.id);
+              if (at >= 0) backupJobs[at] = cloneBackupFixture(operation.job); else backupJobs.push(cloneBackupFixture(operation.job));
+            }
+            if (operation.kind === "delete") backupJobs = backupJobs.filter((job) => job.id !== operation.job.id);
+            if (operation.kind === "install") {
+              if (operation.plan.what === "rclone") backupRuntime.rcloneInstalled = true;
+              if (operation.plan.what === "cron") backupRuntime.cronInstalled = true;
+              if (operation.plan.what === "start_cron") backupRuntime.cronRunning = true;
+            }
+
+          }
+          return {
+            ok: true,
+            operation_id: operation.operationId,
+            kind: operation.kind,
+            state,
+            steps,
+            started_at_ms: BACKUP_FIXTURE_TIME + 10000,
+            finished_at_ms: BACKUP_FIXTURE_TIME + 20000,
+            ...(result !== undefined ? { result } : {}),
+            ...(error ? { error } : {}),
+          };
+        }
+        function backupRunMode(job) {
+          if (["run-copy", "run-sync-confirm", "run-no-changes", "run-failed", "run-cancel-requested", "run-interrupted"].includes(backupsMode)) return backupsMode;
+          return job.transfer === "sync" ? "run-sync-confirm" : "run-copy";
+        }
+        function backupRunPollPayload(run, payload) {
+          run.polls += 1;
+          if (run.cancelRequested) run.cancelPolls += 1;
+          const mode = run.mode;
+          let status;
+          if (run.terminalStatus) status = run.terminalStatus;
+          else if (run.cancelRequested) status = run.cancelPolls < 4 ? "cancel_requested" : "canceled";
+          else if (mode === "run-no-changes") status = run.polls === 1 ? "queued" : run.polls === 2 ? "running" : "no_changes";
+          else if (mode === "run-failed") status = run.polls === 1 ? "preparing" : run.polls === 2 ? "running" : "failed";
+          else if (mode === "run-interrupted") status = run.polls === 1 ? "queued" : run.polls === 2 ? "running" : "interrupted";
+          else status = run.polls === 1 ? "queued" : run.polls === 2 ? "preparing" : run.polls < 5 ? "running" : "success";
+          const terminal = ["success", "no_changes", "failed", "canceled", "interrupted", "partial"].includes(status);
+          const progress = status === "success" ? 1 : status === "running" ? Math.min(0.75, run.polls * 0.2) : status === "failed" ? 0.34 : status === "canceled" || status === "cancel_requested" ? 0.25 : 0;
+          const noChanges = status === "no_changes";
+          const bytesTotal = noChanges ? 0 : 157286400;
+          const filesTotal = noChanges ? 0 : 48;
+          const bytesDone = Math.floor(bytesTotal * progress);
+          const filesDone = Math.floor(filesTotal * progress);
+          const phase = status === "queued" ? "queued" : status === "preparing" ? "preparing" : status === "cancel_requested" ? "cancel_requested" : terminal ? "finished" : "running";
+          const logParts = ["Preparing source " + run.job.source_path + "\n"];
+          if (run.polls >= 2) logParts.push(`${run.job.transfer === "sync" ? "Sync" : "Copy"} transfer admitted\n`);
+          if (run.polls >= 3) logParts.push(noChanges ? "No files required transfer\n" : `Transferred ${filesDone} of ${filesTotal} files\n`);
+          if (terminal) logParts.push(status === "failed" ? "Transfer stopped after a transport error\n" : status === "interrupted" ? "Connection ended before process termination could be verified\n" : status === "canceled" ? "Process group stopped; cleanup complete\n" : "Cleanup complete\n");
+          const fullLog = logParts.join("");
+          run.lastLog = fullLog;
+          if (terminal) run.terminalStatus = status;
+          const requestedCursor = Math.max(0, Number(payload.log_cursor) || 0);
+          const cursor = Math.min(requestedCursor, fullLog.length);
+          let error;
+          if (status === "failed") error = backupFailure("transport_error", "The remote transfer ended after a transport error.", true, { step: "transfer" });
+          if (status === "interrupted") error = backupFailure("interrupted", "The connection ended before process termination could be verified.", true, { step: "verify_process_group" });
+          return {
+            ok: true,
+            run_id: run.runId,
+            status,
+            phase,
+            bytes_done: bytesDone,
+            bytes_total: bytesTotal,
+            files_done: filesDone,
+            files_total: filesTotal,
+            speed_bps: status === "running" ? 12582912 : 0,
+            eta_sec: status === "running" ? 8 : 0,
+            started_at_ms: BACKUP_FIXTURE_TIME + 30000,
+            ...(terminal ? { finished_at_ms: BACKUP_FIXTURE_TIME + 150000 } : {}),
+            log_cursor: fullLog.length,
+            log_delta: fullLog.slice(cursor),
+            dropped: 0,
+            cleanup_state: terminal ? "complete" : "pending",
+            ...(error ? { error } : {}),
+          };
+        }
+        function backupInstallPlan(what) {
+          const commands = {
+            rclone: "sudo -n /usr/bin/apt-get update && sudo -n /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y rclone",
+            cron: "sudo -n /usr/bin/apt-get update && sudo -n /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y cron",
+            start_cron: "sudo -n /usr/sbin/service cron start",
+          };
+          if (!commands[what]) return null;
+          const manual = backupsMode === "unsupported-target";
+          const plan = {
+            ok: true,
+            plan_id: BACKUP_INSTALL_PLAN_IDS[what],
+            expires_at_ms: BACKUP_FIXTURE_TIME + 300000,
+            target: manual ? "unknown" : "ubuntu",
+            privilege: manual ? "none" : "sudo",
+            commands: manual ? [] : [commands[what]],
+            effects: [manual ? "follow the target installation guide manually" : what],
+            rollback: [],
+            manual,
+          };
+          backupInstallPlans.set(plan.plan_id, { ...cloneBackupFixture(plan), what });
+          return plan;
+        }
+        function invokeBackupFixture(command, payload) {
+          if (command === "oars.backup.jobs.list") {
+            const jobs = payload.server_id === BACKUP_SERVER_ID ? backupJobs : [];
+            const recoveryError = backupRecoveryError();
+            return { ok: true, jobs: cloneBackupFixture(jobs), ...(recoveryError ? { recovery_error: recoveryError } : {}) };
+          }
+          if (command === "oars.backup.status") {
+            if (payload.server_id !== BACKUP_SERVER_ID) return { ok: true, status: null, stale: true };
+            const recoveryError = backupRecoveryError();
+            return { ok: true, status: cloneBackupFixture(backupStatusPayload()), stale: backupsMode === "disconnected", ...(recoveryError ? { recovery_error: recoveryError } : {}) };
+          }
+          if (command === "oars.backup.refresh") {
+            if (!payload.operation_id || !payload.server_id) return backupFailure("invalid_payload", "A server ID and operation ID are required to refresh backups.", false);
+            if (backupsMode === "disconnected") return backupFailure("not_connected", "The server is disconnected. Refresh cannot probe it.", true);
+            const operation = startBackupOperation("refresh", payload, { serverId: payload.server_id || BACKUP_SERVER_ID });
+            return { ok: true, operation_id: operation.operationId };
+          }
+          if (command === "oars.backup.jobs.plan") return backupJobPlanPayload(payload);
+          if (command === "oars.backup.jobs.save") {
+            const plan = backupJobPlans.get(payload.plan_id);
+            if (!plan || !payload.operation_id) return backupFailure("invalid_payload", "A current job plan and operation ID are required.", false);
+            const blocker = backupRemoteBlocker();
+            if (blocker) return blocker;
+            if (plan.requires_remote_secret && payload.approved_remote_secret !== true) return backupFailure("invalid_payload", "Approve the remote-secret disclosure before saving this schedule.", false);
+            if (plan.requires_remote_secret && (!payload.schedule_credentials || !payload.schedule_credentials.access_key || !payload.schedule_credentials.secret_key)) return backupFailure("invalid_credentials", "Both schedule credential fields are required.", false);
+            if (plan.job.transfer === "sync" && plan.job.schedule.enabled && plan.job.schedule.mode !== "manual" && payload.confirm_job_name !== plan.job.name) return backupFailure("invalid_payload", "Scheduled Sync requires the exact reviewed job name.", false);
+            const operation = startBackupOperation("save", payload, { planId: plan.plan_id, job: cloneBackupFixture(plan.job) });
+            return { ok: true, operation_id: operation.operationId, job_id: plan.job.id };
+          }
+          if (command === "oars.backup.jobs.deletePlan") {
+            const job = backupJobs.find((item) => item.id === payload.job_id && item.server_id === payload.server_id);
+            if (!job) return backupFailure("not_found", "Backup job not found for this server.", false);
+            if (payload.expected_revision !== job.revision) return backupFailure("conflict", "The backup job changed; refresh before deleting it.", true);
+            const plan = {
+              ok: true,
+              plan_id: BACKUP_DELETE_PLAN_ID,
+              expires_at_ms: BACKUP_FIXTURE_TIME + 600000,
+              job_name: job.name,
+              effects: ["remove local backup job"],
+              leftovers: job.schedule.enabled ? ["remote schedule artifacts and exact crontab marker are removed transactionally"] : [],
+            };
+            backupDeletePlans.set(plan.plan_id, { ...plan, job: cloneBackupFixture(job) });
+            return cloneBackupFixture(plan);
+          }
+          if (command === "oars.backup.jobs.delete") {
+            const plan = backupDeletePlans.get(payload.plan_id);
+            if (!plan || !payload.operation_id) return backupFailure("invalid_payload", "A current delete plan and operation ID are required.", false);
+            if (payload.confirm_job_name !== plan.job_name) return backupFailure("invalid_payload", "Type the exact backup job name to confirm deletion.", false);
+            if (backupsMode === "disconnected") return backupFailure("not_connected", "The server is disconnected. Remote backup artifacts cannot be removed.", true);
+            const operation = startBackupOperation("delete", payload, { planId: plan.plan_id, job: cloneBackupFixture(plan.job) });
+            return { ok: true, operation_id: operation.operationId };
+          }
+          if (command === "oars.backup.operationPoll") {
+            const operation = backupOperations.get(payload.operation_id);
+            if (!operation) return backupFailure("not_found", "Backup operation not found.", false);
+            return runningBackupOperation(operation);
+          }
+          if (command === "oars.backup.operationCancel") {
+            const operation = backupOperations.get(payload.operation_id);
+            if (!operation) return backupFailure("not_found", "Backup operation not found.", false);
+            if (operation.terminal && operation.cleanupRequired) {
+              if (operation.cleanupNeedsCredentials && (!payload.credentials || !payload.credentials.access_key || !payload.credentials.secret_key)) {
+                return backupFailure("invalid_credentials", "Fresh credentials are required for this access-key cleanup retry.", false);
+              }
+              operation.kind = "cleanup";
+              operation.polls = 0;
+              operation.terminal = false;
+              operation.cleanupRequired = false;
+              operation.canceled = false;
+            } else if (!operation.terminal) operation.canceled = true;
+            return { ok: true };
+          }
+          if (command === "oars.backup.history") {
+            const ownsJob = payload.server_id === BACKUP_SERVER_ID && [backupCopyJob.id, backupSyncJob.id].includes(payload.job_id);
+            if (!ownsJob) return backupFailure("not_found", "Backup history not found for this server and job.", false);
+            const requestedLimit = payload.limit === undefined ? 20 : Number(payload.limit);
+            const limit = Math.min(20, Math.max(0, Number.isFinite(requestedLimit) ? requestedLimit : 20));
+            const runs = backupsMode === "empty" ? [] : backupHistory.filter((run) => run.server_id === payload.server_id && run.job_id === payload.job_id).slice(0, limit);
+            const recoveryError = backupRecoveryError();
+            return { ok: true, runs: cloneBackupFixture(runs), ...(recoveryError ? { recovery_error: recoveryError } : {}) };
+          }
+          if (command === "oars.backup.historyLog") {
+            if (payload.server_id !== BACKUP_SERVER_ID) return backupFailure("not_found", "Backup run log not found for this server.", false);
+            const stored = backupHistoryLogs.get(payload.run_id) || (backupRuns.has(payload.run_id) ? backupRuns.get(payload.run_id).lastLog || "" : null);
+            if (stored === null) return backupFailure("not_found", "Backup run log not found for this server.", false);
+            const from = Math.min(Math.max(0, Number(payload.cursor) || 0), stored.length);
+            const max = Math.min(65536, Math.max(1, Number(payload.max) || 32768));
+            const delta = stored.slice(from, from + max);
+            return { ok: true, cursor: from + delta.length, delta, eof: from + delta.length >= stored.length, dropped: 0 };
+          }
+          if (command === "oars.backup.test.plan") {
+            const jobPlan = backupJobPlans.get(payload.job_plan_id);
+            if (!jobPlan) return backupFailure("plan_expired", "The backup job plan is unknown or expired.", true);
+            const plan = {
+              ok: true,
+              test_plan_id: BACKUP_TEST_PLAN_ID,
+              expires_at_ms: BACKUP_FIXTURE_TIME + 600000,
+              remote_object: BACKUP_SENTINEL_OBJECT,
+              checks: ["list", "write", "read", "delete", "cleanup_verify"],
+              mutates: true,
+            };
+            backupTestPlans.set(plan.test_plan_id, { ...plan, job_plan_id: jobPlan.plan_id });
+            return cloneBackupFixture(plan);
+          }
+          if (command === "oars.backup.test") {
+            if (!payload.operation_id || !backupTestPlans.has(payload.test_plan_id)) return backupFailure("invalid_payload", "A current test plan and operation ID are required.", false);
+            const blocker = backupRemoteBlocker();
+            if (blocker) return blocker;
+            const operation = startBackupOperation("test", payload, { testPlanId: payload.test_plan_id });
+            return { ok: true, operation_id: operation.operationId };
+          }
+          if (command === "oars.backup.run") {
+            if (!payload.operation_id) return backupFailure("invalid_payload", "An operation ID is required to start a backup run.", false);
+            const blocker = backupRemoteBlocker(true);
+            if (blocker) return blocker;
+            const job = backupJobs.find((item) => item.id === payload.job_id && item.server_id === payload.server_id);
+            if (!job) return backupFailure("not_found", "Backup job not found for this server.", false);
+            if (payload.expected_revision !== job.revision) return backupFailure("conflict", "The backup job changed; refresh before running it.", true);
+            if (job.transfer === "sync" && payload.confirm_job_name !== job.name) return backupFailure("invalid_payload", "Type the exact sync job name before running it.", false);
+            const priorRunId = backupRunsByOperation.get(payload.operation_id);
+            if (priorRunId) return { ok: true, run_id: priorRunId };
+            const mode = backupRunMode(job);
+            const runId = {
+              "run-copy": "backup-run-copy-001",
+              "run-sync-confirm": "backup-run-sync-001",
+              "run-no-changes": "backup-run-no-changes-001",
+              "run-failed": "backup-run-failed-001",
+              "run-cancel-requested": "backup-run-cancel-001",
+              "run-interrupted": "backup-run-interrupted-001",
+            }[mode];
+            backupRuns.set(runId, { runId, mode, job: cloneBackupFixture(job), polls: 0, cancelRequested: mode === "run-cancel-requested", cancelPolls: 0, lastLog: "" });
+            backupRunsByOperation.set(payload.operation_id, runId);
+            return { ok: true, run_id: runId };
+          }
+          if (command === "oars.backup.poll") {
+            const run = backupRuns.get(payload.run_id);
+            if (!run) return backupFailure("not_found", "Backup run not found.", false);
+            return backupRunPollPayload(run, payload);
+          }
+          if (command === "oars.backup.cancel") {
+            const run = backupRuns.get(payload.run_id);
+            if (!run) return backupFailure("not_found", "Backup run not found.", false);
+            if (!run.terminalStatus) {
+              run.cancelRequested = true;
+              run.cancelPolls = 0;
+            }
+            return { ok: true };
+          }
+          if (command === "oars.backup.install.plan") {
+            const plan = backupInstallPlan(payload.what);
+            return plan || backupFailure("invalid_payload", "Unknown backup install target.", false);
+          }
+          if (command === "oars.backup.install") {
+            if (!payload.operation_id || !backupInstallPlans.has(payload.plan_id)) return backupFailure("invalid_payload", "A current install plan and operation ID are required.", false);
+            if (backupsMode === "disconnected") return backupFailure("not_connected", "The server is disconnected. Installation cannot start.", true);
+            const plan = backupInstallPlans.get(payload.plan_id);
+            const operation = startBackupOperation("install", payload, { planId: plan.plan_id, plan: cloneBackupFixture(plan) });
+            return { ok: true, operation_id: operation.operationId };
+          }
+          return backupFailure("invalid_payload", `Unsupported backup preview command: ${command}.`, false);
+        }
+        function backupCredentialFixtureJson() {
+          return JSON.stringify({ version: 1, access_key: "OARS_FIXTURE_ACCESS_KEY_NOT_A_SECRET", secret_key: "OARS_FIXTURE_SECRET_KEY_NOT_A_SECRET" });
+        }
+        function redactBackupCallPayload(value, key = "") {
+          if (Array.isArray(value)) return value.map((item) => redactBackupCallPayload(item));
+          if (!value || typeof value !== "object") {
+            if (typeof value === "string" && ["access_key", "secret_key", "secret_access_key", "session_token", "token", "password", "secret", "credentials", "schedule_credentials"].includes(key)) return "<redacted>";
+            return value;
+          }
+          return Object.fromEntries(Object.entries(value).map(([childKey, childValue]) => [childKey, redactBackupCallPayload(childValue, childKey)]));
+        }
         function recordCall(command, payload) {
           let recorded = payload;
+          if (command.startsWith("oars.backup.")) recorded = redactBackupCallPayload(payload);
           if (command === "native-sdk.credentials.set" && payload && "secret" in payload) recorded = { ...payload, secret: "<redacted>" };
           if (command === "oars.vnc.setup" && payload && "password" in payload) recorded = { ...payload, password: "<redacted>" };
           if ((command === "oars.sftp.write" || command === "oars.sftp.save") && payload && "base64" in payload) {
@@ -306,7 +959,7 @@
           if ((command === "oars.scripts.run" || command === "oars.scripts.broadcastPrepare") && payload && payload.vars) {
             recorded = { ...payload, vars: Object.fromEntries(Object.entries(payload.vars).map(([k, v]) => [k, { ...v, value: "***" }])) };
           }
-          calls.push({ command, payload: recorded, at: performance.now() });
+          calls.push({ command, payload: recorded, at: command.startsWith("oars.backup.") ? BACKUP_FIXTURE_TIME + calls.length : performance.now() });
           document.documentElement.dataset.oarsCalls = JSON.stringify(calls);
         }
         window.__oarsMock = { calls, servers };
@@ -430,15 +1083,22 @@
             }
             if (command === "oars.servers.delete") return { ok: true };
             if (command.startsWith("native-sdk.credentials.")) {
-              if (command.endsWith(".set")) { previewSecrets.set(payload.account, payload.secret); return { ok: true }; }
+              const account = String(payload.account || "");
+              const backupAccount = account.startsWith("backup:") || account.startsWith("backup-pending:");
+              if (command.endsWith(".set")) {
+                previewSecrets.set(payload.account, backupAccount ? backupCredentialFixtureJson() : payload.secret);
+                return { ok: true };
+              }
               if (command.endsWith(".delete")) { previewSecrets.delete(payload.account); return { ok: true }; }
               if (command.endsWith(".get")) {
+                if (backupAccount) return previewSecrets.get(payload.account) || backupCredentialFixtureJson();
                 if (previewSecrets.has(payload.account)) return previewSecrets.get(payload.account);
-                if (vncCredsMode === "none" && payload.account && String(payload.account).startsWith("vnc:")) return null;
+                if (vncCredsMode === "none" && account.startsWith("vnc:")) return null;
                 return "preview-secret";
               }
               return { ok: true };
             }
+            if (command.startsWith("oars.backup.")) return invokeBackupFixture(command, payload);
             if (command === "oars.ssh.connect" || command === "oars.ssh.disconnect" || command === "oars.ssh.resize" || command === "oars.ssh.input" || command === "oars.ssh.trust") return { ok: true };
             if (command === "oars.ssh.retrust") {
               const server = servers.find((item) => item.id === payload.server_id);

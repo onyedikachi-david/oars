@@ -576,30 +576,31 @@ export interface DeployHistoryRecord { id: number; server_id: string; app_id: st
 // Spec 10: Backups (oars.backup.*)
 // ============================================================================
 
-export type BackupTransferKind = "sync" | "copy";
-export type BackupDestinationType = "s3" | "local";
-export type BackupProvider = "aws" | "r2" | "b2" | "b2_s3" | "wasabi" | "minio" | "spaces";
-export type BackupScheduleMode = "manual" | "interval" | "custom";
+export type BackupProvider = "aws" | "r2" | "b2_s3" | "wasabi" | "minio" | "spaces";
+export type BackupTransfer = "copy" | "sync";
+export type BackupCredentialMode = "access_key" | "aws_runtime";
 export type BackupIntervalUnit = "hours" | "days";
-export type BackupRunStatus = "queued" | "running" | "success" | "failed" | "no_changes" | "canceled" | "interrupted";
 
 export interface BackupDestination {
-  type: BackupDestinationType;
+  type: "s3";
   provider: BackupProvider;
   bucket: string;
   prefix: string;
   endpoint: string;
   region: string;
-  use_iam: boolean;
+  credential_mode: BackupCredentialMode;
   storage_class: string;
 }
 
-export interface BackupSchedule {
-  mode: BackupScheduleMode;
-  interval_unit: BackupIntervalUnit;
-  interval_every: number;
-  expr: string;
-  enabled: boolean;
+export type BackupSchedule =
+  | { mode: "manual"; enabled: false }
+  | { mode: "interval"; enabled: boolean; every: number; unit: BackupIntervalUnit; anchor_epoch_sec: number }
+  | { mode: "custom"; enabled: boolean; expr: string };
+
+export interface BackupCapabilityProof {
+  id: string;
+  expires_at_ms: number;
+  binding_sha256: string;
 }
 
 export interface BackupJob {
@@ -609,45 +610,26 @@ export interface BackupJob {
   name: string;
   source_path: string;
   destination: BackupDestination;
-  transfer: BackupTransferKind;
+  transfer: BackupTransfer;
   schedule: BackupSchedule;
-  // Timestamps on the wire will move to integer milliseconds (NEXT-SPEC).
-  // Keep ns fields for backwards compat until the bridge migration lands.
-  created_at_ns: number;
-  updated_at_ns: number;
-  created_at_ms?: number;
-  updated_at_ms?: number;
+  capability_proof?: BackupCapabilityProof;
+  created_at_ms: number;
+  updated_at_ms: number;
 }
 
-export interface BackupJobInput {
+export interface BackupJobDraft {
   id?: string;
   server_id: string;
-  expected_revision?: number;
   name: string;
   source_path: string;
-  destination: Partial<BackupDestination> & {
-    type?: BackupDestinationType;
-    provider?: BackupProvider;
-    bucket?: string;
-  };
-  transfer?: BackupTransferKind;
-  schedule?: Partial<BackupSchedule>;
+  destination: BackupDestination;
+  transfer: BackupTransfer;
+  schedule: BackupSchedule;
 }
 
 export interface BackupCredentials {
   access_key: string;
   secret_key: string;
-}
-
-export interface BackupJobsListResult {
-  ok: true;
-  jobs: BackupJob[];
-  recovery_error?: string;
-}
-
-export interface BackupJobSaveResult {
-  ok: true;
-  job: BackupJob;
 }
 
 export type BackupErrorCode =
@@ -660,97 +642,47 @@ export type BackupErrorCode =
   | "capability_failed" | "cleanup_failed" | "store_corrupt"
   | "canceled" | "interrupted" | "internal";
 
+export interface BackupFailureDetail {
+  step?: string;
+  path?: string;
+  remote_object?: string;
+}
+
 export interface BackupFailure {
   ok: false;
   code: BackupErrorCode;
   error: string;
   retryable: boolean;
-  detail?: { step?: string; path?: string; remote_object?: string };
+  detail?: BackupFailureDetail;
 }
 
-export type BackupCheckState = "passed" | "failed";
-
-export interface BackupTestResult {
+export interface BackupJobsListResult {
   ok: true;
-  checks: {
-    list: BackupCheckState;
-    write: BackupCheckState;
-    read: BackupCheckState;
-    delete: BackupCheckState;
-    cleanup_verify: BackupCheckState;
-  };
-  capability_proof?: { id: string; expires_at_ms: number; binding_sha256: string };
-  leftover_remote_object?: string;
+  jobs: BackupJob[];
+  recovery_error?: string;
 }
 
-export interface BackupRunStartResult {
-  ok: boolean;
+export interface BackupStatusResult {
+  ok: true;
+  status: BackupServerStatus | null;
+  stale: boolean;
+  recovery_error?: string;
+}
+
+export interface BackupOperationAdmission {
+  ok: true;
+  operation_id: string;
+}
+
+export interface BackupSaveAdmission extends BackupOperationAdmission {
+  job_id: string;
+}
+
+export interface BackupRunAdmission {
+  ok: true;
   run_id: string;
 }
 
-export interface BackupRunRecord {
-  id: string;
-  job_id: string;
-  server_id: string;
-  source: string;
-  status: BackupRunStatus;
-  started_at_ns: number;
-  finished_at_ns: number;
-  bytes_done: number;
-  bytes_total: number;
-  files_done: number;
-  files_total: number;
-  error: string;
-  log: string;
-}
-
-export interface BackupPollResult {
-  ok: boolean;
-  status: BackupRunStatus;
-  bytes_done: number;
-  bytes_total: number;
-  files_done: number;
-  files_total: number;
-  speed_bps: number;
-  eta_sec: number;
-  log_cursor: number;
-  dropped: number;
-  log_delta: string;
-  error: string;
-}
-
-export interface BackupHistoryResult {
-  ok: boolean;
-  runs: BackupRunRecord[];
-}
-
-export interface BackupInstallResult {
-  ok: boolean;
-  action: "already_installed" | "install" | "installed";
-  plan: string;
-}
-
-export interface BackupCronStatusResult {
-  ok: boolean;
-  rclone: boolean;
-  cron_installed: boolean;
-  cron_running: boolean;
-}
-
-// NEXT-SPEC typed operation / plan surfaces (wire ms).
-export type BackupOperationState = "queued" | "running" | "done" | "partial" | "failed" | "canceled";
-export type BackupStepState = "pending" | "running" | "done" | "conflict" | "failed" | "cancel_requested" | "canceled" | "skipped";
-export interface BackupOperation {
-  ok: true;
-  operation_id: string;
-  kind: "refresh" | "test" | "save" | "delete" | "install" | "cleanup";
-  state: BackupOperationState;
-  steps: Array<{ id: string; state: BackupStepState; error?: BackupFailure }>;
-  started_at_ms: number;
-  finished_at_ms?: number;
-  result?: unknown;
-  error?: BackupFailure;
-}
 export interface BackupPlanResult {
   ok: true;
   plan_id: string;
@@ -762,6 +694,19 @@ export interface BackupPlanResult {
   warnings: string[];
   schedule_preview?: { timezone: string; crontab_block: string };
 }
+
+export interface BackupDeletePlanResult {
+  ok: true;
+  plan_id: string;
+  expires_at_ms: number;
+  job_name: string;
+  effects: string[];
+  leftovers: string[];
+}
+
+export type BackupCheckName = "list" | "write" | "read" | "delete" | "cleanup_verify";
+export type BackupCheckState = "passed" | "failed";
+
 export interface BackupTestPlanResult {
   ok: true;
   test_plan_id: string;
@@ -770,16 +715,136 @@ export interface BackupTestPlanResult {
   checks: ["list", "write", "read", "delete", "cleanup_verify"];
   mutates: true;
 }
+
+export interface BackupTestOperationResult {
+  checks: Record<BackupCheckName, BackupCheckState>;
+  capability_proof?: BackupCapabilityProof;
+  leftover_remote_object?: string;
+}
+
+export interface BackupCleanupRequiredResult {
+  cleanup: "required";
+  retry_action: "operationCancel";
+  needs_credentials: boolean;
+  job_id?: string;
+}
+
+export interface BackupCleanupCompleteResult {
+  cleanup: "complete";
+  remote_object?: string;
+}
+
+export interface BackupRefreshOperationResult {
+  status: BackupServerStatus;
+  imported: number;
+  warnings: number;
+}
+
+export interface BackupJobOperationResult {
+  job_id: string;
+}
+
+export interface BackupInstallOperationResult {
+  target: string;
+  what: BackupInstallTarget;
+  partial_effects: boolean;
+}
+
+export type BackupOperationState = "queued" | "running" | "done" | "partial" | "failed" | "canceled";
+export type BackupStepState = "pending" | "running" | "done" | "conflict" | "failed" | "cancel_requested" | "canceled" | "skipped";
+export type BackupOperationKind = "refresh" | "test" | "save" | "delete" | "install" | "cleanup";
+
+export interface BackupOperationStep {
+  id: string;
+  state: BackupStepState;
+  error?: BackupFailure;
+}
+
+interface BackupOperationBase {
+  ok: true;
+  operation_id: string;
+  state: BackupOperationState;
+  steps: BackupOperationStep[];
+  started_at_ms: number;
+  finished_at_ms?: number;
+  error?: BackupFailure;
+}
+
+export type BackupOperation =
+  | (BackupOperationBase & { kind: "refresh"; result?: BackupRefreshOperationResult })
+  | (BackupOperationBase & { kind: "test"; result?: BackupTestOperationResult | BackupCleanupRequiredResult })
+  | (BackupOperationBase & { kind: "save" | "delete"; result?: BackupJobOperationResult | BackupCleanupRequiredResult })
+  | (BackupOperationBase & { kind: "install"; result?: BackupInstallOperationResult })
+  | (BackupOperationBase & { kind: "cleanup"; result?: BackupCleanupRequiredResult | BackupCleanupCompleteResult | BackupJobOperationResult });
+
 export interface BackupServerStatus {
-  rclone_path: string;
-  rclone_version: string;
-  crontab_impl: string;
-  cron_running: boolean;
+  observed_at_ms: number;
+  os: string;
+  arch: string;
+  user: string;
   home: string;
   timezone: string;
-  stale_imports?: number;
-  cleanup_required?: string[];
+  rclone_path: string;
+  rclone_version: string;
+  crontab_implementation: string;
+  cron_installed: boolean;
+  cron_running: boolean;
+  service_manager: string;
+  scheduler_supported: boolean;
+  process_groups: boolean;
+  target: string;
+  privilege: string;
+  warnings: string[];
 }
+
+export type BackupRunStatus =
+  | "queued" | "preparing" | "running" | "cancel_requested"
+  | "success" | "no_changes" | "failed" | "canceled" | "interrupted" | "partial" | "skipped_overlap";
+
+export type BackupRunPhase = "queued" | "preparing" | "running" | "cancel_requested" | "finished";
+export type BackupCleanupState = "pending" | "complete" | "failed";
+
+export interface BackupPollResult {
+  ok: true;
+  run_id: string;
+  status: BackupRunStatus;
+  phase: BackupRunPhase;
+  bytes_done: number;
+  bytes_total: number;
+  files_done: number;
+  files_total: number;
+  speed_bps: number;
+  eta_sec: number;
+  started_at_ms: number;
+  finished_at_ms?: number;
+  log_cursor: number;
+  log_delta: string;
+  dropped: number;
+  cleanup_state: BackupCleanupState;
+  error?: BackupFailure;
+}
+
+export interface BackupRunSummary {
+  run_id: string;
+  job_id: string;
+  server_id: string;
+  source: "manual" | "scheduled";
+  status: BackupRunStatus;
+  bytes_done: number;
+  bytes_total: number;
+  files_done: number;
+  files_total: number;
+  started_at_ms: number;
+  finished_at_ms?: number;
+  error?: BackupFailure;
+}
+
+export interface BackupHistoryResult {
+  ok: true;
+  runs: BackupRunSummary[];
+  recovery_error?: string;
+}
+
 export interface BackupHistoryLogResult {
   ok: true;
   cursor: number;
@@ -787,6 +852,9 @@ export interface BackupHistoryLogResult {
   eof: boolean;
   dropped: number;
 }
+
+export type BackupInstallTarget = "rclone" | "cron" | "start_cron";
+
 export interface BackupInstallPlanResult {
   ok: true;
   plan_id: string;

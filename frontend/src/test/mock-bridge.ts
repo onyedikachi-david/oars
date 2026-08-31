@@ -846,15 +846,54 @@ export class MockBridge {
     this.setHandler("oars.access.export", () => ({ ok: true, exported_bytes: 100 }));
 
     // 13. oars.backup
+    const backupJob = {
+      id: "backup-job-1",
+      server_id: "srv-prod",
+      revision: 1,
+      name: "Mock backup",
+      source_path: "/srv/data",
+      destination: {
+        type: "s3",
+        provider: "aws",
+        bucket: "mock-backups",
+        prefix: "daily",
+        endpoint: "",
+        region: "us-east-1",
+        credential_mode: "aws_runtime",
+        storage_class: "",
+      },
+      transfer: "copy",
+      schedule: { mode: "manual", enabled: false },
+      created_at_ms: 1_700_000_000_000,
+      updated_at_ms: 1_700_000_000_000,
+    };
     this.setHandler("oars.backup.jobs.list", () => ({ ok: true, jobs: [] }));
-    this.setHandler("oars.backup.jobs.save", (p: any) => ({ ok: true, job: p.job }));
-    this.setHandler("oars.backup.jobs.delete", () => ({ ok: true }));
-    this.setHandler("oars.backup.test", () => ({ ok: true, success: true, message: "OK" }));
-    this.setHandler("oars.backup.run", () => ({ ok: true, run_id: "1" }));
-    this.setHandler("oars.backup.poll", () => ({ ok: true, status: "done", finished: true }));
-    this.setHandler("oars.backup.history", () => ({ ok: true, history: [] }));
-    this.setHandler("oars.backup.install", () => ({ ok: true, channel: 1 }));
-    this.setHandler("oars.backup.cronStatus", () => ({ ok: true, installed: true }));
+    this.setHandler("oars.backup.status", () => ({ ok: true, status: null, stale: true }));
+    this.setHandler("oars.backup.refresh", () => ({ ok: true, operation_id: "backup-refresh-1" }));
+    this.setHandler("oars.backup.jobs.plan", () => ({
+      ok: true,
+      plan_id: "backup-plan-1",
+      expires_at_ms: 1_700_000_300_000,
+      job: backupJob,
+      requires_connection_test: false,
+      requires_remote_secret: false,
+      effects: [],
+      warnings: [],
+    }));
+    this.setHandler("oars.backup.jobs.save", () => ({ ok: true, operation_id: "backup-save-1", job_id: backupJob.id }));
+    this.setHandler("oars.backup.jobs.deletePlan", () => ({ ok: true, plan_id: "backup-delete-plan-1", expires_at_ms: 1_700_000_300_000, job_name: backupJob.name, effects: [], leftovers: [] }));
+    this.setHandler("oars.backup.jobs.delete", () => ({ ok: true, operation_id: "backup-delete-1" }));
+    this.setHandler("oars.backup.operationPoll", () => ({ ok: true, operation_id: "backup-refresh-1", kind: "refresh", state: "done", steps: [], started_at_ms: 1_700_000_000_000, finished_at_ms: 1_700_000_000_100 }));
+    this.setHandler("oars.backup.operationCancel", () => ({ ok: true }));
+    this.setHandler("oars.backup.test.plan", () => ({ ok: true, test_plan_id: "backup-test-plan-1", expires_at_ms: 1_700_000_300_000, remote_object: "daily/sentinel", checks: ["list", "write", "read", "delete", "cleanup_verify"], mutates: true }));
+    this.setHandler("oars.backup.test", () => ({ ok: true, operation_id: "backup-test-1" }));
+    this.setHandler("oars.backup.run", () => ({ ok: true, run_id: "backup-run-1" }));
+    this.setHandler("oars.backup.poll", () => ({ ok: true, run_id: "backup-run-1", status: "no_changes", phase: "finished", bytes_done: 0, bytes_total: 0, files_done: 0, files_total: 0, speed_bps: 0, eta_sec: 0, started_at_ms: 1_700_000_000_000, finished_at_ms: 1_700_000_000_100, log_cursor: 0, log_delta: "", dropped: 0, cleanup_state: "complete" }));
+    this.setHandler("oars.backup.cancel", () => ({ ok: true }));
+    this.setHandler("oars.backup.history", () => ({ ok: true, runs: [] }));
+    this.setHandler("oars.backup.historyLog", () => ({ ok: true, cursor: 0, delta: "", eof: true, dropped: 0 }));
+    this.setHandler("oars.backup.install.plan", () => ({ ok: true, plan_id: "backup-install-plan-1", expires_at_ms: 1_700_000_300_000, target: "ubuntu", privilege: "sudo", commands: ["sudo apt-get install -y rclone"], effects: ["rclone"], rollback: [], manual: false }));
+    this.setHandler("oars.backup.install", () => ({ ok: true, operation_id: "backup-install-1" }));
 
     // 14. oars.ai
     this.setHandler("oars.ai.context", () => ({ server_id: "srv-prod", system_info: "Ubuntu 22.04" }));

@@ -66,7 +66,7 @@ export const OarsSelect = forwardRef<HTMLButtonElement, OarsSelectProps>(functio
                   disabled={option.disabled}
                   className="oars-select-item"
                 >
-                  <BaseSelect.ItemIndicator className="oars-select-item-indicator">
+                  <BaseSelect.ItemIndicator className="oars-select-item-indicator" keepMounted>
                     <Check aria-hidden />
                   </BaseSelect.ItemIndicator>
                   <BaseSelect.ItemText className="oars-select-item-text">{option.label}</BaseSelect.ItemText>

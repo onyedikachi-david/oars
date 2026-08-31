@@ -181,6 +181,7 @@ const App = struct {
             .ai = &self.ai_registry,
             .keys = keyjobs.Registry.init(self.allocator),
         };
+        try self.bridge_ctx.startBackupCoordinator();
     }
 
     fn deinit(self: *App) void {
@@ -424,6 +425,19 @@ const TestApp = struct {
     /// it before the next dispatch call.
     fn dispatch(self: *TestApp, request: []const u8) []const u8 {
         return self.dispatcher.dispatch(request, .{ .origin = "zero://app" }, &self.output);
+    }
+
+    fn waitBackupCache(self: *TestApp) !void {
+        try self.ctx.startBackupCoordinator();
+        var attempts: usize = 0;
+        while (attempts < 1000) : (attempts += 1) {
+            var health = try self.backup_registry.storeHealthSnapshot();
+            defer health.deinit(self.ctx.allocator);
+            if (health.ready) return;
+            if (health.failed) return error.TestUnexpectedResult;
+            try std.Io.sleep(self.ctx.io, std.Io.Duration.fromMilliseconds(1), .awake);
+        }
+        return error.TestUnexpectedResult;
     }
 };
 
@@ -1602,107 +1616,271 @@ test "access scan and job handlers validate payloads without sessions" {
     try std.testing.expect(std.mem.indexOf(u8, bad_format, "invalid format") != null);
 }
 
-test "backup jobs save/list/delete, run gates, and capability-test gates through the dispatcher" {
+test "backup plan operations use exact contracts and never report unsupported work done" {
     var app: TestApp = undefined;
     try app.init();
     defer app.deinit();
 
-    // 1. Save a MinIO job with schedule credentials. The job persists
-    //    locally; remote schedule install moved to the coordinator flow so
-    //    legacy save no longer blocks on the session gate.
-    const saved = app.dispatch(
-        \\{"id":"1","command":"oars.backup.jobs.save","payload":{"job":{"server_id":"s1","name":"daily-website","source_path":"/var/www/html","destination":{"type":"s3","provider":"minio","bucket":"acme","endpoint":"http://127.0.0.1:9000","storage_class":"standard"},"transfer":"sync","schedule":{"mode":"interval","interval_unit":"hours","interval_every":24,"enabled":true}},"schedule_credentials":{"access_key":"AKID","secret_key":"SECRET"}}}
+    const PlanEnvelope = struct {
+        result: struct {
+            ok: bool,
+            plan_id: []const u8,
+            job: struct {
+                id: []const u8,
+                revision: u64,
+            },
+        },
+    };
+    const DeletePlanEnvelope = struct {
+        result: struct {
+            ok: bool,
+            plan_id: []const u8,
+            job_name: []const u8,
+        },
+    };
+    const OperationEnvelope = struct {
+        result: struct {
+            ok: bool,
+            state: []const u8,
+            @"error": ?struct { code: []const u8 } = null,
+        },
+    };
+
+    var seeded = try app.backup_registry.jobs.savePlanned(app.ctx.io, .{
+        .id = "bk-existing",
+        .server_id = "s1",
+        .name = "daily-old",
+        .source_path = "/var/www/old",
+        .destination = .{ .provider = "minio", .bucket = "acme", .prefix = "daily", .endpoint = "http://127.0.0.1:9000" },
+        .transfer = "copy",
+        .schedule = .{ .mode = "manual", .enabled = false },
+    }, null, true, 1);
+    seeded.deinit(app.ctx.allocator);
+    try app.waitBackupCache();
+
+    const planned_response = app.dispatch(
+        \\{"id":"1","command":"oars.backup.jobs.plan","payload":{"job":{"id":"bk-existing","server_id":"s1","name":"daily-website","source_path":"/var/www/html","destination":{"type":"s3","provider":"minio","bucket":"acme","prefix":"daily","endpoint":"http://127.0.0.1:9000","region":"","credential_mode":"access_key","storage_class":""},"transfer":"copy","schedule":{"mode":"manual","enabled":false}},"expected_revision":1}}
     );
+    var planned = try std.json.parseFromSlice(PlanEnvelope, std.testing.allocator, planned_response, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    defer planned.deinit();
+    try std.testing.expect(planned.value.result.ok);
+    try std.testing.expect(std.mem.indexOf(u8, planned_response, "created_at_ns") == null);
+    try std.testing.expect(std.mem.indexOf(u8, planned_response, "use_iam") == null);
+
+    var save_buf: [512]u8 = undefined;
+    const save_request = try std.fmt.bufPrint(&save_buf, "{{\"id\":\"2\",\"command\":\"oars.backup.jobs.save\",\"payload\":{{\"operation_id\":\"op-save-1\",\"plan_id\":\"{s}\",\"approved_remote_secret\":false}}}}", .{planned.value.result.plan_id});
+    const saved = app.dispatch(save_request);
+
     try std.testing.expect(std.mem.indexOf(u8, saved, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, planned.value.result.job.id) != null);
 
-    // The job persisted despite the session state; secrets never do.
-    const listed = app.dispatch(
-        \\{"id":"2","command":"oars.backup.jobs.list","payload":{"server_id":"s1"}}
-    );
-    try std.testing.expect(std.mem.indexOf(u8, listed, "\"ok\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, listed, "daily-website") != null);
-    try std.testing.expect(std.mem.indexOf(u8, listed, "\"transfer\":\"sync\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, listed, "AKID") == null);
-    try std.testing.expect(std.mem.indexOf(u8, listed, "SECRET") == null);
-    const id_start = std.mem.indexOf(u8, listed, "\"id\":\"bk-") orelse return error.TestUnexpectedResult;
-    var id_buf: [64]u8 = undefined;
-    var id_len: usize = 0;
-    for (listed[id_start + 6 ..]) |ch| {
-        if (ch == '\"') break;
-        if (id_len >= id_buf.len) return error.TestUnexpectedResult;
-        id_buf[id_len] = ch;
-        id_len += 1;
+    var save_terminal = false;
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        const poll_response = app.dispatch(
+            \\{"id":"3","command":"oars.backup.operationPoll","payload":{"operation_id":"op-save-1"}}
+        );
+        var poll = try std.json.parseFromSlice(OperationEnvelope, std.testing.allocator, poll_response, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+        defer poll.deinit();
+        if (std.mem.eql(u8, poll.value.result.state, "done")) {
+            save_terminal = true;
+            break;
+        }
+        try std.testing.expect(!std.mem.eql(u8, poll.value.result.state, "failed"));
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(2), .awake) catch {};
     }
-    const job_id = id_buf[0..id_len];
+    try std.testing.expect(save_terminal);
 
-    // 2. Enabling an unattended schedule without credentials is rejected
-    //    before any persistence (the remote-secret disclosure gate).
-    const no_creds = app.dispatch(
-        \\{"id":"3","command":"oars.backup.jobs.save","payload":{"job":{"server_id":"s1","name":"daily-website","source_path":"/var/www/html","destination":{"type":"s3","provider":"minio","bucket":"acme","endpoint":"http://127.0.0.1:9000"},"transfer":"sync","schedule":{"mode":"interval","interval_unit":"hours","interval_every":24,"enabled":true}}}}
+    const listed = app.dispatch(
+        \\{"id":"4","command":"oars.backup.jobs.list","payload":{"server_id":"s1"}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, no_creds, "credentials are required") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "daily-website") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"credential_mode\":\"access_key\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "created_at_ns") == null);
 
-    // 3. Editing an existing job by id keeps the generated id.
-    var edit_buf: [512]u8 = undefined;
-    const edit_req = try std.fmt.bufPrint(&edit_buf, "{{\"id\":\"4\",\"command\":\"oars.backup.jobs.save\",\"payload\":{{\"job\":{{\"id\":\"{s}\",\"server_id\":\"s1\",\"name\":\"daily-www\",\"source_path\":\"/var/www/html\",\"destination\":{{\"type\":\"s3\",\"provider\":\"minio\",\"bucket\":\"acme\",\"endpoint\":\"http://127.0.0.1:9000\"}},\"transfer\":\"sync\",\"schedule\":{{\"mode\":\"manual\",\"enabled\":false}}}},\"schedule_credentials\":{{\"access_key\":\"AKID\",\"secret_key\":\"SECRET\"}}}}}}", .{job_id});
-    const edited = app.dispatch(edit_req);
-    try std.testing.expect(std.mem.indexOf(u8, edited, "\"ok\":true") != null);
+    const legacy_save = app.dispatch(
+        \\{"id":"5","command":"oars.backup.jobs.save","payload":{"job":{},"operation_id":"legacy"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, legacy_save, "invalid_payload") != null);
 
-    // 4. Shape errors surface with the spec messages.
-    const bad_bucket = app.dispatch(
-        \\{"id":"5","command":"oars.backup.jobs.save","payload":{"job":{"server_id":"s1","name":"x","source_path":"/var/www","destination":{"type":"s3","provider":"minio","bucket":"bad bucket","endpoint":"http://127.0.0.1:9000"}}}}
+    const refresh = app.dispatch(
+        \\{"id":"6","command":"oars.backup.refresh","payload":{"operation_id":"op-refresh-1","server_id":"s1"}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, bad_bucket, "invalid bucket name") != null);
-    const bad_cron = app.dispatch(
-        \\{"id":"6","command":"oars.backup.jobs.save","payload":{"job":{"server_id":"s1","name":"x","source_path":"/var/www","destination":{"type":"s3","provider":"aws","bucket":"acme","region":"us-east-1"},"schedule":{"mode":"custom","expr":"not a cron","enabled":true}},"schedule_credentials":{"access_key":"A","secret_key":"B"}}}
-    );
-    try std.testing.expect(std.mem.indexOf(u8, bad_cron, "invalid cron expression") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refresh, "\"ok\":true") != null);
+    var refresh_failed = false;
+    attempts = 0;
+    while (attempts < 100) : (attempts += 1) {
+        const poll_response = app.dispatch(
+            \\{"id":"7","command":"oars.backup.operationPoll","payload":{"operation_id":"op-refresh-1"}}
+        );
+        var poll = try std.json.parseFromSlice(OperationEnvelope, std.testing.allocator, poll_response, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+        defer poll.deinit();
+        try std.testing.expect(!std.mem.eql(u8, poll.value.result.state, "done"));
+        if (std.mem.eql(u8, poll.value.result.state, "failed")) {
+            try std.testing.expectEqualStrings("not_connected", poll.value.result.@"error".?.code);
+            refresh_failed = true;
+            break;
+        }
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(2), .awake) catch {};
+    }
+    try std.testing.expect(refresh_failed);
 
-    // 5. Every session-gated handler says so explicitly on a ghost server.
-    const test_req = app.dispatch(
-        \\{"id":"7","command":"oars.backup.test","payload":{"job":{"server_id":"s1","name":"x","source_path":"/var/www","destination":{"type":"s3","provider":"minio","bucket":"acme","endpoint":"http://127.0.0.1:9000"}},"credentials":{"access_key":"AKID","secret_key":"SECRET"}}}
-    );
-    try std.testing.expect(std.mem.indexOf(u8, test_req, "not connected") != null);
-    var run_buf: [256]u8 = undefined;
-    const run_req = try std.fmt.bufPrint(&run_buf, "{{\"id\":\"8\",\"command\":\"oars.backup.run\",\"payload\":{{\"server_id\":\"s1\",\"job_id\":\"{s}\",\"credentials\":{{\"access_key\":\"AKID\",\"secret_key\":\"SECRET\"}}}}}}", .{job_id});
-    const run_resp = app.dispatch(run_req);
-    try std.testing.expect(std.mem.indexOf(u8, run_resp, "not connected") != null);
-    const run_unknown = app.dispatch(
-        \\{"id":"9","command":"oars.backup.run","payload":{"server_id":"s1","job_id":"bk-nope","credentials":{"access_key":"AKID","secret_key":"SECRET"}}}
-    );
-    try std.testing.expect(std.mem.indexOf(u8, run_unknown, "not connected") != null); // session gate precedes job lookup
-    const install = app.dispatch(
-        \\{"id":"10","command":"oars.backup.install","payload":{"server_id":"s1","what":"rclone","dry_run":true}}
-    );
-    try std.testing.expect(std.mem.indexOf(u8, install, "not connected") != null);
-    const cron_status = app.dispatch(
-        \\{"id":"11","command":"oars.backup.cronStatus","payload":{"server_id":"s1"}}
-    );
-    try std.testing.expect(std.mem.indexOf(u8, cron_status, "not connected") != null);
+    var delete_plan_buf: [512]u8 = undefined;
+    const delete_plan_request = try std.fmt.bufPrint(&delete_plan_buf, "{{\"id\":\"8\",\"command\":\"oars.backup.jobs.deletePlan\",\"payload\":{{\"server_id\":\"s1\",\"job_id\":\"{s}\",\"expected_revision\":2}}}}", .{planned.value.result.job.id});
+    const delete_plan_response = app.dispatch(delete_plan_request);
+    var delete_plan = try std.json.parseFromSlice(DeletePlanEnvelope, std.testing.allocator, delete_plan_response, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    defer delete_plan.deinit();
+    try std.testing.expect(delete_plan.value.result.ok);
 
-    // 6. Poll and history never touch the server: poll rejects unknown
-    //    run ids, history serves the empty local store.
-    const poll = app.dispatch(
-        \\{"id":"12","command":"oars.backup.poll","payload":{"run_id":"run-nope"}}
-    );
-    try std.testing.expect(std.mem.indexOf(u8, poll, "unknown run") != null);
-    var hist_buf: [256]u8 = undefined;
-    const hist_req = try std.fmt.bufPrint(&hist_buf, "{{\"id\":\"13\",\"command\":\"oars.backup.history\",\"payload\":{{\"server_id\":\"s1\",\"job_id\":\"{s}\",\"limit\":20}}}}", .{job_id});
-    const hist_response = app.dispatch(hist_req);
-    try std.testing.expect(std.mem.indexOf(u8, hist_response, "\"ok\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, hist_response, "\"runs\":[]") != null);
-
-    // 7. Delete persists without a session; deleting twice is explicit.
-    var del_buf: [256]u8 = undefined;
-    const del_req = try std.fmt.bufPrint(&del_buf, "{{\"id\":\"14\",\"command\":\"oars.backup.jobs.delete\",\"payload\":{{\"server_id\":\"s1\",\"job_id\":\"{s}\"}}}}", .{job_id});
-    const deleted = app.dispatch(del_req);
+    var delete_buf: [512]u8 = undefined;
+    const delete_request = try std.fmt.bufPrint(&delete_buf, "{{\"id\":\"9\",\"command\":\"oars.backup.jobs.delete\",\"payload\":{{\"operation_id\":\"op-delete-1\",\"plan_id\":\"{s}\",\"confirm_job_name\":\"{s}\"}}}}", .{ delete_plan.value.result.plan_id, delete_plan.value.result.job_name });
+    const deleted = app.dispatch(delete_request);
     try std.testing.expect(std.mem.indexOf(u8, deleted, "\"ok\":true") != null);
-    const deleted_again = app.dispatch(del_req);
-    try std.testing.expect(std.mem.indexOf(u8, deleted_again, "unknown job") != null);
-    const after = app.dispatch(
-        \\{"id":"15","command":"oars.backup.jobs.list","payload":{"server_id":"s1"}}
+    var delete_done = false;
+    attempts = 0;
+    while (attempts < 100) : (attempts += 1) {
+        const poll_response = app.dispatch(
+            \\{"id":"10","command":"oars.backup.operationPoll","payload":{"operation_id":"op-delete-1"}}
+        );
+        var poll = try std.json.parseFromSlice(OperationEnvelope, std.testing.allocator, poll_response, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+        defer poll.deinit();
+        if (std.mem.eql(u8, poll.value.result.state, "done")) {
+            delete_done = true;
+            break;
+        }
+        try std.testing.expect(!std.mem.eql(u8, poll.value.result.state, "failed"));
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(2), .awake) catch {};
+    }
+    try std.testing.expect(delete_done);
+    const after_delete = app.dispatch(
+        \\{"id":"11","command":"oars.backup.jobs.list","payload":{"server_id":"s1"}}
     );
-    try std.testing.expect(std.mem.indexOf(u8, after, "daily-www") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after_delete, "daily-website") == null);
+
+    for (app.ctx.policies) |policy| {
+        try std.testing.expect(!std.mem.eql(u8, policy.name, "oars.backup.cronStatus"));
+    }
+}
+
+test "backup save proof and former schedule gates are enforced before admission" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    const PlanEnvelope = struct {
+        result: struct {
+            ok: bool,
+            plan_id: []const u8,
+        },
+    };
+    var scheduled = try app.backup_registry.jobs.savePlanned(app.ctx.io, .{
+        .id = "bk-scheduled",
+        .server_id = "s1",
+        .name = "scheduled-old",
+        .source_path = "/srv/data",
+        .destination = .{ .provider = "aws", .bucket = "acme", .region = "us-east-1", .credential_mode = .aws_runtime },
+        .transfer = "copy",
+        .schedule = .{ .mode = "custom", .enabled = true, .expr = "0 2 * * *" },
+    }, null, true, 1);
+    scheduled.deinit(app.ctx.allocator);
+    try app.waitBackupCache();
+    const new_plan_response = app.dispatch(
+        \\{"id":"1","command":"oars.backup.jobs.plan","payload":{"job":{"server_id":"s1","name":"manual-new","source_path":"/srv/data","destination":{"type":"s3","provider":"minio","bucket":"acme","prefix":"manual","endpoint":"http://127.0.0.1:9000","region":"","credential_mode":"access_key","storage_class":""},"transfer":"copy","schedule":{"mode":"manual","enabled":false}}}}
+    );
+    var new_plan = try std.json.parseFromSlice(PlanEnvelope, std.testing.allocator, new_plan_response, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    defer new_plan.deinit();
+    try std.testing.expect(new_plan.value.result.ok);
+    var save_buf: [512]u8 = undefined;
+    const save_request = try std.fmt.bufPrint(&save_buf, "{{\"id\":\"2\",\"command\":\"oars.backup.jobs.save\",\"payload\":{{\"operation_id\":\"op-new-no-proof\",\"plan_id\":\"{s}\",\"approved_remote_secret\":false}}}}", .{new_plan.value.result.plan_id});
+    const blocked_save = app.dispatch(save_request);
+    try std.testing.expect(std.mem.indexOf(u8, blocked_save, "capability_failed") != null);
+
+    const disable_without_refresh = app.dispatch(
+        \\{"id":"3","command":"oars.backup.jobs.plan","payload":{"job":{"id":"bk-scheduled","server_id":"s1","name":"scheduled-old","source_path":"/srv/data","destination":{"type":"s3","provider":"aws","bucket":"acme","prefix":"","endpoint":"","region":"us-east-1","credential_mode":"aws_runtime","storage_class":""},"transfer":"copy","schedule":{"mode":"manual","enabled":false}},"expected_revision":1}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, disable_without_refresh, "session_not_ready") != null);
+}
+
+const SlowBackupDisconnectHook = struct {
+    called: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn prepare(context: *anyopaque, _: []const u8) bool {
+        const self: *SlowBackupDisconnectHook = @ptrCast(@alignCast(context));
+        self.called.store(true, .release);
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(250), .awake) catch {};
+        self.done.store(true, .release);
+        return true;
+    }
+};
+
+test "backup disconnect bridge admission stays responsive while lifecycle cleanup drains" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+    _ = app.dispatch(
+        \\{"id":"1","command":"oars.servers.save","payload":{"id":"disconnect-live","name":"Disconnect live","host":"127.0.0.1","port":1,"user":"root","auth_method":"password"}}
+    );
+    _ = app.dispatch(
+        \\{"id":"2","command":"oars.ssh.connect","payload":{"server_id":"disconnect-live","password":"test"}}
+    );
+    var hook = SlowBackupDisconnectHook{};
+    app.manager.setBackupDisconnectHook(.{ .context = &hook, .prepare_fn = SlowBackupDisconnectHook.prepare });
+    const started = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds;
+    const response = app.dispatch(
+        \\{"id":"3","command":"oars.ssh.disconnect","payload":{"server_id":"disconnect-live"}}
+    );
+    const elapsed = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds - started;
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"ok\":true") != null);
+    try std.testing.expect(elapsed < 100 * std.time.ns_per_ms);
+    const deadline = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds + 2 * std.time.ns_per_s;
+    while (!hook.done.load(.acquire) and std.Io.Timestamp.now(std.testing.io, .real).nanoseconds < deadline) {
+        try std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(5), .awake);
+    }
+    try std.testing.expect(hook.called.load(.acquire));
+    try std.testing.expect(hook.done.load(.acquire));
+}
+
+test "backup disconnect admission failure reopens the live session" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+    _ = app.dispatch(
+        \\{"id":"1","command":"oars.servers.save","payload":{"id":"disconnect-oom","name":"Disconnect OOM","host":"127.0.0.1","port":1,"user":"root","auth_method":"password"}}
+    );
+    _ = app.dispatch(
+        \\{"id":"2","command":"oars.ssh.connect","payload":{"server_id":"disconnect-oom","password":"test"}}
+    );
+    const session = app.manager.get("disconnect-oom") orelse return error.TestUnexpectedResult;
+    const original_allocator = app.manager.allocator;
+    var failing = std.testing.FailingAllocator.init(original_allocator, .{ .fail_index = 0 });
+    app.manager.allocator = failing.allocator();
+    const result = app.manager.requestDisconnect("disconnect-oom");
+    app.manager.allocator = original_allocator;
+    try std.testing.expectError(error.OutOfMemory, result);
+    try std.testing.expect(!session.backup_admission_closed.load(.acquire));
+    try std.testing.expect(!session.disconnect_admitted.load(.acquire));
+    try std.testing.expect(!session.disconnect_started.load(.acquire));
+}
+
+test "backup registry teardown drains an admitted disconnect hook" {
+    var app: TestApp = undefined;
+    try app.init();
+    _ = app.dispatch(
+        \\{"id":"1","command":"oars.servers.save","payload":{"id":"disconnect-shutdown","name":"Disconnect shutdown","host":"127.0.0.1","port":1,"user":"root","auth_method":"password"}}
+    );
+    _ = app.dispatch(
+        \\{"id":"2","command":"oars.ssh.connect","payload":{"server_id":"disconnect-shutdown","password":"test"}}
+    );
+    var hook = SlowBackupDisconnectHook{};
+    app.manager.setBackupDisconnectHook(.{ .context = &hook, .prepare_fn = SlowBackupDisconnectHook.prepare });
+    const response = app.dispatch(
+        \\{"id":"3","command":"oars.ssh.disconnect","payload":{"server_id":"disconnect-shutdown"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"ok\":true") != null);
+    app.deinit();
+    try std.testing.expect(hook.called.load(.acquire));
+    try std.testing.expect(hook.done.load(.acquire));
 }
 
 test "ai provider config and context/history gates through the dispatcher" {

@@ -54,6 +54,19 @@ pub const Context = struct {
     handlers: [handler_count]native_sdk.BridgeHandler = undefined,
     policies: [handler_count]native_sdk.BridgeCommandPolicy = undefined,
 
+    pub fn startBackupCoordinator(self: *Context) !void {
+        self.backup.setObserver(.{ .context = self, .notify = backupOperationAudit, .notify_run = backupRunAudit });
+        self.backup.setRemoteAdapter(.{
+            .context = self.manager,
+            .submit_fn = backupRemoteSubmit,
+            .submit_cleanup_fn = backupRemoteSubmitCleanup,
+            .start_fn = backupRemoteStart,
+            .detach_fn = backupRemoteDetach,
+        });
+        self.manager.setBackupDisconnectHook(.{ .context = self.backup, .prepare_fn = backupPrepareDisconnect });
+        try self.backup.ensureStarted(self.io);
+    }
+
     pub fn dispatcher(self: *Context) native_sdk.BridgeDispatcher {
         self.handlers = .{
             .{ .name = "oars.servers.list", .context = self, .invoke_fn = handleServersList },
@@ -147,9 +160,10 @@ pub const Context = struct {
             .{ .name = "oars.access.jobCancel", .context = self, .invoke_fn = handleAccessJobCancel },
             .{ .name = "oars.access.export", .context = self, .invoke_fn = handleAccessExport },
             .{ .name = "oars.backup.jobs.list", .context = self, .invoke_fn = handleBackupJobsList },
-            .{ .name = "oars.backup.jobs.save", .context = self, .invoke_fn = handleBackupJobsSave },
-            .{ .name = "oars.backup.jobs.delete", .context = self, .invoke_fn = handleBackupJobsDelete },
             .{ .name = "oars.backup.jobs.plan", .context = self, .invoke_fn = handleBackupJobsPlan },
+            .{ .name = "oars.backup.jobs.save", .context = self, .invoke_fn = handleBackupJobsSave },
+            .{ .name = "oars.backup.jobs.deletePlan", .context = self, .invoke_fn = handleBackupJobsDeletePlan },
+            .{ .name = "oars.backup.jobs.delete", .context = self, .invoke_fn = handleBackupJobsDelete },
             .{ .name = "oars.backup.status", .context = self, .invoke_fn = handleBackupStatus },
             .{ .name = "oars.backup.refresh", .context = self, .invoke_fn = handleBackupRefresh },
             .{ .name = "oars.backup.operationPoll", .context = self, .invoke_fn = handleBackupOperationPoll },
@@ -163,7 +177,6 @@ pub const Context = struct {
             .{ .name = "oars.backup.history", .context = self, .invoke_fn = handleBackupHistory },
             .{ .name = "oars.backup.historyLog", .context = self, .invoke_fn = handleBackupHistoryLog },
             .{ .name = "oars.backup.install", .context = self, .invoke_fn = handleBackupInstall },
-            .{ .name = "oars.backup.cronStatus", .context = self, .invoke_fn = handleBackupCronStatus },
             .{ .name = "oars.ai.context", .context = self, .invoke_fn = handleAiContext },
             .{ .name = "oars.ai.provider.get", .context = self, .invoke_fn = handleAiProviderGet },
             .{ .name = "oars.ai.provider.set", .context = self, .invoke_fn = handleAiProviderSet },
@@ -276,9 +289,10 @@ pub const Context = struct {
             .{ .name = "oars.access.jobCancel", .origins = &allowed_origins },
             .{ .name = "oars.access.export", .origins = &allowed_origins },
             .{ .name = "oars.backup.jobs.list", .origins = &allowed_origins },
-            .{ .name = "oars.backup.jobs.save", .origins = &allowed_origins },
-            .{ .name = "oars.backup.jobs.delete", .origins = &allowed_origins },
             .{ .name = "oars.backup.jobs.plan", .origins = &allowed_origins },
+            .{ .name = "oars.backup.jobs.save", .origins = &allowed_origins },
+            .{ .name = "oars.backup.jobs.deletePlan", .origins = &allowed_origins },
+            .{ .name = "oars.backup.jobs.delete", .origins = &allowed_origins },
             .{ .name = "oars.backup.status", .origins = &allowed_origins },
             .{ .name = "oars.backup.refresh", .origins = &allowed_origins },
             .{ .name = "oars.backup.operationPoll", .origins = &allowed_origins },
@@ -292,7 +306,6 @@ pub const Context = struct {
             .{ .name = "oars.backup.history", .origins = &allowed_origins },
             .{ .name = "oars.backup.historyLog", .origins = &allowed_origins },
             .{ .name = "oars.backup.install", .origins = &allowed_origins },
-            .{ .name = "oars.backup.cronStatus", .origins = &allowed_origins },
             .{ .name = "oars.ai.context", .origins = &allowed_origins },
             .{ .name = "oars.ai.provider.get", .origins = &allowed_origins },
             .{ .name = "oars.ai.provider.set", .origins = &allowed_origins },
@@ -558,7 +571,7 @@ fn handleServersDelete(context: *anyopaque, invocation: native_sdk.bridge.Invoca
         return respondError(output, "invalid payload");
     };
     defer parsed.deinit();
-    self.manager.disconnect(parsed.value.id);
+    self.manager.requestDisconnect(parsed.value.id) catch return respondError(output, "failed to start disconnect");
     self.store.delete(self.io, parsed.value.id) catch {
         return respondError(output, "failed to delete server");
     };
@@ -604,6 +617,7 @@ fn handleSshConnect(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
         }
         return respondError(output, "failed to start connection");
     };
+    self.backup.allowServer(server.id);
     return ok_json;
 }
 
@@ -617,7 +631,7 @@ fn handleSshDisconnect(context: *anyopaque, invocation: native_sdk.bridge.Invoca
         return respondError(output, "invalid payload");
     };
     defer parsed.deinit();
-    self.manager.disconnect(parsed.value.server_id);
+    self.manager.requestDisconnect(parsed.value.server_id) catch return respondError(output, "failed to start disconnect");
     return ok_json;
 }
 
@@ -11305,630 +11319,417 @@ test "logs scan command is marker-escaped for busybox and GNU printf" {
 
 // --- backups (spec 10) ------------------------------------------------------
 
-const backup_exec_cap: usize = 256 * 1024;
-const backup_exec_timeout_ns = 20 * std.time.ns_per_s;
-/// Per-run log bytes in history responses (stored history keeps the full
-/// 200 KB budget; responses stay well under the 1 MB result buffer).
 const backup_response_log_cap: usize = 32 * 1024;
 
 const BackupJobsListPayload = struct { server_id: []const u8 };
 const BackupCredentials = struct {
-    access_key: []const u8 = "",
-    secret_key: []const u8 = "",
+    access_key: []const u8,
+    secret_key: []const u8,
+};
+
+fn backupWipeCredentials(credentials: ?BackupCredentials) void {
+    const value = credentials orelse return;
+    if (value.access_key.len > 0) std.crypto.secureZero(u8, @constCast(value.access_key));
+    if (value.secret_key.len > 0) std.crypto.secureZero(u8, @constCast(value.secret_key));
+}
+const BackupDestinationPayload = struct {
+    type: []const u8,
+    provider: []const u8,
+    bucket: []const u8,
+    prefix: []const u8,
+    endpoint: []const u8,
+    region: []const u8,
+    credential_mode: backup.CredentialMode,
+    storage_class: []const u8,
+};
+const BackupSchedulePayload = struct {
+    mode: []const u8,
+    enabled: bool,
+    every: ?u32 = null,
+    unit: ?[]const u8 = null,
+    anchor_epoch_sec: ?i64 = null,
+    expr: ?[]const u8 = null,
+};
+const BackupJobDraftPayload = struct {
+    id: ?[]const u8 = null,
+    server_id: []const u8,
+    name: []const u8,
+    source_path: []const u8,
+    destination: BackupDestinationPayload,
+    transfer: []const u8,
+    schedule: BackupSchedulePayload,
+};
+const BackupPlanPayload = struct {
+    job: BackupJobDraftPayload,
+    expected_revision: ?u64 = null,
 };
 const BackupJobsSavePayload = struct {
-    job: backup.JobInput,
-    // Legacy save (no operation_id/plan_id) vs new plan→op flow. When
-    // operation_id is present the payload uses the NEXT-SPEC typed flow.
-    operation_id: ?[]const u8 = null,
-    plan_id: ?[]const u8 = null,
+    operation_id: []const u8,
+    plan_id: []const u8,
     capability_proof_id: ?[]const u8 = null,
     schedule_credentials: ?BackupCredentials = null,
-    approved_remote_secret: ?bool = null,
-};
-const BackupJobsDeletePayload = struct {
-    server_id: []const u8,
-    job_id: []const u8,
-};
-const BackupTestPayload = struct {
-    job: backup.JobInput,
-    credentials: ?BackupCredentials = null,
-};
-const BackupRunPayload = struct {
-    server_id: []const u8,
-    job_id: []const u8,
-    credentials: ?BackupCredentials = null,
-    operation_id: ?[]const u8 = null,
-    expected_revision: ?u64 = null,
+    approved_remote_secret: bool,
     confirm_job_name: ?[]const u8 = null,
 };
-const BackupPlanPayload = struct { job: backup.JobInput, expected_revision: ?u64 = null };
+const BackupJobsDeletePlanPayload = struct {
+    server_id: []const u8,
+    job_id: []const u8,
+    expected_revision: u64,
+};
+const BackupJobsDeletePayload = struct {
+    operation_id: []const u8,
+    plan_id: []const u8,
+    confirm_job_name: []const u8,
+};
 const BackupStatusPayload = struct { server_id: []const u8 };
 const BackupRefreshPayload = struct { operation_id: []const u8, server_id: []const u8 };
 const BackupOpPollPayload = struct { operation_id: []const u8 };
-const BackupHistoryLogPayload = struct { server_id: []const u8, run_id: []const u8, cursor: ?u64 = null, max: ?u64 = null };
+const BackupOpCancelPayload = struct {
+    operation_id: []const u8,
+    credentials: ?BackupCredentials = null,
+};
 const BackupInstallPlanPayload = struct { server_id: []const u8, what: []const u8 };
+const BackupInstallPayload = struct { operation_id: []const u8, plan_id: []const u8 };
 const BackupTestPlanPayload = struct { job_plan_id: []const u8 };
+const BackupTestPayload = struct {
+    operation_id: []const u8,
+    test_plan_id: []const u8,
+    credentials: ?BackupCredentials = null,
+};
+const BackupRunPayload = struct {
+    operation_id: []const u8,
+    server_id: []const u8,
+    job_id: []const u8,
+    expected_revision: u64,
+    credentials: ?BackupCredentials = null,
+    confirm_job_name: ?[]const u8 = null,
+};
 const BackupPollPayload = struct {
     run_id: []const u8,
     log_cursor: ?u64 = null,
 };
+const BackupCancelPayload = struct { run_id: []const u8 };
 const BackupHistoryPayload = struct {
     server_id: []const u8,
     job_id: []const u8,
     limit: ?usize = null,
 };
-const BackupInstallPayload = struct {
+const BackupHistoryLogPayload = struct {
     server_id: []const u8,
-    what: []const u8,
-    dry_run: bool = false,
-    operation_id: ?[]const u8 = null,
-    plan_id: ?[]const u8 = null,
-};
-const BackupCronStatusPayload = struct { server_id: []const u8 };
-const BackupCancelPayload = struct { run_id: []const u8 };
-
-fn backupAudit(self: *Context, action: []const u8, server_id: []const u8, detail: []const u8) void {
-    sshkeysAudit(self, action, server_id, detail);
-}
-
-fn backupOperationJson(writer: anytype, op: *backup.BackupOperation) !void {
-    try writer.writeAll("{\"ok\":true,\"operation_id\":");
-    try json.writeJsonString(writer, op.id);
-    try writer.writeAll(",\"kind\":");
-    const kind_name: []const u8 = switch (op.kind) {
-        .status_refresh => "refresh",
-        .jobs_save => "save",
-        .jobs_delete => "delete",
-        .test_capability => "test",
-        .run_manual => "run",
-        .install => "install",
-    };
-    try json.writeJsonString(writer, kind_name);
-    try writer.writeAll(",\"state\":");
-    try json.writeJsonString(writer, op.state.jsonName());
-    try writer.writeAll(",\"steps\":[],\"started_at_ms\":");
-    try writer.print("{d}", .{@divTrunc(op.created_at_ns, std.time.ns_per_ms)});
-    if (op.finished_at_ns) |fin| {
-        try writer.writeAll(",\"finished_at_ms\":");
-        try writer.print("{d}", .{@divTrunc(fin, std.time.ns_per_ms)});
-    }
-    if (op.error_detail) |e| {
-        try writer.writeAll(",\"error\":{\"ok\":false,\"code\":\"internal\",\"error\":");
-        try json.writeJsonString(writer, e);
-        try writer.writeAll(",\"retryable\":false}");
-    }
-    if (op.result_json) |r| {
-        try writer.writeAll(",\"result\":");
-        try writer.writeAll(r);
-    }
-    try writer.writeAll("}");
-}
-
-fn handleBackupJobsPlan(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(BackupPlanPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
-    defer parsed.deinit();
-    const payload = parsed.value;
-    const job_input = payload.job;
-    // Validate without persisting.
-    backup.validate(job_input, null) catch |err| return backupTypedError(output, "invalid_job", backupSaveErrorString(err));
-    if (job_input.id) |jid| if (!backup.validId(jid)) return backupTypedError(output, "invalid_payload", "invalid job id");
-    if (!backup.validId(job_input.server_id)) return backupTypedError(output, "invalid_payload", "invalid server_id");
-    if (payload.expected_revision) |exp| {
-        if (job_input.id == null) return backupTypedError(output, "invalid_payload", "expected_revision needs id");
-        const existing = (self.backup.jobs.find(self.io, job_input.id.?) catch return backupTypedError(output, "store_corrupt", "registry unreadable")) orelse return backupTypedError(output, "not_found", "unknown job");
-        defer {
-            var e = existing;
-            e.deinit(self.allocator);
-        }
-        if (existing.revision != exp) return backupTypedError(output, "conflict", "revision conflict — refresh and retry");
-    }
-    var plan_id_buf: [64]u8 = undefined;
-    const plan_id = std.fmt.bufPrint(&plan_id_buf, "plan-{d}", .{std.Io.Timestamp.now(self.io, .real).nanoseconds}) catch return respondError(output, "out of memory");
-    const plan_id_owned = self.allocator.dupe(u8, plan_id) catch return respondError(output, "out of memory");
-    errdefer self.allocator.free(plan_id_owned);
-    const payload_json = std.fmt.allocPrint(self.allocator, "{}", .{std.json.fmt(job_input, .{})}) catch return respondError(output, "out of memory");
-    errdefer self.allocator.free(payload_json);
-    const now_ns: i128 = std.Io.Timestamp.now(self.io, .real).nanoseconds;
-    const now_ms: i64 = @intCast(@divTrunc(now_ns, std.time.ns_per_ms));
-    const plan = self.allocator.create(backup.BackupPlan) catch return respondError(output, "out of memory");
-    errdefer self.allocator.destroy(plan);
-    plan.* = .{
-        .id = plan_id_owned,
-        .server_id = self.allocator.dupe(u8, job_input.server_id) catch return respondError(output, "out of memory"),
-        .job_id = if (job_input.id) |jid| self.allocator.dupe(u8, jid) catch return respondError(output, "out of memory") else "",
-        .created_at_ms = now_ms,
-        .expires_at_ms = now_ms + 5 * 60 * 1000,
-        .payload_json = payload_json,
-    };
-    self.backup.registerPlan(plan) catch return backupTypedError(output, "internal", "too many plans");
-    const needs_secret = !job_input.destination.use_iam and job_input.schedule.enabled and !std.mem.eql(u8, job_input.schedule.mode, "manual");
-    const needs_test = needs_secret; // NEXT-SPEC: requires_connection_test when new destination/auth
-    var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,\"plan_id\":") catch return output[0..0];
-    json.writeJsonString(&writer, plan.id) catch return output[0..0];
-    writer.print(",\"expires_at_ms\":{d},\"requires_connection_test\":{s},\"requires_remote_secret\":{s},\"effects\":[],\"warnings\":[]", .{ plan.expires_at_ms, if (needs_test) "true" else "false", if (needs_secret) "true" else "false" }) catch return output[0..0];
-    writer.writeAll("}") catch return output[0..0];
-    return writer.buffered();
-}
-
-fn handleBackupStatus(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(BackupStatusPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
-    defer parsed.deinit();
-    const server_id = parsed.value.server_id;
-    if (!backup.validId(server_id)) return backupTypedError(output, "invalid_payload", "invalid server_id");
-    if (self.backup.getStatus(server_id)) |st| {
-        var writer = std.Io.Writer.fixed(output);
-        writer.writeAll("{\"ok\":true,\"stale\":") catch return output[0..0];
-        writer.writeAll(if (st.stale) "true" else "false") catch return output[0..0];
-        writer.writeAll(",\"status\":") catch return output[0..0];
-        if (st.json) |j| writer.writeAll(j) catch return output[0..0] else writer.writeAll("null") catch return output[0..0];
-        writer.writeAll("}") catch return output[0..0];
-        return writer.buffered();
-    }
-    var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,\"stale\":true,\"status\":null}") catch return output[0..0];
-    return writer.buffered();
-}
-
-fn handleBackupRefresh(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(BackupRefreshPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
-    defer parsed.deinit();
-    const p = parsed.value;
-    if (!backup.validId(p.operation_id) or !backup.validId(p.server_id)) return backupTypedError(output, "invalid_payload", "invalid id");
-    self.backup.ensureStarted(self.io);
-    // Idempotent: repeated operation_id returns existing op.
-    if (self.backup.operationById(p.operation_id)) |op| {
-        var writer = std.Io.Writer.fixed(output);
-        writer.writeAll("{\"ok\":true,\"operation_id\":") catch return output[0..0];
-        json.writeJsonString(&writer, op.id) catch return output[0..0];
-        writer.writeAll("}") catch return output[0..0];
-        return writer.buffered();
-    }
-    const op = self.allocator.create(backup.BackupOperation) catch return respondError(output, "out of memory");
-    errdefer self.allocator.destroy(op);
-    const now: i128 = std.Io.Timestamp.now(self.io, .real).nanoseconds;
-    op.* = .{
-        .id = self.allocator.dupe(u8, p.operation_id) catch return respondError(output, "out of memory"),
-        .kind = .status_refresh,
-        .state = .queued,
-        .server_id = self.allocator.dupe(u8, p.server_id) catch return respondError(output, "out of memory"),
-        .created_at_ns = now,
-        .touched_ns = now,
-    };
-    self.backup.registerOperation(op) catch return backupTypedError(output, "internal", "too many operations");
-    var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,\"operation_id\":") catch return output[0..0];
-    json.writeJsonString(&writer, op.id) catch return output[0..0];
-    writer.writeAll("}") catch return output[0..0];
-    return writer.buffered();
-}
-
-fn handleBackupOperationPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(BackupOpPollPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
-    defer parsed.deinit();
-    const op = self.backup.operationById(parsed.value.operation_id) orelse return backupTypedError(output, "not_found", "unknown operation");
-    self.backup.ensureStarted(self.io);
-    var writer = std.Io.Writer.fixed(output);
-    backupOperationJson(&writer, op) catch return output[0..0];
-    return writer.buffered();
-}
-
-fn handleBackupOperationCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(BackupOpPollPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
-    defer parsed.deinit();
-    const res = self.backup.opCancelById(parsed.value.operation_id);
-    if (res == null) return backupTypedError(output, "not_found", "unknown operation");
-    return ok_json;
-}
-
-fn handleBackupInstallPlan(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(BackupInstallPlanPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
-    defer parsed.deinit();
-    const p = parsed.value;
-    if (!backup.validId(p.server_id)) return backupTypedError(output, "invalid_payload", "invalid server_id");
-    if (!std.mem.eql(u8, p.what, "rclone") and !std.mem.eql(u8, p.what, "cron") and !std.mem.eql(u8, p.what, "start_cron")) return backupTypedError(output, "invalid_payload", "unknown component");
-    // Read-only plan: detect OS/arch/privilege without mutating.
-    const plan_text = backupInstallPlan(self, p.server_id, p.what) orelse "manual: cannot detect the server OS";
-    var plan_id_buf: [64]u8 = undefined;
-    const plan_id = std.fmt.bufPrint(&plan_id_buf, "bkplan-{d}", .{std.Io.Timestamp.now(self.io, .real).nanoseconds}) catch return respondError(output, "out of memory");
-    const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_ms));
-    var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,\"plan_id\":") catch return output[0..0];
-    json.writeJsonString(&writer, plan_id) catch return output[0..0];
-    writer.print(",\"expires_at_ms\":{d},\"target\":", .{now_ms + 5 * 60 * 1000}) catch return output[0..0];
-    json.writeJsonString(&writer, p.what) catch return output[0..0];
-    writer.writeAll(",\"privilege\":\"root\",\"commands\":[") catch return output[0..0];
-    json.writeJsonString(&writer, plan_text) catch return output[0..0];
-    writer.writeAll("],\"effects\":[") catch return output[0..0];
-    json.writeJsonString(&writer, plan_text) catch return output[0..0];
-    writer.writeAll("],\"rollback\":[],\"manual\":") catch return output[0..0];
-    writer.writeAll(if (std.mem.startsWith(u8, plan_text, "manual:")) "true" else "false") catch return output[0..0];
-    writer.writeAll("}") catch return output[0..0];
-    return writer.buffered();
-}
-
-fn handleBackupTestPlan(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(BackupTestPlanPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
-    defer parsed.deinit();
-    const p = parsed.value;
-    if (!backup.validId(p.job_plan_id)) return backupTypedError(output, "invalid_payload", "invalid plan id");
-    const plan = self.backup.peekPlan(p.job_plan_id) orelse return backupTypedError(output, "plan_expired", "plan expired — recreate it");
-    const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_ms));
-    if (plan.expired(now_ms)) return backupTypedError(output, "plan_expired", "plan expired — recreate it");
-    var test_plan_id_buf: [64]u8 = undefined;
-    const test_plan_id = std.fmt.bufPrint(&test_plan_id_buf, "tplan-{d}", .{std.Io.Timestamp.now(self.io, .real).nanoseconds}) catch return respondError(output, "out of memory");
-    // Derive remote object path from plan payload (bucket/prefix).
-    var remote_obj_buf: [1024]u8 = undefined;
-    const remote_obj = std.fmt.bufPrint(&remote_obj_buf, "{s}/oars-sentinel-{d}", .{ plan.job_id, std.Io.Timestamp.now(self.io, .real).nanoseconds }) catch "oars-sentinel-test";
-    var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,\"test_plan_id\":") catch return output[0..0];
-    json.writeJsonString(&writer, test_plan_id) catch return output[0..0];
-    writer.print(",\"expires_at_ms\":{d},\"remote_object\":", .{now_ms + 5 * 60 * 1000}) catch return output[0..0];
-    json.writeJsonString(&writer, remote_obj) catch return output[0..0];
-    writer.writeAll(",\"checks\":[\"list\",\"write\",\"read\",\"delete\",\"cleanup_verify\"],\"mutates\":true}") catch return output[0..0];
-    return writer.buffered();
-}
-
-fn handleBackupHistoryLog(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(BackupHistoryLogPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
-    defer parsed.deinit();
-    const p = parsed.value;
-    if (!backup.validId(p.server_id) or !backup.validId(p.run_id)) return backupTypedError(output, "invalid_payload", "invalid id");
-    // Clamp max per NEXT-SPEC.
-    const max: usize = @intCast(@min(p.max orelse 32 * 1024, 64 * 1024));
-    const cursor: u64 = p.cursor orelse 0;
-    // Find the run's log.
-    const runs = self.backup.history.listForJob(self.io, p.run_id, 1) catch return backupTypedError(output, "store_corrupt", "history unreadable");
-    _ = runs; // TODO: expose per-run log with cursor; for now echo the stored run log slice.
-    // Minimal shim: delegate to backup.poll cursor path where possible, else empty delta.
-    var writer = std.Io.Writer.fixed(output);
-    writer.print("{{\"ok\":true,\"cursor\":{d},\"delta\":\"\",\"eof\":true,\"dropped\":0}}", .{cursor + max}) catch return output[0..0];
-    return writer.buffered();
-}
-
-fn handleBackupCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(BackupCancelPayload, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
-    defer parsed.deinit();
-    if (!backup.validId(parsed.value.run_id)) return backupTypedError(output, "invalid_payload", "invalid run_id");
-    // Mark the live run as cancel_requested where possible.
-    self.backup.runs.lock();
-    defer self.backup.runs.unlock();
-    if (self.backup.runs.byId(parsed.value.run_id)) |run| {
-        if (!run.finalized and run.record.status == .running) {
-            run.record.status = .interrupted;
-            // Close the channel if present so the worker notices promptly.
-            if (run.channel) |ch| {
-                _ = self.manager.closeChannel(run.record.server_id, ch) catch {};
-            }
-        }
-    } else return backupTypedError(output, "not_found", "unknown run");
-    return ok_json;
-}
-
-/// Returns null when the session is ready, otherwise the error response
-/// the caller must return verbatim (empty result slices become
-/// `"result":null` in the envelope, so callers must never swallow it).
-fn backupSessionReady(self: *Context, output: []u8, server_id: []const u8) ?[]const u8 {
-    const session = self.manager.get(server_id) orelse return respondError(output, "not connected");
-    if (session.status.load(.acquire) != .ready) return respondError(output, "session not ready");
-    return null;
-}
-
-fn backupExec(self: *Context, server_id: []const u8, cmd: []const u8) ?sessions.ExecOutcome {
-    return self.manager.execWait(server_id, cmd, backup_exec_cap, backup_exec_timeout_ns) catch null;
-}
-
-/// Runs a command and returns true when it exited 0.
-fn backupCheck(self: *Context, server_id: []const u8, cmd: []const u8) bool {
-    var out = backupExec(self, server_id, cmd) orelse return false;
-    defer out.output.deinit(self.allocator);
-    return out.exit == 0;
-}
-
-fn backupRcloneInstalled(self: *Context, server_id: []const u8) bool {
-    return backupCheck(self, server_id, "command -v rclone >/dev/null 2>&1");
-}
-
-/// The scheduled-run staging dir for a job.
-fn backupStateDir(allocator: std.mem.Allocator, job_id: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ backup.state_dir, job_id });
-}
-
-fn backupJobToJson(writer: anytype, job: *const backup.Job) !void {
-    try writer.writeAll("{\"id\":");
-    try json.writeJsonString(writer, job.id);
-    try writer.writeAll(",\"server_id\":");
-    try json.writeJsonString(writer, job.server_id);
-    try writer.writeAll(",\"revision\":");
-    try writer.print("{d}", .{job.revision});
-    try writer.writeAll(",\"name\":");
-    try json.writeJsonString(writer, job.name);
-    try writer.writeAll(",\"source_path\":");
-    try json.writeJsonString(writer, job.source_path);
-    try writer.writeAll(",\"destination\":{\"type\":");
-    try json.writeJsonString(writer, job.destination.type);
-    try writer.writeAll(",\"provider\":");
-    try json.writeJsonString(writer, job.destination.provider);
-    try writer.writeAll(",\"bucket\":");
-    try json.writeJsonString(writer, job.destination.bucket);
-    try writer.writeAll(",\"prefix\":");
-    try json.writeJsonString(writer, job.destination.prefix);
-    try writer.writeAll(",\"endpoint\":");
-    try json.writeJsonString(writer, job.destination.endpoint);
-    try writer.writeAll(",\"region\":");
-    try json.writeJsonString(writer, job.destination.region);
-    try writer.print(",\"use_iam\":{s},\"storage_class\":", .{if (job.destination.use_iam) "true" else "false"});
-    try json.writeJsonString(writer, job.destination.storage_class);
-    try writer.writeAll("},\"transfer\":");
-    try json.writeJsonString(writer, job.transfer.jsonName());
-    try writer.writeAll(",\"schedule\":{\"mode\":");
-    try json.writeJsonString(writer, job.schedule.mode);
-    try writer.writeAll(",\"interval_unit\":");
-    try json.writeJsonString(writer, job.schedule.interval_unit);
-    try writer.print(",\"interval_every\":{d},\"expr\":", .{job.schedule.interval_every});
-    try json.writeJsonString(writer, job.schedule.expr);
-    try writer.print(",\"enabled\":{s}}}", .{if (job.schedule.enabled) "true" else "false"});
-    // Back-compat ns + new ms (NEXT-SPEC requires ms).
-    try writer.print(",\"created_at_ns\":{d},\"updated_at_ns\":{d},\"created_at_ms\":{d},\"updated_at_ms\":{d}}}", .{ job.created_at_ns, job.updated_at_ns, @divFloor(job.created_at_ns, std.time.ns_per_ms), @divFloor(job.updated_at_ns, std.time.ns_per_ms) });
-}
-
-/// Reads the current crontab (empty when none exists). Owned.
-fn backupCrontabGet(self: *Context, server_id: []const u8) ?[]u8 {
-    var out = backupExec(self, server_id, "crontab -l 2>/dev/null") orelse return null;
-    defer out.output.deinit(self.allocator);
-    return self.allocator.dupe(u8, out.output.items) catch null;
-}
-
-/// Installs a crontab from content via stdin (no shell interpolation of
-/// the content). The content is written through an exec channel's stdin
-/// path (secret-safe), not `printf '%s'`.
-fn backupCrontabSet(self: *Context, server_id: []const u8, content: []const u8) bool {
-    // Use a tracked exec that feeds content as stdin to `crontab -`, so the
-    // table bytes are never interpolated into a shell string.
-    const session = self.manager.get(server_id) orelse return false;
-    if (session.status.load(.acquire) != .ready) return false;
-    // Fallback: if stdin-via-channel is unavailable for this helper, send
-    // through a base64 round-trip (bounded helper, not data channel).
-    const enc_buf = self.allocator.alloc(u8, (content.len + 2) / 3 * 4 + 64) catch return false;
-    defer self.allocator.free(enc_buf);
-    const encoded = std.base64.standard.Encoder.encode(enc_buf, content);
-    var cmd_buf: [96 * 1024]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&cmd_buf, "printf '%s' '{s}' | base64 -d | crontab -", .{encoded}) catch return false;
-    return backupCheck(self, server_id, cmd);
-}
-
-/// The five-field expression for a job's schedule.
-fn backupScheduleExpr(allocator: std.mem.Allocator, job: *const backup.Job) ![]u8 {
-    if (std.mem.eql(u8, job.schedule.mode, "custom")) return allocator.dupe(u8, job.schedule.expr);
-    return backup.intervalToCronExpr(allocator, job.schedule.interval_unit, job.schedule.interval_every);
-}
-
-/// The shell-quoted rclone invocation for a job (no stats flags — the
-/// wrapper and the manual runner add their own).
-fn backupRcloneInvocation(self: *Context, job: *const backup.Job, remote: []const u8, config_path: []const u8) ![]u8 {
-    const transfer = job.transfer.jsonName();
-    const src = try shellquote.quote(self.allocator, job.source_path);
-    defer self.allocator.free(src);
-    const dest = try backup.destinationArg(self.allocator, job, remote);
-    defer self.allocator.free(dest);
-    const dest_q = try shellquote.quote(self.allocator, dest);
-    defer self.allocator.free(dest_q);
-    const cfg_q = try shellquote.quote(self.allocator, config_path);
-    defer self.allocator.free(cfg_q);
-    return std.fmt.allocPrint(self.allocator, "rclone {s} {s} {s} --config {s}", .{ transfer, src, dest_q, cfg_q });
-}
-
-/// Writes the job's remote config section to `path` (0600, secrets in the
-/// file only — never argv or audit). Write-failure text is formatted into
-/// `write_err_buf` (owned by the outermost caller; see sshkeysWrite).
-fn backupWriteConfig(self: *Context, server_id: []const u8, job: *const backup.Job, remote: []const u8, path: []const u8, credentials: ?BackupCredentials, write_err_buf: []u8) ?[]const u8 {
-    const section = backup.remoteConfigSection(self.allocator, job, remote, if (credentials) |c| c.access_key else null, if (credentials) |c| c.secret_key else null) catch return "out of memory";
-    defer self.allocator.free(section);
-    if (std.mem.eql(u8, path, backup.remote_config_path)) {
-        // Merge into the dedicated config; never touch other sections.
-        const existing = sshkeysRead(self, server_id, path) orelse "";
-        defer if (existing.len > 0) self.allocator.free(existing);
-        const merged = backup.configMergeSection(self.allocator, existing, remote, section) catch return "out of memory";
-        defer self.allocator.free(merged);
-        if (sshkeysWrite(self, server_id, path, merged, 0o600, null, write_err_buf)) |msg| return msg;
-    } else {
-        if (sshkeysWrite(self, server_id, path, section, 0o600, null, write_err_buf)) |msg| return msg;
-    }
-    return null;
-}
-
-/// Enables a job's unattended schedule: dedicated config, run wrapper,
-/// crontab line (idempotent). `credentials` are copied into the config
-/// on the server — the documented remote-secret disclosure (spec 10 §8).
-fn backupInstallSchedule(self: *Context, output: []u8, job: *const backup.Job, credentials: ?BackupCredentials, write_err_buf: []u8) ?[]const u8 {
-    _ = output;
-    var mkdir_buf: [512]u8 = undefined;
-    const mkdir = std.fmt.bufPrint(&mkdir_buf, "mkdir -p ~/.config/oars && chmod 700 ~/.config/oars && mkdir -p {s}/{s} && chmod 700 {s}/{s}", .{ backup.state_dir, job.id, backup.state_dir, job.id }) catch return "out of memory";
-    if (!backupCheck(self, job.server_id, mkdir)) return "failed to prepare the server state directories";
-
-    const remote = backup.remoteName(self.allocator, job.id) catch return "out of memory";
-    defer self.allocator.free(remote);
-    if (backupWriteConfig(self, job.server_id, job, remote, backup.remote_config_path, credentials, write_err_buf)) |msg| return msg;
-
-    const invocation = backupRcloneInvocation(self, job, remote, backup.remote_config_path) catch return "out of memory";
-    defer self.allocator.free(invocation);
-    const script = backup.wrapperScript(self.allocator, job.id, invocation) catch return "out of memory";
-    defer self.allocator.free(script);
-    var wrapper_path_buf: [512]u8 = undefined;
-    const wrapper_path = std.fmt.bufPrint(&wrapper_path_buf, "{s}/{s}/run.sh", .{ backup.state_dir, job.id }) catch return "out of memory";
-    if (sshkeysWrite(self, job.server_id, wrapper_path, script, 0o700, null, write_err_buf)) |msg| return msg;
-
-    const expr = backupScheduleExpr(self.allocator, job) catch return "out of memory";
-    defer self.allocator.free(expr);
-    var line_buf: [1024]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "{s} /bin/sh {s}", .{ expr, wrapper_path }) catch return "out of memory";
-    const escaped = backup.escapePercent(self.allocator, line) catch return "out of memory";
-    defer self.allocator.free(escaped);
-    const existing = backupCrontabGet(self, job.server_id) orelse return "cannot read the crontab";
-    defer self.allocator.free(existing);
-    const edited = backup.crontabAdd(self.allocator, existing, job.id, escaped) catch return "out of memory";
-    defer self.allocator.free(edited.content);
-    if (edited.changed and !backupCrontabSet(self, job.server_id, edited.content)) return "failed to install the crontab entry";
-    return null;
-}
-
-/// Removes a job's crontab lines (idempotent).
-fn backupRemoveSchedule(self: *Context, job_id: []const u8, server_id: []const u8) ?[]const u8 {
-    const existing = backupCrontabGet(self, server_id) orelse return null; // no crontab → nothing to remove
-    defer self.allocator.free(existing);
-    var qid: [512]u8 = undefined;
-    const qjob = shellquote.quoteAppend(&qid, job_id);
-    if (std.mem.indexOfScalar(u8, qjob, '\n') != null or std.mem.indexOfScalar(u8, qjob, '\r') != null) return "invalid job id";
-    const edited = backup.crontabRemove(self.allocator, existing, job_id) catch return "out of memory";
-    defer self.allocator.free(edited.content);
-    if (edited.changed and !backupCrontabSet(self, server_id, edited.content)) return "failed to update the crontab";
-    return null;
-}
-
-const BackupStatusFile = struct {
-    v: ?u32 = null,
-    job_id: []const u8 = "",
-    run_id: []const u8 = "",
-    ts: []const u8 = "",
-    exit: []const u8 = "",
-    started_at: []const u8 = "",
-    finished_at: []const u8 = "",
-    status: []const u8 = "",
+    run_id: []const u8,
+    cursor: ?u64 = null,
+    max: ?u64 = null,
 };
 
-fn backupTypedError(output: []u8, code: []const u8, msg: []const u8) []const u8 {
-    return backupTypedErrorDetail(output, code, msg, null);
+fn backupJobInput(payload: BackupJobDraftPayload) !backup.JobInput {
+    const schedule: backup.Schedule = if (std.mem.eql(u8, payload.schedule.mode, "manual")) blk: {
+        if (payload.schedule.enabled or payload.schedule.every != null or payload.schedule.unit != null or payload.schedule.anchor_epoch_sec != null or payload.schedule.expr != null) return error.InvalidSchedule;
+        break :blk .{ .mode = payload.schedule.mode, .enabled = false };
+    } else if (std.mem.eql(u8, payload.schedule.mode, "interval")) blk: {
+        if (payload.schedule.expr != null) return error.InvalidSchedule;
+        break :blk .{
+            .mode = payload.schedule.mode,
+            .enabled = payload.schedule.enabled,
+            .every = payload.schedule.every orelse return error.InvalidSchedule,
+            .unit = payload.schedule.unit orelse return error.InvalidSchedule,
+            .anchor_epoch_sec = payload.schedule.anchor_epoch_sec orelse return error.InvalidSchedule,
+        };
+    } else if (std.mem.eql(u8, payload.schedule.mode, "custom")) blk: {
+        if (payload.schedule.every != null or payload.schedule.unit != null or payload.schedule.anchor_epoch_sec != null) return error.InvalidSchedule;
+        break :blk .{
+            .mode = payload.schedule.mode,
+            .enabled = payload.schedule.enabled,
+            .expr = payload.schedule.expr orelse return error.InvalidSchedule,
+        };
+    } else return error.InvalidSchedule;
+    return .{
+        .id = payload.id,
+        .server_id = payload.server_id,
+        .name = payload.name,
+        .source_path = payload.source_path,
+        .destination = .{
+            .type = payload.destination.type,
+            .provider = payload.destination.provider,
+            .bucket = payload.destination.bucket,
+            .prefix = payload.destination.prefix,
+            .endpoint = payload.destination.endpoint,
+            .region = payload.destination.region,
+            .credential_mode = payload.destination.credential_mode,
+            .storage_class = payload.destination.storage_class,
+        },
+        .transfer = payload.transfer,
+        .schedule = schedule,
+    };
 }
 
-fn backupTypedErrorDetail(output: []u8, code: []const u8, msg: []const u8, detail: ?[]const u8) []const u8 {
+fn backupRemoteSubmit(context: *anyopaque, server_id: []const u8, request: sessions.BackupRequest, outcome: *sessions.BackupOutcome) anyerror!void {
+    const manager: *sessions.Manager = @ptrCast(@alignCast(context));
+    try manager.enqueueBackup(server_id, request, outcome);
+}
+
+fn backupRemoteSubmitCleanup(context: *anyopaque, server_id: []const u8, request: sessions.BackupRequest, outcome: *sessions.BackupOutcome) anyerror!void {
+    const manager: *sessions.Manager = @ptrCast(@alignCast(context));
+    try manager.enqueueBackupCleanup(server_id, request, outcome);
+}
+
+fn backupPrepareDisconnect(context: *anyopaque, server_id: []const u8) bool {
+    const registry: *backup.Registry = @ptrCast(@alignCast(context));
+    return registry.prepareDisconnect(server_id);
+}
+
+fn backupRemoteDetach(context: *anyopaque, registry_context: *anyopaque) void {
+    const manager: *sessions.Manager = @ptrCast(@alignCast(context));
+    manager.detachBackupDisconnectHook(registry_context);
+}
+
+fn backupRemoteStart(context: *anyopaque, server_id: []const u8, command: []const u8, stdin_data: ?[]const u8, process: *sessions.BackupProcess) anyerror!void {
+    const manager: *sessions.Manager = @ptrCast(@alignCast(context));
+    try manager.startBackupProcess(server_id, command, stdin_data, process);
+}
+
+fn backupNowMs(self: *Context) i64 {
+    return @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_ms));
+}
+
+fn backupAuditFileContains(self: *Context, action: []const u8, identity: []const u8) bool {
+    const content = std.Io.Dir.cwd().readFileAlloc(self.io, self.audit.path, self.allocator, .limited(128 * 1024 * 1024)) catch return false;
+    defer self.allocator.free(content);
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, action) != null and std.mem.indexOf(u8, line, identity) != null) return true;
+    }
+    return false;
+}
+
+fn backupAuditDurable(self: *Context, action: []const u8, target: []const u8, detail: []const u8, identity: []const u8) bool {
+    if (backupAuditFileContains(self, action, identity)) return true;
+    self.audit.append(self.io, action, target, detail) catch return false;
+    return backupAuditFileContains(self, action, identity);
+}
+
+fn backupOperationAudit(context: *anyopaque, event: *const backup.OperationEvent) bool {
+    const self = contextOf(context);
+    var detail_buf: [512]u8 = undefined;
+    const failure_code = if (event.failure_code) |code| code.jsonName() else "none";
+    const detail = std.fmt.bufPrint(&detail_buf, "operation={s} attempt={d} plan_hash={s} kind={s} state={s} job={s} failure={s}", .{
+        event.operation_id,
+        event.audit_attempt,
+        &event.plan_hash,
+        event.kind.jsonName(),
+        event.state.jsonName(),
+        event.job_id,
+        failure_code,
+    }) catch "backup operation event";
+    var identity_buf: [192]u8 = undefined;
+    const identity = std.fmt.bufPrint(&identity_buf, "operation={s} attempt={d} ", .{ event.operation_id, event.audit_attempt }) catch return false;
+    return backupAuditDurable(
+        self,
+        if (event.admitted) "backup.operation.admitted" else "backup.operation.terminal",
+        if (event.server_id.len > 0) event.server_id else "local",
+        detail,
+        identity,
+    );
+}
+
+fn backupRunAudit(context: *anyopaque, event: *const backup.RunEvent) bool {
+    const self = contextOf(context);
+    var detail_buf: [512]u8 = undefined;
+    const failure_code = if (event.failure_code) |code| code.jsonName() else "none";
+    const detail = std.fmt.bufPrint(&detail_buf, "operation={s} run={s} attempt={d} plan_hash={s} job={s} status={s} failure={s}", .{ event.operation_id, event.run_id, event.audit_attempt, &event.plan_hash, event.job_id, event.status.jsonName(), failure_code }) catch "backup run event";
+    var identity_buf: [192]u8 = undefined;
+    const identity = std.fmt.bufPrint(&identity_buf, "run={s} attempt={d} ", .{ event.run_id, event.audit_attempt }) catch return false;
+    return backupAuditDurable(self, if (event.admitted) "backup.run.admitted" else "backup.run.terminal", event.server_id, detail, identity);
+}
+
+fn backupJsonAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    return out.toOwnedSlice();
+}
+
+fn backupStoreError(output: []u8, err: anyerror, noun: []const u8) []const u8 {
+    var message_buf: [256]u8 = undefined;
+    const detail = switch (err) {
+        error.StorePermissionDenied => "permission was denied",
+        error.StoreTimeout => "the read timed out",
+        error.StoreTooLarge => "the file exceeds its size limit",
+        error.StoreQuarantineFailed => "malformed data could not be quarantined",
+        error.StoreCorrupt => "the data is malformed or unavailable",
+        else => "an I/O error occurred",
+    };
+    const message = std.fmt.bufPrint(&message_buf, "{s}: {s}", .{ noun, detail }) catch noun;
+    return backupTypedError(output, switch (err) {
+        error.StorePermissionDenied => "permission_denied",
+        error.StoreTimeout => "timeout",
+        error.StoreTooLarge => "source_too_large",
+        else => "store_corrupt",
+    }, message);
+}
+
+fn backupSnapshotError(output: []u8, err: backup.Registry.StoreSnapshotError, noun: []const u8) []const u8 {
+    return switch (err) {
+        error.StoreNotReady => backupTypedError(output, "busy", "backup stores are still loading; retry shortly"),
+        error.StoreCorrupt => backupTypedError(output, "store_corrupt", noun),
+        error.OutOfMemory => backupTypedError(output, "internal", "could not copy the coordinator snapshot"),
+    };
+}
+
+fn backupTypedError(output: []u8, code: []const u8, message: []const u8) []const u8 {
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":false,\"code\":") catch return output[0..0];
     json.writeJsonString(&writer, code) catch return output[0..0];
     writer.writeAll(",\"error\":") catch return output[0..0];
-    json.writeJsonString(&writer, msg) catch return output[0..0];
+    json.writeJsonString(&writer, message) catch return output[0..0];
     writer.writeAll(",\"retryable\":") catch return output[0..0];
-    writer.writeAll(if (std.mem.eql(u8, code, "transport_error") or std.mem.eql(u8, code, "timeout") or std.mem.eql(u8, code, "busy")) "true" else "false") catch return output[0..0];
-    if (detail) |d| {
-        writer.writeAll(",\"detail\":{\"step\":") catch return output[0..0];
-        json.writeJsonString(&writer, d) catch return output[0..0];
-        writer.writeAll("}") catch return output[0..0];
-    }
+    const retryable = std.mem.eql(u8, code, "transport_error") or std.mem.eql(u8, code, "timeout") or std.mem.eql(u8, code, "busy") or std.mem.eql(u8, code, "store_corrupt");
+    writer.writeAll(if (retryable) "true" else "false") catch return output[0..0];
     writer.writeAll("}") catch return output[0..0];
     return writer.buffered();
 }
 
-/// Imports completed scheduled runs staged on the server (the wrapper
-/// writes `<ts>.status` + `<ts>.log`; cron may have run while Oars was
-/// closed). Idempotent: history dedupes by run id and files are removed
-/// after a successful import.
-fn backupImportStaged(self: *Context, server_id: []const u8, job_id: []const u8) void {
-    const state_dir = backupStateDir(self.allocator, job_id) catch return;
-    defer self.allocator.free(state_dir);
-    var ls_buf: [1024]u8 = undefined;
-    const ls_cmd = std.fmt.bufPrint(&ls_buf, "ls {s} 2>/dev/null", .{state_dir}) catch return;
-    var ls = backupExec(self, server_id, ls_cmd) orelse return;
-    defer ls.output.deinit(self.allocator);
-    var lines = std.mem.splitScalar(u8, ls.output.items, '\n');
-    while (lines.next()) |raw| {
-        const name = std.mem.trim(u8, raw, " \t\r");
-        if (!std.mem.endsWith(u8, name, ".status")) continue;
-        const ts = name[0 .. name.len - 7];
-        var cat_buf: [1024]u8 = undefined;
-        const status_path = std.fmt.bufPrint(&cat_buf, "{s}/{s}.status", .{ state_dir, ts }) catch continue;
-        var status_out = backupExec(self, server_id, status_path) orelse continue;
-        defer status_out.output.deinit(self.allocator);
-        const parsed = std.json.parseFromSlice(BackupStatusFile, self.allocator, status_out.output.items, .{
-            .ignore_unknown_fields = true,
-            .allocate = .alloc_always,
-        }) catch continue;
-        defer parsed.deinit();
-        const st = parsed.value;
-        const exit = std.fmt.parseInt(i32, std.mem.trim(u8, st.exit, " \t\r\n"), 10) catch continue;
-        const started = std.fmt.parseInt(i64, std.mem.trim(u8, st.started_at, " \t\r\n"), 10) catch continue;
-        const finished = std.fmt.parseInt(i64, std.mem.trim(u8, st.finished_at, " \t\r\n"), 10) catch continue;
-        if (exit < 0) continue;
-
-        var log_buf: [1024]u8 = undefined;
-        const log_path = std.fmt.bufPrint(&log_buf, "{s}/{s}.log", .{ state_dir, ts }) catch continue;
-        var log_out = backupExec(self, server_id, log_path) orelse continue;
-        defer log_out.output.deinit(self.allocator);
-        const summary = backup.lastStatsFromLog(self.allocator, log_out.output.items);
-        var id_buf: [128]u8 = undefined;
-        const id = std.fmt.bufPrint(&id_buf, "sched-{s}-{s}", .{ job_id, ts }) catch continue;
-        var record = backup.RunRecord{
-            .id = self.allocator.dupe(u8, id) catch continue,
-            .job_id = self.allocator.dupe(u8, job_id) catch continue,
-            .server_id = self.allocator.dupe(u8, server_id) catch continue,
-            .source = self.allocator.dupe(u8, "scheduled") catch continue,
-            .status = if (exit == 0) (if (summary.stats.files_done == 0) .no_changes else .success) else .failed,
-            .started_at_ns = started * std.time.ns_per_s,
-            .finished_at_ns = finished * std.time.ns_per_s,
-            .bytes_done = summary.stats.bytes_done,
-            .bytes_total = summary.stats.bytes_total,
-            .files_done = summary.stats.files_done,
-            .files_total = summary.stats.files_total,
-        };
-        var failed = false;
-        record.trimLog(self.allocator, log_out.output.items) catch {
-            failed = true;
-        };
-        if (summary.@"error".len > 0) {
-            record.@"error" = self.allocator.dupe(u8, summary.@"error") catch null;
-        } else if (exit != 0) {
-            var err_buf: [64]u8 = undefined;
-            const msg = std.fmt.bufPrint(&err_buf, "rclone exited {d}", .{exit}) catch "rclone failed";
-            record.@"error" = self.allocator.dupe(u8, msg) catch null;
+fn backupFailureJson(writer: anytype, failure: backup.BackupFailure) !void {
+    try writer.writeAll("{\"ok\":false,\"code\":");
+    try json.writeJsonString(writer, failure.code.jsonName());
+    try writer.writeAll(",\"error\":");
+    try json.writeJsonString(writer, failure.message);
+    try writer.writeAll(",\"retryable\":");
+    try writer.writeAll(if (failure.retryable) "true" else "false");
+    if (failure.step.len > 0 or failure.path.len > 0 or failure.remote_object.len > 0) {
+        try writer.writeAll(",\"detail\":{");
+        var first = true;
+        if (failure.step.len > 0) {
+            try writer.writeAll("\"step\":");
+            try json.writeJsonString(writer, failure.step);
+            first = false;
         }
-        if (!failed) self.backup.history.append(self.io, &record, @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds)) catch {};
-        record.deinit(self.allocator);
-        // Consumed: remove the staged pair (a failed import leaves them
-        // for the next connection — history dedupes by id).
-        var rm_buf: [2048]u8 = undefined;
-        const rm_cmd = std.fmt.bufPrint(&rm_buf, "rm -f {s}/{s}.status {s}/{s}.log", .{ state_dir, ts, state_dir, ts }) catch continue;
-        _ = backupCheck(self, server_id, rm_cmd);
+        if (failure.path.len > 0) {
+            if (!first) try writer.writeAll(",");
+            try writer.writeAll("\"path\":");
+            try json.writeJsonString(writer, failure.path);
+            first = false;
+        }
+        if (failure.remote_object.len > 0) {
+            if (!first) try writer.writeAll(",");
+            try writer.writeAll("\"remote_object\":");
+            try json.writeJsonString(writer, failure.remote_object);
+        }
+        try writer.writeAll("}");
     }
+    try writer.writeAll("}");
 }
 
-fn handleBackupJobsList(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(BackupJobsListPayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
-    defer parsed.deinit();
-    const server_id = parsed.value.server_id;
-    if (!backup.validId(server_id)) return backupTypedError(output, "invalid_payload", "invalid server_id");
-
-    // Local-only per NEXT-SPEC. Probe/import is via refresh (coordinator),
-    // not inline in list. Keep last-good snapshot visible while refreshing.
-    self.backup.ensureStarted(self.io);
-    const jobs = self.backup.jobs.listForServer(self.io, server_id) catch {
-        return backupTypedError(output, "store_corrupt", "job registry is unreadable");
-    };
-    defer {
-        for (jobs) |*j| j.deinit(self.allocator);
-        self.allocator.free(jobs);
+fn backupOperationJson(writer: anytype, snapshot: *const backup.OperationSnapshot) !void {
+    try writer.writeAll("{\"ok\":true,\"operation_id\":");
+    try json.writeJsonString(writer, snapshot.id);
+    try writer.writeAll(",\"kind\":");
+    try json.writeJsonString(writer, snapshot.kind.jsonName());
+    try writer.writeAll(",\"state\":");
+    try json.writeJsonString(writer, snapshot.state.jsonName());
+    try writer.writeAll(",\"steps\":[");
+    for (snapshot.steps, 0..) |step, index| {
+        if (index > 0) try writer.writeAll(",");
+        try writer.writeAll("{\"id\":");
+        try json.writeJsonString(writer, step.id);
+        try writer.writeAll(",\"state\":");
+        try json.writeJsonString(writer, step.state.jsonName());
+        if (step.failure) |failure| {
+            try writer.writeAll(",\"error\":");
+            try backupFailureJson(writer, failure);
+        }
+        try writer.writeAll("}");
     }
-
-    var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,\"jobs\":[") catch return output[0..0];
-    var first = true;
-    for (jobs) |*j| {
-        if (!first) writer.writeAll(",") catch return output[0..0];
-        first = false;
-        backupJobToJson(&writer, j) catch return output[0..0];
+    try writer.print("],\"started_at_ms\":{d}", .{snapshot.started_at_ms});
+    if (snapshot.finished_at_ms) |finished| try writer.print(",\"finished_at_ms\":{d}", .{finished});
+    if (snapshot.result_json) |result| {
+        try writer.writeAll(",\"result\":");
+        try writer.writeAll(result);
     }
-    writer.writeAll("]}") catch return output[0..0];
-    return writer.buffered();
+    if (snapshot.failure) |failure| {
+        try writer.writeAll(",\"error\":");
+        try backupFailureJson(writer, failure);
+    }
+    try writer.writeAll("}");
+}
+
+fn backupDestinationJson(writer: anytype, destination: backup.Destination) !void {
+    try writer.writeAll("{\"type\":\"s3\",\"provider\":");
+    try json.writeJsonString(writer, destination.provider);
+    try writer.writeAll(",\"bucket\":");
+    try json.writeJsonString(writer, destination.bucket);
+    try writer.writeAll(",\"prefix\":");
+    try json.writeJsonString(writer, destination.prefix);
+    try writer.writeAll(",\"endpoint\":");
+    try json.writeJsonString(writer, destination.endpoint);
+    try writer.writeAll(",\"region\":");
+    try json.writeJsonString(writer, destination.region);
+    try writer.writeAll(",\"credential_mode\":");
+    try json.writeJsonString(writer, destination.credential_mode.jsonName());
+    try writer.writeAll(",\"storage_class\":");
+    try json.writeJsonString(writer, destination.storage_class);
+    try writer.writeAll("}");
+}
+
+fn backupScheduleJson(writer: anytype, schedule: backup.Schedule) !void {
+    try writer.writeAll("{\"mode\":");
+    try json.writeJsonString(writer, schedule.mode);
+    try writer.writeAll(",\"enabled\":");
+    try writer.writeAll(if (schedule.enabled) "true" else "false");
+    if (std.mem.eql(u8, schedule.mode, "interval")) {
+        try writer.print(",\"every\":{d},\"unit\":", .{schedule.every});
+        try json.writeJsonString(writer, schedule.unit);
+        try writer.print(",\"anchor_epoch_sec\":{d}", .{schedule.anchor_epoch_sec});
+    } else if (std.mem.eql(u8, schedule.mode, "custom")) {
+        try writer.writeAll(",\"expr\":");
+        try json.writeJsonString(writer, schedule.expr);
+    }
+    try writer.writeAll("}");
+}
+
+fn backupJobFieldsJson(
+    writer: anytype,
+    id: []const u8,
+    server_id: []const u8,
+    revision: u64,
+    name: []const u8,
+    source_path: []const u8,
+    destination: backup.Destination,
+    transfer: []const u8,
+    schedule: backup.Schedule,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+) !void {
+    try writer.writeAll("{\"id\":");
+    try json.writeJsonString(writer, id);
+    try writer.writeAll(",\"server_id\":");
+    try json.writeJsonString(writer, server_id);
+    try writer.print(",\"revision\":{d},\"name\":", .{revision});
+    try json.writeJsonString(writer, name);
+    try writer.writeAll(",\"source_path\":");
+    try json.writeJsonString(writer, source_path);
+    try writer.writeAll(",\"destination\":");
+    try backupDestinationJson(writer, destination);
+    try writer.writeAll(",\"transfer\":");
+    try json.writeJsonString(writer, transfer);
+    try writer.writeAll(",\"schedule\":");
+    try backupScheduleJson(writer, schedule);
+    try writer.print(",\"created_at_ms\":{d},\"updated_at_ms\":{d}}}", .{ created_at_ms, updated_at_ms });
+}
+
+fn backupJobToJson(writer: anytype, job: *const backup.Job) !void {
+    try backupJobFieldsJson(
+        writer,
+        job.id,
+        job.server_id,
+        job.revision,
+        job.name,
+        job.source_path,
+        job.destination,
+        job.transfer.jsonName(),
+        job.schedule,
+        @divFloor(job.created_at_ns, std.time.ns_per_ms),
+        @divFloor(job.updated_at_ns, std.time.ns_per_ms),
+    );
 }
 
 fn backupSaveErrorString(err: backup.SaveError) []const u8 {
@@ -11943,368 +11744,669 @@ fn backupSaveErrorString(err: backup.SaveError) []const u8 {
         error.InvalidEndpoint => "invalid endpoint",
         error.InvalidRegion => "invalid region",
         error.InvalidStorageClass => "storage class not supported by this provider",
-        error.IamRequiresAws => "IAM role access is only supported on AWS",
+        error.IamRequiresAws => "aws_runtime is only supported on AWS",
         error.InvalidTransfer => "invalid transfer type",
         error.InvalidSchedule => "invalid schedule",
         error.InvalidCronExpr => "invalid cron expression",
-        error.EnabledScheduleNeedsCredentials => "credentials are required to enable an unattended schedule (they are copied into the server's rclone config, mode 0600; rclone obscuring is not encryption)",
         error.UnknownId => "unknown job",
         error.TooManyJobs => "too many jobs for this server",
         error.ImmutableServerId => "server_id is immutable",
-        error.RevConflict => "revision conflict — refresh and retry",
+        error.RevConflict => "revision conflict; refresh and retry",
         error.InvalidPrefix => "invalid prefix",
         error.InvalidCredentials => "invalid credentials",
         else => "job registry is unreadable",
     };
 }
 
+fn backupCreatePlan(
+    self: *Context,
+    kind: backup.PlanKind,
+    id: []const u8,
+    server_id: []const u8,
+    job_id: []const u8,
+    job_name: []const u8,
+    expires_at_ms: i64,
+    payload_json: []const u8,
+    remote_object: []const u8,
+    remote_required: bool,
+) !*backup.BackupPlan {
+    const plan = try self.allocator.create(backup.BackupPlan);
+    plan.* = .{
+        .id = "",
+        .kind = kind,
+        .created_at_ms = backupNowMs(self),
+        .expires_at_ms = expires_at_ms,
+        .remote_required = remote_required,
+    };
+    errdefer {
+        plan.deinit(self.allocator);
+        self.allocator.destroy(plan);
+    }
+    plan.id = try backup.dupOrLiteral(self.allocator, id);
+    plan.server_id = try backup.dupOrLiteral(self.allocator, server_id);
+    plan.job_id = try backup.dupOrLiteral(self.allocator, job_id);
+    plan.job_name = try backup.dupOrLiteral(self.allocator, job_name);
+    plan.payload_json = try backup.dupOrLiteral(self.allocator, payload_json);
+    plan.remote_object = try backup.dupOrLiteral(self.allocator, remote_object);
+    return plan;
+}
+
+fn backupRegisterPlan(self: *Context, plan: *backup.BackupPlan, output: []u8) ?[]const u8 {
+    self.backup.registerPlan(plan) catch |err| {
+        plan.deinit(self.allocator);
+        self.allocator.destroy(plan);
+        return backupTypedError(output, if (err == error.TooManyPlans) "busy" else "internal", if (err == error.TooManyPlans) "too many retained backup plans" else "could not register backup plan");
+    };
+    return null;
+}
+
+fn backupSyncAdvanceApproved(job: backup.JobInput, confirm_job_name: ?[]const u8) bool {
+    if (!job.schedule.enabled or !std.mem.eql(u8, job.transfer, "sync")) return true;
+    return confirm_job_name != null and std.mem.eql(u8, confirm_job_name.?, job.name);
+}
+
+fn backupCredentialsForMode(
+    self: *Context,
+    mode: backup.CredentialMode,
+    supplied: ?BackupCredentials,
+    required: bool,
+) !?backup.OwnedCredentials {
+    if (mode == .aws_runtime) {
+        if (supplied != null) return error.InvalidCredentials;
+        return null;
+    }
+    const credentials = supplied orelse {
+        if (required) return error.InvalidCredentials;
+        return null;
+    };
+    return try backup.OwnedCredentials.init(self.allocator, .{
+        .access_key = credentials.access_key,
+        .secret_key = credentials.secret_key,
+    });
+}
+
+fn backupReceiptJson(output: []u8, receipt: *const backup.OperationReceipt, include_job_id: bool) []const u8 {
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"operation_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, receipt.operation_id) catch return output[0..0];
+    if (include_job_id) {
+        writer.writeAll(",\"job_id\":") catch return output[0..0];
+        json.writeJsonString(&writer, receipt.job_id) catch return output[0..0];
+    }
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn backupAdmissionError(output: []u8, err: backup.Registry.AdmitError) []const u8 {
+    return switch (err) {
+        error.PlanExpired => backupTypedError(output, "plan_expired", "plan expired; recreate it"),
+        error.PlanKindMismatch, error.IdempotencyConflict => backupTypedError(output, "conflict", "operation id or plan does not match the admitted request"),
+        error.PlanConsumed => backupTypedError(output, "conflict", "plan was already consumed by another operation"),
+        error.Busy, error.TooManyActive => backupTypedError(output, "busy", "another backup mutation is already active for this server"),
+        error.SessionNotReady => backupTypedError(output, "session_not_ready", "the server is disconnecting"),
+        error.OutOfMemory => backupTypedError(output, "internal", "could not register backup operation"),
+    };
+}
+
+fn backupAdmit(
+    self: *Context,
+    operation_id: []const u8,
+    kind: backup.OperationKind,
+    server_id: []const u8,
+    plan_id: ?[]const u8,
+    credentials: ?*const backup.OwnedCredentials,
+    sync_advance_approved: bool,
+) backup.Registry.AdmitError!backup.Admission {
+    self.startBackupCoordinator() catch return error.OutOfMemory;
+    const credentials_view: ?backup.CredentialsView = if (credentials) |owned| .{
+        .access_key = owned.access_key,
+        .secret_key = owned.secret_key,
+    } else null;
+    return try self.backup.admitOperation(.{
+        .operation_id = operation_id,
+        .kind = kind,
+        .server_id = server_id,
+        .plan_id = plan_id,
+        .credentials = credentials_view,
+        .sync_advance_approved = sync_advance_approved,
+    }, backupNowMs(self));
+}
+
+fn backupUniqueJobId(self: *Context) ![]u8 {
+    var attempts: usize = 0;
+    while (attempts < 8) : (attempts += 1) {
+        const candidate = try backup.randomJobId(self.allocator, self.io);
+        const existing = try self.backup.jobSnapshot(candidate);
+        if (existing) |job_value| {
+            var job = job_value;
+            job.deinit(self.allocator);
+            self.allocator.free(candidate);
+            continue;
+        }
+        return candidate;
+    }
+    return error.IdCollision;
+}
+
+fn handleBackupJobsList(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(BackupJobsListPayload, self.allocator, invocation.request.payload) catch return backupTypedError(output, "invalid_payload", "invalid payload");
+    defer parsed.deinit();
+    if (!backup.validId(parsed.value.server_id)) return backupTypedError(output, "invalid_payload", "invalid server_id");
+    self.startBackupCoordinator() catch return backupTypedError(output, "internal", "backup coordinator is unavailable");
+    var listed = self.backup.jobsForServerSnapshot(parsed.value.server_id) catch |err| return backupSnapshotError(output, err, "backup job registry could not be read");
+    defer listed.deinit(self.allocator);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"jobs\":[") catch return output[0..0];
+    for (listed.jobs, 0..) |*job, index| {
+        if (index > 0) writer.writeAll(",") catch return output[0..0];
+        backupJobToJson(&writer, job) catch return output[0..0];
+    }
+    writer.writeAll("]") catch return output[0..0];
+    if (listed.recovery_error) |recovery_error| {
+        writer.writeAll(",\"recovery_error\":") catch return output[0..0];
+        json.writeJsonString(&writer, recovery_error) catch return output[0..0];
+    }
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleBackupJobsPlan(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(BackupPlanPayload, self.allocator, invocation.request.payload) catch return backupTypedError(output, "invalid_payload", "invalid payload");
+    defer parsed.deinit();
+    const input = backupJobInput(parsed.value.job) catch return backupTypedError(output, "invalid_payload", "job draft does not match the shipping backup contract");
+    backup.validate(input) catch |err| return backupTypedError(output, "invalid_job", backupSaveErrorString(err));
+    self.startBackupCoordinator() catch return backupTypedError(output, "internal", "backup coordinator is unavailable");
+
+    var existing: ?backup.Job = null;
+    defer if (existing) |*job| job.deinit(self.allocator);
+    var job_id_owned: ?[]u8 = null;
+    defer if (job_id_owned) |job_id| self.allocator.free(job_id);
+    var expected_revision: ?u64 = null;
+    var revision: u64 = 1;
+    var created_at_ms = backupNowMs(self);
+    if (input.id) |job_id| {
+        existing = (self.backup.jobSnapshot(job_id) catch |err| return backupSnapshotError(output, err, "backup job registry could not be read")) orelse return backupTypedError(output, "not_found", "unknown job");
+        if (!std.mem.eql(u8, existing.?.server_id, input.server_id)) return backupTypedError(output, "conflict", "server ownership is immutable");
+        if (parsed.value.expected_revision) |requested| {
+            if (requested != existing.?.revision) return backupTypedError(output, "conflict", "revision conflict; refresh and retry");
+        }
+        expected_revision = existing.?.revision;
+        revision = existing.?.revision + 1;
+        created_at_ms = @divFloor(existing.?.created_at_ns, std.time.ns_per_ms);
+    } else {
+        job_id_owned = backupUniqueJobId(self) catch return backupTypedError(output, "internal", "could not generate a unique job id");
+    }
+    const job_id = input.id orelse job_id_owned.?;
+    const prefix = backup.normalizePrefix(self.allocator, input.destination.prefix) catch return backupTypedError(output, "internal", "could not normalize prefix");
+    defer self.allocator.free(prefix);
+    var planned = input;
+    planned.id = job_id;
+    planned.name = std.mem.trim(u8, input.name, " \t\r\n");
+    planned.source_path = std.mem.trim(u8, input.source_path, " \t\r\n");
+    planned.destination = input.destination;
+    planned.destination.prefix = prefix;
+    const previous_ptr: ?*const backup.Job = if (existing) |*job| job else null;
+    const requires_capability_proof = backup.capabilityFieldsChanged(previous_ptr, planned);
+    const former_remote = if (existing) |job| job.schedule.enabled else false;
+    const remote_required = planned.schedule.enabled or former_remote;
+    var schedule_facts: ?backup.RuntimeFactsSnapshot = null;
+    defer if (schedule_facts) |*snapshot| snapshot.deinit(self.allocator);
+    if (remote_required) {
+        schedule_facts = self.backup.runtimeFactsSnapshot(planned.server_id) catch return backupTypedError(output, "internal", "could not copy refreshed backup runtime facts");
+        if (schedule_facts == null) return backupTypedError(output, "session_not_ready", "refresh the server before planning a schedule");
+        if (schedule_facts.?.facts.rclone_path.len == 0) return backupTypedError(output, "rclone_missing", "rclone is required for scheduled backups");
+        if (schedule_facts.?.facts.crontab_path.len == 0) return backupTypedError(output, "cron_missing", "crontab is required for scheduled backups");
+    }
+    const schedule_basis: ?backup.ScheduleBasis = if (schedule_facts) |*snapshot| .{
+        .home = snapshot.facts.home,
+        .rclone_path = snapshot.facts.rclone_path,
+        .crontab_path = snapshot.facts.crontab_path,
+        .timezone = snapshot.facts.timezone,
+        .target = snapshot.facts.target,
+        .privilege = snapshot.facts.privilege,
+        .process_groups = snapshot.facts.process_groups,
+        .crontab = snapshot.facts.crontab,
+        .crontab_sha256 = snapshot.facts.crontab_sha256,
+    } else null;
+    const payload_json = backupJsonAlloc(self.allocator, backup.SavePlanPayload{
+        .job = planned,
+        .expected_revision = expected_revision,
+        .previous_job = if (existing) |job| job else null,
+        .schedule_basis = schedule_basis,
+        .requires_capability_proof = requires_capability_proof,
+    }) catch return backupTypedError(output, "internal", "could not serialize plan");
+    defer self.allocator.free(payload_json);
+    const plan_id = backup.randomId(self.allocator, self.io, "plan") catch return backupTypedError(output, "internal", "could not generate plan id");
+    defer self.allocator.free(plan_id);
+    const now_ms = backupNowMs(self);
+    const expires_at_ms = now_ms + 5 * 60 * 1000;
+    const plan = backupCreatePlan(self, .save, plan_id, planned.server_id, job_id, planned.name, expires_at_ms, payload_json, "", remote_required) catch return backupTypedError(output, "internal", "could not allocate plan");
+    if (backupRegisterPlan(self, plan, output)) |failure| return failure;
+
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"plan_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, plan_id) catch return output[0..0];
+    writer.print(",\"expires_at_ms\":{d},\"job\":", .{expires_at_ms}) catch return output[0..0];
+    backupJobFieldsJson(&writer, job_id, planned.server_id, revision, planned.name, planned.source_path, planned.destination, planned.transfer, planned.schedule, created_at_ms, now_ms) catch return output[0..0];
+    writer.writeAll(",\"requires_connection_test\":") catch return output[0..0];
+    writer.writeAll(if (requires_capability_proof) "true" else "false") catch return output[0..0];
+    writer.writeAll(",\"requires_remote_secret\":") catch return output[0..0];
+    const requires_secret = planned.schedule.enabled and planned.destination.credential_mode == .access_key;
+    writer.writeAll(if (requires_secret) "true" else "false") catch return output[0..0];
+    writer.writeAll(",\"effects\":[\"persist local backup job\"") catch return output[0..0];
+    if (remote_required) {
+        writer.writeAll(",\"write verified remote config/wrapper/metadata\",\"replace exact Oars crontab block\"],\"warnings\":[\"scheduled access-key credentials are a reversible remote config copy, not encryption\"]}") catch return output[0..0];
+    } else {
+        writer.writeAll("]") catch return output[0..0];
+        writer.writeAll(",\"warnings\":[]}") catch return output[0..0];
+    }
+    return writer.buffered();
+}
+
 fn handleBackupJobsSave(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
-    var parsed = parsePayload(BackupJobsSavePayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
+    var parsed = parsePayload(BackupJobsSavePayload, self.allocator, invocation.request.payload) catch return backupTypedError(output, "invalid_payload", "invalid payload");
+    defer parsed.deinit();
+    defer backupWipeCredentials(parsed.value.schedule_credentials);
+    const payload = parsed.value;
+    if (!backup.validId(payload.operation_id) or !backup.validId(payload.plan_id)) return backupTypedError(output, "invalid_payload", "invalid id");
+    if (payload.capability_proof_id) |proof_id| if (!backup.validId(proof_id)) return backupTypedError(output, "invalid_payload", "invalid capability_proof_id");
+    if (self.backup.existingReceipt(payload.operation_id, .save, payload.plan_id) catch |err| return backupAdmissionError(output, err)) |receipt_value| {
+        var receipt = receipt_value;
+        defer receipt.deinit(self.allocator);
+        return backupReceiptJson(output, &receipt, true);
+    }
+    var plan = (self.backup.planSnapshot(payload.plan_id, backupNowMs(self)) catch return backupTypedError(output, "internal", "could not copy plan")) orelse return backupTypedError(output, "plan_expired", "plan expired; recreate it");
+    defer plan.deinit(self.allocator);
+    if (plan.kind != .save) return backupTypedError(output, "conflict", "not a save plan");
+
+    var planned = std.json.parseFromSlice(backup.SavePlanPayload, self.allocator, plan.payload_json, .{}) catch return backupTypedError(output, "internal", "saved plan is unreadable");
+    defer planned.deinit();
+    if (planned.value.requires_capability_proof) {
+        const proof_id = payload.capability_proof_id orelse return backupTypedError(output, "capability_failed", "a successful unexpired connection test is required for a new or changed destination/auth/transfer");
+        const binding = backup.capabilityBinding(planned.value.job);
+        if (!self.backup.validateCapabilityProof(proof_id, binding, backupNowMs(self))) return backupTypedError(output, "capability_failed", "connection-test proof is expired or does not match the destination/auth/transfer");
+    }
+    const scheduled_sync = planned.value.job.schedule.enabled and std.mem.eql(u8, planned.value.job.transfer, "sync");
+    if (!backupSyncAdvanceApproved(planned.value.job, payload.confirm_job_name)) return backupTypedError(output, "invalid_payload", "scheduled sync requires the exact confirm_job_name as advance approval");
+    const scheduled_access_key = planned.value.job.schedule.enabled and planned.value.job.destination.credential_mode == .access_key;
+    if (scheduled_access_key and !payload.approved_remote_secret) return backupTypedError(output, "invalid_payload", "scheduled access-key backup requires explicit remote-secret approval");
+    var credentials = backupCredentialsForMode(self, planned.value.job.destination.credential_mode, payload.schedule_credentials, planned.value.job.schedule.enabled) catch return backupTypedError(output, "invalid_credentials", "access and secret keys must both be 1-4096 bytes without NUL, CR, or LF; aws_runtime rejects keys");
+    defer if (credentials) |*owned| owned.deinit(self.allocator);
+    var admission = backupAdmit(self, payload.operation_id, .save, "", payload.plan_id, if (credentials) |*owned| owned else null, scheduled_sync) catch |err| return backupAdmissionError(output, err);
+    defer admission.receipt.deinit(self.allocator);
+    return backupReceiptJson(output, &admission.receipt, true);
+}
+
+fn handleBackupJobsDeletePlan(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(BackupJobsDeletePlanPayload, self.allocator, invocation.request.payload) catch return backupTypedError(output, "invalid_payload", "invalid payload");
     defer parsed.deinit();
     const payload = parsed.value;
-    // Operation-based flow (NEXT-SPEC): when operation_id/plan_id present, create
-    // a refresh-like operation that the coordinator will drive as a transactional
-    // local+remote save. For legacy callers keep the existing synchronous path
-    // but make it local-only (no remote crontab) to avoid blocking.
-    if (payload.operation_id != null and payload.plan_id != null) {
-        const op_id = payload.operation_id.?;
-        if (!backup.validId(op_id)) return backupTypedError(output, "invalid_payload", "invalid operation_id");
-        if (self.backup.operationById(op_id)) |existing| {
-            var writer = std.Io.Writer.fixed(output);
-            writer.writeAll("{\"ok\":true,\"operation_id\":") catch return output[0..0];
-            json.writeJsonString(&writer, existing.id) catch return output[0..0];
-            writer.writeAll(",\"job_id\":") catch return output[0..0];
-            json.writeJsonString(&writer, existing.job_id) catch return output[0..0];
-            writer.writeAll("}") catch return output[0..0];
-            return writer.buffered();
-        }
-        const plan = self.backup.peekPlan(payload.plan_id.?) orelse return backupTypedError(output, "plan_expired", "plan expired — recreate it");
-        _ = plan;
-        self.backup.ensureStarted(self.io);
-        const op = self.allocator.create(backup.BackupOperation) catch return respondError(output, "out of memory");
-        errdefer self.allocator.destroy(op);
-        const now: i128 = std.Io.Timestamp.now(self.io, .real).nanoseconds;
-        op.* = .{
-            .id = self.allocator.dupe(u8, op_id) catch return respondError(output, "out of memory"),
-            .kind = .jobs_save,
-            .state = .queued,
-            .server_id = self.allocator.dupe(u8, payload.job.server_id) catch return respondError(output, "out of memory"),
-            .job_id = if (payload.job.id) |jid| self.allocator.dupe(u8, jid) catch return respondError(output, "out of memory") else "",
-            .created_at_ns = now,
-            .touched_ns = now,
-        };
-        const job_id_for_resp: []const u8 = if (op.job_id.len > 0) op.job_id else op.id;
-        self.backup.registerOperation(op) catch return backupTypedError(output, "internal", "too many operations");
-        var writer = std.Io.Writer.fixed(output);
-        writer.writeAll("{\"ok\":true,\"operation_id\":") catch return output[0..0];
-        json.writeJsonString(&writer, op.id) catch return output[0..0];
-        writer.writeAll(",\"job_id\":") catch return output[0..0];
-        json.writeJsonString(&writer, job_id_for_resp) catch return output[0..0];
-        writer.writeAll("}") catch return output[0..0];
-        return writer.buffered();
+    if (!backup.validId(payload.server_id) or !backup.validId(payload.job_id)) return backupTypedError(output, "invalid_payload", "invalid id");
+    self.startBackupCoordinator() catch return backupTypedError(output, "internal", "backup coordinator is unavailable");
+    var job = (self.backup.jobSnapshot(payload.job_id) catch |err| return backupSnapshotError(output, err, "backup job registry could not be read")) orelse return backupTypedError(output, "not_found", "unknown job");
+    defer job.deinit(self.allocator);
+    if (!std.mem.eql(u8, job.server_id, payload.server_id)) return backupTypedError(output, "not_found", "job not found on this server");
+    if (job.revision != payload.expected_revision) return backupTypedError(output, "conflict", "revision conflict; refresh and retry");
+    var delete_facts: ?backup.RuntimeFactsSnapshot = null;
+    defer if (delete_facts) |*snapshot| snapshot.deinit(self.allocator);
+    if (job.schedule.enabled) {
+        delete_facts = self.backup.runtimeFactsSnapshot(job.server_id) catch return backupTypedError(output, "internal", "could not copy refreshed backup runtime facts");
+        if (delete_facts == null) return backupTypedError(output, "session_not_ready", "refresh the server before planning scheduled backup deletion");
     }
-    const now = @as(i64, @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds));
-    var saved = self.backup.jobs.save(self.io, payload.job, if (payload.schedule_credentials) |_| "x" else null, now) catch |err| {
-        const msg = backupSaveErrorString(err);
-        if (err == error.RevConflict) return backupTypedError(output, "conflict", msg);
-        if (err == error.StoreCorrupt) return backupTypedError(output, "store_corrupt", msg);
-        if (err == error.TooManyJobs) return backupTypedError(output, "invalid_job", msg);
-        return respondError(output, msg);
-    };
-    defer saved.deinit(self.allocator);
-    // Legacy path: local-only to avoid blocking. Remote schedule moves to
-    // the operation-based flow above (coordinator installs via session worker).
-    var detail_buf: [256]u8 = undefined;
-    const detail = std.fmt.bufPrint(&detail_buf, "job={s} schedule={s}", .{ saved.id, if (saved.schedule.enabled) "enabled" else "disabled" }) catch "backup.jobs.save";
-    backupAudit(self, "backup.jobs.save", saved.server_id, detail);
+    const delete_basis: ?backup.ScheduleBasis = if (delete_facts) |*snapshot| .{
+        .home = snapshot.facts.home,
+        .rclone_path = snapshot.facts.rclone_path,
+        .crontab_path = snapshot.facts.crontab_path,
+        .timezone = snapshot.facts.timezone,
+        .target = snapshot.facts.target,
+        .privilege = snapshot.facts.privilege,
+        .process_groups = snapshot.facts.process_groups,
+        .crontab = snapshot.facts.crontab,
+        .crontab_sha256 = snapshot.facts.crontab_sha256,
+    } else null;
+    const plan_payload = backup.DeletePlanPayload{ .server_id = job.server_id, .job_id = job.id, .expected_revision = job.revision, .job_name = job.name, .schedule_basis = delete_basis };
+    const payload_json = backupJsonAlloc(self.allocator, plan_payload) catch return backupTypedError(output, "internal", "could not serialize plan");
+    defer self.allocator.free(payload_json);
+    const plan_id = backup.randomId(self.allocator, self.io, "delete-plan") catch return backupTypedError(output, "internal", "could not generate plan id");
+    defer self.allocator.free(plan_id);
+    const expires_at_ms = backupNowMs(self) + 5 * 60 * 1000;
+    const remote_required = job.schedule.enabled;
+    const plan = backupCreatePlan(self, .delete, plan_id, job.server_id, job.id, job.name, expires_at_ms, payload_json, "", remote_required) catch return backupTypedError(output, "internal", "could not allocate plan");
+    if (backupRegisterPlan(self, plan, output)) |failure| return failure;
     var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,\"job\":") catch return output[0..0];
-    backupJobToJson(&writer, &saved) catch return output[0..0];
-    writer.writeAll("}") catch return output[0..0];
+    writer.writeAll("{\"ok\":true,\"plan_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, plan_id) catch return output[0..0];
+    writer.print(",\"expires_at_ms\":{d},\"job_name\":", .{expires_at_ms}) catch return output[0..0];
+    json.writeJsonString(&writer, job.name) catch return output[0..0];
+    writer.writeAll(",\"effects\":[\"remove the local backup job\"") catch return output[0..0];
+    if (remote_required) {
+        writer.writeAll(",") catch return output[0..0];
+        json.writeJsonString(&writer, "remove the exact crontab block, wrapper, metadata, interval state, staged run pairs, and dedicated rclone config section") catch return output[0..0];
+    }
+    var keychain_effect_buf: [256]u8 = undefined;
+    const keychain_effect = std.fmt.bufPrint(&keychain_effect_buf, "remove Keychain account backup:{s} after the backend commit", .{job.id}) catch "remove the job's Keychain account after the backend commit";
+    writer.writeAll(",") catch return output[0..0];
+    json.writeJsonString(&writer, keychain_effect) catch return output[0..0];
+    writer.writeAll("],\"leftovers\":[\"destination objects are not deleted\",\"bounded local run history remains in the local history store\"]}") catch return output[0..0];
     return writer.buffered();
 }
 
 fn handleBackupJobsDelete(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
-    var parsed = parsePayload(BackupJobsDeletePayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
+    var parsed = parsePayload(BackupJobsDeletePayload, self.allocator, invocation.request.payload) catch return backupTypedError(output, "invalid_payload", "invalid payload");
     defer parsed.deinit();
     const payload = parsed.value;
-    if (!backup.validId(payload.job_id) or !backup.validId(payload.server_id)) return backupTypedError(output, "invalid_payload", "invalid id");
-    const existing = (self.backup.jobs.find(self.io, payload.job_id) catch return backupTypedError(output, "store_corrupt", "job registry is unreadable")) orelse return backupTypedError(output, "not_found", "unknown job");
-    defer {
-        var e = existing;
-        e.deinit(self.allocator);
+    if (!backup.validId(payload.operation_id) or !backup.validId(payload.plan_id)) return backupTypedError(output, "invalid_payload", "invalid id");
+    if (self.backup.existingReceipt(payload.operation_id, .delete, payload.plan_id) catch |err| return backupAdmissionError(output, err)) |receipt_value| {
+        var receipt = receipt_value;
+        defer receipt.deinit(self.allocator);
+        return backupReceiptJson(output, &receipt, false);
     }
-    if (!std.mem.eql(u8, existing.server_id, payload.server_id)) return backupTypedError(output, "not_found", "job not found on this server");
-    // Local-only delete to avoid blocking UI. Remote crontab/config cleanup
-    // moves to an operation (coordinator verifies removal + readback).
-    if (!(self.backup.jobs.delete(self.io, payload.job_id) catch return backupTypedError(output, "store_corrupt", "job registry is unreadable"))) {
-        return backupTypedError(output, "not_found", "unknown job");
-    }
-    var detail_buf: [128]u8 = undefined;
-    const detail = std.fmt.bufPrint(&detail_buf, "job={s}", .{payload.job_id}) catch "backup.jobs.delete";
-    backupAudit(self, "backup.jobs.delete", payload.server_id, detail);
-    return ok_json;
+    var plan = (self.backup.planSnapshot(payload.plan_id, backupNowMs(self)) catch return backupTypedError(output, "internal", "could not copy plan")) orelse return backupTypedError(output, "plan_expired", "plan expired; recreate it");
+    defer plan.deinit(self.allocator);
+    if (plan.kind != .delete) return backupTypedError(output, "conflict", "not a delete plan");
+    if (!std.mem.eql(u8, payload.confirm_job_name, plan.job_name)) return backupTypedError(output, "invalid_payload", "confirm_job_name does not match");
+    var admission = backupAdmit(self, payload.operation_id, .delete, "", payload.plan_id, null, false) catch |err| return backupAdmissionError(output, err);
+    defer admission.receipt.deinit(self.allocator);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"operation_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, admission.receipt.operation_id) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
 }
 
-// Legacy capability test path — still blocks on execWait. New callers
-// should use oars.backup.test.plan -> oars.backup.test with operation_id
-// which runs on the coordinator. Keep this shim until the frontend
-// migrates fully, but warn callers that it blocks.
-/// The capability test (spec 10 §5): real list/write/read/delete on one
-/// unique sentinel in the job's exact bucket/prefix; sync jobs must also
-/// prove destination delete authority. A failed cleanup is reported with
-/// the leftover object path and never marked passed.
+fn handleBackupStatus(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(BackupStatusPayload, self.allocator, invocation.request.payload) catch return backupTypedError(output, "invalid_payload", "invalid payload");
+    defer parsed.deinit();
+    if (!backup.validId(parsed.value.server_id)) return backupTypedError(output, "invalid_payload", "invalid server_id");
+
+    self.startBackupCoordinator() catch return backupTypedError(output, "internal", "backup coordinator is unavailable");
+    var store_health = self.backup.storeHealthSnapshot() catch return backupTypedError(output, "internal", "could not copy backup store health");
+    defer store_health.deinit(self.allocator);
+    if (!store_health.ready) return backupTypedError(output, if (store_health.failed) "store_corrupt" else "busy", if (store_health.failed) "backup stores could not be loaded" else "backup stores are still loading; retry shortly");
+    var snapshot = self.backup.statusSnapshot(parsed.value.server_id) catch return backupTypedError(output, "internal", "could not copy cached status");
+    defer if (snapshot) |*value| value.deinit(self.allocator);
+
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"status\":") catch return output[0..0];
+    if (snapshot) |value| {
+        if (value.json) |status_json| writer.writeAll(status_json) catch return output[0..0] else writer.writeAll("null") catch return output[0..0];
+    } else writer.writeAll("null") catch return output[0..0];
+    writer.writeAll(",\"stale\":") catch return output[0..0];
+    writer.writeAll(if (snapshot == null or snapshot.?.stale) "true" else "false") catch return output[0..0];
+    if (store_health.jobs_recovery_error != null or store_health.history_recovery_error != null) {
+        var recovery_buf: [8192]u8 = undefined;
+        const recovery_error = if (store_health.jobs_recovery_error != null and store_health.history_recovery_error != null)
+            std.fmt.bufPrint(&recovery_buf, "jobs={s}; history={s}", .{ store_health.jobs_recovery_error.?, store_health.history_recovery_error.? }) catch "multiple backup stores were quarantined"
+        else
+            store_health.jobs_recovery_error orelse store_health.history_recovery_error.?;
+        writer.writeAll(",\"recovery_error\":") catch return output[0..0];
+        json.writeJsonString(&writer, recovery_error) catch return output[0..0];
+    }
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleBackupRefresh(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(BackupRefreshPayload, self.allocator, invocation.request.payload) catch return backupTypedError(output, "invalid_payload", "invalid payload");
+    defer parsed.deinit();
+    if (!backup.validId(parsed.value.operation_id) or !backup.validId(parsed.value.server_id)) return backupTypedError(output, "invalid_payload", "invalid id");
+    var admission = backupAdmit(self, parsed.value.operation_id, .refresh, parsed.value.server_id, null, null, false) catch |err| return backupAdmissionError(output, err);
+    defer admission.receipt.deinit(self.allocator);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"operation_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, admission.receipt.operation_id) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleBackupOperationPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(BackupOpPollPayload, self.allocator, invocation.request.payload) catch return backupTypedError(output, "invalid_payload", "invalid payload");
+    defer parsed.deinit();
+    if (!backup.validId(parsed.value.operation_id)) return backupTypedError(output, "invalid_payload", "invalid operation_id");
+    var snapshot = (self.backup.operationSnapshot(parsed.value.operation_id) catch return backupTypedError(output, "internal", "could not copy operation")) orelse return backupTypedError(output, "not_found", "unknown operation");
+    defer snapshot.deinit(self.allocator);
+    var writer = std.Io.Writer.fixed(output);
+    backupOperationJson(&writer, &snapshot) catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleBackupOperationCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(BackupOpCancelPayload, self.allocator, invocation.request.payload) catch return backupTypedError(output, "invalid_payload", "invalid payload");
+    defer parsed.deinit();
+    defer backupWipeCredentials(parsed.value.credentials);
+    if (!backup.validId(parsed.value.operation_id)) return backupTypedError(output, "invalid_payload", "invalid operation_id");
+    var credentials: ?backup.OwnedCredentials = if (parsed.value.credentials) |value|
+        backup.OwnedCredentials.init(self.allocator, .{ .access_key = value.access_key, .secret_key = value.secret_key }) catch return backupTypedError(output, "invalid_credentials", "access and secret keys must both be 1-4096 bytes without NUL, CR, or LF")
+    else
+        null;
+    defer if (credentials) |*owned| owned.deinit(self.allocator);
+    const credentials_view: ?backup.CredentialsView = if (credentials) |owned| .{ .access_key = owned.access_key, .secret_key = owned.secret_key } else null;
+    return switch (self.backup.cancelOperation(parsed.value.operation_id, credentials_view, backupNowMs(self))) {
+        .accepted => ok_json,
+        .busy => backupTypedError(output, "busy", "another backup mutation is active for this server"),
+        .invalid_credentials => backupTypedError(output, "invalid_credentials", "fresh credentials are required only for this access-key cleanup retry"),
+        .internal => backupTypedError(output, "internal", "could not prepare retained cleanup retry"),
+        .not_found => backupTypedError(output, "not_found", "unknown operation"),
+    };
+}
+
+fn handleBackupTestPlan(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(BackupTestPlanPayload, self.allocator, invocation.request.payload) catch return backupTypedError(output, "invalid_payload", "invalid payload");
+    defer parsed.deinit();
+    if (!backup.validId(parsed.value.job_plan_id)) return backupTypedError(output, "invalid_payload", "invalid job_plan_id");
+    var source_plan = (self.backup.planSnapshot(parsed.value.job_plan_id, backupNowMs(self)) catch return backupTypedError(output, "internal", "could not copy plan")) orelse return backupTypedError(output, "plan_expired", "plan expired; recreate it");
+    defer source_plan.deinit(self.allocator);
+    if (source_plan.kind != .save) return backupTypedError(output, "conflict", "connection tests require a job save plan");
+    var planned = std.json.parseFromSlice(backup.SavePlanPayload, self.allocator, source_plan.payload_json, .{}) catch return backupTypedError(output, "internal", "saved plan is unreadable");
+    defer planned.deinit();
+    const sentinel_id = backup.randomId(self.allocator, self.io, "sentinel") catch return backupTypedError(output, "internal", "could not generate sentinel id");
+    defer self.allocator.free(sentinel_id);
+    const remote_object = if (planned.value.job.destination.prefix.len > 0)
+        std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ planned.value.job.destination.prefix, sentinel_id }) catch return backupTypedError(output, "internal", "could not build sentinel path")
+    else
+        self.allocator.dupe(u8, sentinel_id) catch return backupTypedError(output, "internal", "could not build sentinel path");
+    defer self.allocator.free(remote_object);
+    const test_plan_id = backup.randomId(self.allocator, self.io, "test-plan") catch return backupTypedError(output, "internal", "could not generate test plan id");
+    defer self.allocator.free(test_plan_id);
+    const expires_at_ms = backupNowMs(self) + 5 * 60 * 1000;
+    const test_plan = backupCreatePlan(self, .@"test", test_plan_id, source_plan.server_id, source_plan.job_id, source_plan.job_name, expires_at_ms, source_plan.payload_json, remote_object, true) catch return backupTypedError(output, "internal", "could not allocate test plan");
+    if (backupRegisterPlan(self, test_plan, output)) |failure| return failure;
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"test_plan_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, test_plan_id) catch return output[0..0];
+    writer.print(",\"expires_at_ms\":{d},\"remote_object\":", .{expires_at_ms}) catch return output[0..0];
+    json.writeJsonString(&writer, remote_object) catch return output[0..0];
+    writer.writeAll(",\"checks\":[\"list\",\"write\",\"read\",\"delete\",\"cleanup_verify\"],\"mutates\":true}") catch return output[0..0];
+    return writer.buffered();
+}
+
 fn handleBackupTest(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
-    var parsed = parsePayload(BackupTestPayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
+    var parsed = parsePayload(BackupTestPayload, self.allocator, invocation.request.payload) catch return backupTypedError(output, "invalid_payload", "invalid payload");
+    defer parsed.deinit();
+    defer backupWipeCredentials(parsed.value.credentials);
+    const payload = parsed.value;
+    if (!backup.validId(payload.operation_id) or !backup.validId(payload.test_plan_id)) return backupTypedError(output, "invalid_payload", "invalid id");
+    if (self.backup.existingReceipt(payload.operation_id, .@"test", payload.test_plan_id) catch |err| return backupAdmissionError(output, err)) |receipt_value| {
+        var receipt = receipt_value;
+        defer receipt.deinit(self.allocator);
+        return backupReceiptJson(output, &receipt, false);
+    }
+    var plan = (self.backup.planSnapshot(payload.test_plan_id, backupNowMs(self)) catch return backupTypedError(output, "internal", "could not copy plan")) orelse return backupTypedError(output, "plan_expired", "plan expired; recreate it");
+    defer plan.deinit(self.allocator);
+    if (plan.kind != .@"test") return backupTypedError(output, "conflict", "not a connection-test plan");
+    var planned = std.json.parseFromSlice(backup.SavePlanPayload, self.allocator, plan.payload_json, .{}) catch return backupTypedError(output, "internal", "saved plan is unreadable");
+    defer planned.deinit();
+    var credentials = backupCredentialsForMode(self, planned.value.job.destination.credential_mode, payload.credentials, true) catch return backupTypedError(output, "invalid_credentials", "access and secret keys must both be 1-4096 bytes without NUL, CR, or LF; aws_runtime rejects keys");
+    defer if (credentials) |*owned| owned.deinit(self.allocator);
+    var admission = backupAdmit(self, payload.operation_id, .@"test", "", payload.test_plan_id, if (credentials) |*owned| owned else null, false) catch |err| return backupAdmissionError(output, err);
+    defer admission.receipt.deinit(self.allocator);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"operation_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, admission.receipt.operation_id) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleBackupInstallPlan(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(BackupInstallPlanPayload, self.allocator, invocation.request.payload) catch return backupTypedError(output, "invalid_payload", "invalid payload");
     defer parsed.deinit();
     const payload = parsed.value;
-    backup.validate(payload.job, if (payload.credentials) |_| "x" else null) catch |err| {
-        return backupTypedError(output, "invalid_job", switch (err) {
-            error.InvalidProvider => "unsupported provider",
-            error.InvalidBucket => "invalid bucket name",
-            error.InvalidEndpoint => "invalid endpoint",
-            error.InvalidRegion => "invalid region",
-            error.InvalidStorageClass => "storage class not supported by this provider",
-            error.IamRequiresAws => "IAM role access is only supported on AWS",
-            error.MissingSource, error.InvalidSource => "invalid source path",
-            else => "invalid job",
-        });
-    };
-    const server_id = payload.job.server_id;
-    if (!backup.validId(server_id)) return backupTypedError(output, "invalid_payload", "invalid server_id");
-    if (backupSessionReady(self, output, server_id)) |err| return err;
-    if (!backupRcloneInstalled(self, server_id)) return backupTypedError(output, "rclone_missing", "rclone is not installed on this server; install it first");
-    if (std.mem.eql(u8, payload.job.destination.type, "local")) {
-        return backupTypedError(output, "unsupported_target", "local destinations are an Oars+ feature and are not implemented yet");
+    if (!backup.validId(payload.server_id)) return backupTypedError(output, "invalid_payload", "invalid server_id");
+    if (!std.mem.eql(u8, payload.what, "rclone") and !std.mem.eql(u8, payload.what, "cron") and !std.mem.eql(u8, payload.what, "start_cron")) return backupTypedError(output, "invalid_payload", "unknown install target");
+    var facts_snapshot = self.backup.runtimeFactsSnapshot(payload.server_id) catch return backupTypedError(output, "internal", "could not copy refreshed runtime facts");
+    defer if (facts_snapshot) |*snapshot| snapshot.deinit(self.allocator);
+    var target: []const u8 = "unknown";
+    var privilege: []const u8 = "unknown";
+    var command: []const u8 = "";
+    var manual = true;
+    if (facts_snapshot) |*snapshot| {
+        target = snapshot.facts.target;
+        privilege = snapshot.facts.privilege;
+        const sudo = std.mem.eql(u8, privilege, "sudo");
+        const root = std.mem.eql(u8, privilege, "root");
+        if (root or sudo) {
+            if (std.mem.eql(u8, target, "alpine")) {
+                command = if (std.mem.eql(u8, payload.what, "rclone"))
+                    if (sudo) "sudo -n /sbin/apk add --no-cache rclone" else "/sbin/apk add --no-cache rclone"
+                else if (std.mem.eql(u8, payload.what, "cron"))
+                    if (sudo) "sudo -n /sbin/apk add --no-cache dcron" else "/sbin/apk add --no-cache dcron"
+                else if (sudo) "pgrep -x crond >/dev/null 2>&1 || sudo -n /usr/sbin/crond" else "pgrep -x crond >/dev/null 2>&1 || /usr/sbin/crond";
+                manual = false;
+            } else if (std.mem.eql(u8, target, "debian") or std.mem.eql(u8, target, "ubuntu")) {
+                command = if (std.mem.eql(u8, payload.what, "rclone"))
+                    if (sudo) "sudo -n /usr/bin/apt-get update && sudo -n /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y rclone" else "/usr/bin/apt-get update && /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y rclone"
+                else if (std.mem.eql(u8, payload.what, "cron"))
+                    if (sudo) "sudo -n /usr/bin/apt-get update && sudo -n /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y cron" else "/usr/bin/apt-get update && /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y cron"
+                else if (sudo) "sudo -n /usr/sbin/service cron start" else "/usr/sbin/service cron start";
+                manual = false;
+            }
+        }
     }
-
-    var job = backup.Job{
-        .id = backup.dupOrLiteral(self.allocator, "test") catch return respondError(output, "out of memory"),
-        .server_id = backup.dupOrLiteral(self.allocator, server_id) catch return respondError(output, "out of memory"),
-        .name = backup.dupOrLiteral(self.allocator, "test") catch return respondError(output, "out of memory"),
-        .source_path = backup.dupOrLiteral(self.allocator, payload.job.source_path) catch return respondError(output, "out of memory"),
-        .destination = .{
-            .type = backup.dupOrLiteral(self.allocator, payload.job.destination.type) catch return respondError(output, "out of memory"),
-            .provider = backup.dupOrLiteral(self.allocator, payload.job.destination.provider) catch return respondError(output, "out of memory"),
-            .bucket = backup.dupOrLiteral(self.allocator, payload.job.destination.bucket) catch return respondError(output, "out of memory"),
-            .prefix = backup.dupOrLiteral(self.allocator, payload.job.destination.prefix) catch return respondError(output, "out of memory"),
-            .endpoint = backup.dupOrLiteral(self.allocator, payload.job.destination.endpoint) catch return respondError(output, "out of memory"),
-            .region = backup.dupOrLiteral(self.allocator, payload.job.destination.region) catch return respondError(output, "out of memory"),
-            .use_iam = payload.job.destination.use_iam,
-            .storage_class = backup.dupOrLiteral(self.allocator, payload.job.destination.storage_class) catch return respondError(output, "out of memory"),
-        },
-        .transfer = backup.Transfer.fromJsonName(payload.job.transfer) orelse .copy,
-        // Own the schedule defaults: `Schedule.mode` defaults to the
-        // comptime literal "manual", which deinit must never free.
-        .schedule = .{
-            .mode = backup.dupOrLiteral(self.allocator, "manual") catch return respondError(output, "out of memory"),
-            .interval_unit = backup.dupOrLiteral(self.allocator, "hours") catch return respondError(output, "out of memory"),
-            .expr = "",
-        },
-    };
-    defer job.deinit(self.allocator);
-
-    const remote = backup.remoteName(self.allocator, "test") catch return respondError(output, "out of memory");
-    defer self.allocator.free(remote);
-    var ts_buf: [64]u8 = undefined;
-    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.Io.Timestamp.now(self.io, .real).nanoseconds}) catch return respondError(output, "out of memory");
-    var cfg_buf: [256]u8 = undefined;
-    const cfg = std.fmt.bufPrint(&cfg_buf, "/tmp/oars-rclone-test-{s}.conf", .{ts}) catch return respondError(output, "out of memory");
-    var sentinel_buf: [256]u8 = undefined;
-    const sentinel = std.fmt.bufPrint(&sentinel_buf, "/tmp/oars-sentinel-{s}", .{ts}) catch return respondError(output, "out of memory");
-    const sentinel_name = std.fmt.bufPrint(&sentinel_buf, "oars-sentinel-{s}", .{ts}) catch return respondError(output, "out of memory");
-
-    var write_err_buf: [256]u8 = undefined;
-    if (backupWriteConfig(self, server_id, &job, remote, cfg, payload.credentials, &write_err_buf)) |msg| return respondError(output, msg);
-    defer _ = backupCheck(self, server_id, std.fmt.bufPrint(&ts_buf, "rm -f {s}", .{cfg}) catch "rm -f /tmp/oars-rclone-test.conf");
-
-    const dest = backup.destinationArg(self.allocator, &job, remote) catch return respondError(output, "out of memory");
-    defer self.allocator.free(dest);
-    // The sentinel lives at remote:bucket/prefix/oars-sentinel-<ts> — a
-    // bare local path would make the whole test pass vacuously.
-    const object_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dest, sentinel_name }) catch return respondError(output, "out of memory");
-    defer self.allocator.free(object_path);
-    const dest_q = shellquote.quote(self.allocator, dest) catch return respondError(output, "out of memory");
-    defer self.allocator.free(dest_q);
-    const obj_q = shellquote.quote(self.allocator, object_path) catch return respondError(output, "out of memory");
-    defer self.allocator.free(obj_q);
-    const cfg_q = shellquote.quote(self.allocator, cfg) catch return respondError(output, "out of memory");
-    defer self.allocator.free(cfg_q);
-    const sentinel_q = shellquote.quote(self.allocator, sentinel) catch return respondError(output, "out of memory");
-    defer self.allocator.free(sentinel_q);
-
-    var cmd_buf: [2048]u8 = undefined;
-    // 1. list the exact bucket/prefix.
-    const list_cmd = std.fmt.bufPrint(&cmd_buf, "rclone lsf {s} --max-depth 1 --config {s}", .{ dest_q, cfg_q }) catch return respondError(output, "out of memory");
-    if (!backupCheck(self, server_id, list_cmd)) return respondError(output, "list: the bucket or prefix is not readable");
-    // 2. write the sentinel.
-    const write_cmd = std.fmt.bufPrint(&cmd_buf, "printf '%s' 'oars-test-{s}' > {s} && rclone copyto {s} {s} --config {s}", .{ ts, sentinel_q, sentinel_q, obj_q, cfg_q }) catch return respondError(output, "out of memory");
-    if (!backupCheck(self, server_id, write_cmd)) return respondError(output, "write: the bucket/prefix rejects objects");
-    // 3. read/stat the sentinel from the bucket/prefix.
-    const read_cmd = std.fmt.bufPrint(&cmd_buf, "rclone lsf {s} --include 'oars-sentinel-{s}*' --config {s}", .{ dest_q, ts, cfg_q }) catch return respondError(output, "out of memory");
-    if (!backupCheck(self, server_id, read_cmd)) return respondError(output, "read: the sentinel object cannot be read");
-    // 4. delete: sync must prove destination delete authority (the
-    //    prefix-level delete op); copy only needs its own cleanup.
-    const delete_ok = if (job.transfer == .sync)
-        backupCheck(self, server_id, std.fmt.bufPrint(&cmd_buf, "rclone delete {s} --include 'oars-sentinel-{s}*' --config {s}", .{ dest_q, ts, cfg_q }) catch "false")
-    else
-        backupCheck(self, server_id, std.fmt.bufPrint(&cmd_buf, "rclone deletefile {s} --config {s}", .{ obj_q, cfg_q }) catch "false");
-    if (!delete_ok) {
-        return respondError(output, "delete: the bucket/prefix rejects deletes; the sentinel object may be left behind");
-    }
-    // 5. verify cleanup.
-    const verify = backupCheck(self, server_id, std.fmt.bufPrint(&cmd_buf, "rclone lsf {s} --config {s}", .{ dest_q, cfg_q }) catch "true");
-    var verify_out = backupExec(self, server_id, std.fmt.bufPrint(&cmd_buf, "rclone lsf {s} --config {s}", .{ dest_q, cfg_q }) catch "true");
-    var leftover = false;
-    if (verify_out) |*vo| {
-        defer vo.output.deinit(self.allocator);
-        leftover = std.mem.indexOf(u8, vo.output.items, sentinel_name) != null;
-    }
-    if (!verify or leftover) {
-        return respondError(output, "cleanup verification failed; the sentinel object may be left behind in the bucket/prefix");
-    }
-    _ = backupCheck(self, server_id, std.fmt.bufPrint(&cmd_buf, "rm -f {s}", .{sentinel}) catch "true");
-    backupAudit(self, "backup.test", server_id, "bucket/prefix capability test");
+    const plan_id = backup.randomId(self.allocator, self.io, "install-plan") catch return backupTypedError(output, "internal", "could not generate plan id");
+    defer self.allocator.free(plan_id);
+    const payload_json = backupJsonAlloc(self.allocator, backup.InstallPlanPayload{ .server_id = payload.server_id, .what = payload.what, .target = target, .command = command, .manual = manual }) catch return backupTypedError(output, "internal", "could not serialize plan");
+    defer self.allocator.free(payload_json);
+    const expires_at_ms = backupNowMs(self) + 5 * 60 * 1000;
+    const plan = backupCreatePlan(self, .install, plan_id, payload.server_id, "", "", expires_at_ms, payload_json, "", true) catch return backupTypedError(output, "internal", "could not allocate plan");
+    if (backupRegisterPlan(self, plan, output)) |failure| return failure;
     var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,\"checks\":{\"list\":true,\"write\":true,\"read\":true,\"delete\":") catch return output[0..0];
-    writer.writeAll(if (delete_ok) "true" else "false") catch return output[0..0];
-    writer.writeAll("}}") catch return output[0..0];
+    writer.writeAll("{\"ok\":true,\"plan_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, plan_id) catch return output[0..0];
+    writer.print(",\"expires_at_ms\":{d},\"target\":", .{expires_at_ms}) catch return output[0..0];
+    json.writeJsonString(&writer, target) catch return output[0..0];
+    writer.writeAll(",\"privilege\":") catch return output[0..0];
+    json.writeJsonString(&writer, privilege) catch return output[0..0];
+    writer.writeAll(",\"commands\":[") catch return output[0..0];
+    if (!manual) json.writeJsonString(&writer, command) catch return output[0..0];
+    writer.writeAll("],\"effects\":[") catch return output[0..0];
+    json.writeJsonString(&writer, if (manual) "follow the target installation guide manually" else payload.what) catch return output[0..0];
+    writer.writeAll("],\"rollback\":[],\"manual\":") catch return output[0..0];
+    writer.writeAll(if (manual) "true}" else "false}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleBackupInstall(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(BackupInstallPayload, self.allocator, invocation.request.payload) catch return backupTypedError(output, "invalid_payload", "invalid payload");
+    defer parsed.deinit();
+    if (!backup.validId(parsed.value.operation_id) or !backup.validId(parsed.value.plan_id)) return backupTypedError(output, "invalid_payload", "invalid id");
+    if (self.backup.existingReceipt(parsed.value.operation_id, .install, parsed.value.plan_id) catch |err| return backupAdmissionError(output, err)) |receipt_value| {
+        var receipt = receipt_value;
+        defer receipt.deinit(self.allocator);
+        return backupReceiptJson(output, &receipt, false);
+    }
+    var admission = backupAdmit(self, parsed.value.operation_id, .install, "", parsed.value.plan_id, null, false) catch |err| return backupAdmissionError(output, err);
+    defer admission.receipt.deinit(self.allocator);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"operation_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, admission.receipt.operation_id) catch return output[0..0];
+    writer.writeAll("}") catch return output[0..0];
     return writer.buffered();
 }
 
 fn handleBackupRun(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
-    var parsed = parsePayload(BackupRunPayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
+    var parsed = parsePayload(BackupRunPayload, self.allocator, invocation.request.payload) catch return backupTypedError(output, "invalid_payload", "invalid payload");
     defer parsed.deinit();
+    defer backupWipeCredentials(parsed.value.credentials);
     const payload = parsed.value;
-    // New operation path — when operation_id present, handlers only register.
-    if (payload.operation_id != null) {
-        const op_id = payload.operation_id.?;
-        if (!backup.validId(op_id) or !backup.validId(payload.server_id) or !backup.validId(payload.job_id)) return backupTypedError(output, "invalid_payload", "invalid id");
-        if (self.backup.operationById(op_id)) |existing| {
-            var writer = std.Io.Writer.fixed(output);
-            writer.writeAll("{\"ok\":true,\"run_id\":") catch return output[0..0];
-            const run_id: []const u8 = if (existing.run_id.len > 0) existing.run_id else existing.id;
-            json.writeJsonString(&writer, run_id) catch return output[0..0];
-            writer.writeAll("}") catch return output[0..0];
-            return writer.buffered();
-        }
-        const rev = payload.expected_revision orelse 0;
-        const job_for_check = (self.backup.jobs.find(self.io, payload.job_id) catch return backupTypedError(output, "store_corrupt", "registry unreadable")) orelse return backupTypedError(output, "not_found", "unknown job");
-        defer {
-            var j = job_for_check;
-            j.deinit(self.allocator);
-        }
-        if (!std.mem.eql(u8, job_for_check.server_id, payload.server_id)) return backupTypedError(output, "not_found", "job not found on this server");
-        if (rev != 0 and job_for_check.revision != rev) return backupTypedError(output, "conflict", "revision conflict — refresh and retry");
-        if (std.mem.eql(u8, job_for_check.destination.type, "local")) return backupTypedError(output, "unsupported_target", "local destinations are Oars+ only");
-        if (job_for_check.transfer == .sync and payload.confirm_job_name == null) return backupTypedError(output, "invalid_payload", "sync run requires confirm_job_name");
-        if (job_for_check.transfer == .sync and payload.confirm_job_name != null and !std.mem.eql(u8, payload.confirm_job_name.?, job_for_check.name)) return backupTypedError(output, "invalid_payload", "confirm_job_name does not match");
-        self.backup.runs.lock();
-        const busy = self.backup.runs.runningForServer(payload.server_id) != null;
-        self.backup.runs.unlock();
-        if (busy) return backupTypedError(output, "busy", "a backup run is already in progress on this server");
-        self.backup.ensureStarted(self.io);
-        const op = self.allocator.create(backup.BackupOperation) catch return respondError(output, "out of memory");
-        errdefer self.allocator.destroy(op);
-        const now: i128 = std.Io.Timestamp.now(self.io, .real).nanoseconds;
-        const job_id_owned = self.allocator.dupe(u8, payload.job_id) catch return respondError(output, "out of memory");
-        errdefer self.allocator.free(job_id_owned);
-        const run_id_tmp = backup.randomRunId(self.allocator, self.io) catch return respondError(output, "out of memory");
-        errdefer self.allocator.free(run_id_tmp);
-        op.* = .{
-            .id = self.allocator.dupe(u8, op_id) catch return respondError(output, "out of memory"),
-            .kind = .run_manual,
-            .state = .queued,
-            .server_id = self.allocator.dupe(u8, payload.server_id) catch return respondError(output, "out of memory"),
-            .job_id = job_id_owned,
-            .run_id = run_id_tmp,
-            .created_at_ns = now,
-            .touched_ns = now,
-        };
-        self.backup.registerOperation(op) catch return backupTypedError(output, "internal", "too many operations");
-        var writer = std.Io.Writer.fixed(output);
-        writer.writeAll("{\"ok\":true,\"run_id\":") catch return output[0..0];
-        json.writeJsonString(&writer, op.run_id) catch return output[0..0];
-        writer.writeAll("}") catch return output[0..0];
-        return writer.buffered();
-    }
-    if (!backup.validId(payload.server_id) or !backup.validId(payload.job_id)) return backupTypedError(output, "invalid_payload", "invalid id");
-    if (backupSessionReady(self, output, payload.server_id)) |err| return err;
-    var job = (self.backup.jobs.find(self.io, payload.job_id) catch {
-        return backupTypedError(output, "store_corrupt", "job registry is unreadable");
-    }) orelse return backupTypedError(output, "not_found", "unknown job");
+    if (!backup.validId(payload.operation_id) or !backup.validId(payload.server_id) or !backup.validId(payload.job_id)) return backupTypedError(output, "invalid_payload", "invalid id");
+    self.startBackupCoordinator() catch return backupTypedError(output, "internal", "backup coordinator is unavailable");
+    var job = (self.backup.jobSnapshot(payload.job_id) catch |err| return backupSnapshotError(output, err, "backup job registry could not be read")) orelse return backupTypedError(output, "not_found", "unknown job");
     defer job.deinit(self.allocator);
     if (!std.mem.eql(u8, job.server_id, payload.server_id)) return backupTypedError(output, "not_found", "job not found on this server");
-    if (std.mem.eql(u8, job.destination.type, "local")) {
-        return backupTypedError(output, "unsupported_target", "local destinations are an Oars+ feature and are not implemented yet");
-    }
-    if (!backupRcloneInstalled(self, payload.server_id)) return backupTypedError(output, "rclone_missing", "rclone is not installed on this server; install it first");
-    if (!job.destination.use_iam and payload.credentials == null) {
-        return backupTypedError(output, "invalid_credentials", "credentials are required for a manual run (stored in Keychain as backup:<job_id>)");
-    }
-    self.backup.runs.lock();
-    const busy2 = self.backup.runs.runningForServer(payload.server_id) != null;
-    self.backup.runs.unlock();
-    if (busy2) return backupTypedError(output, "busy", "a backup run is already in progress on this server");
-    var src_buf: [2048]u8 = undefined;
-    const src_q = shellquote.quote(self.allocator, job.source_path) catch return respondError(output, "out of memory");
-    defer self.allocator.free(src_q);
-    const src_cmd = std.fmt.bufPrint(&src_buf, "test -d {s} || test -f {s}", .{ src_q, src_q }) catch return respondError(output, "out of memory");
-    if (!backupCheck(self, payload.server_id, src_cmd)) return backupTypedError(output, "source_missing", "the source path does not exist on the server");
-
-    const remote = backup.remoteName(self.allocator, job.id) catch return respondError(output, "out of memory");
-    defer self.allocator.free(remote);
-    var ts_buf: [64]u8 = undefined;
-    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.Io.Timestamp.now(self.io, .real).nanoseconds}) catch return respondError(output, "out of memory");
-    var cfg_buf: [256]u8 = undefined;
-    const cfg = std.fmt.bufPrint(&cfg_buf, "/tmp/oars-rclone-run-{s}.conf", .{ts}) catch return respondError(output, "out of memory");
-    var write_err_buf: [256]u8 = undefined;
-    if (backupWriteConfig(self, payload.server_id, &job, remote, cfg, payload.credentials, &write_err_buf)) |msg| return backupTypedError(output, "internal", msg);
-
-    const invocation_cmd = backupRcloneInvocation(self, &job, remote, cfg) catch return respondError(output, "out of memory");
-    defer self.allocator.free(invocation_cmd);
-    var full_buf: [4096]u8 = undefined;
-    // rclone's --use-json-log lines go to stderr; the exec channel
-    // captures stdout only, so merge the streams or the run log stays
-    // empty and no stats are ever parsed.
-    const full = std.fmt.bufPrint(&full_buf, "{s} --use-json-log --stats 1s --stats-log-level NOTICE 2>&1", .{invocation_cmd}) catch return respondError(output, "out of memory");
-    const channel = self.manager.execTracked(payload.server_id, full, "backup", null, &.{}) catch {
-        _ = backupCheck(self, payload.server_id, std.fmt.bufPrint(&ts_buf, "rm -f {s}", .{cfg}) catch "true");
-        return backupTypedError(output, "not_connected", "not connected");
+    if (job.revision != payload.expected_revision) return backupTypedError(output, "conflict", "revision conflict; refresh and retry");
+    if (job.transfer == .sync and (payload.confirm_job_name == null or !std.mem.eql(u8, payload.confirm_job_name.?, job.name))) return backupTypedError(output, "invalid_payload", "sync requires the exact confirm_job_name");
+    var credentials = backupCredentialsForMode(self, job.destination.credential_mode, payload.credentials, true) catch return backupTypedError(output, "invalid_credentials", "access and secret keys must both be 1-4096 bytes without NUL, CR, or LF; aws_runtime rejects keys");
+    defer if (credentials) |*owned| owned.deinit(self.allocator);
+    const credentials_view: ?backup.CredentialsView = if (credentials) |owned| .{ .access_key = owned.access_key, .secret_key = owned.secret_key } else null;
+    var receipt = self.backup.admitRun(payload.operation_id, &job, credentials_view, @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds)) catch |err| return switch (err) {
+        error.Busy => backupTypedError(output, "busy", "another manual backup run is active on this server"),
+        error.IdempotencyConflict => backupTypedError(output, "conflict", "operation_id belongs to a different manual run"),
+        error.SessionNotReady => backupTypedError(output, "session_not_ready", "the server is disconnecting"),
+        error.StoreNotReady => backupTypedError(output, "busy", "backup stores are still loading; retry shortly"),
+        error.StoreCorrupt => backupTypedError(output, "store_corrupt", "run history could not verify this operation_id"),
+        error.OutOfMemory => backupTypedError(output, "internal", "could not register manual backup run"),
     };
-
-    self.backup.runs.lock();
-    defer self.backup.runs.unlock();
-    var run = self.backup.runs.start(job.id, payload.server_id, "manual", @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds)) catch {
-        _ = backupCheck(self, payload.server_id, std.fmt.bufPrint(&ts_buf, "rm -f {s}", .{cfg}) catch "true");
-        return respondError(output, "out of memory");
-    };
-    run.channel = channel;
-    run.temp_config = self.allocator.dupe(u8, cfg) catch "";
-    var detail_buf: [256]u8 = undefined;
-    const detail = std.fmt.bufPrint(&detail_buf, "job={s}", .{job.id}) catch "backup.run";
-    backupAudit(self, "backup.run", payload.server_id, detail);
+    defer receipt.deinit(self.allocator);
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":true,\"run_id\":") catch return output[0..0];
-    json.writeJsonString(&writer, run.record.id) catch return output[0..0];
+    json.writeJsonString(&writer, receipt.run_id) catch return output[0..0];
     writer.writeAll("}") catch return output[0..0];
     return writer.buffered();
 }
 
-fn backupRunToJson(writer: anytype, run: *const backup.RunRecord) !void {
-    try writer.writeAll("{\"id\":");
+fn handleBackupPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(BackupPollPayload, self.allocator, invocation.request.payload) catch return backupTypedError(output, "invalid_payload", "invalid payload");
+    defer parsed.deinit();
+    if (!backup.validId(parsed.value.run_id)) return backupTypedError(output, "invalid_payload", "invalid run_id");
+    var snapshot = (self.backup.runSnapshot(parsed.value.run_id, parsed.value.log_cursor orelse 0) catch return backupTypedError(output, "internal", "could not copy manual run state")) orelse return backupTypedError(output, "not_found", "unknown run");
+    defer snapshot.deinit(self.allocator);
+    var writer = std.Io.Writer.fixed(output);
+    writer.writeAll("{\"ok\":true,\"run_id\":") catch return output[0..0];
+    json.writeJsonString(&writer, snapshot.run_id) catch return output[0..0];
+    writer.writeAll(",\"status\":") catch return output[0..0];
+    json.writeJsonString(&writer, snapshot.status.jsonName()) catch return output[0..0];
+    writer.writeAll(",\"phase\":") catch return output[0..0];
+    json.writeJsonString(&writer, snapshot.phase) catch return output[0..0];
+    writer.print(",\"bytes_done\":{d},\"bytes_total\":{d},\"files_done\":{d},\"files_total\":{d},\"speed_bps\":{d},\"eta_sec\":{d},\"started_at_ms\":{d}", .{ snapshot.bytes_done, snapshot.bytes_total, snapshot.files_done, snapshot.files_total, snapshot.speed_bps, snapshot.eta_sec, snapshot.started_at_ms }) catch return output[0..0];
+    if (snapshot.finished_at_ms) |finished| writer.print(",\"finished_at_ms\":{d}", .{finished}) catch return output[0..0];
+    writer.print(",\"log_cursor\":{d},\"log_delta\":", .{snapshot.log_cursor}) catch return output[0..0];
+    json.writeJsonString(&writer, snapshot.log_delta) catch return output[0..0];
+    writer.print(",\"dropped\":{d},\"cleanup_state\":", .{snapshot.dropped}) catch return output[0..0];
+    json.writeJsonString(&writer, snapshot.cleanup_state) catch return output[0..0];
+    if (snapshot.failure) |failure| {
+        writer.writeAll(",\"error\":") catch return output[0..0];
+        backupFailureJson(&writer, failure) catch return output[0..0];
+    }
+    writer.writeAll("}") catch return output[0..0];
+    return writer.buffered();
+}
+
+fn handleBackupCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(BackupCancelPayload, self.allocator, invocation.request.payload) catch return backupTypedError(output, "invalid_payload", "invalid payload");
+    defer parsed.deinit();
+    if (!backup.validId(parsed.value.run_id)) return backupTypedError(output, "invalid_payload", "invalid run_id");
+    if (!self.backup.cancelRun(parsed.value.run_id)) return backupTypedError(output, "not_found", "unknown run");
+    return ok_json;
+}
+
+fn backupRunSummaryToJson(writer: anytype, run: *const backup.RunRecord) !void {
+    try writer.writeAll("{\"run_id\":");
     try json.writeJsonString(writer, run.id);
     try writer.writeAll(",\"job_id\":");
     try json.writeJsonString(writer, run.job_id);
@@ -12314,290 +12416,161 @@ fn backupRunToJson(writer: anytype, run: *const backup.RunRecord) !void {
     try json.writeJsonString(writer, run.source);
     try writer.writeAll(",\"status\":");
     try json.writeJsonString(writer, run.status.jsonName());
-    try writer.print(",\"started_at_ns\":{d},\"finished_at_ns\":{d}", .{ run.started_at_ns, run.finished_at_ns });
+    try writer.print(",\"started_at_ms\":{d}", .{@divFloor(run.started_at_ns, std.time.ns_per_ms)});
+    if (run.finished_at_ns > 0) try writer.print(",\"finished_at_ms\":{d}", .{@divFloor(run.finished_at_ns, std.time.ns_per_ms)});
     try writer.print(",\"bytes_done\":{d},\"bytes_total\":{d},\"files_done\":{d},\"files_total\":{d}", .{ run.bytes_done, run.bytes_total, run.files_done, run.files_total });
-    try writer.writeAll(",\"error\":");
-    try json.writeJsonString(writer, run.@"error" orelse "");
-    try writer.writeAll(",\"log\":");
-    const log = run.log orelse "";
-    const capped_log = if (log.len > backup_response_log_cap) log[log.len - backup_response_log_cap ..] else log;
-    try json.writeJsonString(writer, capped_log);
-    try writer.writeAll("}");
-}
-
-fn handleBackupPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(BackupPollPayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
-    defer parsed.deinit();
-    const payload = parsed.value;
-    self.backup.runs.lock();
-    defer self.backup.runs.unlock();
-    const run = self.backup.runs.byId(payload.run_id) orelse {
-        return respondError(output, "unknown run");
-    };
-    const cursor = payload.log_cursor orelse 0;
-    var delta: []u8 = &.{};
-    var new_cursor: u64 = cursor;
-    var dropped: u64 = 0;
-    var eof = false;
-    var exit: ?i32 = null;
-    var final_log: []u8 = &.{};
-    defer if (delta.len > 0) self.allocator.free(delta);
-    defer if (final_log.len > 0) self.allocator.free(final_log);
-
-    if (!run.finalized) {
-        if (run.channel) |ch| {
-            const polls = self.manager.pollChannels(run.record.server_id, &.{.{ .id = ch, .pos = cursor }}, false, backup_exec_cap, 1024 * 1024) catch null;
-            if (polls) |list| {
-                defer {
-                    for (list) |*poll| poll.deinit(self.allocator);
-                    self.allocator.free(list);
-                }
-                for (list) |*poll| {
-                    if (poll.id != ch) continue;
-                    // poll.data dies with the poll list below; the
-                    // response (and the finalize rewind) needs it alive.
-                    delta = self.allocator.dupe(u8, poll.data) catch &.{};
-                    new_cursor = poll.cursor;
-                    dropped = poll.gap;
-                    eof = poll.eof;
-                    exit = poll.exit_status;
-                }
-                var lines = std.mem.splitScalar(u8, delta, '\n');
-                while (lines.next()) |line| {
-                    const trimmed = std.mem.trim(u8, line, " \t\r");
-                    if (trimmed.len == 0) continue;
-                    switch (backup.parseJsonLogLine(self.allocator, trimmed)) {
-                        .stats => |s| {
-                            run.record.bytes_done = s.bytes_done;
-                            run.record.bytes_total = s.bytes_total;
-                            run.record.files_done = s.files_done;
-                            run.record.files_total = s.files_total;
-                            run.speed_bps = s.speed_bps;
-                            run.eta_sec = s.eta_sec;
-                        },
-                        .@"error" => |msg| {
-                            if (run.record.@"error") |e| self.allocator.free(e);
-                            run.record.@"error" = self.allocator.dupe(u8, msg) catch null;
-                        },
-                        .other => {},
-                    }
-                }
-            }
-        }
-        if (eof) {
-            // Finalize: capture the bounded log, map the exit status.
-            const ch = run.channel orelse 0;
-            run.finalized = true;
-            run.channel = null;
-            run.record.finished_at_ns = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds);
-            if (exit) |code| {
-                if (code == 0) {
-                    run.record.status = if (run.record.files_done == 0) .no_changes else .success;
-                } else {
-                    run.record.status = .failed;
-                    if (run.record.@"error" == null) {
-                        var err_buf: [64]u8 = undefined;
-                        const msg = std.fmt.bufPrint(&err_buf, "rclone exited {d}", .{code}) catch "rclone failed";
-                        run.record.@"error" = self.allocator.dupe(u8, msg) catch null;
-                    }
-                }
-            } else {
-                run.record.status = .failed;
-            }
-            const polls = self.manager.pollChannels(run.record.server_id, &.{}, true, backup_exec_cap, backup_exec_cap) catch null;
-            if (polls) |list| {
-                defer {
-                    for (list) |*poll| poll.deinit(self.allocator);
-                    self.allocator.free(list);
-                }
-                for (list) |*poll| {
-                    if (poll.id == ch and poll.data.len > 0) {
-                        // The channel is gone (nulled above); the rewind
-                        // replays the retained buffer — copy it now.
-                        final_log = self.allocator.dupe(u8, poll.data) catch &.{};
-                        break;
-                    }
-                }
-            }
-            if (final_log.len == 0) final_log = self.allocator.dupe(u8, delta) catch &.{};
-            run.record.trimLog(self.allocator, if (final_log.len > 0) final_log else delta) catch {};
-            self.backup.history.append(self.io, &run.record, @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds)) catch {};
-            if (run.temp_config.len > 0) {
-                var rm_buf: [512]u8 = undefined;
-                const rm_cmd = std.fmt.bufPrint(&rm_buf, "rm -f {s}", .{run.temp_config}) catch "true";
-                _ = backupCheck(self, run.record.server_id, rm_cmd);
-                self.allocator.free(run.temp_config);
-                run.temp_config = "";
-            }
-            self.backup.runs.evictCompleted();
-        }
+    if (run.@"error") |message| {
+        try writer.writeAll(",\"error\":{\"ok\":false,\"code\":");
+        try json.writeJsonString(writer, if (run.error_code) |code| code.jsonName() else "internal");
+        try writer.writeAll(",\"error\":");
+        try json.writeJsonString(writer, message);
+        try writer.writeAll(",\"retryable\":");
+        try writer.writeAll(if (run.error_retryable) "true}" else "false}");
     }
-
-    var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,\"status\":") catch return output[0..0];
-    json.writeJsonString(&writer, run.record.status.jsonName()) catch return output[0..0];
-    writer.print(",\"bytes_done\":{d},\"bytes_total\":{d},\"files_done\":{d},\"files_total\":{d},\"speed_bps\":{d},\"eta_sec\":{d},\"log_cursor\":{d},\"dropped\":{d},\"log_delta\":", .{ run.record.bytes_done, run.record.bytes_total, run.record.files_done, run.record.files_total, run.speed_bps, run.eta_sec, new_cursor, dropped }) catch return output[0..0];
-    json.writeJsonString(&writer, delta) catch return output[0..0];
-    writer.writeAll(",\"error\":") catch return output[0..0];
-    json.writeJsonString(&writer, run.record.@"error" orelse "") catch return output[0..0];
-    writer.writeAll("}") catch return output[0..0];
-    return writer.buffered();
+    try writer.writeAll("}");
 }
 
 fn handleBackupHistory(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
-    var parsed = parsePayload(BackupHistoryPayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
+    var parsed = parsePayload(BackupHistoryPayload, self.allocator, invocation.request.payload) catch return backupTypedError(output, "invalid_payload", "invalid payload");
     defer parsed.deinit();
     const payload = parsed.value;
     if (!backup.validId(payload.server_id) or !backup.validId(payload.job_id)) return backupTypedError(output, "invalid_payload", "invalid id");
-    // Local-only; staged import is via refresh (coordinator), not inline.
-    self.backup.ensureStarted(self.io);
-    const limit_raw = payload.limit orelse 20;
-    const limit = @min(limit_raw, 20);
-    const runs = self.backup.history.listForJob(self.io, payload.job_id, limit) catch {
-        return backupTypedError(output, "store_corrupt", "run history is unreadable");
-    };
-    defer {
-        for (runs) |*r| r.deinit(self.allocator);
-        self.allocator.free(runs);
-    }
+    self.startBackupCoordinator() catch return backupTypedError(output, "internal", "backup coordinator is unavailable");
+    var job = (self.backup.jobSnapshot(payload.job_id) catch |err| return backupSnapshotError(output, err, "backup job registry could not be read")) orelse return backupTypedError(output, "not_found", "unknown job");
+    defer job.deinit(self.allocator);
+    if (!std.mem.eql(u8, job.server_id, payload.server_id)) return backupTypedError(output, "not_found", "job not found on this server");
+    var listed = self.backup.historyForJobSnapshot(payload.job_id, @min(payload.limit orelse 20, 20)) catch |err| return backupSnapshotError(output, err, "backup run history could not be read");
+    defer listed.deinit(self.allocator);
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":true,\"runs\":[") catch return output[0..0];
-    var first = true;
-    for (runs) |*r| {
-        if (!first) writer.writeAll(",") catch return output[0..0];
-        first = false;
-        backupRunToJson(&writer, r) catch return output[0..0];
+    for (listed.runs, 0..) |*run, index| {
+        if (index > 0) writer.writeAll(",") catch return output[0..0];
+        backupRunSummaryToJson(&writer, run) catch return output[0..0];
     }
-    writer.writeAll("]}") catch return output[0..0];
-    return writer.buffered();
-}
-
-fn backupInstallPlan(self: *Context, server_id: []const u8, what: []const u8) ?[]const u8 {
-    var os_out = backupExec(self, server_id, "cat /etc/os-release 2>/dev/null") orelse return null;
-    defer os_out.output.deinit(self.allocator);
-    const os = os_out.output.items;
-    const alpine = std.mem.indexOf(u8, os, "ID=alpine") != null;
-    const debian = std.mem.indexOf(u8, os, "ID=debian") != null or std.mem.indexOf(u8, os, "ID=ubuntu") != null;
-    if (std.mem.eql(u8, what, "rclone")) {
-        if (alpine) return "apk add rclone";
-        if (debian) return "apt-get update && apt-get install -y rclone";
-        return "manual: download the rclone binary for this OS from rclone.org and place it on PATH";
+    writer.writeAll("]") catch return output[0..0];
+    if (listed.recovery_error) |recovery_error| {
+        writer.writeAll(",\"recovery_error\":") catch return output[0..0];
+        json.writeJsonString(&writer, recovery_error) catch return output[0..0];
     }
-    if (std.mem.eql(u8, what, "cron")) {
-        if (alpine) return "apk add cronie && crond -b";
-        if (debian) return "apt-get install -y cron && service cron start";
-        return "manual: install and start the system cron daemon";
-    }
-    return "unknown component";
-}
-
-fn handleBackupInstall(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = contextOf(context);
-    var parsed = parsePayload(BackupInstallPayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
-    defer parsed.deinit();
-    const payload = parsed.value;
-    // New plan-gated flow.
-    if (payload.plan_id != null and payload.operation_id != null) {
-        const op_id = payload.operation_id.?;
-        if (!backup.validId(op_id)) return backupTypedError(output, "invalid_payload", "invalid operation_id");
-        if (self.backup.operationById(op_id)) |existing| {
-            var writer = std.Io.Writer.fixed(output);
-            writer.writeAll("{\"ok\":true,\"operation_id\":") catch return output[0..0];
-            json.writeJsonString(&writer, existing.id) catch return output[0..0];
-            writer.writeAll("}") catch return output[0..0];
-            return writer.buffered();
-        }
-        self.backup.ensureStarted(self.io);
-        const op = self.allocator.create(backup.BackupOperation) catch return respondError(output, "out of memory");
-        errdefer self.allocator.destroy(op);
-        const now: i128 = std.Io.Timestamp.now(self.io, .real).nanoseconds;
-        op.* = .{
-            .id = self.allocator.dupe(u8, op_id) catch return respondError(output, "out of memory"),
-            .kind = .install,
-            .state = .queued,
-            .server_id = self.allocator.dupe(u8, payload.server_id) catch return respondError(output, "out of memory"),
-            .created_at_ns = now,
-            .touched_ns = now,
-        };
-        self.backup.registerOperation(op) catch return backupTypedError(output, "internal", "too many operations");
-        var writer = std.Io.Writer.fixed(output);
-        writer.writeAll("{\"ok\":true,\"operation_id\":") catch return output[0..0];
-        json.writeJsonString(&writer, op.id) catch return output[0..0];
-        writer.writeAll("}") catch return output[0..0];
-        return writer.buffered();
-    }
-    if (backupSessionReady(self, output, payload.server_id)) |err| return err;
-    if (!std.mem.eql(u8, payload.what, "rclone") and !std.mem.eql(u8, payload.what, "cron")) {
-        return respondError(output, "unknown component");
-    }
-    const already = if (std.mem.eql(u8, payload.what, "rclone"))
-        backupRcloneInstalled(self, payload.server_id)
-    else
-        backupCheck(self, payload.server_id, "command -v crontab >/dev/null 2>&1 && command -v crond >/dev/null 2>&1");
-    if (already) {
-        var writer = std.Io.Writer.fixed(output);
-        writer.writeAll("{\"ok\":true,\"action\":\"already_installed\",\"plan\":\"\"}") catch return output[0..0];
-        return writer.buffered();
-    }
-    const plan = backupInstallPlan(self, payload.server_id, payload.what) orelse return respondError(output, "cannot detect the server OS");
-    if (payload.dry_run) {
-        var writer = std.Io.Writer.fixed(output);
-        writer.writeAll("{\"ok\":true,\"action\":\"install\",\"plan\":") catch return output[0..0];
-        json.writeJsonString(&writer, plan) catch return output[0..0];
-        writer.writeAll("}") catch return output[0..0];
-        return writer.buffered();
-    }
-    if (std.mem.startsWith(u8, plan, "manual")) {
-        return respondError(output, "no tested adapter for this server; follow the manual instructions in the plan");
-    }
-    var idc = backupExec(self, payload.server_id, "id -u") orelse return respondError(output, "not connected");
-    defer idc.output.deinit(self.allocator);
-    if (idc.exit != 0 or std.mem.indexOf(u8, std.mem.trim(u8, idc.output.items, " \t\r\n"), "0") == null) {
-        return respondError(output, "installing components requires root access on the server");
-    }
-    if (!backupCheck(self, payload.server_id, plan)) return respondError(output, "installation failed");
-    backupAudit(self, "backup.install", payload.server_id, payload.what);
-    var writer = std.Io.Writer.fixed(output);
-    writer.writeAll("{\"ok\":true,\"action\":\"installed\",\"plan\":") catch return output[0..0];
-    json.writeJsonString(&writer, plan) catch return output[0..0];
     writer.writeAll("}") catch return output[0..0];
     return writer.buffered();
 }
 
-fn handleBackupCronStatus(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+fn handleBackupHistoryLog(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = contextOf(context);
-    var parsed = parsePayload(BackupCronStatusPayload, self.allocator, invocation.request.payload) catch {
-        return respondError(output, "invalid payload");
-    };
+    var parsed = parsePayload(BackupHistoryLogPayload, self.allocator, invocation.request.payload) catch return backupTypedError(output, "invalid_payload", "invalid payload");
     defer parsed.deinit();
-    const server_id = parsed.value.server_id;
-    if (!backup.validId(server_id)) return backupTypedError(output, "invalid_payload", "invalid server_id");
-    // Legacy sync probe — kept for old callers; new callers use
-    // oars.backup.status (cached) + oars.backup.refresh (coordinator).
-    if (self.backup.getStatus(server_id)) |st| {
-        if (st.json) |j| {
-            var writer = std.Io.Writer.fixed(output);
-            // Try to derive the three booleans from cached json; fallback to probe.
-            const has_rclone = std.mem.indexOf(u8, j, "\"rclone_path\":") != null or std.mem.indexOf(u8, j, "rclone") != null;
-            writer.print("{{\"ok\":true,\"rclone\":{s},\"cron_installed\":true,\"cron_running\":true}}", .{if (has_rclone) "true" else "false"}) catch return output[0..0];
-            return writer.buffered();
-        }
-    }
-    if (backupSessionReady(self, output, server_id)) |err| return err;
-    const rclone = backupRcloneInstalled(self, server_id);
-    const cron_installed = backupCheck(self, server_id, "command -v crontab >/dev/null 2>&1 && command -v crond >/dev/null 2>&1");
-    const cron_running = backupCheck(self, server_id, "pgrep -x crond >/dev/null 2>&1 || pgrep -f 'crond -b' >/dev/null 2>&1");
+    const payload = parsed.value;
+    if (!backup.validId(payload.server_id) or !backup.validId(payload.run_id)) return backupTypedError(output, "invalid_payload", "invalid id");
+    self.startBackupCoordinator() catch return backupTypedError(output, "internal", "backup coordinator is unavailable");
+    var run = (self.backup.historyRunSnapshot(payload.run_id) catch |err| return backupSnapshotError(output, err, "backup run history could not be read")) orelse return backupTypedError(output, "not_found", "unknown run");
+    defer run.deinit(self.allocator);
+    if (!std.mem.eql(u8, run.server_id, payload.server_id)) return backupTypedError(output, "not_found", "run not found on this server");
+    const log = run.log orelse "";
+    const cursor: usize = @intCast(@min(payload.cursor orelse 0, log.len));
+    const max: usize = @intCast(@min(payload.max orelse 32 * 1024, 64 * 1024));
+    const end_cursor = @min(cursor + max, log.len);
     var writer = std.Io.Writer.fixed(output);
-    writer.print("{{\"ok\":true,\"rclone\":{s},\"cron_installed\":{s},\"cron_running\":{s}}}", .{ if (rclone) "true" else "false", if (cron_installed) "true" else "false", if (cron_running) "true" else "false" }) catch return output[0..0];
+    writer.print("{{\"ok\":true,\"cursor\":{d},\"delta\":", .{end_cursor}) catch return output[0..0];
+    json.writeJsonString(&writer, log[cursor..end_cursor]) catch return output[0..0];
+    writer.writeAll(",\"eof\":") catch return output[0..0];
+    writer.writeAll(if (end_cursor == log.len) "true" else "false") catch return output[0..0];
+    writer.writeAll(",\"dropped\":0}") catch return output[0..0];
     return writer.buffered();
+}
+
+test "backup shipping payloads reject legacy save and test job fields" {
+    try std.testing.expectError(error.UnknownField, parsePayload(BackupJobsSavePayload, std.testing.allocator, "{\"operation_id\":\"op-1\",\"plan_id\":\"p-1\",\"approved_remote_secret\":false,\"job\":{}}"));
+    try std.testing.expectError(error.UnknownField, parsePayload(BackupTestPayload, std.testing.allocator, "{\"operation_id\":\"op-1\",\"test_plan_id\":\"p-1\",\"job\":{}}"));
+    var save = try parsePayload(BackupJobsSavePayload, std.testing.allocator, "{\"operation_id\":\"op-1\",\"plan_id\":\"p-1\",\"approved_remote_secret\":false}");
+    defer save.deinit();
+    try std.testing.expectEqualStrings("op-1", save.value.operation_id);
+}
+
+test "backup plan payload requires exact destination and schedule fields" {
+    try std.testing.expectError(error.MissingField, parsePayload(BackupPlanPayload, std.testing.allocator, "{\"job\":{\"server_id\":\"s1\",\"name\":\"daily\",\"source_path\":\"/srv\",\"destination\":{\"type\":\"s3\",\"provider\":\"aws\",\"bucket\":\"bucket\",\"prefix\":\"\",\"endpoint\":\"\",\"region\":\"us-east-1\",\"storage_class\":\"\"},\"transfer\":\"copy\",\"schedule\":{\"mode\":\"manual\",\"enabled\":false}}}"));
+    try std.testing.expectError(error.UnknownField, parsePayload(BackupPlanPayload, std.testing.allocator, "{\"job\":{\"server_id\":\"s1\",\"name\":\"daily\",\"source_path\":\"/srv\",\"destination\":{\"type\":\"s3\",\"provider\":\"aws\",\"bucket\":\"bucket\",\"prefix\":\"\",\"endpoint\":\"\",\"region\":\"us-east-1\",\"credential_mode\":\"access_key\",\"storage_class\":\"\",\"use_iam\":false},\"transfer\":\"copy\",\"schedule\":{\"mode\":\"manual\",\"enabled\":false}}}"));
+    var exact = try parsePayload(BackupPlanPayload, std.testing.allocator, "{\"job\":{\"server_id\":\"s1\",\"name\":\"daily\",\"source_path\":\"/srv\",\"destination\":{\"type\":\"s3\",\"provider\":\"aws\",\"bucket\":\"bucket\",\"prefix\":\"\",\"endpoint\":\"\",\"region\":\"us-east-1\",\"credential_mode\":\"access_key\",\"storage_class\":\"\"},\"transfer\":\"copy\",\"schedule\":{\"mode\":\"interval\",\"enabled\":true,\"every\":12,\"unit\":\"hours\",\"anchor_epoch_sec\":100}}}");
+    defer exact.deinit();
+    const input = try backupJobInput(exact.value.job);
+    try std.testing.expectEqual(@as(u32, 12), input.schedule.every);
+    try std.testing.expectEqual(@as(i64, 100), input.schedule.anchor_epoch_sec);
+}
+
+test "backup credential copy rejects injection and aws runtime keys" {
+    var fake: Context = undefined;
+    fake.allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidCredentials, backupCredentialsForMode(&fake, .access_key, .{ .access_key = "bad\nkey", .secret_key = "secret" }, true));
+    try std.testing.expectError(error.InvalidCredentials, backupCredentialsForMode(&fake, .aws_runtime, .{ .access_key = "key", .secret_key = "secret" }, false));
+}
+
+test "scheduled sync save payload carries exact-name advance approval" {
+    var payload = try parsePayload(BackupJobsSavePayload, std.testing.allocator, "{\"operation_id\":\"op-1\",\"plan_id\":\"plan-1\",\"approved_remote_secret\":false,\"confirm_job_name\":\"daily-sync\"}");
+    defer payload.deinit();
+    try std.testing.expectEqualStrings("daily-sync", payload.value.confirm_job_name.?);
+    const job = backup.JobInput{
+        .server_id = "s1",
+        .name = "daily-sync",
+        .source_path = "/srv/data",
+        .destination = .{ .provider = "aws", .bucket = "backups", .region = "us-east-1", .credential_mode = .aws_runtime },
+        .transfer = "sync",
+        .schedule = .{ .mode = "custom", .enabled = true, .expr = "0 2 * * *" },
+    };
+    try std.testing.expect(backupSyncAdvanceApproved(job, "daily-sync"));
+    try std.testing.expect(!backupSyncAdvanceApproved(job, null));
+    try std.testing.expect(!backupSyncAdvanceApproved(job, "wrong"));
+}
+
+test "backup failure wire retains exact cleanup paths" {
+    var failure = try backup.BackupFailure.init(std.testing.allocator, .cleanup_failed, "cleanup failed", true, "cleanup");
+    defer failure.deinit(std.testing.allocator);
+    failure.path = try std.testing.allocator.dupe(u8, "/tmp/exact-config");
+    failure.remote_object = try std.testing.allocator.dupe(u8, "prefix/exact-sentinel");
+    var output: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    try backupFailureJson(&writer, failure);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"path\":\"/tmp/exact-config\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"remote_object\":\"prefix/exact-sentinel\"") != null);
+}
+
+test "backup audit observer reports success only after a durable append" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var dir_buf: [192]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/oars-backup-audit-observer-{d}", .{std.Io.Timestamp.now(io, .real).nanoseconds});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    var bad_path_buf: [256]u8 = undefined;
+    const bad_path = try std.fmt.bufPrint(&bad_path_buf, "{s}/audit-as-directory", .{dir});
+    try std.Io.Dir.cwd().createDirPath(io, bad_path);
+    var bad_store = history.AuditStore{ .allocator = allocator, .path = bad_path };
+    defer bad_store.deinit();
+    var bad_context: Context = undefined;
+    bad_context.allocator = allocator;
+    bad_context.io = io;
+    bad_context.audit = &bad_store;
+    const event = backup.OperationEvent{
+        .operation_id = "op-durable-audit",
+        .kind = .save,
+        .server_id = "s1",
+        .job_id = "bk-1",
+        .state = .done,
+        .admitted = false,
+    };
+    try std.testing.expect(!backupOperationAudit(&bad_context, &event));
+
+    var good_path_buf: [256]u8 = undefined;
+    const good_path = try std.fmt.bufPrint(&good_path_buf, "{s}/audit.jsonl", .{dir});
+    var good_store = history.AuditStore{ .allocator = allocator, .path = good_path };
+    defer good_store.deinit();
+    var good_context: Context = undefined;
+    good_context.allocator = allocator;
+    good_context.io = io;
+    good_context.audit = &good_store;
+    try std.testing.expect(backupOperationAudit(&good_context, &event));
+    try std.testing.expect(backupOperationAudit(&good_context, &event));
+    try std.testing.expectEqual(@as(usize, 1), good_store.entries.items.len);
 }
 
 // --- AI terminal (spec 11) ------------------------------------------------

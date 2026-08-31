@@ -1,254 +1,300 @@
 # Spec 10 — Backups
 
-**Status:** 🚧 in progress (feat/spec-10-backups) · **Depends on:** 02 (exec/follow) · **Spec owner:** core
+**Status:** ✅ v1 frontend + backend implemented · **Depends on:** 02 (exec/follow), 15 (audit) · **Spec owner:** core
 
-> **This spec is under active implementation on branch `feat/spec-10-backups`
-> per `docs/NEXT-SPEC.md`. Acceptance boxes above reflect the landed slice
-> at `bc2aa83`; the remaining 12 gates live in NEXT-SPEC.**
+> Verified on 2026-08-31 against the full working tree. The release evidence
+> includes unit tests, the Alpine SSH and MinIO integration harness, a real
+> disconnected cron run, TypeScript checks, the frontend suite, and desktop
+> and narrow deterministic browser fixtures.
 
 ## 1. Overview
 
-Scheduled copies of any folder to S3-compatible storage: fill one form,
-test the connection, and the rclone config and crontab are written for
-you. Every run keeps a log with file counts — a backup you can prove.
+Oars copies a remote source path to S3-compatible storage. A user can test the
+exact destination, save a manual or scheduled job, run it now, stop it, and
+review durable progress and history. A scheduled job runs on the server when
+Oars is closed and imports its result after the next connection.
 
-## 2. Goals / non-goals
+## 2. Goals and non-goals
 
-**Goals**
-- Job model: source path, provider, bucket, credentials (or IAM), sync/copy, storage class, schedule (manual/interval/custom cron).
-- Test Connection before save; one-click install of rclone and cron when missing.
-- Run now, or scheduled via crontab written by Oars; live progress (bytes, files, speed, ETA); per-run logs.
-- (Oars+ — beyond CtrlOps) optional **local destination** (copy to a local folder on the user's machine) alongside S3.
+### Goals
 
-**Non-goals**
-- No restore (documented; restore = provider console or rclone reverse), no retention/rotation policy (sync mirrors; lifecycle rules live in the bucket), no DB-aware snapshots (documented: dump first), no destinations beyond S3-compatible (+ local Oars+).
+- Support AWS S3, Cloudflare R2, Backblaze B2 S3, Wasabi, MinIO, and
+  DigitalOcean Spaces through explicit provider adapters.
+- Support `copy` and `sync`. Copy keeps destination-only objects. Sync removes
+  them and requires exact job-name confirmation.
+- Support manual, interval, and five-field custom cron schedules in the
+  server time zone.
+- Prove list, write, read, delete, and cleanup access on the exact bucket and
+  prefix before save.
+- Keep local credentials in Keychain. Copy credentials to a mode-0600 remote
+  config only after explicit approval for an unattended schedule.
+- Keep bridge admission fast. A bounded coordinator and the SSH session worker
+  own all remote work.
+- Keep durable job, operation, run, audit, and recovery evidence.
+
+### Non-goals
+
+- V1 does not restore data. The user restores with the provider console or a
+  reverse rclone command.
+- V1 does not make database snapshots. The user must create a consistent dump
+  before Oars copies database files.
+- V1 does not manage bucket lifecycle or version-retention rules.
+- V1 does not support a local laptop destination. This remains an Oars+ idea
+  and is outside the v1 contract.
 
 ## 3. User stories
 
-- I create `daily-website` pointing at `/var/www/html` → `s3://acme-backups`; connection tested before I save.
-- At 2 AM the crontab fires it; I open the app and see "1,284/1,284 files · 2.3 GB · Success".
-- A run fails; View Log shows the exact rclone error and I hand it to the AI terminal.
-- (Oars+) I back up a folder to my own machine when there's no bucket.
+- I can create `daily-website` for `/var/www/html`, test its exact S3 prefix,
+  and save it only after the capability proof passes.
+- I can choose Copy when I must keep objects that exist only at the
+  destination, or Sync when I want the destination to match the source.
+- I can run a job now, follow its log with an independent cursor, and stop the
+  tracked remote process group.
+- I can close Oars before a cron run and see the real result and bounded log
+  after I reconnect.
+- I can see the exact leftover path or object when cleanup needs recovery.
 
-## 4. UI/UX
+## 4. UI and interaction
 
-### 4.1 Backups view (per server)
-- Status strip: rclone installed? cron running? (banner + one-click install/start).
-- Job list: name · source → destination · schedule · last run (Success/Failed · files · size · duration) · actions (Run now, Edit, Delete, View Log).
-- **Create Job** form:
-  1. Basic: job name · source path · destination type (S3-compatible / Local folder) · transfer type (Sync mirrors / Copy adds).
-  2. Provider (S3): AWS S3, Cloudflare R2 (+endpoint), Backblaze B2, Wasabi (+endpoint), MinIO (+endpoint), DigitalOcean Spaces (+endpoint) · bucket · region (where applicable) · access key / secret key (Keychain) **or** Use IAM Role · only storage classes supported by the selected backend adapter.
-  3. Schedule: Manual / Interval (every N hours/days) / Custom cron expression · timezone notice (server TZ).
-  4. Test Connection → preview the exact bucket/prefix capability test, run it
-     after approval, and show list/write/read/delete results before save.
-- **Run view:** progress card (size transferred, files transferred, speed, ETA, elapsed) + live log lines; per-run record with status.
-- History: last 20 runs per job; View Log opens the raw output.
+The Backups view is scoped to the active server. It shows runtime readiness,
+jobs, last-run state, history, and recovery warnings.
 
-### 4.2 Local destination (Oars+)
-- Destination = pick a local folder (native dialog); transfer = rclone copy **to local**? rclone works locally too (`rclone copy remote:... local:` or plain `cp -a`-style): v1 implementation = stream via SFTP download to the local folder with the same progress UI (reuse spec 05 transfer machinery) — no rclone required for local jobs.
-- Local-destination jobs are manual while Oars is open. A server cron job
-  cannot write to a folder on a laptop that can be asleep or disconnected.
+The editor includes:
 
-## 5. Bridge API
+1. **Source and destination.** The user enters the source path, provider,
+   bucket, prefix, endpoint, region, storage class, and transfer behavior.
+2. **Credentials.** AWS can use runtime credentials. Other adapters use an
+   access key and secret key. Saved keys use `backup:<job_id>` in Keychain.
+3. **Schedule.** Manual, interval, and custom cron modes show the server time
+   zone and the exact generated schedule plan.
+4. **Proof and approval.** The UI shows the sentinel mutation before Test. It
+   shows remote secret placement before scheduled save. Sync and Delete use
+   exact job-name confirmation.
 
-### `oars.backup.jobs.list` `{server_id}` → `{ok, jobs}`
-### `oars.backup.jobs.save` `{job, schedule_credentials?}` → `{ok, job}` · `oars.backup.jobs.delete` `{server_id, job_id}` → `{ok}`
-Job model:
-```json
-{"id":"b1…","server_id":"s1…","name":"daily-website","source_path":"/var/www/html",
- "destination":{"type":"s3","provider":"aws","bucket":"acme-backups","endpoint":"",
-                "region":"us-east-1","use_iam":false,"storage_class":"standard"},
- "transfer":"sync","schedule":{"mode":"custom","expr":"0 2 * * *","enabled":true},
- "created_at":…,"updated_at":…}
+Operation sheets show every plan step and its state. Run sheets show bytes,
+files, speed, ETA, elapsed time, cleanup state, and cursor-based logs. Partial
+operations keep the exact recovery action. A user can retry cleanup without
+repeating the remote transfer or mutation.
+
+The view has deterministic fixtures for populated, empty, disconnected,
+runtime-missing, cron-stopped, editor, proof, save, copy, sync-confirmation,
+no-change, failure, cancel, interrupted, partial-import, delete-recovery,
+install, and unsupported-target states. The desktop and narrow layouts keep
+all actions keyboard reachable and return focus after a sheet closes.
+
+## 5. Bridge contract
+
+All timestamps are integer epoch milliseconds. Every mutation uses a bounded
+`operation_id`. A retry with the same ID refers to the same frozen work.
+User-facing failures have a stable code, message, retry flag, and optional
+step, path, or remote-object detail.
+
+### Jobs and server state
+
+```text
+oars.backup.jobs.list {server_id}
+oars.backup.jobs.plan {job}
+oars.backup.jobs.save {
+  operation_id, plan_id, capability_proof_id?,
+  schedule_credentials?, approved_remote_secret, confirm_job_name?
+}
+oars.backup.jobs.deletePlan {server_id, job_id, expected_revision}
+oars.backup.jobs.delete {operation_id, plan_id, confirm_job_name}
+oars.backup.status {server_id}
+oars.backup.refresh {operation_id, server_id}
 ```
-- Secret keys (access/secret) live in Keychain under `backup:<job_id>`; never in JSON.
-  `schedule_credentials` is accepted only when enabling an unattended
-  non-IAM schedule, after the remote-secret disclosure.
-### `oars.backup.test` `{job, credentials?}` → `{ok, ok:bool, error?}`
-- Test the exact bucket and prefix, not only the remote root. After a clear
-  mutation notice, create a unique small sentinel object, read/stat it, and
-  delete it. A Copy job requires list, write, read/stat, and sentinel cleanup.
-  A Sync job must also prove destination delete authority. If cleanup fails,
-  report the leftover object path prominently and do not mark the test passed.
-### `oars.backup.run` `{server_id, job_id, credentials?}` → `{ok, run_id}`
-- The frontend reads the job's Keychain entry only for Test, a manual run, or
-  schedule installation. Tests and manual runs use a unique remote temporary
-  config with mode 0600 and delete it after completion. IAM mode sends no
-  credentials.
-### `oars.backup.poll` `{run_id, log_cursor?}` → `{ok, status, bytes_done, bytes_total, files_done, files_total, speed_bps, eta_sec, log_cursor, log_delta, dropped, error?}`
-- Run rclone with JSON logs and parse structured stats fields. Human one-line
-  output is for display and is not a stable machine protocol.
-- `log_cursor` is caller-owned under spec 02. Progress counters are current
-  snapshots; reading log deltas in one view cannot drain another.
-### `oars.backup.history` `{server_id, job_id, limit}` → `{ok, runs}`
-- Canonical history is local. Scheduled runs stage bounded status and log files
-  on the server until Oars imports them on the next connection.
-### `oars.backup.install` `{server_id, what: rclone|cron}` → `{ok}` (exec install; approval-gated; audit)
-### `oars.backup.cronStatus` `{server_id}` → `{ok, rclone: bool, cron_installed: bool, cron_running: bool}`
 
-## 6. Zig core design
+A job has a stable random ID, immutable server ID, monotonic revision, source
+path, typed S3 destination, `copy|sync` transfer, typed schedule, and optional
+capability proof. Stored job JSON never contains credentials.
 
-- `src/backup.zig` — Job model + store (`<data>/backups.json`), a dedicated
-  remote config file at `~/.config/oars/rclone.conf` only for enabled
-  unattended schedules, crontab management with
-  `# oars:job:<id>` markers, and a run state machine. Validate source existence
-  before rclone. A successful run with zero transfers means "no changes" and
-  remains success; an empty source can also be valid.
-- Install helpers first detect the OS, architecture, package manager, service
-  manager, and current package source. They show a tested adapter's exact
-  download/package, checksum or repository change, service action, and
-  privilege before approval. An unknown target gets manual instructions, not a
-  guessed command.
-- Use `--use-json-log` and a short stats interval. Do not use
-  `--error-on-no-transfer`: rclone documents exit 9 as "successful, but no
-  files transferred," which is normal for an unchanged backup.
-- `crontab -T` is a Cronie extension and is not portable to every target. Use
-  it when detected. Otherwise validate the supported five-field grammar in
-  Oars, then install and read back the resulting crontab.
-- A small generated remote wrapper writes one run log and a machine-readable
-  status file per scheduled run under `~/.local/state/oars/backups/<job-id>/`.
-  Cron calls that wrapper. On reconnect, Oars imports completed records into
-  local history and applies retention. Without this remote status boundary, a
-  run that happens while Oars is closed cannot appear truthfully in history.
-- Local-destination jobs bypass rclone: SFTP download stream (spec 05 machinery) with progress.
-- SSH exec still accepts one shell string. Rclone flags and paths use fixed
-  templates plus the shared POSIX-shell quoting function.
+### Capability, install, and durable operations
 
-## 7. Data model
+```text
+oars.backup.test.plan {job_plan_id}
+oars.backup.test {operation_id, test_plan_id, credentials?}
+oars.backup.install.plan {server_id, what}
+oars.backup.install {operation_id, plan_id}
+oars.backup.operationPoll {operation_id}
+oars.backup.operationCancel {operation_id, credentials?}
+```
 
-- `<data>/backups.json`: jobs (no secrets). `<data>/backup_runs.json`: run history (status, stats, trimmed log 200 KB, kept 90 days).
-- Server-side: dedicated rclone config, generated run wrapper, bounded status
-  and log files, and crontab lines with id markers.
+Poll is observation only. It never advances remote work. `operationCancel`
+stops admitted work or retries the exact cleanup for retained partial state.
+
+### Manual runs and history
+
+```text
+oars.backup.run {
+  operation_id, server_id, job_id, expected_revision,
+  credentials?, confirm_job_name?
+}
+oars.backup.poll {run_id, log_cursor?}
+oars.backup.cancel {run_id}
+oars.backup.history {server_id, job_id, limit?}
+oars.backup.historyLog {server_id, run_id, cursor?, max?}
+```
+
+Run states are `queued`, `preparing`, `running`, `cancel_requested`,
+`success`, `no_changes`, `failed`, `canceled`, `interrupted`, `partial`, and
+`skipped_overlap`. Each caller owns its absolute log cursor. `dropped` reports
+an individual cursor gap.
+
+## 6. Core design
+
+`src/backup.zig` owns validation, adapters, plan hashes, stores, the bounded
+coordinator, operation snapshots, run state, rclone JSON-log parsing, cron
+generation, scheduled import, cancellation, and recovery. `src/bridge.zig`
+only validates bounded input, admits work, and copies locked snapshots.
+
+The coordinator uses the session worker through an asynchronous remote
+adapter. No backup bridge handler calls a network wait, SFTP wait, sleep, or
+libssh2 function. Admission remains responsive while a remote step is held.
+
+Save and delete are planned mutations:
+
+- Save freezes the job, revision, capability binding, schedule effects, remote
+  secret decision, and plan hash. Remote prepare and read-back happen before
+  the local commit.
+- Delete freezes the job identity and exact effects. It removes and verifies
+  scheduled artifacts before the local delete. A failed cleanup remains
+  partial and retains the same operation ID.
+- Audit admission must persist before a remote side effect. Completion audit
+  must persist before a successful terminal state is exposed.
+
+Manual runs create a unique mode-0600 rclone config in
+`~/.local/state/oars/backups/.manual/<run-id>/`. The tracked command runs in a
+new process group. Stop sends `TERM`, waits to a bound, sends `KILL` when
+needed, and verifies that the process group is absent. Oars then removes and
+verifies the config file, process-ID file, and empty state directory.
+
+Scheduled jobs use a versioned server wrapper, a dedicated mode-0600 config,
+a metadata file, a lock, and one crontab marker block. The wrapper writes a
+bounded log and atomically publishes a paired status file. Source failures and
+overlap also publish paired records. Oars imports only a valid pair, appends
+history and audit first, and removes the pair only after both durable writes
+succeed. Re-import is idempotent.
+
+## 7. Persistence
+
+- `backups.json` stores versioned jobs with no secrets.
+- `backup_runs.json` stores bounded history and trimmed logs.
+- `backup_operations.json` stores at most 64 versioned operation records. It
+  stores identity, state, plan payload, remote sentinel, result, failure,
+  cleanup, audit generation, and the plan hash. It stores no credentials.
+- All local stores use bounded reads, quarantine invalid data, write a
+  mode-0600 sibling temporary file, sync it, rename it, and sync the parent
+  directory.
+- Restart restores terminal operations. A non-terminal operation becomes
+  partial and interrupted. Recovery can perform cleanup only; it does not
+  repeat ambiguous remote work.
 
 ## 8. Security
 
-- Bucket credentials → Keychain; IAM-role option avoids storing any.
-- Scheduled S3 jobs copy credentials from Keychain into the dedicated remote
-  rclone config because cron cannot read the local Keychain. Rclone obscuring
-  is reversible and is not encryption. Show this disclosure before save and
-  enforce mode 0600. IAM roles avoid this remote secret copy.
-- Installs, Test Connection, Run now, and job deletion are approval-gated and
-  audited. Enabling a schedule is the recorded advance approval for its future
-  cron runs; each scheduled result is imported into audit history.
-- Check source existence before each run. A successful zero-transfer run is
-  shown as "No changes". Missing source and permission failures are errors.
+- Access keys and secret keys use Keychain account `backup:<job_id>`. Edit uses
+  a pending account until the backend commit succeeds. Delete and runtime-mode
+  changes remove obsolete entries after the backend commit.
+- The frontend clears credential fields after admission. Backend-owned copies
+  are bounded, validated against NUL and line injection, and overwritten on
+  all paths.
+- Test and manual-run configs are unique, mode 0600, and removed with exact
+  cleanup proof.
+- A scheduled key must exist on the server because cron runs without Oars.
+  The UI states this fact and requires approval. AWS runtime credentials avoid
+  the remote key copy.
+- Shell values use the shared POSIX quoting function. Credentials travel by
+  worker-owned input and never appear in command text, JSON stores, logs, or
+  audit details.
+- Test, save, delete, install, run, cancel, scheduled results, and recovery
+  have audit records with secret-free identifiers.
 
-## 9. Performance
+## 9. Bounds and performance
 
-- Progress polling rides the channel stream (no extra threads); ETA math client-side.
-- A server can have multiple jobs. Limit concurrent manual runs per server and
-  use a per-job lock in generated cron wrappers so the same job cannot overlap
-  itself.
+- A server can have at most 128 jobs and one live manual run.
+- Operation storage keeps 64 records. Completed live runs keep a bounded ring.
+- Local run history keeps 90 days. Stored and staged logs have fixed byte
+  limits, and scheduled artifacts keep a bounded run count.
+- Input strings, credentials, cron fields, JSON files, remote files, stream
+  deltas, and operation results are bounded before allocation.
+- Bridge admission is below 500 ms in the real container test. Remote work and
+  polling do not block unrelated bridge commands.
 
 ## 10. Edge cases
 
-- Missing source path → fail before rclone. An existing empty directory is
-  valid and can complete with no changes.
-- rclone missing → banner + one-click install; manual runs blocked until installed.
-- cron missing/stopped → banner; interval/custom schedules disabled in the form until fixed.
-- Server timezone mismatch → schedule note in form + actual crontab shows server TZ; run history timestamps normalized to UTC + local display.
-- Bucket permission error → test catches pre-save; run errors surface the exact rclone line.
-- Disk fills locally during a local-destination job → job fails with clear message, partial files cleaned.
+- An unchanged or empty valid source is `no_changes`.
+- A missing or unreadable source fails before rclone starts.
+- A second scheduled run for the same job is `skipped_overlap`.
+- Disconnect without verified process termination is `interrupted`.
+- Cleanup failure is `partial` with the exact leftover path or object.
+- Missing rclone, missing or stopped cron, unsupported OS, stale revision,
+  expired plan, denied Keychain access, audit failure, corrupt local store,
+  and invalid staged files each have a typed state.
+- A valid status file without its paired log is not imported. Invalid or
+  oversized pairs are quarantined or retained with a warning.
 
-## 11. Testing
+## 11. Verification
 
-- Unit: rclone INI generation, crontab line add/remove (round-trip fixtures),
-  JSON-log and numeric `stats` object parsing, and zero-transfer state.
-- Integration (container + MinIO via docker): capability test and sentinel
-  cleanup, run sync job, verify objects in bucket, second unchanged run, changed
-  file, missing source failure, and history entries.
-- Manual: schedule writes crontab (verify with `crontab -l`), timezone notice, local-destination job.
+The Zig unit suite covers validation, all six provider config goldens,
+schedule grammar and migration, wrapper output, JSON-log parsing, bounds,
+atomic stores, audit gates, operation replay, cleanup recovery, cancellation,
+and coordinator responsiveness.
+
+The real Alpine SSH and MinIO test covers:
+
+- the exact sentinel list, write, read, delete, and absence proof;
+- initial, unchanged, incremental, empty, and missing-source manual runs;
+- Copy preserving a destination-only object and Sync removing it;
+- exact Sync confirmation;
+- `TERM`-resistant process cancellation with `KILL` and absence proof;
+- a cron run during a 70-second period with no live Oars manager or registry;
+- import through a fresh manager and registry, exact-once re-import, and
+  verified scheduled-job deletion.
+
+The React suite covers typed reducers, Keychain states, plans, approvals,
+progress, cursor logs, partial cleanup, import warnings, delete recovery,
+focus, and responsive behavior. The deterministic preview covers the full
+state matrix at desktop and narrow sizes.
 
 ## 12. Acceptance criteria
 
-- [x] S3 job (MinIO in tests) runs and lands objects; progress + log correct.
-      (container integration: `src/integration_backup.zig` — sync run polled to
-      success with 2 files, incremental run after a source edit, no-changes run,
-      history records, and object-landing verification via `rclone lsf`.)
-- [x] Test Connection proves the selected prefix permissions needed by Copy or
-      Sync and removes its sentinel object. (real sentinel write/read/delete in
-      the bucket, leftover verified absent; sync jobs additionally prove
-      prefix-level delete authority.)
-- [x] Crontab entries are idempotent (re-save doesn't duplicate). (unit:
-      `crontabAdd`/`crontabRemove` round trip, marker `# oars:job:<id>`, and
-      unchanged-content no-op; the live cron-daemon leg of the install path is
-      not container-tested yet.)
-- [ ] A scheduled run that completes while Oars is closed appears after the
-      next connection with its real exit status and log. (import path
-      `backupImportStaged` implemented — status/log staging under
-      `~/.local/state/oars/backups/<job-id>/` — but needs a live cron run in
-      the harness; pending next spec cycle.)
-- [x] Unchanged and empty valid sources finish as "No changes"; missing or
-      unreadable sources fail before transfer. (no-changes verified in the
-      container; the pre-transfer `test -d || test -f` gate is handler-level.)
-- [x] Secrets never appear in JSON, logs, or audit. (dispatcher test asserts
-      access/secret key material is absent from `jobs.list`; run/test configs
-      are unique temp files mode 0600, deleted after finalize; audit detail
-      carries only job ids.)
+- [x] All bridge handlers return after local validation and admission. The
+  coordinator and session worker own remote work.
+- [x] All six provider adapters generate verified rclone configuration, and
+  the exact selected prefix passes a real mutation and cleanup proof.
+- [x] Job save and delete use frozen plans, revisions, idempotent operation
+  IDs, durable audit gates, verified remote effects, and restart recovery.
+- [x] Manual Stop uses process-group `TERM` and bounded `KILL`, proves absence,
+  and reports exact cleanup state.
+- [x] Keychain, transient secret, scheduled disclosure, mode-0600 remote
+  secret, overwrite, and obsolete-entry cleanup flows work end to end.
+- [x] Copy and Sync have distinct proven behavior. Unchanged and empty sources
+  are `no_changes`; missing and unreadable sources fail before transfer.
+- [x] A real scheduled run completes while Oars is closed and imports once
+  through a fresh manager and registry with its status and log.
+- [x] Local stores, remote staging, logs, histories, operations, queues, and
+  inputs have tested bounds and recovery behavior.
+- [x] The typed Backups UI, deterministic preview matrix, keyboard behavior,
+  desktop layout, and narrow layout pass their release checks.
+- [x] Zig format, Zig build and tests, container integration, frontend tests,
+  TypeScript checks, frontend production build, and diff checks pass in the
+  same working tree.
 
-Integration harness (spec 10): `scripts/dev-sshd.sh` now also starts an
-`oars-dev-minio` container on the shared `oars-dev-net` network and exports
-`OARS_TEST_MINIO_*`; the dev sshd image installs rclone. Run the full leg
-with `scripts/integration-test.sh`.
+## 13. Research and references
 
-Known rclone quirks handled (spec 13): `--use-json-log` writes to stderr, so
-manual runs append `2>&1`; MinIO rejects the lowercase `storage_class`, so
-configs emit the canonical uppercase S3 value.
-
-## 13. Research & References
-
-- **rclone semantics** — verified against official rclone docs
-  (`https://rclone.org/docs/` and
-  `https://rclone.org/commands/rclone_copy/`):
-  - `copy` transfers files that differ (size + modtime, or MD5SUM)
-    and never deletes destination extras; `sync` "make[s] source and
-    dest identical, modifying destination only" — matches the
-    Transfer-type choice in the job model.
-  - `rclone lsd` lists directories/buckets, but success at the remote root does
-    not prove write or delete authority in the selected prefix. The capability
-    test in §5 uses real operations on one unique sentinel and requires cleanup.
-  - `--use-json-log` emits JSON Lines. Current official docs state that stats
-    records include a `stats` object with fields such as `bytes`, `checks`,
-    `elapsedTime`, `eta`, `speed`, `totalBytes`, and `transfers`. Use
-    `--stats <interval>` plus an enabled stats log level and parse that object;
-    do not parse the human `--stats-one-line` string.
-  - **Zero-file correction:** rclone says `--error-on-no-transfer` changes a
-    normally successful no-change run into exit 9. That is not evidence of a
-    bad source. The flag was removed; Oars checks the source first and treats
-    zero transfers as a normal no-change result.
-  - `--dry-run` for trial runs (used by Test Connection variants).
-- **rclone config file** — documented format: basic INI at
-  `~/.config/rclone/rclone.conf` (Unix), `[section]` header per remote,
-  `key = value` entries, required `type` key, comments `;` or `#`,
-  passwords stored in obscured form; the file "will typically contain
-  login information, and should therefore have restricted permissions"
-  (rclone writes temp+rename itself) — validates spec §8's chmod 600
-  and the merge-section write strategy (append a new `[oars-<job_id>]`
-  section; never rewrite other sections).
-- **crontab** — verified against cronie crontab(1)/crontab(5) man pages
-  (`https://man7.org/linux/man-pages/man1/crontab.1.html`,
-  `https://man7.org/linux/man-pages/man5/crontab.5.html`):
-  - `crontab -l` prints the current table to stdout; `crontab -`
-    installs a new table from stdin (both used by the crontab
-    management in §6).
-  - Five time fields (minute 0–59, hour 0–23, day-of-month 1–31,
-    month 1–12, day-of-week 0–7); `#` comments only at line start
-    (our `# oars:job:<id>` marker lines are safe); commands run via
-    `/bin/sh` or `$SHELL`; cron checks every minute; `%` in a command
-    becomes newline (must escape `%` in rclone invocations — worth a
-    parser test); the crontab file must end in a newline.
-  - Cronie provides `crontab -T`, but this is not a portable crontab option.
-    Oars must detect it and keep an internal validator for other cron
-    implementations.
-- **S3-compatible providers** — AWS S3, Cloudflare R2 (S3-compatible
-  endpoint), Backblaze B2, Wasabi, MinIO, DigitalOcean Spaces are all
-  rclone-supported backends (documented backend list,
-  `https://rclone.org/docs/#configure`); endpoint+region semantics
-  come from each backend's rclone docs page.
-- **Storage classes** — storage-class names and support vary by S3 provider.
-  Oars exposes only values defined by its tested backend adapter and passes the
-  selected value through the backend's documented rclone option; it does not
-  offer AWS Glacier names as universal S3 choices.
-
-Sources: rclone docs (usage, copy, flags), cronie crontab(1)/(5),
-rclone backend list.
+- [rclone S3 backend](https://rclone.org/s3/) defines provider values,
+  endpoint and region fields, runtime authentication, and storage classes.
+- [rclone copy](https://rclone.org/commands/rclone_copy/) keeps files that
+  exist only at the destination.
+- [rclone sync](https://rclone.org/commands/rclone_sync/) changes the
+  destination to match the source and can remove destination-only files.
+- [rclone global flags](https://rclone.org/flags/) defines JSON logs and stats
+  options. Oars parses structured JSON instead of human status text.
+- [rclone exit codes](https://rclone.org/docs/#list-of-exit-codes) defines exit
+  9 for `--error-on-no-transfer`. Oars does not use that flag because no
+  transfer is a valid no-change result.
+- [crontab(1)](https://man7.org/linux/man-pages/man1/crontab.1.html) defines
+  list and install behavior. `crontab -T` is not portable, so Oars uses its own
+  bounded grammar and uses target validation only when available.
+- [crontab(5)](https://man7.org/linux/man-pages/man5/crontab.5.html) defines
+  five-field time syntax, shell execution, comments, percent handling, and the
+  one-minute scheduler interval used by the integration test.
