@@ -9,6 +9,7 @@ const provider: AiProvider = {
   id: "aip-0123456789abcdef",
   name: "Primary",
   adapter: "openai_responses",
+  tool_mode: "structured_result",
   base_url: "https://api.openai.com/v1",
   model: "gpt-test",
   instruction_role: null,

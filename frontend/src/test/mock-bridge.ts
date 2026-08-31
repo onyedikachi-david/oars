@@ -426,6 +426,7 @@ export class MockBridge {
       id: "aip-0123456789abcdef",
       name: "Mock provider",
       adapter: "openai_responses" as const,
+      tool_mode: "structured_result" as const,
       base_url: "https://api.openai.com/v1",
       model: "gpt-test",
       instruction_role: null,

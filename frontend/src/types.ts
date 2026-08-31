@@ -873,6 +873,7 @@ export interface BackupInstallPlanResult {
 // ============================================================================
 
 export type AiAdapter = "openai_responses" | "openai_chat_completions";
+export type AiToolMode = "native_function" | "structured_result";
 export type AiInstructionRole = "developer" | "system";
 export type AiStructuredOutput = "json_schema" | "json_object";
 export type AiProviderTestStatus = "untested" | "passed" | "failed" | "stale";
@@ -898,6 +899,7 @@ export interface AiProvider {
   id: string;
   name: string;
   adapter: AiAdapter;
+  tool_mode: AiToolMode;
   base_url: string;
   model: string;
   instruction_role: AiInstructionRole | null;
@@ -911,6 +913,7 @@ export interface AiProviderDraft {
   id?: string;
   name: string;
   adapter: AiAdapter;
+  tool_mode?: AiToolMode;
   base_url: string;
   model: string;
   instruction_role?: AiInstructionRole;

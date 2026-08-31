@@ -23,6 +23,7 @@ pub const Draft = struct {
     id: ?[]const u8 = null,
     name: []const u8,
     adapter: Adapter,
+    tool_mode: types.ToolMode = .structured_result,
     base_url: []const u8,
     model: []const u8,
     instruction_role: ?InstructionRole = null,
@@ -33,6 +34,7 @@ pub const Public = struct {
     id: []const u8,
     name: []const u8,
     adapter: Adapter,
+    tool_mode: types.ToolMode = .structured_result,
     base_url: []const u8,
     model: []const u8,
     instruction_role: ?InstructionRole = null,
@@ -226,7 +228,13 @@ pub fn validateDraft(draft: Draft) Error!void {
     if (model.len == 0 or model.len > max_model_bytes or hasUnsafeText(model)) return error.InvalidModel;
     switch (draft.adapter) {
         .openai_responses => if (draft.instruction_role != null or draft.structured_output != null) return error.InvalidCompatibility,
-        .openai_chat_completions => if (draft.instruction_role == null or draft.structured_output == null) return error.InvalidCompatibility,
+        .openai_chat_completions => {
+            if (draft.tool_mode == .structured_result) {
+                if (draft.instruction_role == null or draft.structured_output == null) return error.InvalidCompatibility;
+            } else {
+                if (draft.structured_output != null) return error.InvalidCompatibility;
+            }
+        },
     }
 }
 
@@ -242,6 +250,7 @@ fn clonePublic(allocator: std.mem.Allocator, provider: Public) !Public {
         .id = id,
         .name = name,
         .adapter = provider.adapter,
+        .tool_mode = provider.tool_mode,
         .base_url = base_url,
         .model = model,
         .instruction_role = provider.instruction_role,
@@ -267,6 +276,8 @@ fn hashSaveRequest(draft: Draft, expected_revision: ?u64, output: *[64]u8) []con
     hash.update(draft.name);
     hash.update("\x00");
     hash.update(@tagName(draft.adapter));
+    hash.update("\x00");
+    hash.update(@tagName(draft.tool_mode));
     hash.update("\x00");
     hash.update(draft.base_url);
     hash.update("\x00");
@@ -305,6 +316,7 @@ fn validDocument(document: Document) bool {
             .id = provider.id,
             .name = provider.name,
             .adapter = provider.adapter,
+            .tool_mode = provider.tool_mode,
             .base_url = provider.base_url,
             .model = provider.model,
             .instruction_role = provider.instruction_role,
@@ -401,6 +413,7 @@ pub const Store = struct {
             .id = id,
             .name = name,
             .adapter = adapter,
+            .tool_mode = .structured_result,
             .base_url = try normalizeBaseUrl(legacy.value.base_url),
             .model = name,
             .instruction_role = role,
@@ -408,7 +421,7 @@ pub const Store = struct {
             .revision = 1,
             .test_status = .stale,
         };
-        try validateDraft(.{ .id = provider.id, .name = provider.name, .adapter = provider.adapter, .base_url = provider.base_url, .model = provider.model, .instruction_role = provider.instruction_role, .structured_output = provider.structured_output });
+        try validateDraft(.{ .id = provider.id, .name = provider.name, .adapter = provider.adapter, .tool_mode = provider.tool_mode, .base_url = provider.base_url, .model = provider.model, .instruction_role = provider.instruction_role, .structured_output = provider.structured_output });
         var providers = [_]Public{provider};
         try stringifyAndWrite(self.allocator, io, self.path, .{ .providers = &providers });
         const migrated_bytes = std.Io.Dir.cwd().readFileAlloc(io, self.path, self.allocator, .limited(max_store_bytes)) catch return error.StoreAccess;
@@ -517,6 +530,7 @@ pub const Store = struct {
             .id = id,
             .name = std.mem.trim(u8, draft.name, " \t\r\n"),
             .adapter = draft.adapter,
+            .tool_mode = draft.tool_mode,
             .base_url = normalized,
             .model = std.mem.trim(u8, draft.model, " \t\r\n"),
             .instruction_role = draft.instruction_role,
@@ -755,16 +769,21 @@ test "provider URLs are normalized and reject unsafe authority and suffix data" 
 }
 
 test "adapter compatibility switches are explicit" {
-    const responses = Draft{ .name = "OpenAI", .adapter = .openai_responses, .base_url = "https://api.openai.com/v1", .model = "gpt-5" };
+    const responses = Draft{ .name = "OpenAI", .adapter = .openai_responses, .tool_mode = .native_function, .base_url = "https://api.openai.com/v1", .model = "gpt-5" };
     try validateDraft(responses);
     var bad_responses = responses;
     bad_responses.instruction_role = .developer;
     try std.testing.expectError(error.InvalidCompatibility, validateDraft(bad_responses));
-    const chat = Draft{ .name = "Ollama", .adapter = .openai_chat_completions, .base_url = "http://localhost:11434/v1", .model = "qwen3", .instruction_role = .system, .structured_output = .json_schema };
+    const chat = Draft{ .name = "Ollama", .adapter = .openai_chat_completions, .tool_mode = .structured_result, .base_url = "http://localhost:11434/v1", .model = "qwen3", .instruction_role = .system, .structured_output = .json_schema };
     try validateDraft(chat);
     var bad_chat = chat;
     bad_chat.structured_output = null;
     try std.testing.expectError(error.InvalidCompatibility, validateDraft(bad_chat));
+    const chat_native = Draft{ .name = "Ollama Tools", .adapter = .openai_chat_completions, .tool_mode = .native_function, .base_url = "http://localhost:11434/v1", .model = "qwen3" };
+    try validateDraft(chat_native);
+    var bad_chat_native = chat_native;
+    bad_chat_native.structured_output = .json_schema;
+    try std.testing.expectError(error.InvalidCompatibility, validateDraft(bad_chat_native));
 }
 
 test "provider store is versioned, idempotent, atomic, owner-only, and revision checked" {

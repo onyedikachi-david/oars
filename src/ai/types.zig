@@ -6,6 +6,11 @@ const std = @import("std");
 
 pub const schema_version: u8 = 1;
 
+pub const ToolMode = enum {
+    native_function,
+    structured_result,
+};
+
 pub const max_providers: usize = 16;
 pub const max_threads: usize = 100;
 pub const max_turns_per_thread: usize = 50;
