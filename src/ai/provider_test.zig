@@ -304,27 +304,28 @@ fn runNative(
     client_request_id: []const u8,
     cancellation: *transport.Cancellation,
 ) anyerror!transport.Meta {
-    const instructions = "Return exactly one valid proposal object. Do not call tools. This is a provider capability test only.";
+    const instructions = switch (selected.tool_mode) {
+        .structured_result => "Return exactly one valid proposal object. Do not call tools. This is a provider capability test only.",
+        .native_function => "Return a tool call proposing a safe read-only command. This is a provider capability test only.",
+    };
     const question = "Return a harmless command proposal that prints the operating-system kernel name.";
     var endpoint_buffer: [provider.max_base_url_bytes + 32]u8 = undefined;
     return switch (selected.adapter) {
         .openai_responses => blk: {
-            const body = try responses.buildRequest(allocator, selected.model, instructions, question);
+            const body = try responses.buildRequestWithMode(allocator, selected.model, instructions, question, "[]", selected.tool_mode);
             defer allocator.free(body);
             const endpoint = try transport.composeEndpoint(&endpoint_buffer, selected.base_url, responses.endpoint_suffix);
-            var state = responses.State.init(allocator);
+            var state = responses.State.initWithMode(allocator, selected.tool_mode, false);
             defer state.deinit();
             const meta = try transport.postSseTimed(allocator, io, endpoint, secret, client_request_id, body, cancellation, state.sink(), .{});
             try state.finish();
             break :blk meta;
         },
         .openai_chat_completions => blk: {
-            const role = selected.instruction_role orelse return error.InvalidCompatibility;
-            const mode = selected.structured_output orelse return error.InvalidCompatibility;
-            const body = try chat.buildRequest(allocator, selected.model, role, mode, instructions, question);
+            const body = try chat.buildRequestWithMode(allocator, selected.model, selected.instruction_role, selected.structured_output, instructions, question, "[]", selected.tool_mode);
             defer allocator.free(body);
             const endpoint = try transport.composeEndpoint(&endpoint_buffer, selected.base_url, chat.endpoint_suffix);
-            var state = chat.State.init(allocator);
+            var state = chat.State.initWithMode(allocator, selected.tool_mode, false);
             defer state.deinit();
             const meta = try transport.postSseTimed(allocator, io, endpoint, secret, client_request_id, body, cancellation, state.sink(), .{});
             try state.finish();

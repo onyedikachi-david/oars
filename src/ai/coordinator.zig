@@ -97,6 +97,10 @@ pub const FrozenProposal = struct {
     created_at_ms: i64,
     expires_at_ms: i64,
     state: types.ProposalState,
+    tool_mode: types.ToolMode = .structured_result,
+    provider_call_id: ?[]const u8 = null,
+    tool_name: ?[]const u8 = null,
+    preamble: ?[]const u8 = null,
 
     pub fn deinit(self: *FrozenProposal, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
@@ -107,6 +111,9 @@ pub const FrozenProposal = struct {
         allocator.free(self.command);
         allocator.free(self.command_sha256);
         allocator.free(self.explanation);
+        if (self.provider_call_id) |v| allocator.free(v);
+        if (self.tool_name) |v| allocator.free(v);
+        if (self.preamble) |v| allocator.free(v);
     }
 };
 
@@ -128,6 +135,10 @@ const ProposalJournalPayload = struct {
     created_at_ms: i64,
     expires_at_ms: i64,
     state: types.ProposalState,
+    tool_mode: ?types.ToolMode = null,
+    provider_call_id: ?[]const u8 = null,
+    tool_name: ?[]const u8 = null,
+    preamble: ?[]const u8 = null,
 };
 
 pub const Turn = struct {
@@ -1384,6 +1395,17 @@ fn workerMain(registry: *Registry, turn: *Turn) void {
         return;
     };
     defer registry.allocator.free(event_payload);
+
+    if (frozen.preamble) |preamble| {
+        const preamble_payload = std.fmt.allocPrint(registry.allocator, "{{\"message\":{f},\"explanation\":\"\"}}", .{std.json.fmt(preamble, .{})}) catch null;
+        if (preamble_payload) |payload| {
+            defer registry.allocator.free(payload);
+            lockSpin(&registry.mutex);
+            turn.stream.append("assistant.message", payload) catch {};
+            registry.mutex.unlock();
+        }
+    }
+
     lockSpin(&registry.mutex);
     turn.proposal = frozen;
     turn.state = .awaiting_approval;
@@ -1569,10 +1591,10 @@ fn runNative(_: ?*anyopaque, allocator: std.mem.Allocator, io: std.Io, selected:
     var endpoint_buffer: [provider.max_base_url_bytes + 32]u8 = undefined;
     return switch (selected.adapter) {
         .openai_responses => blk: {
-            const body = try responses.buildRequestWithContinuation(allocator, selected.model, provider_instructions, user_text, continuation_json);
+            const body = try responses.buildRequestWithMode(allocator, selected.model, provider_instructions, user_text, continuation_json, selected.tool_mode);
             defer allocator.free(body);
             const endpoint = try transport.composeEndpoint(&endpoint_buffer, selected.base_url, responses.endpoint_suffix);
-            var state = responses.State.init(allocator);
+            var state = responses.State.initWithMode(allocator, selected.tool_mode, false);
             defer state.deinit();
             const meta = try transport.postSseTimedObserved(allocator, io, endpoint, secret, client_request_id, body, cancellation, state.sink(), .{}, observer);
             try state.finish();
@@ -1583,12 +1605,10 @@ fn runNative(_: ?*anyopaque, allocator: std.mem.Allocator, io: std.Io, selected:
             break :blk .{ .validated = validated, .meta = meta, .continuation_json = continuation, .received_bytes = state.output.items.len };
         },
         .openai_chat_completions => blk: {
-            const role = selected.instruction_role orelse return error.InvalidCompatibility;
-            const mode = selected.structured_output orelse return error.InvalidCompatibility;
-            const body = try chat.buildRequestWithContinuation(allocator, selected.model, role, mode, provider_instructions, user_text, continuation_json);
+            const body = try chat.buildRequestWithMode(allocator, selected.model, selected.instruction_role, selected.structured_output, provider_instructions, user_text, continuation_json, selected.tool_mode);
             defer allocator.free(body);
             const endpoint = try transport.composeEndpoint(&endpoint_buffer, selected.base_url, chat.endpoint_suffix);
-            var state = chat.State.init(allocator);
+            var state = chat.State.initWithMode(allocator, selected.tool_mode, false);
             defer state.deinit();
             const meta = try transport.postSseTimedObserved(allocator, io, endpoint, secret, client_request_id, body, cancellation, state.sink(), .{}, observer);
             try state.finish();
@@ -1635,7 +1655,35 @@ fn freezeProposal(allocator: std.mem.Allocator, io: std.Io, turn: *const Turn, v
     const command_hash = try hashHex(allocator, command);
     errdefer allocator.free(command_hash);
     const explanation = try allocator.dupe(u8, validated.explanation);
-    return .{ .id = id, .turn_id = turn_id, .revision = 1, .server_id = server_id, .connection_id = turn.connection_id, .provider_id = provider_id, .provider_revision = turn.provider_revision, .context_hash = context_hash, .command = command_copy, .command_sha256 = command_hash, .explanation = explanation, .model_destructive = validated.model_destructive, .local_destructive = validated.local_destructive, .needs_sudo = validated.needs_sudo, .created_at_ms = now_ms, .expires_at_ms = now_ms + proposal_ttl_ms, .state = .awaiting_approval };
+    errdefer allocator.free(explanation);
+    const provider_call_id = if (validated.provider_call_id) |cid| try allocator.dupe(u8, cid) else null;
+    errdefer if (provider_call_id) |cid| allocator.free(cid);
+    const tool_name = if (validated.tool_name) |tn| try allocator.dupe(u8, tn) else null;
+    errdefer if (tool_name) |tn| allocator.free(tn);
+    const preamble = if (validated.preamble) |p| try allocator.dupe(u8, p) else null;
+    return .{
+        .id = id,
+        .turn_id = turn_id,
+        .revision = 1,
+        .server_id = server_id,
+        .connection_id = turn.connection_id,
+        .provider_id = provider_id,
+        .provider_revision = turn.provider_revision,
+        .context_hash = context_hash,
+        .command = command_copy,
+        .command_sha256 = command_hash,
+        .explanation = explanation,
+        .model_destructive = validated.model_destructive,
+        .local_destructive = validated.local_destructive,
+        .needs_sudo = validated.needs_sudo,
+        .created_at_ms = now_ms,
+        .expires_at_ms = now_ms + proposal_ttl_ms,
+        .state = .awaiting_approval,
+        .tool_mode = validated.tool_mode,
+        .provider_call_id = provider_call_id,
+        .tool_name = tool_name,
+        .preamble = preamble,
+    };
 }
 
 fn serializeThread(allocator: std.mem.Allocator, conversation: *const Conversation) ![]u8 {
@@ -1647,7 +1695,22 @@ fn serializeTurnQueuedFields(allocator: std.mem.Allocator, message: []const u8, 
 }
 
 fn serializeValidated(allocator: std.mem.Allocator, validated: *const proposal_domain.Validated, request_id: []const u8, continuation_json: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{{\"kind\":{f},\"message\":{f},\"command\":{f},\"question\":{f},\"explanation\":{f},\"model_destructive\":{s},\"local_destructive\":{s},\"needs_sudo\":{s},\"provider_request_id\":{f},\"continuation_items\":{s}}}", .{ std.json.fmt(@tagName(validated.kind), .{}), std.json.fmt(validated.message, .{}), std.json.fmt(validated.command, .{}), std.json.fmt(validated.question, .{}), std.json.fmt(validated.explanation, .{}), if (validated.model_destructive) "true" else "false", if (validated.local_destructive) "true" else "false", if (validated.needs_sudo) "true" else "false", std.json.fmt(request_id, .{}), continuation_json });
+    return std.fmt.allocPrint(allocator, "{{\"kind\":{f},\"message\":{f},\"command\":{f},\"question\":{f},\"explanation\":{f},\"model_destructive\":{s},\"local_destructive\":{s},\"needs_sudo\":{s},\"provider_request_id\":{f},\"continuation_items\":{s},\"tool_mode\":{f},\"provider_call_id\":{f},\"tool_name\":{f},\"preamble\":{f}}}", .{
+        std.json.fmt(@tagName(validated.kind), .{}),
+        std.json.fmt(validated.message, .{}),
+        std.json.fmt(validated.command, .{}),
+        std.json.fmt(validated.question, .{}),
+        std.json.fmt(validated.explanation, .{}),
+        if (validated.model_destructive) "true" else "false",
+        if (validated.local_destructive) "true" else "false",
+        if (validated.needs_sudo) "true" else "false",
+        std.json.fmt(request_id, .{}),
+        continuation_json,
+        std.json.fmt(@tagName(validated.tool_mode), .{}),
+        std.json.fmt(validated.provider_call_id, .{}),
+        std.json.fmt(validated.tool_name, .{}),
+        std.json.fmt(validated.preamble, .{}),
+    });
 }
 
 fn composeContinuation(allocator: std.mem.Allocator, adapter: provider.Adapter, previous_json: []const u8, message: []const u8, output_json: []const u8) ![]u8 {
@@ -1689,11 +1752,53 @@ fn composeContinuation(allocator: std.mem.Allocator, adapter: provider.Adapter, 
 }
 
 pub fn serializeProposal(allocator: std.mem.Allocator, value: *const FrozenProposal) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{{\"id\":{f},\"turn_id\":{f},\"revision\":{d},\"server_id\":{f},\"provider_id\":{f},\"provider_revision\":{d},\"context_hash\":{f},\"command\":{f},\"command_sha256\":{f},\"explanation\":{f},\"model_destructive\":{s},\"local_destructive\":{s},\"needs_sudo\":{s},\"created_at_ms\":{d},\"expires_at_ms\":{d},\"state\":{f}}}", .{ std.json.fmt(value.id, .{}), std.json.fmt(value.turn_id, .{}), value.revision, std.json.fmt(value.server_id, .{}), std.json.fmt(value.provider_id, .{}), value.provider_revision, std.json.fmt(value.context_hash, .{}), std.json.fmt(value.command, .{}), std.json.fmt(value.command_sha256, .{}), std.json.fmt(value.explanation, .{}), if (value.model_destructive) "true" else "false", if (value.local_destructive) "true" else "false", if (value.needs_sudo) "true" else "false", value.created_at_ms, value.expires_at_ms, std.json.fmt(@tagName(value.state), .{}) });
+    return std.fmt.allocPrint(allocator, "{{\"id\":{f},\"turn_id\":{f},\"revision\":{d},\"server_id\":{f},\"provider_id\":{f},\"provider_revision\":{d},\"context_hash\":{f},\"command\":{f},\"command_sha256\":{f},\"explanation\":{f},\"model_destructive\":{s},\"local_destructive\":{s},\"needs_sudo\":{s},\"created_at_ms\":{d},\"expires_at_ms\":{d},\"state\":{f},\"tool_mode\":{f},\"provider_call_id\":{f},\"tool_name\":{f}}}", .{
+        std.json.fmt(value.id, .{}),
+        std.json.fmt(value.turn_id, .{}),
+        value.revision,
+        std.json.fmt(value.server_id, .{}),
+        std.json.fmt(value.provider_id, .{}),
+        value.provider_revision,
+        std.json.fmt(value.context_hash, .{}),
+        std.json.fmt(value.command, .{}),
+        std.json.fmt(value.command_sha256, .{}),
+        std.json.fmt(value.explanation, .{}),
+        if (value.model_destructive) "true" else "false",
+        if (value.local_destructive) "true" else "false",
+        if (value.needs_sudo) "true" else "false",
+        value.created_at_ms,
+        value.expires_at_ms,
+        std.json.fmt(@tagName(value.state), .{}),
+        std.json.fmt(@tagName(value.tool_mode), .{}),
+        std.json.fmt(value.provider_call_id, .{}),
+        std.json.fmt(value.tool_name, .{}),
+    });
 }
 
 fn serializeProposalJournal(allocator: std.mem.Allocator, value: *const FrozenProposal) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{{\"id\":{f},\"turn_id\":{f},\"revision\":{d},\"server_id\":{f},\"connection_id\":{d},\"provider_id\":{f},\"provider_revision\":{d},\"context_hash\":{f},\"command\":{f},\"command_sha256\":{f},\"explanation\":{f},\"model_destructive\":{s},\"local_destructive\":{s},\"needs_sudo\":{s},\"created_at_ms\":{d},\"expires_at_ms\":{d},\"state\":{f}}}", .{ std.json.fmt(value.id, .{}), std.json.fmt(value.turn_id, .{}), value.revision, std.json.fmt(value.server_id, .{}), value.connection_id, std.json.fmt(value.provider_id, .{}), value.provider_revision, std.json.fmt(value.context_hash, .{}), std.json.fmt(value.command, .{}), std.json.fmt(value.command_sha256, .{}), std.json.fmt(value.explanation, .{}), if (value.model_destructive) "true" else "false", if (value.local_destructive) "true" else "false", if (value.needs_sudo) "true" else "false", value.created_at_ms, value.expires_at_ms, std.json.fmt(@tagName(value.state), .{}) });
+    return std.fmt.allocPrint(allocator, "{{\"id\":{f},\"turn_id\":{f},\"revision\":{d},\"server_id\":{f},\"connection_id\":{d},\"provider_id\":{f},\"provider_revision\":{d},\"context_hash\":{f},\"command\":{f},\"command_sha256\":{f},\"explanation\":{f},\"model_destructive\":{s},\"local_destructive\":{s},\"needs_sudo\":{s},\"created_at_ms\":{d},\"expires_at_ms\":{d},\"state\":{f},\"tool_mode\":{f},\"provider_call_id\":{f},\"tool_name\":{f},\"preamble\":{f}}}", .{
+        std.json.fmt(value.id, .{}),
+        std.json.fmt(value.turn_id, .{}),
+        value.revision,
+        std.json.fmt(value.server_id, .{}),
+        value.connection_id,
+        std.json.fmt(value.provider_id, .{}),
+        value.provider_revision,
+        std.json.fmt(value.context_hash, .{}),
+        std.json.fmt(value.command, .{}),
+        std.json.fmt(value.command_sha256, .{}),
+        std.json.fmt(value.explanation, .{}),
+        if (value.model_destructive) "true" else "false",
+        if (value.local_destructive) "true" else "false",
+        if (value.needs_sudo) "true" else "false",
+        value.created_at_ms,
+        value.expires_at_ms,
+        std.json.fmt(@tagName(value.state), .{}),
+        std.json.fmt(@tagName(value.tool_mode), .{}),
+        std.json.fmt(value.provider_call_id, .{}),
+        std.json.fmt(value.tool_name, .{}),
+        std.json.fmt(value.preamble, .{}),
+    });
 }
 
 fn cloneConversation(allocator: std.mem.Allocator, value: Conversation) !Conversation {
@@ -1714,7 +1819,29 @@ fn cloneConversation(allocator: std.mem.Allocator, value: Conversation) !Convers
 }
 
 fn cloneProposal(allocator: std.mem.Allocator, value: FrozenProposal) !FrozenProposal {
-    return cloneRawProposal(allocator, .{ .id = value.id, .turn_id = value.turn_id, .revision = value.revision, .server_id = value.server_id, .connection_id = value.connection_id, .provider_id = value.provider_id, .provider_revision = value.provider_revision, .context_hash = value.context_hash, .command = value.command, .command_sha256 = value.command_sha256, .explanation = value.explanation, .model_destructive = value.model_destructive, .local_destructive = value.local_destructive, .needs_sudo = value.needs_sudo, .created_at_ms = value.created_at_ms, .expires_at_ms = value.expires_at_ms, .state = value.state });
+    return cloneRawProposal(allocator, .{
+        .id = value.id,
+        .turn_id = value.turn_id,
+        .revision = value.revision,
+        .server_id = value.server_id,
+        .connection_id = value.connection_id,
+        .provider_id = value.provider_id,
+        .provider_revision = value.provider_revision,
+        .context_hash = value.context_hash,
+        .command = value.command,
+        .command_sha256 = value.command_sha256,
+        .explanation = value.explanation,
+        .model_destructive = value.model_destructive,
+        .local_destructive = value.local_destructive,
+        .needs_sudo = value.needs_sudo,
+        .created_at_ms = value.created_at_ms,
+        .expires_at_ms = value.expires_at_ms,
+        .state = value.state,
+        .tool_mode = value.tool_mode,
+        .provider_call_id = value.provider_call_id,
+        .tool_name = value.tool_name,
+        .preamble = value.preamble,
+    });
 }
 
 fn cloneRawProposal(allocator: std.mem.Allocator, value: ProposalJournalPayload) !FrozenProposal {
@@ -1733,7 +1860,35 @@ fn cloneRawProposal(allocator: std.mem.Allocator, value: ProposalJournalPayload)
     const command_sha256 = try allocator.dupe(u8, value.command_sha256);
     errdefer allocator.free(command_sha256);
     const explanation = try allocator.dupe(u8, value.explanation);
-    return .{ .id = id, .turn_id = turn_id, .revision = value.revision, .server_id = server_id, .connection_id = value.connection_id, .provider_id = provider_id, .provider_revision = value.provider_revision, .context_hash = context_hash, .command = command, .command_sha256 = command_sha256, .explanation = explanation, .model_destructive = value.model_destructive, .local_destructive = value.local_destructive, .needs_sudo = value.needs_sudo, .created_at_ms = value.created_at_ms, .expires_at_ms = value.expires_at_ms, .state = value.state };
+    errdefer allocator.free(explanation);
+    const provider_call_id = if (value.provider_call_id) |cid| try allocator.dupe(u8, cid) else null;
+    errdefer if (provider_call_id) |cid| allocator.free(cid);
+    const tool_name = if (value.tool_name) |tn| try allocator.dupe(u8, tn) else null;
+    errdefer if (tool_name) |tn| allocator.free(tn);
+    const preamble = if (value.preamble) |p| try allocator.dupe(u8, p) else null;
+    return .{
+        .id = id,
+        .turn_id = turn_id,
+        .revision = value.revision,
+        .server_id = server_id,
+        .connection_id = value.connection_id,
+        .provider_id = provider_id,
+        .provider_revision = value.provider_revision,
+        .context_hash = context_hash,
+        .command = command,
+        .command_sha256 = command_sha256,
+        .explanation = explanation,
+        .model_destructive = value.model_destructive,
+        .local_destructive = value.local_destructive,
+        .needs_sudo = value.needs_sudo,
+        .created_at_ms = value.created_at_ms,
+        .expires_at_ms = value.expires_at_ms,
+        .state = value.state,
+        .tool_mode = value.tool_mode orelse .structured_result,
+        .provider_call_id = provider_call_id,
+        .tool_name = tool_name,
+        .preamble = preamble,
+    };
 }
 
 fn cloneRecoveredProvider(allocator: std.mem.Allocator, conversation: Conversation, revision: u64) !provider.Public {
@@ -2151,4 +2306,70 @@ test "restart recovery interrupts provider work preserves valid proposals and ne
     defer capped_provider.deinit(allocator);
     try std.testing.expectError(error.LimitExceeded, registry.admitOwned("turn-operation-over-cap", "thread-page", "server-one", capped_provider, generation, 7, "One turn too many", "{}", 100));
     try std.testing.expectEqual(@as(usize, 0), limiter.count());
+}
+
+test "coordinator handles native tool proposal, preamble emission, and recovery" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var dir_buffer: [192]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buffer, "/tmp/oars-ai-native-tool-{d}", .{std.Io.Timestamp.now(io, .real).nanoseconds});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var provider_path_buffer: [256]u8 = undefined;
+    const provider_path = try std.fmt.bufPrint(&provider_path_buffer, "{s}/ai.json", .{dir});
+    var journal_path_buffer: [256]u8 = undefined;
+    const journal_path = try std.fmt.bufPrint(&journal_path_buffer, "{s}/ai_journal.jsonl", .{dir});
+
+    var providers = provider.Store{ .allocator = allocator, .path = provider_path };
+    var configured = try providers.save(io, "provider-save-tool", .{
+        .name = "Native Provider",
+        .adapter = .openai_responses,
+        .base_url = "https://example.com/v1",
+        .model = "gpt-4o",
+        .tool_mode = .native_function,
+    }, null);
+    defer configured.deinit(allocator);
+    try providers.bindCredential(io, configured.id, configured.base_url);
+    const generation = (try providers.credentialGeneration(io, configured.id, configured.base_url)).?;
+    var tested = try providers.recordTestResult(io, configured.id, configured.revision, generation, .passed, 1);
+    tested.deinit(allocator);
+
+    var journal_store = journal.Store{ .allocator = allocator, .path = journal_path };
+    defer journal_store.deinit();
+    var limiter = request_slots.Limiter{};
+    var registry = Registry.init(allocator, io, &providers, &journal_store, &limiter);
+    defer registry.deinit();
+
+    var fake = FakeRunner{
+        .document = "{\"kind\":\"command\",\"command\":\"df -h\",\"question\":null,\"explanation\":\"Check disk space.\",\"destructive\":false,\"needs_sudo\":false}",
+    };
+    registry.runner = fake.runner();
+
+    const selected = try providers.get(io, configured.id);
+    const admission = try registry.admitOwned("turn-native-1", null, "server-one", selected, generation, 7, "Check disk", "{\"server_id\":\"server-one\"}", 10);
+    try registry.setSecretAndStart(admission.turn_id, fixtureSecret());
+    try waitForState(&registry, admission.turn_id, .awaiting_approval);
+
+    var polled = try registry.poll(admission.turn_id, 0, false);
+    defer polled.poll.deinit(allocator);
+    var saw_proposal = false;
+    for (polled.poll.events) |event| {
+        if (std.mem.eql(u8, event.type, "proposal.ready")) saw_proposal = true;
+    }
+    try std.testing.expect(saw_proposal);
+
+    const prop = registry.turns.items[0].proposal.?;
+    try std.testing.expectEqual(types.ToolMode.native_function, prop.tool_mode);
+    try std.testing.expectEqualStrings("df -h", prop.command);
+
+    // Verify journal records
+    const records = try journal_store.snapshot(io);
+    defer journal.Store.deinitSnapshot(allocator, records);
+    var found_proposal_record = false;
+    for (records) |rec| {
+        if (rec.kind == .proposal_ready) {
+            found_proposal_record = true;
+            try std.testing.expect(std.mem.indexOf(u8, rec.payload_json, "\"tool_mode\":\"native_function\"") != null);
+        }
+    }
+    try std.testing.expect(found_proposal_record);
 }
