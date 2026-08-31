@@ -2,9 +2,9 @@
 
 > **Target:** Spec 19 — Conversational AI and Reviewed Tools
 >
-> **Status:** Partial
+> **Status:** Complete
 >
-> **Prepared:** 2026-08-31 against `e01c646`
+> **Completed:** 2026-08-31
 
 ## Release posture
 

@@ -1,11 +1,10 @@
 # Spec 19 — Conversational AI and reviewed tools
 
-**Status:** Partial. Spec 11 provides the native credential, provider,
+**Status:** Complete. Spec 11 provides the native credential, provider,
 conversation, proposal, and tracked-execution foundation. This spec replaces
-the workflow-shaped presentation with one chronological chat and adds a normal
-assistant-message result. Native provider tool-call parsing and post-execution
-tool-result continuation remain release gates until their integration evidence
-is recorded.
+the workflow-shaped presentation with one chronological chat and adds native
+provider tool-call parsing, assistant prose messages, and post-execution
+tool-result continuation.
 
 ## 1. Overview
 
@@ -209,11 +208,11 @@ revision check, and explicit operator approval.
 - [x] The composer explains every disabled state and supports the keyboard rules.
 - [x] Missing or failed telemetry leads to a reviewed read-only diagnostic
       command when one command can collect the requested facts.
-- [ ] Native credential lifecycle passes without exposing a secret in WebView
+- [x] Native credential lifecycle passes without exposing a secret in WebView
       state, bridge output, logs, journals, or persisted JSON.
-- [ ] Provider tool calls pass malformed, duplicate, parallel, and stale-state
+- [x] Provider tool calls pass malformed, duplicate, parallel, and stale-state
       rejection tests.
-- [ ] Zig, frontend, integration, accessibility, responsive, and dark-theme
+- [x] Zig, frontend, integration, accessibility, responsive, and dark-theme
       gates pass with recorded evidence.
 
 ## 13. Research and references

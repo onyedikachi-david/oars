@@ -16,13 +16,11 @@ pub const strict_parameters_schema_json =
 
 pub const responses_tool_json =
     \\{"type":"function","name":"run_server_command","description":"Propose one shell command to inspect or change the selected Linux server. The command is reviewed by the operator before execution.","strict":true,"parameters":
-    ++ strict_parameters_schema_json ++ "}"
-;
+++ strict_parameters_schema_json ++ "}";
 
 pub const chat_tool_json =
     \\{"type":"function","function":{"name":"run_server_command","description":"Propose one shell command to inspect or change the selected Linux server. The command is reviewed by the operator before execution.","strict":true,"parameters":
-    ++ strict_parameters_schema_json ++ "}}"
-;
+++ strict_parameters_schema_json ++ "}}";
 
 pub const Error = error{
     InvalidJson,
