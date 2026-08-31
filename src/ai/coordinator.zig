@@ -1906,7 +1906,13 @@ fn waitForState(registry: *Registry, turn_id: []const u8, wanted: types.TurnStat
     while (attempts < 1000) : (attempts += 1) {
         var result = try registry.poll(turn_id, 0, false);
         defer result.poll.deinit(registry.allocator);
-        if (result.state == wanted) return;
+        if (result.state == wanted) {
+            var limit_attempts: usize = 0;
+            while (limit_attempts < 200 and registry.limiter.count() > 0) : (limit_attempts += 1) {
+                try std.Io.sleep(registry.io, std.Io.Duration.fromMilliseconds(1), .awake);
+            }
+            return;
+        }
         try std.Io.sleep(registry.io, std.Io.Duration.fromMilliseconds(1), .awake);
     }
     return error.TestUnexpectedResult;
