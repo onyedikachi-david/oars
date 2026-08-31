@@ -1018,6 +1018,9 @@ export interface AiProposal {
   created_at_ms: number;
   expires_at_ms: number;
   state: "awaiting_approval" | "approved" | "executing" | "completed" | "failed" | "canceled" | "expired" | "recovery_required";
+  tool_mode?: AiToolMode;
+  provider_call_id?: string | null;
+  tool_name?: string | null;
 }
 
 export type AiTurnState =

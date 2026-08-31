@@ -71,12 +71,14 @@ interface ExecutionView extends AiExecutionAdmission {
 }
 
 function snapshotToolState(turn: AiTurnSnapshot): ChatToolState {
-  if (turn.state === "executing" || turn.state === "approved") return "running";
+  if (turn.state === "executing") return "running";
+  if (turn.state === "approved") return "approved";
   if (turn.state === "completed") return turn.exit_status !== null && turn.exit_status !== 0 ? "failed" : "completed";
   if (turn.state === "canceled") return "canceled";
   if (turn.state === "interrupted" || turn.state === "recovery_required") return "recovery-required";
   if (turn.state === "failed") return "failed";
-  return "approval-requested";
+  if (turn.proposal?.state === "expired") return "expired";
+  return "awaiting-approval";
 }
 
 export function AiTab({ serverId, onOpenScriptDraft }: { serverId: string; onOpenScriptDraft?: (command: string, destructive: boolean) => void }) {
@@ -536,9 +538,13 @@ export function AiTab({ serverId, onOpenScriptDraft }: { serverId: string; onOpe
   const liveAssistant = turnFeed.assistantMessage && turnFeed.assistantMessage !== latestSnapshot?.assistant_message ? turnFeed.assistantMessage : null;
   const liveQuestion = turnFeed.question && turnFeed.question !== latestSnapshot?.question ? turnFeed.question : null;
   const hasVisibleAssistantResult = Boolean(liveAssistant || liveQuestion || latestSnapshot?.assistant_message || latestSnapshot?.question || latestSnapshot?.proposal);
-  const toolState = turnState === "recovery_required" || turnState === "interrupted" ? "recovery-required" : execution
+  const toolState: ChatToolState = turnState === "recovery_required" || turnState === "interrupted" ? "recovery-required" : execution
     ? execution.eof ? (execution.exit === 0 ? "completed" : "failed") : "running"
-    : proposal?.state === "canceled" ? "canceled" : "approval-requested";
+    : proposal?.state === "canceled" ? "canceled"
+    : proposal?.state === "expired" ? "expired"
+    : turnState === "approved" ? "approved"
+    : turnState === "validating" || turnState === "requesting" || turnState === "streaming" ? "preparing"
+    : "awaiting-approval";
 
   return <div className="ai-workspace ai-chat-workspace" aria-labelledby="ai-workspace-title">
     <header className="ai-chat-header">
