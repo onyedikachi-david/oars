@@ -231,9 +231,14 @@ export function AiTab({ serverId, onOpenScriptDraft }: { serverId: string; onOpe
     catch (cause) { setError(errorMessage(cause)); }
   };
 
-  const setAdapter = (adapter: AiAdapter) => setDraft((current) => adapter === "openai_responses"
-    ? { ...current, adapter, instruction_role: undefined, structured_output: undefined }
-    : { ...current, adapter, instruction_role: "system", structured_output: "json_schema" });
+  const setAdapter = (adapter: AiAdapter) => setDraft((current) => {
+    const { instruction_role: _instructionRole, structured_output: _structuredOutput, ...portable } = current;
+    if (adapter === "openai_responses") return { ...portable, adapter };
+    if ((current.tool_mode ?? "structured_result") === "native_function") {
+      return { ...portable, adapter, instruction_role: "system" };
+    }
+    return { ...portable, adapter, instruction_role: "system", structured_output: current.structured_output ?? "json_schema" };
+  });
 
   const reloadProviders = async () => {
     const next = (await api.ai.providerList()).providers;

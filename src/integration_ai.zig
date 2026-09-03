@@ -63,6 +63,7 @@ const ProviderFixture = struct {
         _: []const u8,
         context_json: []const u8,
         _: []const u8,
+        _: ?*const ai.coordinator.ToolResultSelection,
         cancellation: *ai.transport.Cancellation,
         observer: ai.transport.Observer,
     ) anyerror!ai.coordinator.RunOutput {

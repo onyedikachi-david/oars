@@ -13402,6 +13402,28 @@ fn handleAiTurnSummarize(context: *anyopaque, invocation: native_sdk.bridge.Invo
     const turns = if (self.ai.turns) |*value| value else return aiTypedError(output, .recovery_required, "AI coordinator is unavailable");
     var source = turns.summarySource(payload.thread_id, payload.execution_id) catch |err| return aiCoordinatorError(output, err);
     defer source.deinit(self.allocator);
+    if (payload.output_selection.end_cursor > source.execution_cursor) return aiTypedError(output, .invalid_argument, "output selection exceeds the completed execution output");
+    const message = std.fmt.allocPrint(self.allocator, "Summarize the selected output for execution {s}, bytes {d} through {d}.", .{ payload.execution_id, payload.output_selection.start_cursor, payload.output_selection.end_cursor }) catch return aiTypedError(output, .recovery_required, "the summary request could not be retained");
+    defer self.allocator.free(message);
+    const identity = ai.coordinator.ToolResultIdentity{
+        .execution_id = payload.execution_id,
+        .start_cursor = payload.output_selection.start_cursor,
+        .end_cursor = payload.output_selection.end_cursor,
+        .exit_status = source.exit_status,
+        .tool_mode = source.tool_mode,
+        .provider_call_id = source.provider_call_id,
+        .tool_name = source.tool_name,
+    };
+    if (turns.lookupToolResultOperation(payload.operation_id, payload.thread_id, source.server_id, source.provider_id, source.provider_revision, message, identity) catch |err| return aiCoordinatorError(output, err)) |replay| return writeAiTurnAdmission(output, replay);
+    var selected = self.ai.providers.get(self.io, source.provider_id) catch |err| return aiProviderError(output, err);
+    var selected_owned = true;
+    defer if (selected_owned) selected.deinit(self.allocator);
+    if (selected.revision != source.provider_revision or selected.tool_mode != source.tool_mode) return aiTypedError(output, .stale_revision, "the provider changed after this command was proposed");
+    const connection_id = self.manager.connectionIdentity(source.server_id) catch return aiTypedError(output, .not_connected, "server is not connected");
+    if (connection_id != source.connection_id) return aiTypedError(output, .conflict, "the server connection changed after this command ran");
+    if (selected.test_status != .passed) return aiTypedError(output, .provider_untested, "test this provider successfully before summarizing output");
+    const generation = (self.ai.providers.credentialGeneration(self.io, selected.id, selected.base_url) catch |err| return aiProviderError(output, err)) orelse return aiTypedError(output, .credential_missing, "configure a credential for this provider before summarizing output");
+    if (generation != source.credential_generation) return aiTypedError(output, .stale_revision, "the provider credential changed after this command was proposed");
     const output_bytes = (self.manager.readChannelRange(source.server_id, source.channel, payload.output_selection.start_cursor, payload.output_selection.end_cursor) catch |err| switch (err) {
         error.NoSession => return aiTypedError(output, .not_connected, "the command output channel is unavailable"),
         error.OutputNotRetained => return aiTypedError(output, .conflict, "the selected command output range is no longer retained"),
@@ -13409,22 +13431,23 @@ fn handleAiTurnSummarize(context: *anyopaque, invocation: native_sdk.bridge.Invo
     }) orelse return aiTypedError(output, .not_found, "the command output channel was not found");
     defer self.allocator.free(output_bytes);
     if (!std.unicode.utf8ValidateSlice(output_bytes) or std.mem.indexOfScalar(u8, output_bytes, 0) != null) return aiTypedError(output, .invalid_argument, "the selected command output is not valid text");
-    const context_spec = buildAiSummaryContext(self.allocator, payload.execution_id, payload.output_selection.start_cursor, payload.output_selection.end_cursor, output_bytes) catch return aiTypedError(output, .recovery_required, "the summary context could not be retained");
+    const context_spec = buildAiSummaryContext(self.allocator, payload.execution_id, payload.output_selection.start_cursor, payload.output_selection.end_cursor, source.exit_status, source.tool_mode, source.provider_call_id, source.tool_name, output_bytes) catch return aiTypedError(output, .recovery_required, "the summary context could not be retained");
     defer self.allocator.free(context_spec);
-    const message = std.fmt.allocPrint(self.allocator, "Summarize the selected output for execution {s}, bytes {d} through {d}.", .{ payload.execution_id, payload.output_selection.start_cursor, payload.output_selection.end_cursor }) catch return aiTypedError(output, .recovery_required, "the summary request could not be retained");
-    defer self.allocator.free(message);
-    var selected = self.ai.providers.get(self.io, source.provider_id) catch |err| return aiProviderError(output, err);
-    var selected_owned = true;
-    defer if (selected_owned) selected.deinit(self.allocator);
-    if (turns.lookupOperation(payload.operation_id, source.server_id, source.provider_id, selected.revision, message) catch |err| return aiCoordinatorError(output, err)) |replay| return writeAiTurnAdmission(output, replay);
-    const connection_id = self.manager.connectionIdentity(source.server_id) catch return aiTypedError(output, .not_connected, "server is not connected");
-    if (selected.test_status != .passed) return aiTypedError(output, .provider_untested, "test this provider successfully before summarizing output");
-    const generation = (self.ai.providers.credentialGeneration(self.io, selected.id, selected.base_url) catch |err| return aiProviderError(output, err)) orelse return aiTypedError(output, .credential_missing, "configure a credential for this provider before summarizing output");
+    const tool_result = ai.coordinator.ToolResultInput{
+        .execution_id = payload.execution_id,
+        .start_cursor = payload.output_selection.start_cursor,
+        .end_cursor = payload.output_selection.end_cursor,
+        .exit_status = source.exit_status,
+        .tool_mode = source.tool_mode,
+        .provider_call_id = source.provider_call_id,
+        .tool_name = source.tool_name,
+        .output = output_bytes,
+    };
     var secret = self.ai.credential_facade.copySecret(selected.id) catch return aiTypedError(output, .credential_missing, "the provider credential is unavailable");
     var secret_owned = true;
     defer if (secret_owned) secret.clear();
     const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_ms));
-    const admission = turns.admitOwned(payload.operation_id, payload.thread_id, source.server_id, selected, generation, connection_id, message, context_spec, now_ms) catch |err| return aiCoordinatorError(output, err);
+    const admission = turns.admitToolResultOwned(payload.operation_id, payload.thread_id, source.server_id, selected, generation, connection_id, message, context_spec, tool_result, now_ms) catch |err| return aiCoordinatorError(output, err);
     selected_owned = false;
     turns.setSecretAndStart(admission.turn_id, secret) catch |err| return aiCoordinatorError(output, err);
     secret_owned = false;
@@ -13432,12 +13455,12 @@ fn handleAiTurnSummarize(context: *anyopaque, invocation: native_sdk.bridge.Invo
     return writeAiTurnAdmission(output, admission);
 }
 
-fn buildAiSummaryContext(allocator: std.mem.Allocator, execution_id: []const u8, start_cursor: u64, end_cursor: u64, output: []const u8) ![]u8 {
+fn buildAiSummaryContext(allocator: std.mem.Allocator, execution_id: []const u8, start_cursor: u64, end_cursor: u64, exit_status: ?i32, tool_mode: ai.types.ToolMode, provider_call_id: ?[]const u8, tool_name: ?[]const u8, output: []const u8) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
     writer.writer.writeAll("{\"context\":{\"kind\":\"command_output\",\"execution_id\":") catch return error.OutOfMemory;
     std.json.Stringify.value(execution_id, .{}, &writer.writer) catch return error.OutOfMemory;
-    writer.writer.print(",\"start_cursor\":{d},\"end_cursor\":{d},\"content\":", .{ start_cursor, end_cursor }) catch return error.OutOfMemory;
+    writer.writer.print(",\"start_cursor\":{d},\"end_cursor\":{d},\"exit_status\":{f},\"tool_mode\":{f},\"provider_call_id\":{f},\"tool_name\":{f},\"content\":", .{ start_cursor, end_cursor, std.json.fmt(exit_status, .{}), std.json.fmt(@tagName(tool_mode), .{}), std.json.fmt(provider_call_id, .{}), std.json.fmt(tool_name, .{}) }) catch return error.OutOfMemory;
     std.json.Stringify.value(output, .{}, &writer.writer) catch return error.OutOfMemory;
     writer.writer.writeAll("},\"log\":null}") catch return error.OutOfMemory;
     return writer.toOwnedSlice() catch error.OutOfMemory;

@@ -7,6 +7,7 @@ const credentials = @import("credentials.zig");
 const transport = @import("transport.zig");
 const responses = @import("responses.zig");
 const chat = @import("chat.zig");
+const proposal_domain = @import("proposal.zig");
 const events = @import("events.zig");
 const request_slots = @import("request_slots.zig");
 
@@ -312,26 +313,65 @@ fn runNative(
     var endpoint_buffer: [provider.max_base_url_bytes + 32]u8 = undefined;
     return switch (selected.adapter) {
         .openai_responses => blk: {
-            const body = try responses.buildRequestWithMode(allocator, selected.model, instructions, question, "[]", selected.tool_mode);
+            const body = if (selected.tool_mode == .native_function)
+                try responses.buildCapabilityTestRequest(allocator, selected.model, instructions, question)
+            else
+                try responses.buildRequestWithMode(allocator, selected.model, instructions, question, "[]", selected.tool_mode);
             defer allocator.free(body);
             const endpoint = try transport.composeEndpoint(&endpoint_buffer, selected.base_url, responses.endpoint_suffix);
             var state = responses.State.initWithMode(allocator, selected.tool_mode, false);
             defer state.deinit();
             const meta = try transport.postSseTimed(allocator, io, endpoint, secret, client_request_id, body, cancellation, state.sink(), .{});
             try state.finish();
+            if (selected.tool_mode == .native_function) try validateNativeCapability(state.result orelse return error.OutputInvalid);
             break :blk meta;
         },
         .openai_chat_completions => blk: {
-            const body = try chat.buildRequestWithMode(allocator, selected.model, selected.instruction_role, selected.structured_output, instructions, question, "[]", selected.tool_mode);
+            const body = if (selected.tool_mode == .native_function)
+                try chat.buildCapabilityTestRequest(allocator, selected.model, selected.instruction_role, instructions, question)
+            else
+                try chat.buildRequestWithMode(allocator, selected.model, selected.instruction_role, selected.structured_output, instructions, question, "[]", selected.tool_mode);
             defer allocator.free(body);
             const endpoint = try transport.composeEndpoint(&endpoint_buffer, selected.base_url, chat.endpoint_suffix);
             var state = chat.State.initWithMode(allocator, selected.tool_mode, false);
             defer state.deinit();
             const meta = try transport.postSseTimed(allocator, io, endpoint, secret, client_request_id, body, cancellation, state.sink(), .{});
             try state.finish();
+            if (selected.tool_mode == .native_function) try validateNativeCapability(state.result orelse return error.OutputInvalid);
             break :blk meta;
         },
     };
+}
+
+fn validateNativeCapability(result: proposal_domain.Validated) !void {
+    if (result.kind != .command or
+        result.provider_call_id == null or result.provider_call_id.?.len == 0 or result.provider_call_id.?.len > 128 or !std.unicode.utf8ValidateSlice(result.provider_call_id.?) or std.mem.indexOfScalar(u8, result.provider_call_id.?, 0) != null or
+        result.tool_name == null or !std.mem.eql(u8, result.tool_name.?, "run_server_command")) return error.OutputInvalid;
+}
+
+test "native provider capability requests force the exact command tool" {
+    try std.testing.expect(@hasDecl(responses, "buildCapabilityTestRequest"));
+    if (@hasDecl(responses, "buildCapabilityTestRequest")) {
+        const body = try responses.buildCapabilityTestRequest(std.testing.allocator, "gpt-test", "Test tools.", "Return a command.");
+        defer std.testing.allocator.free(body);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":{\"type\":\"function\",\"name\":\"run_server_command\"}") != null);
+    }
+
+    try std.testing.expect(@hasDecl(chat, "buildCapabilityTestRequest"));
+    if (@hasDecl(chat, "buildCapabilityTestRequest")) {
+        const body = try chat.buildCapabilityTestRequest(std.testing.allocator, "gpt-test", .system, "Test tools.", "Return a command.");
+        defer std.testing.allocator.free(body);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"run_server_command\"}}") != null);
+    }
+}
+
+test "native provider capability rejects assistant prose" {
+    var result = try proposal_domain.parse(std.testing.allocator, "{\"kind\":\"message\",\"message\":\"Linux\",\"command\":null,\"question\":null,\"explanation\":\"Returned prose.\",\"destructive\":false,\"needs_sudo\":false}");
+    defer result.deinit(std.testing.allocator);
+    result.tool_mode = .native_function;
+    result.provider_call_id = try std.testing.allocator.dupe(u8, "call_test");
+    result.tool_name = try std.testing.allocator.dupe(u8, "run_server_command");
+    try std.testing.expectError(error.OutputInvalid, validateNativeCapability(result));
 }
 
 fn nowMs(io: std.Io) i64 {

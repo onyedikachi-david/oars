@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AiTab } from "./AiTab";
 import type { AiProvider } from "./types";
@@ -73,6 +74,34 @@ describe("AiTab credentials", () => {
     expect((screen.getByLabelText("Provider name") as HTMLInputElement).value).toBe("Secondary");
     expect(details.open).toBe(true);
     expect(manage.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("does not add structured output when native tools switch to Chat Completions", async () => {
+    const user = userEvent.setup();
+    window.zero = {
+      invoke: vi.fn(async (command: string, payload?: unknown) => {
+        calls.push({ command, payload });
+        if (command === "oars.ai.provider.list") return { ok: true, providers: [] };
+        if (command === "oars.ai.context.get") return { ok: true, state: "missing", context: null, stale: true };
+        if (command === "oars.ai.provider.save") return { ok: true, provider };
+        throw new Error(`unexpected command: ${command}`);
+      }),
+    };
+
+    render(<AiTab serverId="server-one" />);
+    await user.click(await screen.findByRole("button", { name: /manage providers/i }));
+    fireEvent.change(await screen.findByLabelText("Provider name"), { target: { value: "Native Chat" } });
+    fireEvent.change(screen.getByLabelText("Provider model"), { target: { value: "tool-model" } });
+    await user.click(screen.getByRole("combobox", { name: "Tool capability" }));
+    await user.click(await screen.findByRole("option", { name: "Native function tools" }));
+    await user.click(screen.getByRole("combobox", { name: "Provider adapter" }));
+    await user.click(await screen.findByRole("option", { name: "Chat Completions" }));
+    await user.click(screen.getByRole("button", { name: "Save provider" }));
+
+    await waitFor(() => expect(calls.some((call) => call.command === "oars.ai.provider.save")).toBe(true));
+    const saved = calls.find((call) => call.command === "oars.ai.provider.save");
+    expect(saved?.payload).toMatchObject({ provider: { adapter: "openai_chat_completions", tool_mode: "native_function", instruction_role: "system" } });
+    expect((saved?.payload as { provider: Record<string, unknown> }).provider).not.toHaveProperty("structured_output");
   });
 
   it("opens native credential management without putting a secret in WebView state or bridge payloads", async () => {

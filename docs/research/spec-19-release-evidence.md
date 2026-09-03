@@ -1,101 +1,91 @@
 # Spec 19 Release Evidence: Conversational AI and Reviewed Tools
 
-Date: 2026-08-31
+Date: 2026-09-01
 Target: Spec 19 (`docs/specs/19-ai-chat-tools.md`)
-Status: Complete
+Status: Partial
 
-## 1. Summary of Delivered Work
+## Implemented and locally verified
 
-Spec 19 native provider tools, conversation lifecycle, reviewed command proposals, and output-continuation features have been fully implemented across all 8 slices:
+- Providers persist an explicit `native_function` or `structured_result` tool
+  mode. A native capability test forces exactly `run_server_command` and fails
+  when the provider returns prose or an invalid call.
+- Responses and Chat Completions parse one bounded, strict native tool call.
+  They reject missing, changed, duplicate, parallel, malformed, oversized, and
+  incomplete call identity or arguments.
+- One validated call becomes the existing frozen proposal. It cannot run until
+  the operator approves the exact command through the native SSH path.
+- An output continuation binds the selected execution, provider revision,
+  credential generation, connection identity, call ID, tool name, cursor
+  range, exit status, and disclosed bytes. Oars journals that selection before
+  the continuation POST.
+- Operation replay returns the durable continuation admission before it reads
+  retained output again. A restart restores the selected result and marks an
+  in-flight continuation interrupted without resending it.
+- Assistant preambles survive snapshot and journal recovery. Switching a Chat
+  provider to native tools removes the incompatible structured-output option.
 
-1. **Provider Tool Capabilities (`src/ai/types.zig`, `src/ai/provider.zig`, `src/ai/provider_test.zig`):**
-   - Added explicit `ToolMode` (`.native_function` and `.structured_result`).
-   - Integrated into provider draft validation, optimistic concurrency (`revision`), migration defaults (`structured_result`), and credential testing.
-   - Provider tests for `native_function` enforce tool declaration without executing proposals.
+## Current automated evidence
 
-2. **Provider-Neutral Tool Call Schema and Validation (`src/ai/tool_call.zig`):**
-   - Strict JSON Schema for `run_server_command` with required arguments: `command`, `explanation`, `destructive`, `needs_sudo`, `additionalProperties: false`.
-   - Strict UTF-8, null byte, length bounds checking, and authoritative local destructive classification.
+The 2026-09-01 review added focused regressions for provider capability,
+fragmented stream identity, exact call/result binding, journal ordering,
+restart recovery, assistant preamble recovery, and adapter-switch metadata.
 
-3. **OpenAI Responses Function Calling (`src/ai/responses.zig`):**
-   - Emits strict `run_server_command` tool definition and `parallel_tool_calls: false`.
-   - Streaming state machine parses `response.function_call_arguments.delta`, `response.function_call_arguments.done`, `response.output_item.done`.
-   - Assembles and validates arguments against limits, captures optional assistant preamble, and generates `function_call_output` continuation requests.
+The current local results are:
 
-4. **Chat Completions Tool Calling (`src/ai/chat.zig`):**
-   - Streamed `choice.delta.tool_calls` parsing enforcing index 0, single call, and `finish_reason: "tool_calls"`.
-   - Captures assistant preamble, rejects deprecated `function_call`, and builds role `"tool"` continuation requests.
+- `zig build test --summary all`: 360 of 361 tests passed. One live-SSH test
+  was skipped by its environment gate.
+- `zig build --summary all`: all 8 build steps passed.
+- `cd frontend && npx tsc --noEmit`: passed.
+- `cd frontend && npm test -- --run`: 42 files and 513 tests passed.
+- `cd frontend && npm run build`: passed. Vite reported its existing large
+  chunk warning.
+- `./scripts/integration-test.sh`: passed against the Docker SSH and MinIO
+  fixtures.
 
-5. **Journaling & Frozen Proposal Integration (`src/ai/coordinator.zig`):**
-   - Extended `FrozenProposal` with `tool_mode`, `provider_call_id`, `tool_name`.
-   - Journaled proposal ready and execution states before displaying approval or invoking side effects.
-   - Reconstructed transcript preserves preambles and verified proposal states.
+Run the full gate from the repository root:
 
-6. **Reviewed Output Continuation (`src/ai/coordinator.zig`, `src/bridge.zig`):**
-   - `summarySource` retrieves turn execution metadata, connection ID, channel, and provider call identity.
-   - `extractToolContinuation` parses reviewed command output and constructs provider continuation requests.
-   - Coordinator executes continuation turn producing prose explanation without proposing subsequent commands in the same turn.
-
-7. **Conversational Tool UX (`frontend/src/`):**
-   - Tool parts render verified lifecycle states (`preparing`, `awaiting-approval`, `approved`, `running`, `completed`, `failed`, `canceled`, `expired`, `recovery-required`).
-   - Assistant preambles render in chronological conversation order above tool cards.
-   - "Explain this result" action appears on completed executions with retained output and triggers continuation turns.
-
-8. **Security & Recovery Gates:**
-   - Secrets and credentials never leak into WebView state, bridge payloads, logs, traces, or journals.
-   - Local destructive classifier remains authoritative over model self-assessment.
-   - Zero or one tool call per turn strictly enforced across both providers.
-
----
-
-## 2. Validation Gate Commands & Results
-
-### A. Zig Formatting & Build Verification
 ```bash
 zig fmt src build.zig
-# Passed (0 errors)
-
-zig build
-# Passed (0 errors)
-```
-
-### B. Native Unit Test Suite
-```bash
 zig build test --summary all
-# Output: Build Summary: 8/8 steps succeeded; 354/355 tests passed (1 skipped - requires live OARS_TEST_SSH environment)
-```
+zig build --summary all
 
-### C. TypeScript & Frontend Test Suite
-```bash
-cd frontend && npx tsc --noEmit
-# Output: Passed (0 errors)
+cd frontend
+npx tsc --noEmit
+npm test -- --run
+npm run build
 
-cd frontend && npm test
-# Output: Test Files 42 passed (42), Tests 512 passed (512)
-
-cd frontend && npm run build
-# Output: vite v8.2.0 building client environment for production... built in 865ms (0 errors)
-```
-
-### D. Dockerized SSH Integration Test Suite
-```bash
+cd ..
 ./scripts/integration-test.sh
-# Output: Passed all tests against live dev-sshd and minio containers (0 errors)
+git diff --check
 ```
 
----
+Record the final counts and environment-gated skips in the delivery note for
+the branch. A skipped external gate stays open; it is not a pass.
 
-## 3. Acceptance Criteria Checklist
+## Open release evidence
 
-- [x] A normal server question can end in an assistant prose message.
-- [x] A retained-output summary returns prose in the same conversation.
-- [x] A proposed command appears as an inline reviewed tool call.
-- [x] The model cannot run a command without explicit native approval.
-- [x] Execution output and verified exit status remain attached to the tool call.
-- [x] Refresh and restart reconstruct the transcript from native state; output bytes are reattached only while their tracked SSH channel is retained.
-- [x] Provider and context setup are discoverable but secondary to chat.
-- [x] The composer explains every disabled state and supports the keyboard rules.
-- [x] Missing or failed telemetry leads to a reviewed read-only diagnostic command when one command can collect the requested facts.
-- [x] Native credential lifecycle passes without exposing a secret in WebView state, bridge output, logs, journals, or persisted JSON.
-- [x] Provider tool calls pass malformed, duplicate, parallel, and stale-state rejection tests.
-- [x] Zig, frontend, integration, accessibility, responsive, and dark-theme gates pass with recorded evidence.
+- [ ] Run canceled, denied, unavailable, configure, replace, use, delete, and
+      shutdown credential cases against the real macOS Keychain and the
+      supported Linux credential backend. Scan WebView state, bridge results,
+      logs, journals, audit, history, and persisted JSON for the secret sentinel.
+- [ ] Run one real local Responses-compatible provider and one real
+      Chat-compatible provider through ask, reviewed call, approval, real SSH
+      execution, explicit result disclosure, and assistant prose.
+- [ ] Force process restart after call persistence, approval, SSH admission,
+      execution completion, tool-result persistence, continuation request
+      start, and continuation response creation. Confirm that no provider POST
+      or SSH command repeats.
+- [ ] Scan all retained and persisted surfaces for an undisclosed-output
+      sentinel. Confirm that only the selected bounded output reaches the
+      approved continuation request.
+- [ ] Complete keyboard-only, screen-reader status, narrow layout, light and
+      dark theme, and reduced-motion checks in the packaged desktop app.
+- [ ] Build, install, launch, upgrade, and remove the supported macOS and Linux
+      packages and record platform-specific results.
+
+## Acceptance status
+
+The source and automated contracts are implemented. Spec 19 remains Partial
+until every open item above has current, reproducible evidence. Do not change
+the spec to Complete because a required desktop or real-provider gate was
+skipped.

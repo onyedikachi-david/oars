@@ -7,6 +7,7 @@ const credentials = @import("credentials.zig");
 const transport = @import("transport.zig");
 const responses = @import("responses.zig");
 const chat = @import("chat.zig");
+const tool_call = @import("tool_call.zig");
 const proposal_domain = @import("proposal.zig");
 const events = @import("events.zig");
 const journal = @import("journal.zig");
@@ -164,6 +165,8 @@ pub const Turn = struct {
     assistant_message: ?[]const u8 = null,
     question: ?[]const u8 = null,
     question_explanation: ?[]const u8 = null,
+    tool_result: ?ToolResultSelection = null,
+    continuation_started: bool = false,
 
     fn deinit(self: *Turn) void {
         if (self.thread) |thread| thread.join();
@@ -174,6 +177,7 @@ pub const Turn = struct {
         if (self.assistant_message) |value| self.allocator.free(value);
         if (self.question) |value| self.allocator.free(value);
         if (self.question_explanation) |value| self.allocator.free(value);
+        if (self.tool_result) |*value| value.deinit(self.allocator);
         self.stream.deinit();
         self.selected.deinit(self.allocator);
         self.allocator.free(self.id);
@@ -182,6 +186,45 @@ pub const Turn = struct {
         self.allocator.free(self.context_json);
         self.allocator.free(self.context_hash);
         self.allocator.destroy(self);
+    }
+};
+
+pub const ToolResultInput = struct {
+    execution_id: []const u8,
+    start_cursor: u64,
+    end_cursor: u64,
+    exit_status: ?i32,
+    tool_mode: types.ToolMode,
+    provider_call_id: ?[]const u8 = null,
+    tool_name: ?[]const u8 = null,
+    output: []const u8,
+};
+
+pub const ToolResultIdentity = struct {
+    execution_id: []const u8,
+    start_cursor: u64,
+    end_cursor: u64,
+    exit_status: ?i32,
+    tool_mode: types.ToolMode,
+    provider_call_id: ?[]const u8 = null,
+    tool_name: ?[]const u8 = null,
+};
+
+pub const ToolResultSelection = struct {
+    execution_id: []const u8,
+    start_cursor: u64,
+    end_cursor: u64,
+    exit_status: ?i32,
+    tool_mode: types.ToolMode,
+    provider_call_id: ?[]const u8 = null,
+    tool_name: ?[]const u8 = null,
+    output: []const u8,
+
+    fn deinit(self: *ToolResultSelection, allocator: std.mem.Allocator) void {
+        allocator.free(self.execution_id);
+        if (self.provider_call_id) |value| allocator.free(value);
+        if (self.tool_name) |value| allocator.free(value);
+        allocator.free(self.output);
     }
 };
 
@@ -220,7 +263,11 @@ pub const SummarySource = struct {
     server_id: []const u8,
     provider_id: []const u8,
     provider_revision: u64,
+    credential_generation: u64,
+    connection_id: u64,
     channel: u32,
+    execution_cursor: u64,
+    exit_status: ?i32,
     tool_mode: types.ToolMode = .structured_result,
     provider_call_id: ?[]const u8 = null,
     tool_name: ?[]const u8 = null,
@@ -262,7 +309,7 @@ pub const RunOutput = struct {
 
 pub const Runner = struct {
     context: ?*anyopaque = null,
-    run_fn: *const fn (?*anyopaque, std.mem.Allocator, std.Io, *const provider.Public, *const credentials.SecretBuffer, []const u8, []const u8, []const u8, []const u8, *transport.Cancellation, transport.Observer) anyerror!RunOutput,
+    run_fn: *const fn (?*anyopaque, std.mem.Allocator, std.Io, *const provider.Public, *const credentials.SecretBuffer, []const u8, []const u8, []const u8, []const u8, ?*const ToolResultSelection, *transport.Cancellation, transport.Observer) anyerror!RunOutput,
 
     pub fn native() Runner {
         return .{ .run_fn = runNative };
@@ -324,7 +371,9 @@ pub const Registry = struct {
                 if (conversation.delete_operation_id == null) conversation.delete_operation_id = if (record.operation_id) |operation_id| self.allocator.dupe(u8, operation_id) catch return error.OutOfMemory else null;
             },
             .turn_queued => self.recoverTurnLocked(record) catch return error.OutOfMemory,
+            .tool_result_selected => self.recoverToolResultSelectedLocked(record) catch return error.OutOfMemory,
             .context_collected => self.setRecoveredTurnState(record.turn_id, .collecting_context),
+            .continuation_request_started => self.recoverContinuationStartedLocked(record),
             .provider_request_started => self.setRecoveredTurnState(record.turn_id, .requesting),
             .provider_result => self.recoverProviderResultLocked(record) catch return error.OutOfMemory,
             .proposal_ready, .proposal_edited => self.recoverProposalLocked(record) catch return error.OutOfMemory,
@@ -405,7 +454,37 @@ pub const Registry = struct {
         return null;
     }
 
-    /// Takes ownership of the provider and secret only on success.
+    pub fn lookupToolResultOperation(
+        self: *Registry,
+        operation_id: []const u8,
+        thread_id: []const u8,
+        server_id: []const u8,
+        provider_id: []const u8,
+        expected_provider_revision: u64,
+        message: []const u8,
+        identity: ToolResultIdentity,
+    ) Error!?Admission {
+        if (!types.validOperationId(operation_id) or !validId(thread_id) or !validToolResultIdentity(identity)) return error.InvalidOperationId;
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.turns.items) |turn| {
+            if (!std.mem.eql(u8, turn.operation_id, operation_id)) continue;
+            if (!std.mem.eql(u8, turn.conversation.id, thread_id) or
+                !std.mem.eql(u8, turn.conversation.server_id, server_id) or
+                !std.mem.eql(u8, turn.conversation.provider_id, provider_id) or
+                turn.provider_revision != expected_provider_revision or
+                !std.mem.eql(u8, turn.message, message) or
+                !toolResultIdentityMatches(turn.tool_result, identity)) return error.OperationConflict;
+            return .{ .thread_id = turn.conversation.id, .turn_id = turn.id, .state = turn.state };
+        }
+        for (self.turns.items) |turn| {
+            const previous = turn.tool_result orelse continue;
+            if (turn.continuation_started and std.mem.eql(u8, previous.execution_id, identity.execution_id)) return error.InvalidState;
+        }
+        return null;
+    }
+
+    /// Takes ownership of the provider only on success.
     pub fn admitOwned(
         self: *Registry,
         operation_id: []const u8,
@@ -418,8 +497,47 @@ pub const Registry = struct {
         context_json: []const u8,
         now_ms: i64,
     ) Error!Admission {
+        return self.admitOwnedInternal(operation_id, thread_id, server_id, selected, credential_generation, connection_id, message, context_json, null, now_ms);
+    }
+
+    /// Admits one reviewed, bounded command-output range. The exact execution,
+    /// call identity, cursor range, and disclosed bytes become durable in the
+    /// same write as the turn before any provider work can start.
+    pub fn admitToolResultOwned(
+        self: *Registry,
+        operation_id: []const u8,
+        thread_id: []const u8,
+        server_id: []const u8,
+        selected: provider.Public,
+        credential_generation: u64,
+        connection_id: u64,
+        message: []const u8,
+        context_json: []const u8,
+        tool_result: ToolResultInput,
+        now_ms: i64,
+    ) Error!Admission {
+        return self.admitOwnedInternal(operation_id, thread_id, server_id, selected, credential_generation, connection_id, message, context_json, tool_result, now_ms);
+    }
+
+    fn admitOwnedInternal(
+        self: *Registry,
+        operation_id: []const u8,
+        thread_id: ?[]const u8,
+        server_id: []const u8,
+        selected: provider.Public,
+        credential_generation: u64,
+        connection_id: u64,
+        message: []const u8,
+        context_json: []const u8,
+        tool_result: ?ToolResultInput,
+        now_ms: i64,
+    ) Error!Admission {
         if (!types.validOperationId(operation_id)) return error.InvalidOperationId;
         if (!validId(server_id) or !validMessage(message) or !validContext(context_json)) return if (!validMessage(message)) error.InvalidMessage else error.InvalidContext;
+        if (tool_result) |value| {
+            if (thread_id == null or !validToolResultInput(value)) return error.InvalidContext;
+            if (value.tool_mode != selected.tool_mode) return error.ThreadMismatch;
+        }
         if (selected.test_status != .passed) return error.ProviderUntested;
         if (credential_generation == 0 or connection_id == 0) return error.StaleRevision;
         lockSpin(&self.mutex);
@@ -427,8 +545,14 @@ pub const Registry = struct {
         if (!self.accepting) return error.Busy;
         for (self.turns.items) |turn| {
             if (!std.mem.eql(u8, turn.operation_id, operation_id)) continue;
-            if (!std.mem.eql(u8, turn.conversation.server_id, server_id) or !std.mem.eql(u8, turn.conversation.provider_id, selected.id) or turn.provider_revision != selected.revision or !std.mem.eql(u8, turn.message, message)) return error.OperationConflict;
+            if (!std.mem.eql(u8, turn.conversation.server_id, server_id) or !std.mem.eql(u8, turn.conversation.provider_id, selected.id) or turn.provider_revision != selected.revision or !std.mem.eql(u8, turn.message, message) or !toolResultMatches(turn.tool_result, tool_result)) return error.OperationConflict;
             return .{ .thread_id = turn.conversation.id, .turn_id = turn.id, .state = turn.state };
+        }
+        if (tool_result) |value| {
+            for (self.turns.items) |turn| {
+                const previous = turn.tool_result orelse continue;
+                if (turn.continuation_started and std.mem.eql(u8, previous.execution_id, value.execution_id)) return error.InvalidState;
+            }
         }
 
         var conversation = if (thread_id) |id| self.findConversationLocked(id) orelse return error.NotFound else null;
@@ -469,22 +593,43 @@ pub const Registry = struct {
         errdefer self.allocator.free(context_copy);
         const context_hash = hashHex(self.allocator, context_json) catch return error.OutOfMemory;
         errdefer self.allocator.free(context_hash);
+        var owned_tool_result = if (tool_result) |value| cloneToolResultInput(self.allocator, value) catch return error.OutOfMemory else null;
+        errdefer if (owned_tool_result) |*value| value.deinit(self.allocator);
         var stream = events.Stream.init(self.allocator, id) catch return error.OutOfMemory;
         errdefer stream.deinit();
         stream.append("turn.started", "{\"state\":\"queued\"}") catch return error.OutOfMemory;
         self.turns.ensureUnusedCapacity(self.allocator, 1) catch return error.OutOfMemory;
         const queued_payload = serializeTurnQueuedFields(self.allocator, message, selected.revision, credential_generation, connection_id, context_hash) catch return error.OutOfMemory;
         defer self.allocator.free(queued_payload);
+        const tool_result_payload = if (owned_tool_result) |*value| serializeToolResultSelection(self.allocator, value) catch return error.OutOfMemory else null;
+        defer if (tool_result_payload) |value| self.allocator.free(value);
         if (creates_conversation) {
             const thread_payload = serializeThread(self.allocator, conversation.?) catch return error.OutOfMemory;
             defer self.allocator.free(thread_payload);
-            const records = [_]journal.AppendInput{
-                .{ .kind = .thread_created, .operation_id = operation_id, .thread_id = conversation.?.id, .payload_json = thread_payload },
-                .{ .kind = .turn_queued, .operation_id = operation_id, .thread_id = conversation.?.id, .turn_id = id, .payload_json = queued_payload },
-            };
-            _ = self.journal_store.appendBatch(self.io, now_ms, &records) catch return error.JournalUnavailable;
+            if (tool_result_payload) |selection_payload| {
+                const records = [_]journal.AppendInput{
+                    .{ .kind = .thread_created, .operation_id = operation_id, .thread_id = conversation.?.id, .payload_json = thread_payload },
+                    .{ .kind = .turn_queued, .operation_id = operation_id, .thread_id = conversation.?.id, .turn_id = id, .payload_json = queued_payload },
+                    .{ .kind = .tool_result_selected, .operation_id = operation_id, .thread_id = conversation.?.id, .turn_id = id, .execution_id = owned_tool_result.?.execution_id, .payload_json = selection_payload },
+                };
+                _ = self.journal_store.appendBatch(self.io, now_ms, &records) catch return error.JournalUnavailable;
+            } else {
+                const records = [_]journal.AppendInput{
+                    .{ .kind = .thread_created, .operation_id = operation_id, .thread_id = conversation.?.id, .payload_json = thread_payload },
+                    .{ .kind = .turn_queued, .operation_id = operation_id, .thread_id = conversation.?.id, .turn_id = id, .payload_json = queued_payload },
+                };
+                _ = self.journal_store.appendBatch(self.io, now_ms, &records) catch return error.JournalUnavailable;
+            }
         } else {
-            _ = self.journal_store.append(self.io, now_ms, .{ .kind = .turn_queued, .operation_id = operation_id, .thread_id = conversation.?.id, .turn_id = id, .payload_json = queued_payload }) catch return error.JournalUnavailable;
+            if (tool_result_payload) |selection_payload| {
+                const records = [_]journal.AppendInput{
+                    .{ .kind = .turn_queued, .operation_id = operation_id, .thread_id = conversation.?.id, .turn_id = id, .payload_json = queued_payload },
+                    .{ .kind = .tool_result_selected, .operation_id = operation_id, .thread_id = conversation.?.id, .turn_id = id, .execution_id = owned_tool_result.?.execution_id, .payload_json = selection_payload },
+                };
+                _ = self.journal_store.appendBatch(self.io, now_ms, &records) catch return error.JournalUnavailable;
+            } else {
+                _ = self.journal_store.append(self.io, now_ms, .{ .kind = .turn_queued, .operation_id = operation_id, .thread_id = conversation.?.id, .turn_id = id, .payload_json = queued_payload }) catch return error.JournalUnavailable;
+            }
         }
         turn.* = .{
             .allocator = self.allocator,
@@ -500,7 +645,9 @@ pub const Registry = struct {
             .selected = selected,
             .secret = credentials.SecretBuffer{},
             .stream = stream,
+            .tool_result = owned_tool_result,
         };
+        owned_tool_result = null;
         // No fallible operation follows the ownership transfer above.
         if (creates_conversation) {
             self.conversations.appendAssumeCapacity(conversation.?);
@@ -918,12 +1065,21 @@ pub const Registry = struct {
                 };
             }
         }
+        if (tool_mode == .native_function and (provider_call_id == null or tool_name == null or !std.mem.eql(u8, tool_name.?, tool_call.tool_name))) {
+            if (provider_call_id) |value| self.allocator.free(value);
+            if (tool_name) |value| self.allocator.free(value);
+            return error.InvalidState;
+        }
 
         return .{
             .server_id = server_id,
             .provider_id = provider_id,
             .provider_revision = turn.provider_revision,
+            .credential_generation = turn.credential_generation,
+            .connection_id = turn.connection_id,
             .channel = channel,
+            .execution_cursor = turn.execution.?.cursor,
+            .exit_status = turn.execution.?.exit_status,
             .tool_mode = tool_mode,
             .provider_call_id = provider_call_id,
             .tool_name = tool_name,
@@ -1072,6 +1228,37 @@ pub const Registry = struct {
         conversation.updated_at_ms = @max(conversation.updated_at_ms, record.timestamp_ms);
     }
 
+    fn recoverToolResultSelectedLocked(self: *Registry, record: journal.Record) !void {
+        const turn = self.findTurnLocked(record.turn_id orelse return) orelse return;
+        const Payload = struct {
+            execution_id: []const u8,
+            start_cursor: u64,
+            end_cursor: u64,
+            exit_status: ?i32 = null,
+            tool_mode: types.ToolMode,
+            provider_call_id: ?[]const u8 = null,
+            tool_name: ?[]const u8 = null,
+            output: []const u8,
+        };
+        var parsed = try std.json.parseFromSlice(Payload, self.allocator, record.payload_json, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        const input = ToolResultInput{
+            .execution_id = parsed.value.execution_id,
+            .start_cursor = parsed.value.start_cursor,
+            .end_cursor = parsed.value.end_cursor,
+            .exit_status = parsed.value.exit_status,
+            .tool_mode = parsed.value.tool_mode,
+            .provider_call_id = parsed.value.provider_call_id,
+            .tool_name = parsed.value.tool_name,
+            .output = parsed.value.output,
+        };
+        if (!validToolResultInput(input) or (record.execution_id != null and !std.mem.eql(u8, record.execution_id.?, input.execution_id))) return;
+        const recovered = try cloneToolResultInput(self.allocator, input);
+        if (turn.tool_result) |*old| old.deinit(self.allocator);
+        turn.tool_result = recovered;
+        turn.selected.tool_mode = recovered.tool_mode;
+    }
+
     fn recoverProposalLocked(self: *Registry, record: journal.Record) !void {
         const turn = self.findTurnLocked(record.turn_id orelse return) orelse return;
         var parsed = try std.json.parseFromSlice(ProposalJournalPayload, self.allocator, record.payload_json, .{ .allocate = .alloc_always });
@@ -1090,6 +1277,7 @@ pub const Registry = struct {
             message: ?[]const u8 = null,
             question: ?[]const u8,
             explanation: []const u8,
+            preamble: ?[]const u8 = null,
             continuation_items: std.json.Value,
         };
         var parsed = try std.json.parseFromSlice(Payload, self.allocator, record.payload_json, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
@@ -1101,6 +1289,8 @@ pub const Registry = struct {
             const recovered_question = parsed.value.question orelse return;
             if (!validBoundedText(recovered_question, types.max_question_bytes, false) or
                 !validBoundedText(parsed.value.explanation, types.max_explanation_bytes, true)) return;
+        } else if (parsed.value.kind == .command and parsed.value.preamble != null and !validBoundedText(parsed.value.preamble.?, types.max_message_bytes, false)) {
+            return;
         }
         const continuation = parsed.value.continuation_items;
         if (continuation != .array) return;
@@ -1110,7 +1300,12 @@ pub const Registry = struct {
         if (encoded.writer.buffered().len > types.max_continuation_bytes) return;
         const owned = try encoded.toOwnedSlice();
         errdefer self.allocator.free(owned);
-        const assistant_message = if (parsed.value.kind == .message) try self.allocator.dupe(u8, parsed.value.message orelse return) else null;
+        const assistant_message = if (parsed.value.kind == .message)
+            try self.allocator.dupe(u8, parsed.value.message orelse return)
+        else if (parsed.value.kind == .command and parsed.value.preamble != null)
+            try self.allocator.dupe(u8, parsed.value.preamble.?)
+        else
+            null;
         errdefer if (assistant_message) |value| self.allocator.free(value);
         const question = if (parsed.value.kind == .question) try self.allocator.dupe(u8, parsed.value.question orelse return) else null;
         errdefer if (question) |value| self.allocator.free(value);
@@ -1155,13 +1350,14 @@ pub const Registry = struct {
 
     fn recoverExecutionFinishedLocked(self: *Registry, record: journal.Record) void {
         const turn = self.findTurnLocked(record.turn_id orelse return) orelse return;
-        const Payload = struct { state: []const u8, exit_status: ?i32 = null };
+        const Payload = struct { state: []const u8, exit_status: ?i32 = null, cursor: u64 = 0 };
         var parsed = std.json.parseFromSlice(Payload, self.allocator, record.payload_json, .{ .ignore_unknown_fields = true }) catch return;
         defer parsed.deinit();
         const state = std.meta.stringToEnum(types.TurnState, parsed.value.state) orelse return;
         if (turn.execution) |*execution| {
             execution.state = state;
             execution.exit_status = parsed.value.exit_status;
+            execution.cursor = parsed.value.cursor;
         }
         if (turn.proposal) |*proposal| proposal.state = switch (state) {
             .completed => .completed,
@@ -1176,6 +1372,13 @@ pub const Registry = struct {
         if (turn_id) |id| {
             if (self.findTurnLocked(id)) |turn| turn.state = state;
         }
+    }
+
+    fn recoverContinuationStartedLocked(self: *Registry, record: journal.Record) void {
+        const turn = self.findTurnLocked(record.turn_id orelse return) orelse return;
+        if (turn.tool_result == null) return;
+        turn.continuation_started = true;
+        turn.state = .summarizing;
     }
 
     fn recoverTerminalLocked(self: *Registry, record: journal.Record) void {
@@ -1248,19 +1451,40 @@ fn workerMain(registry: *Registry, turn: *Turn) void {
         return;
     };
     defer registry.allocator.free(request_payload);
-    _ = registry.journal_store.append(registry.io, now, .{ .kind = .provider_request_started, .operation_id = turn.operation_id, .thread_id = turn.conversation.id, .turn_id = turn.id, .payload_json = request_payload }) catch {
-        failTurn(registry, turn, .recovery_required, "provider request could not be journaled");
-        return;
-    };
+    const continuation_payload = if (turn.tool_result) |selection|
+        std.fmt.allocPrint(registry.allocator, "{{\"state\":\"summarizing\",\"execution_id\":{f},\"provider_call_id\":{f}}}", .{ std.json.fmt(selection.execution_id, .{}), std.json.fmt(selection.provider_call_id, .{}) }) catch {
+            failTurn(registry, turn, .recovery_required, "continuation metadata could not be serialized");
+            return;
+        }
+    else
+        null;
+    defer if (continuation_payload) |value| registry.allocator.free(value);
+    if (continuation_payload) |value| {
+        const records = [_]journal.AppendInput{
+            .{ .kind = .continuation_request_started, .operation_id = turn.operation_id, .thread_id = turn.conversation.id, .turn_id = turn.id, .execution_id = turn.tool_result.?.execution_id, .payload_json = value },
+            .{ .kind = .provider_request_started, .operation_id = turn.operation_id, .thread_id = turn.conversation.id, .turn_id = turn.id, .payload_json = request_payload },
+        };
+        _ = registry.journal_store.appendBatch(registry.io, now, &records) catch {
+            failTurn(registry, turn, .recovery_required, "provider continuation could not be journaled");
+            return;
+        };
+    } else {
+        _ = registry.journal_store.append(registry.io, now, .{ .kind = .provider_request_started, .operation_id = turn.operation_id, .thread_id = turn.conversation.id, .turn_id = turn.id, .payload_json = request_payload }) catch {
+            failTurn(registry, turn, .recovery_required, "provider request could not be journaled");
+            return;
+        };
+    }
     lockSpin(&registry.mutex);
-    turn.state = .requesting;
+    turn.state = if (turn.tool_result != null) .summarizing else .requesting;
+    if (turn.tool_result != null) turn.continuation_started = true;
     turn.stream.append("context.ready", context_payload) catch {};
+    if (continuation_payload) |value| turn.stream.append("continuation.request_started", value) catch {};
     turn.stream.append("provider.request_started", request_payload) catch {};
     registry.mutex.unlock();
 
     var progress_context = ProviderProgressContext{ .registry = registry, .turn = turn };
     const observer = transport.Observer{ .context = &progress_context, .response_fn = providerResponseCreated, .progress_fn = providerProgress };
-    const result = registry.runner.run_fn(registry.runner.context, registry.allocator, registry.io, &turn.selected, &turn.secret, turn.operation_id, turn.message, turn.context_json, turn.conversation.continuation_json, &turn.cancellation, observer);
+    const result = registry.runner.run_fn(registry.runner.context, registry.allocator, registry.io, &turn.selected, &turn.secret, turn.operation_id, turn.message, turn.context_json, turn.conversation.continuation_json, if (turn.tool_result) |*value| value else null, &turn.cancellation, observer);
     if (turn.cancellation.isCanceled()) {
         lockSpin(&registry.mutex);
         finishCanceledLocked(registry, turn);
@@ -1304,12 +1528,8 @@ fn workerMain(registry: *Registry, turn: *Turn) void {
         failTurn(registry, turn, .stale_revision, "provider or credential changed during the request");
         return;
     }
-    const maybe_tool_continuation: ?ContinuationToolCall = if (turn.selected.tool_mode == .native_function) extractToolContinuation(registry.allocator, turn.selected.adapter, turn.conversation.continuation_json, turn.context_json) else null;
-    defer if (maybe_tool_continuation) |tc| {
-        registry.allocator.free(tc.call_id);
-        registry.allocator.free(tc.output);
-    };
-    const next_continuation = composeContinuation(registry.allocator, turn.selected.adapter, turn.conversation.continuation_json, turn.message, output.continuation_json, maybe_tool_continuation) catch {
+    const maybe_native_tool_result: ?*const ToolResultSelection = if (turn.tool_result) |*value| if (value.tool_mode == .native_function) value else null else null;
+    const next_continuation = composeContinuation(registry.allocator, turn.selected.adapter, turn.conversation.continuation_json, turn.message, output.continuation_json, maybe_native_tool_result) catch {
         failTurn(registry, turn, .recovery_required, "provider continuation data exceeded its safe bound");
         return;
     };
@@ -1318,7 +1538,8 @@ fn workerMain(registry: *Registry, turn: *Turn) void {
         failTurn(registry, turn, .recovery_required, "provider result could not be serialized");
         return;
     };
-    const durable_assistant_message = if (output.validated.message) |value| registry.allocator.dupe(u8, value) catch {
+    const assistant_text = output.validated.message orelse output.validated.preamble;
+    const durable_assistant_message = if (assistant_text) |value| registry.allocator.dupe(u8, value) catch {
         registry.allocator.free(durable_result);
         failTurn(registry, turn, .recovery_required, "assistant message could not be retained");
         return;
@@ -1491,7 +1712,7 @@ fn finishExecution(registry: *Registry, turn: *Turn, state: types.TurnState, exi
     std.json.Stringify.value(exit_status, .{}, &writer) catch return;
     writer.writeAll(",\"message\":") catch return;
     std.json.Stringify.value(message, .{}, &writer) catch return;
-    writer.print(",\"finished_at_ms\":{d}}}", .{now}) catch return;
+    writer.print(",\"cursor\":{d},\"finished_at_ms\":{d}}}", .{ turn.execution.?.cursor, now }) catch return;
     const payload = writer.buffered();
     _ = registry.journal_store.append(registry.io, now, .{ .kind = .execution_finished, .operation_id = turn.execution.?.operation_id, .thread_id = turn.conversation.id, .turn_id = turn.id, .proposal_id = turn.proposal.?.id, .execution_id = turn.execution.?.id, .payload_json = payload }) catch {
         stateAfterExecutionPersistenceFailure(registry, turn);
@@ -1636,6 +1857,10 @@ fn extractToolContinuation(allocator: std.mem.Allocator, adapter: provider.Adapt
     if (kind_val != .string or !std.mem.eql(u8, kind_val.string, "command_output")) return null;
     const content_val = ctx.get("content") orelse return null;
     if (content_val != .string) return null;
+    const call_id_val = ctx.get("provider_call_id") orelse return null;
+    if (call_id_val != .string or !validBoundedText(call_id_val.string, 128, false)) return null;
+    const tool_name_val = ctx.get("tool_name") orelse return null;
+    if (tool_name_val != .string or !std.mem.eql(u8, tool_name_val.string, tool_call.tool_name)) return null;
 
     var cont_parsed = std.json.parseFromSlice(std.json.Value, allocator, continuation_json, .{}) catch return null;
     defer cont_parsed.deinit();
@@ -1643,66 +1868,87 @@ fn extractToolContinuation(allocator: std.mem.Allocator, adapter: provider.Adapt
 
     switch (adapter) {
         .openai_responses => {
-            var i = cont_parsed.value.array.items.len;
-            while (i > 0) {
-                i -= 1;
-                const item = cont_parsed.value.array.items[i];
+            var found = false;
+            for (cont_parsed.value.array.items) |item| {
                 if (item == .object) {
                     const type_val = item.object.get("type");
                     if (type_val != null and type_val.? == .string and std.mem.eql(u8, type_val.?.string, "function_call")) {
                         if (item.object.get("call_id")) |cid_val| {
-                            if (cid_val == .string) {
-                                const cid = allocator.dupe(u8, cid_val.string) catch return null;
-                                errdefer allocator.free(cid);
-                                const out = allocator.dupe(u8, content_val.string) catch return null;
-                                return .{ .call_id = cid, .output = out };
+                            if (cid_val == .string and std.mem.eql(u8, cid_val.string, call_id_val.string)) {
+                                const name = item.object.get("name") orelse return null;
+                                if (name != .string or !std.mem.eql(u8, name.string, tool_call.tool_name) or found) return null;
+                                found = true;
                             }
                         }
                     }
                 }
             }
+            if (found) {
+                const cid = allocator.dupe(u8, call_id_val.string) catch return null;
+                errdefer allocator.free(cid);
+                const out = allocator.dupe(u8, content_val.string) catch return null;
+                return .{ .call_id = cid, .output = out };
+            }
         },
         .openai_chat_completions => {
-            var i = cont_parsed.value.array.items.len;
-            while (i > 0) {
-                i -= 1;
-                const item = cont_parsed.value.array.items[i];
+            var found = false;
+            for (cont_parsed.value.array.items) |item| {
                 if (item == .object) {
                     if (item.object.get("tool_calls")) |tc_arr| {
-                        if (tc_arr == .array and tc_arr.array.items.len > 0 and tc_arr.array.items[0] == .object) {
-                            if (tc_arr.array.items[0].object.get("id")) |id_val| {
-                                if (id_val == .string) {
-                                    const cid = allocator.dupe(u8, id_val.string) catch return null;
-                                    errdefer allocator.free(cid);
-                                    const out = allocator.dupe(u8, content_val.string) catch return null;
-                                    return .{ .call_id = cid, .output = out };
+                        if (tc_arr != .array) return null;
+                        for (tc_arr.array.items) |call| {
+                            if (call != .object) return null;
+                            if (call.object.get("id")) |id_val| {
+                                if (id_val == .string and std.mem.eql(u8, id_val.string, call_id_val.string)) {
+                                    const function = call.object.get("function") orelse return null;
+                                    if (function != .object) return null;
+                                    const name = function.object.get("name") orelse return null;
+                                    if (name != .string or !std.mem.eql(u8, name.string, tool_call.tool_name) or found) return null;
+                                    found = true;
                                 }
                             }
                         }
                     }
                 }
             }
+            if (found) {
+                const cid = allocator.dupe(u8, call_id_val.string) catch return null;
+                errdefer allocator.free(cid);
+                const out = allocator.dupe(u8, content_val.string) catch return null;
+                return .{ .call_id = cid, .output = out };
+            }
         },
     }
     return null;
 }
 
-fn runNative(_: ?*anyopaque, allocator: std.mem.Allocator, io: std.Io, selected: *const provider.Public, secret: *const credentials.SecretBuffer, client_request_id: []const u8, message: []const u8, context_json: []const u8, continuation_json: []const u8, cancellation: *transport.Cancellation, observer: transport.Observer) anyerror!RunOutput {
+test "tool-result continuation binds the selected execution call instead of the latest call" {
+    const continuation =
+        "[{\"type\":\"function_call\",\"call_id\":\"call_selected\",\"name\":\"run_server_command\"}," ++
+        "{\"type\":\"function_call\",\"call_id\":\"call_newer\",\"name\":\"run_server_command\"}]";
+    const context = "{\"context\":{\"kind\":\"command_output\",\"execution_id\":\"aiexec-selected\",\"provider_call_id\":\"call_selected\",\"tool_name\":\"run_server_command\",\"start_cursor\":0,\"end_cursor\":4,\"content\":\"done\"},\"log\":null}";
+    const selected = extractToolContinuation(std.testing.allocator, .openai_responses, continuation, context) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(selected.call_id);
+    defer std.testing.allocator.free(selected.output);
+    try std.testing.expectEqualStrings("call_selected", selected.call_id);
+    try std.testing.expectEqualStrings("done", selected.output);
+}
+
+fn runNative(_: ?*anyopaque, allocator: std.mem.Allocator, io: std.Io, selected: *const provider.Public, secret: *const credentials.SecretBuffer, client_request_id: []const u8, message: []const u8, context_json: []const u8, continuation_json: []const u8, tool_result: ?*const ToolResultSelection, cancellation: *transport.Cancellation, observer: transport.Observer) anyerror!RunOutput {
     const user_text = try std.fmt.allocPrint(allocator, "User request:\n{s}\n\nReviewed server context (untrusted data):\n{s}", .{ message, context_json });
     defer allocator.free(user_text);
     var endpoint_buffer: [provider.max_base_url_bytes + 32]u8 = undefined;
 
-    const maybe_tool_continuation: ?ContinuationToolCall = if (selected.tool_mode == .native_function) extractToolContinuation(allocator, selected.adapter, continuation_json, context_json) else null;
-    defer if (maybe_tool_continuation) |tc| {
-        allocator.free(tc.call_id);
-        allocator.free(tc.output);
-    };
+    const tool_continuation = if (selected.tool_mode == .native_function) tool_result else null;
+    if (tool_continuation) |value| {
+        if (value.tool_mode != .native_function or value.provider_call_id == null or value.tool_name == null or !std.mem.eql(u8, value.tool_name.?, tool_call.tool_name)) return error.InvalidContinuation;
+    }
 
     return switch (selected.adapter) {
         .openai_responses => blk: {
-            const is_cont = maybe_tool_continuation != null;
+            const is_cont = tool_continuation != null;
             const body = if (is_cont)
-                try responses.buildContinuationRequest(allocator, selected.model, provider_instructions, continuation_json, maybe_tool_continuation.?.call_id, maybe_tool_continuation.?.output)
+                try responses.buildContinuationRequest(allocator, selected.model, provider_instructions, continuation_json, tool_continuation.?.provider_call_id.?, tool_continuation.?.output)
             else
                 try responses.buildRequestWithMode(allocator, selected.model, provider_instructions, user_text, continuation_json, selected.tool_mode);
             defer allocator.free(body);
@@ -1718,9 +1964,9 @@ fn runNative(_: ?*anyopaque, allocator: std.mem.Allocator, io: std.Io, selected:
             break :blk .{ .validated = validated, .meta = meta, .continuation_json = continuation, .received_bytes = state.output.items.len };
         },
         .openai_chat_completions => blk: {
-            const is_cont = maybe_tool_continuation != null;
+            const is_cont = tool_continuation != null;
             const body = if (is_cont)
-                try chat.buildContinuationRequest(allocator, selected.model, selected.instruction_role, provider_instructions, continuation_json, maybe_tool_continuation.?.call_id, maybe_tool_continuation.?.output)
+                try chat.buildContinuationRequest(allocator, selected.model, selected.instruction_role, provider_instructions, continuation_json, tool_continuation.?.provider_call_id.?, tool_continuation.?.output)
             else
                 try chat.buildRequestWithMode(allocator, selected.model, selected.instruction_role, selected.structured_output, provider_instructions, user_text, continuation_json, selected.tool_mode);
             defer allocator.free(body);
@@ -1811,6 +2057,84 @@ fn serializeTurnQueuedFields(allocator: std.mem.Allocator, message: []const u8, 
     return std.fmt.allocPrint(allocator, "{{\"state\":\"queued\",\"message\":{f},\"provider_revision\":{d},\"credential_generation\":{d},\"connection_id\":{d},\"context_hash\":{f}}}", .{ std.json.fmt(message, .{}), provider_revision, credential_generation, connection_id, std.json.fmt(context_hash, .{}) });
 }
 
+fn serializeToolResultSelection(allocator: std.mem.Allocator, value: *const ToolResultSelection) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{{\"execution_id\":{f},\"start_cursor\":{d},\"end_cursor\":{d},\"exit_status\":{f},\"tool_mode\":{f},\"provider_call_id\":{f},\"tool_name\":{f},\"output\":{f}}}", .{
+        std.json.fmt(value.execution_id, .{}),
+        value.start_cursor,
+        value.end_cursor,
+        std.json.fmt(value.exit_status, .{}),
+        std.json.fmt(@tagName(value.tool_mode), .{}),
+        std.json.fmt(value.provider_call_id, .{}),
+        std.json.fmt(value.tool_name, .{}),
+        std.json.fmt(value.output, .{}),
+    });
+}
+
+fn cloneToolResultInput(allocator: std.mem.Allocator, value: ToolResultInput) !ToolResultSelection {
+    const execution_id = try allocator.dupe(u8, value.execution_id);
+    errdefer allocator.free(execution_id);
+    const provider_call_id = if (value.provider_call_id) |call_id| try allocator.dupe(u8, call_id) else null;
+    errdefer if (provider_call_id) |call_id| allocator.free(call_id);
+    const tool_name = if (value.tool_name) |name| try allocator.dupe(u8, name) else null;
+    errdefer if (tool_name) |name| allocator.free(name);
+    const output = try allocator.dupe(u8, value.output);
+    return .{
+        .execution_id = execution_id,
+        .start_cursor = value.start_cursor,
+        .end_cursor = value.end_cursor,
+        .exit_status = value.exit_status,
+        .tool_mode = value.tool_mode,
+        .provider_call_id = provider_call_id,
+        .tool_name = tool_name,
+        .output = output,
+    };
+}
+
+fn validToolResultInput(value: ToolResultInput) bool {
+    return validToolResultIdentity(.{
+        .execution_id = value.execution_id,
+        .start_cursor = value.start_cursor,
+        .end_cursor = value.end_cursor,
+        .exit_status = value.exit_status,
+        .tool_mode = value.tool_mode,
+        .provider_call_id = value.provider_call_id,
+        .tool_name = value.tool_name,
+    }) and value.end_cursor - value.start_cursor == value.output.len and validBoundedText(value.output, types.max_log_tail_bytes, false);
+}
+
+fn validToolResultIdentity(value: ToolResultIdentity) bool {
+    if (!validId(value.execution_id) or value.end_cursor <= value.start_cursor or value.end_cursor - value.start_cursor > types.max_log_tail_bytes) return false;
+    return switch (value.tool_mode) {
+        .structured_result => value.provider_call_id == null and value.tool_name == null,
+        .native_function => value.provider_call_id != null and value.tool_name != null and validBoundedText(value.provider_call_id.?, 128, false) and std.mem.eql(u8, value.tool_name.?, tool_call.tool_name),
+    };
+}
+
+fn toolResultIdentityMatches(actual: ?ToolResultSelection, expected: ToolResultIdentity) bool {
+    const left = actual orelse return false;
+    if (!std.mem.eql(u8, left.execution_id, expected.execution_id) or
+        left.start_cursor != expected.start_cursor or left.end_cursor != expected.end_cursor or
+        left.exit_status != expected.exit_status or left.tool_mode != expected.tool_mode) return false;
+    if ((left.provider_call_id == null) != (expected.provider_call_id == null) or (left.tool_name == null) != (expected.tool_name == null)) return false;
+    if (left.provider_call_id) |value| if (!std.mem.eql(u8, value, expected.provider_call_id.?)) return false;
+    if (left.tool_name) |value| if (!std.mem.eql(u8, value, expected.tool_name.?)) return false;
+    return true;
+}
+
+fn toolResultMatches(actual: ?ToolResultSelection, expected: ?ToolResultInput) bool {
+    if (actual == null or expected == null) return actual == null and expected == null;
+    const left = actual.?;
+    const right = expected.?;
+    if (!std.mem.eql(u8, left.execution_id, right.execution_id) or
+        left.start_cursor != right.start_cursor or left.end_cursor != right.end_cursor or
+        left.exit_status != right.exit_status or left.tool_mode != right.tool_mode or
+        !std.mem.eql(u8, left.output, right.output)) return false;
+    if ((left.provider_call_id == null) != (right.provider_call_id == null) or (left.tool_name == null) != (right.tool_name == null)) return false;
+    if (left.provider_call_id) |value| if (!std.mem.eql(u8, value, right.provider_call_id.?)) return false;
+    if (left.tool_name) |value| if (!std.mem.eql(u8, value, right.tool_name.?)) return false;
+    return true;
+}
+
 fn serializeValidated(allocator: std.mem.Allocator, validated: *const proposal_domain.Validated, request_id: []const u8, continuation_json: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{{\"kind\":{f},\"message\":{f},\"command\":{f},\"question\":{f},\"explanation\":{f},\"model_destructive\":{s},\"local_destructive\":{s},\"needs_sudo\":{s},\"provider_request_id\":{f},\"continuation_items\":{s},\"tool_mode\":{f},\"provider_call_id\":{f},\"tool_name\":{f},\"preamble\":{f}}}", .{
         std.json.fmt(@tagName(validated.kind), .{}),
@@ -1830,7 +2154,7 @@ fn serializeValidated(allocator: std.mem.Allocator, validated: *const proposal_d
     });
 }
 
-fn composeContinuation(allocator: std.mem.Allocator, adapter: provider.Adapter, previous_json: []const u8, message: []const u8, output_json: []const u8, maybe_tool_continuation: ?ContinuationToolCall) ![]u8 {
+fn composeContinuation(allocator: std.mem.Allocator, adapter: provider.Adapter, previous_json: []const u8, message: []const u8, output_json: []const u8, maybe_tool_continuation: ?*const ToolResultSelection) ![]u8 {
     var previous = try std.json.parseFromSlice(std.json.Value, allocator, previous_json, .{});
     defer previous.deinit();
     var output = try std.json.parseFromSlice(std.json.Value, allocator, output_json, .{});
@@ -1851,14 +2175,14 @@ fn composeContinuation(allocator: std.mem.Allocator, adapter: provider.Adapter, 
         switch (adapter) {
             .openai_responses => {
                 writer.writeAll("{\"type\":\"function_call_output\",\"call_id\":") catch return error.OutOfMemory;
-                std.json.Stringify.value(tc.call_id, .{}, writer) catch return error.OutOfMemory;
+                std.json.Stringify.value(tc.provider_call_id.?, .{}, writer) catch return error.OutOfMemory;
                 writer.writeAll(",\"output\":") catch return error.OutOfMemory;
                 std.json.Stringify.value(tc.output, .{}, writer) catch return error.OutOfMemory;
                 writer.writeAll("}") catch return error.OutOfMemory;
             },
             .openai_chat_completions => {
                 writer.writeAll("{\"role\":\"tool\",\"tool_call_id\":") catch return error.OutOfMemory;
-                std.json.Stringify.value(tc.call_id, .{}, writer) catch return error.OutOfMemory;
+                std.json.Stringify.value(tc.provider_call_id.?, .{}, writer) catch return error.OutOfMemory;
                 writer.writeAll(",\"content\":") catch return error.OutOfMemory;
                 std.json.Stringify.value(tc.output, .{}, writer) catch return error.OutOfMemory;
                 writer.writeAll("}") catch return error.OutOfMemory;
@@ -1888,7 +2212,7 @@ fn composeContinuation(allocator: std.mem.Allocator, adapter: provider.Adapter, 
 }
 
 pub fn serializeProposal(allocator: std.mem.Allocator, value: *const FrozenProposal) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{{\"id\":{f},\"turn_id\":{f},\"revision\":{d},\"server_id\":{f},\"provider_id\":{f},\"provider_revision\":{d},\"context_hash\":{f},\"command\":{f},\"command_sha256\":{f},\"explanation\":{f},\"model_destructive\":{s},\"local_destructive\":{s},\"needs_sudo\":{s},\"created_at_ms\":{d},\"expires_at_ms\":{d},\"state\":{f},\"tool_mode\":{f},\"provider_call_id\":{f},\"tool_name\":{f}}}", .{
+    return std.fmt.allocPrint(allocator, "{{\"id\":{f},\"turn_id\":{f},\"revision\":{d},\"server_id\":{f},\"provider_id\":{f},\"provider_revision\":{d},\"context_hash\":{f},\"command\":{f},\"command_sha256\":{f},\"explanation\":{f},\"model_destructive\":{s},\"local_destructive\":{s},\"needs_sudo\":{s},\"created_at_ms\":{d},\"expires_at_ms\":{d},\"state\":{f},\"tool_mode\":{f},\"provider_call_id\":{f},\"tool_name\":{f},\"preamble\":{f}}}", .{
         std.json.fmt(value.id, .{}),
         std.json.fmt(value.turn_id, .{}),
         value.revision,
@@ -1908,6 +2232,7 @@ pub fn serializeProposal(allocator: std.mem.Allocator, value: *const FrozenPropo
         std.json.fmt(@tagName(value.tool_mode), .{}),
         std.json.fmt(value.provider_call_id, .{}),
         std.json.fmt(value.tool_name, .{}),
+        std.json.fmt(value.preamble, .{}),
     });
 }
 
@@ -2135,7 +2460,7 @@ const FakeRunner = struct {
     document: []const u8 = "{\"kind\":\"command\",\"command\":\"uname -s\",\"question\":null,\"explanation\":\"Read the kernel name.\",\"destructive\":false,\"needs_sudo\":false}",
     failure: ?anyerror = null,
 
-    fn run(context: ?*anyopaque, allocator: std.mem.Allocator, _: std.Io, selected: *const provider.Public, secret: *const credentials.SecretBuffer, _: []const u8, _: []const u8, context_json: []const u8, _: []const u8, _: *transport.Cancellation, _: transport.Observer) anyerror!RunOutput {
+    fn run(context: ?*anyopaque, allocator: std.mem.Allocator, _: std.Io, selected: *const provider.Public, secret: *const credentials.SecretBuffer, _: []const u8, _: []const u8, context_json: []const u8, _: []const u8, _: ?*const ToolResultSelection, _: *transport.Cancellation, _: transport.Observer) anyerror!RunOutput {
         const self: *FakeRunner = @ptrCast(@alignCast(context.?));
         if (!std.mem.eql(u8, secret.slice(), "fixture-secret")) return error.AuthenticationFailed;
         if (std.mem.indexOf(u8, context_json, "server-one") == null and std.mem.indexOf(u8, context_json, "command_output") == null) return error.InvalidContext;
@@ -2396,13 +2721,20 @@ test "restart recovery interrupts provider work preserves valid proposals and ne
     try appendRecoveryProposal(allocator, io, &journal_store, &configured, "thread-completed", "turn-completed", "recover-op-completed", "proposal-completed");
     _ = try journal_store.append(io, 5, .{ .kind = .approval_recorded, .operation_id = "proposal-run-completed", .thread_id = "thread-completed", .turn_id = "turn-completed", .proposal_id = "proposal-completed", .execution_id = "execution-completed", .payload_json = "{\"state\":\"approved\"}" });
     _ = try journal_store.append(io, 6, .{ .kind = .execution_admitted, .operation_id = "proposal-run-completed", .thread_id = "thread-completed", .turn_id = "turn-completed", .proposal_id = "proposal-completed", .execution_id = "execution-completed", .payload_json = "{\"state\":\"executing\",\"channel\":92,\"connection_id\":7}" });
-    _ = try journal_store.append(io, 7, .{ .kind = .execution_finished, .operation_id = "proposal-run-completed", .thread_id = "thread-completed", .turn_id = "turn-completed", .proposal_id = "proposal-completed", .execution_id = "execution-completed", .payload_json = "{\"state\":\"completed\",\"exit_status\":0,\"message\":\"remote command completed\"}" });
+    _ = try journal_store.append(io, 7, .{ .kind = .execution_finished, .operation_id = "proposal-run-completed", .thread_id = "thread-completed", .turn_id = "turn-completed", .proposal_id = "proposal-completed", .execution_id = "execution-completed", .payload_json = "{\"state\":\"completed\",\"exit_status\":0,\"cursor\":128,\"message\":\"remote command completed\"}" });
     _ = try journal_store.append(io, 8, .{ .kind = .turn_terminal, .operation_id = "recover-op-completed", .thread_id = "thread-completed", .turn_id = "turn-completed", .payload_json = "{\"state\":\"completed\"}" });
     try appendRecoveryTurn(allocator, io, &journal_store, &configured, generation, "thread-question", "turn-question", "recover-op-question");
     _ = try journal_store.append(io, 5, .{ .kind = .provider_result, .operation_id = "recover-op-question", .thread_id = "thread-question", .turn_id = "turn-question", .payload_json = "{\"kind\":\"question\",\"command\":null,\"question\":\"Which service should I inspect?\",\"explanation\":\"The request is ambiguous.\",\"model_destructive\":false,\"local_destructive\":false,\"needs_sudo\":false,\"provider_request_id\":\"req-question\",\"continuation_items\":[]}" });
     _ = try journal_store.append(io, 6, .{ .kind = .turn_terminal, .operation_id = "recover-op-question", .thread_id = "thread-question", .turn_id = "turn-question", .payload_json = "{\"state\":\"completed\"}" });
     try appendRecoveryTurn(allocator, io, &journal_store, &configured, generation, "thread-invalid-question", "turn-invalid-question", "recover-op-invalid-question");
     _ = try journal_store.append(io, 7, .{ .kind = .provider_result, .operation_id = "recover-op-invalid-question", .thread_id = "thread-invalid-question", .turn_id = "turn-invalid-question", .payload_json = "{\"kind\":\"question\",\"command\":null,\"question\":\"\",\"explanation\":\"Invalid empty question.\",\"model_destructive\":false,\"local_destructive\":false,\"needs_sudo\":false,\"provider_request_id\":\"req-invalid-question\",\"continuation_items\":[{\"type\":\"message\"}]}" });
+    try appendRecoveryTurn(allocator, io, &journal_store, &configured, generation, "thread-preamble", "turn-preamble", "recover-op-preamble");
+    _ = try journal_store.append(io, 8, .{ .kind = .provider_result, .operation_id = "recover-op-preamble", .thread_id = "thread-preamble", .turn_id = "turn-preamble", .payload_json = "{\"kind\":\"command\",\"message\":null,\"command\":\"df -h\",\"question\":null,\"explanation\":\"Inspect disk use.\",\"model_destructive\":false,\"local_destructive\":false,\"needs_sudo\":false,\"provider_request_id\":\"req-preamble\",\"continuation_items\":[],\"tool_mode\":\"native_function\",\"provider_call_id\":\"call_preamble\",\"tool_name\":\"run_server_command\",\"preamble\":\"I will inspect disk use.\"}" });
+    try appendRecoveryProposal(allocator, io, &journal_store, &configured, "thread-preamble", "turn-preamble", "recover-op-preamble", "proposal-preamble");
+    try appendRecoveryTurn(allocator, io, &journal_store, &configured, generation, "thread-summary", "turn-summary", "recover-op-summary");
+    _ = try journal_store.append(io, 9, .{ .kind = .tool_result_selected, .operation_id = "recover-op-summary", .thread_id = "thread-summary", .turn_id = "turn-summary", .execution_id = "execution-summary", .payload_json = "{\"execution_id\":\"execution-summary\",\"start_cursor\":0,\"end_cursor\":4,\"exit_status\":0,\"tool_mode\":\"structured_result\",\"provider_call_id\":null,\"tool_name\":null,\"output\":\"96G\\n\"}" });
+    _ = try journal_store.append(io, 10, .{ .kind = .continuation_request_started, .operation_id = "recover-op-summary", .thread_id = "thread-summary", .turn_id = "turn-summary", .execution_id = "execution-summary", .payload_json = "{\"state\":\"summarizing\",\"execution_id\":\"execution-summary\",\"provider_call_id\":null}" });
+    _ = try journal_store.append(io, 11, .{ .kind = .provider_request_started, .operation_id = "recover-op-summary", .thread_id = "thread-summary", .turn_id = "turn-summary", .payload_json = "{\"state\":\"requesting\",\"client_request_id\":\"recover-op-summary\"}" });
 
     var page_index: usize = 0;
     while (page_index < types.max_turns_per_thread) : (page_index += 1) {
@@ -2427,6 +2759,7 @@ test "restart recovery interrupts provider work preserves valid proposals and ne
     try std.testing.expectEqual(types.TurnState.completed, completed_execution.state);
     try std.testing.expectEqual(types.ProposalState.completed, completed_execution.proposal.?.state);
     try std.testing.expectEqual(@as(?i32, 0), completed_execution.execution.?.exit_status);
+    try std.testing.expectEqual(@as(u64, 128), completed_execution.execution.?.cursor);
     const recovered_question = registry.findTurnLocked("turn-question").?;
     try std.testing.expectEqual(types.TurnState.completed, recovered_question.state);
     try std.testing.expectEqualStrings("Which service should I inspect?", recovered_question.question.?);
@@ -2436,6 +2769,17 @@ test "restart recovery interrupts provider work preserves valid proposals and ne
     try std.testing.expectEqual(types.TurnState.interrupted, rejected_question.state);
     try std.testing.expectEqual(@as(?[]const u8, null), rejected_question.question);
     try std.testing.expectEqualStrings("[]", rejected_question.conversation.continuation_json);
+    const recovered_preamble = registry.findTurnLocked("turn-preamble").?;
+    try std.testing.expectEqual(types.TurnState.awaiting_approval, recovered_preamble.state);
+    try std.testing.expectEqualStrings("I will inspect disk use.", recovered_preamble.assistant_message.?);
+    const recovered_summary = registry.findTurnLocked("turn-summary").?;
+    try std.testing.expectEqual(types.TurnState.interrupted, recovered_summary.state);
+    try std.testing.expect(recovered_summary.continuation_started);
+    try std.testing.expectEqualStrings("execution-summary", recovered_summary.tool_result.?.execution_id);
+    try std.testing.expectEqualStrings("96G\n", recovered_summary.tool_result.?.output);
+    const preamble_detail = try registry.threadDetailJson("thread-preamble", 64 * 1024);
+    defer allocator.free(preamble_detail);
+    try std.testing.expect(std.mem.indexOf(u8, preamble_detail, "\"assistant_message\":\"I will inspect disk use.\"") != null);
     const paged_detail = try registry.threadDetailJson("thread-page", 1024);
     defer allocator.free(paged_detail);
     var parsed_detail = try std.json.parseFromSlice(std.json.Value, allocator, paged_detail, .{});
@@ -2572,8 +2916,19 @@ test "coordinator continues native tool execution with reviewed output explanati
     // Now turn 2: summarize output
     fake.document = "{\"kind\":\"message\",\"message\":\"The disk is 85% used.\",\"command\":null,\"question\":null,\"explanation\":\"Summarized disk usage.\",\"destructive\":false,\"needs_sudo\":false}";
     const cont_provider = try providers.get(io, configured.id);
-    const cont_context = "{\"context\":{\"kind\":\"command_output\",\"execution_id\":\"" ++ "execution-1" ++ "\",\"start_cursor\":0,\"end_cursor\":100,\"content\":\"Filesystem 85% used\"},\"log\":null}";
-    const cont_admission = try registry.admitOwned("turn-native-2", admission.thread_id, "server-one", cont_provider, generation, 7, "Explain this result", cont_context, 30);
+    const selected_output = "Filesystem 85% used";
+    const cont_context = try std.fmt.allocPrint(allocator, "{{\"context\":{{\"kind\":\"command_output\",\"execution_id\":{f},\"provider_call_id\":{f},\"tool_name\":{f},\"start_cursor\":0,\"end_cursor\":{d},\"content\":{f}}},\"log\":null}}", .{ std.json.fmt(approval.execution_id, .{}), std.json.fmt(source.provider_call_id, .{}), std.json.fmt(source.tool_name, .{}), selected_output.len, std.json.fmt(selected_output, .{}) });
+    defer allocator.free(cont_context);
+    const cont_admission = try registry.admitToolResultOwned("turn-native-2", admission.thread_id, "server-one", cont_provider, generation, 7, "Explain this result", cont_context, .{
+        .execution_id = approval.execution_id,
+        .start_cursor = 0,
+        .end_cursor = selected_output.len,
+        .exit_status = 0,
+        .tool_mode = source.tool_mode,
+        .provider_call_id = source.provider_call_id,
+        .tool_name = source.tool_name,
+        .output = selected_output,
+    }, 30);
     try registry.setSecretAndStart(cont_admission.turn_id, fixtureSecret());
     try waitForState(&registry, cont_admission.turn_id, .completed);
 
@@ -2587,4 +2942,47 @@ test "coordinator continues native tool execution with reviewed output explanati
 
     const durable_turn2 = registry.findTurnLocked(cont_admission.turn_id).?;
     try std.testing.expectEqualStrings("The disk is 85% used.", durable_turn2.assistant_message.?);
+    try std.testing.expectEqualStrings("call_1", durable_turn2.tool_result.?.provider_call_id.?);
+    try std.testing.expectError(error.InvalidState, registry.lookupToolResultOperation("turn-native-duplicate", admission.thread_id, "server-one", configured.id, durable_turn2.provider_revision, "Explain this result again", .{
+        .execution_id = approval.execution_id,
+        .start_cursor = 0,
+        .end_cursor = selected_output.len,
+        .exit_status = 0,
+        .tool_mode = source.tool_mode,
+        .provider_call_id = source.provider_call_id,
+        .tool_name = source.tool_name,
+    }));
+    var duplicate_provider = try providers.get(io, configured.id);
+    try std.testing.expectError(error.InvalidState, registry.admitToolResultOwned("turn-native-duplicate", admission.thread_id, "server-one", duplicate_provider, generation, 7, "Explain this result again", cont_context, .{
+        .execution_id = approval.execution_id,
+        .start_cursor = 0,
+        .end_cursor = selected_output.len,
+        .exit_status = 0,
+        .tool_mode = source.tool_mode,
+        .provider_call_id = source.provider_call_id,
+        .tool_name = source.tool_name,
+        .output = selected_output,
+    }, 40));
+    duplicate_provider.deinit(allocator);
+
+    const records = try journal_store.snapshot(io);
+    defer journal.Store.deinitSnapshot(allocator, records);
+    var selected_sequence: ?u64 = null;
+    var continuation_sequence: ?u64 = null;
+    var provider_sequence: ?u64 = null;
+    for (records) |record| {
+        if (record.turn_id == null or !std.mem.eql(u8, record.turn_id.?, cont_admission.turn_id)) continue;
+        switch (record.kind) {
+            .tool_result_selected => {
+                selected_sequence = record.sequence;
+                try std.testing.expect(std.mem.indexOf(u8, record.payload_json, selected_output) != null);
+                try std.testing.expect(std.mem.indexOf(u8, record.payload_json, "\"provider_call_id\":\"call_1\"") != null);
+            },
+            .continuation_request_started => continuation_sequence = record.sequence,
+            .provider_request_started => provider_sequence = record.sequence,
+            else => {},
+        }
+    }
+    try std.testing.expect(selected_sequence != null and continuation_sequence != null and provider_sequence != null);
+    try std.testing.expect(selected_sequence.? < continuation_sequence.? and continuation_sequence.? < provider_sequence.?);
 }

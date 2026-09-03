@@ -27,6 +27,8 @@ pub const Error = error{
     OutOfMemory,
 };
 
+const NativeToolChoice = enum { auto, force };
+
 pub fn buildRequest(
     allocator: std.mem.Allocator,
     model: []const u8,
@@ -59,6 +61,30 @@ pub fn buildRequestWithMode(
     user_text: []const u8,
     continuation_json: []const u8,
     tool_mode: types.ToolMode,
+) Error![]u8 {
+    return buildRequestWithNativeChoice(allocator, model, role, mode, instructions, user_text, continuation_json, tool_mode, .auto);
+}
+
+pub fn buildCapabilityTestRequest(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    role: ?provider.InstructionRole,
+    instructions: []const u8,
+    user_text: []const u8,
+) Error![]u8 {
+    return buildRequestWithNativeChoice(allocator, model, role, null, instructions, user_text, "[]", .native_function, .force);
+}
+
+fn buildRequestWithNativeChoice(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    role: ?provider.InstructionRole,
+    mode: ?provider.StructuredOutput,
+    instructions: []const u8,
+    user_text: []const u8,
+    continuation_json: []const u8,
+    tool_mode: types.ToolMode,
+    native_choice: NativeToolChoice,
 ) Error![]u8 {
     if (!validText(model, 256) or !validText(instructions, types.max_message_bytes) or !validText(user_text, types.max_message_bytes)) return error.InvalidInput;
     if (continuation_json.len > types.max_continuation_bytes) return error.RequestTooLarge;
@@ -108,7 +134,12 @@ pub fn buildRequestWithMode(
         .native_function => {
             writer.writeAll(",\"tools\":[") catch return error.OutOfMemory;
             writer.writeAll(tool_call.chat_tool_json) catch return error.OutOfMemory;
-            writer.writeAll("],\"parallel_tool_calls\":false}") catch return error.OutOfMemory;
+            writer.writeAll("],\"tool_choice\":") catch return error.OutOfMemory;
+            switch (native_choice) {
+                .auto => writer.writeAll("\"auto\"") catch return error.OutOfMemory,
+                .force => writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"run_server_command\"}}") catch return error.OutOfMemory,
+            }
+            writer.writeAll(",\"parallel_tool_calls\":false}") catch return error.OutOfMemory;
         },
     }
 
@@ -125,7 +156,7 @@ pub fn buildContinuationRequest(
     tool_call_id: []const u8,
     output: []const u8,
 ) Error![]u8 {
-    if (!validText(model, 256) or !validText(instructions, types.max_message_bytes) or tool_call_id.len == 0 or tool_call_id.len > 128) return error.InvalidInput;
+    if (!validText(model, 256) or !validText(instructions, types.max_message_bytes) or !validText(tool_call_id, 128)) return error.InvalidInput;
     if (continuation_json.len > types.max_continuation_bytes or output.len > types.max_structured_output_bytes) return error.RequestTooLarge;
 
     var continuation = std.json.parseFromSlice(std.json.Value, allocator, continuation_json, .{}) catch return error.InvalidInput;
@@ -157,7 +188,7 @@ pub fn buildContinuationRequest(
     std.json.Stringify.value(output, .{}, writer) catch return error.OutOfMemory;
     writer.writeAll("}],\"tools\":[") catch return error.OutOfMemory;
     writer.writeAll(tool_call.chat_tool_json) catch return error.OutOfMemory;
-    writer.writeAll("],\"parallel_tool_calls\":false}") catch return error.OutOfMemory;
+    writer.writeAll("],\"tool_choice\":\"none\",\"parallel_tool_calls\":false}") catch return error.OutOfMemory;
 
     if (writer.buffered().len > types.max_request_body_bytes) return error.RequestTooLarge;
     return out.toOwnedSlice() catch return error.OutOfMemory;
@@ -215,6 +246,7 @@ pub const State = struct {
     tool_call_name: ?[]u8 = null,
     tool_call_arguments: std.ArrayList(u8) = .empty,
     saw_tool_call: bool = false,
+    saw_tool_call_type: bool = false,
     preamble: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator) State {
@@ -251,7 +283,7 @@ pub const State = struct {
             if (self.saw_refusal or self.incomplete or !self.saw_chunk) return;
 
             if (self.saw_tool_calls_finish or self.saw_tool_call) {
-                if (!self.saw_tool_calls_finish or self.tool_call_arguments.items.len == 0) return;
+                if (!self.saw_tool_calls_finish or !self.saw_tool_call_type or self.tool_call_id == null or self.tool_call_name == null or self.tool_call_arguments.items.len == 0) return error.MalformedChunk;
                 var parsed_args = tool_call.parseArguments(self.allocator, self.tool_call_arguments.items) catch |err| return switch (err) {
                     error.OutOfMemory => error.OutOfMemory,
                     error.LimitExceeded => error.OutputTooLarge,
@@ -259,9 +291,9 @@ pub const State = struct {
                 };
                 errdefer parsed_args.deinit(self.allocator);
 
-                const call_id_owned = try self.allocator.dupe(u8, self.tool_call_id orelse "");
+                const call_id_owned = try self.allocator.dupe(u8, self.tool_call_id.?);
                 errdefer self.allocator.free(call_id_owned);
-                const tool_name_owned = try self.allocator.dupe(u8, tool_call.tool_name);
+                const tool_name_owned = try self.allocator.dupe(u8, self.tool_call_name.?);
                 errdefer self.allocator.free(tool_name_owned);
 
                 var preamble: ?[]u8 = null;
@@ -328,9 +360,15 @@ pub const State = struct {
 
         if (choice.delta.tool_calls) |tool_calls_arr| {
             if (self.tool_mode == .structured_result or self.is_continuation) return error.ToolCallRejected;
+            if (tool_calls_arr.len != 1) return error.ToolCallRejected;
             for (tool_calls_arr) |tc| {
                 if (tc.index != 0) return error.ToolCallRejected;
+                if (tc.type) |tool_type| {
+                    if (!std.mem.eql(u8, tool_type, "function")) return error.ToolCallRejected;
+                    self.saw_tool_call_type = true;
+                }
                 if (tc.id) |cid| {
+                    if (!validText(cid, 128)) return error.MalformedChunk;
                     if (self.tool_call_id == null) {
                         self.tool_call_id = try self.allocator.dupe(u8, cid);
                     } else if (!std.mem.eql(u8, self.tool_call_id.?, cid)) {
@@ -339,13 +377,16 @@ pub const State = struct {
                 }
                 if (tc.function) |func| {
                     if (func.name) |fname| {
+                        if (!validText(fname, 64)) return error.InvalidToolName;
                         if (!std.mem.eql(u8, fname, tool_call.tool_name)) return error.InvalidToolName;
                         if (self.tool_call_name == null) {
                             self.tool_call_name = try self.allocator.dupe(u8, fname);
+                        } else if (!std.mem.eql(u8, self.tool_call_name.?, fname)) {
+                            return error.InconsistentItem;
                         }
                     }
                     if (func.arguments) |args| {
-                        if (!std.unicode.utf8ValidateSlice(args) or self.tool_call_arguments.items.len + args.len > types.max_structured_output_bytes) return error.OutputTooLarge;
+                        if (!std.unicode.utf8ValidateSlice(args) or std.mem.indexOfScalar(u8, args, 0) != null or self.tool_call_arguments.items.len + args.len > types.max_structured_output_bytes) return error.OutputTooLarge;
                         try self.tool_call_arguments.appendSlice(self.allocator, args);
                     }
                 }
@@ -431,7 +472,20 @@ test "Chat request declares strict tool and parallel_tool_calls false in native_
     defer std.testing.allocator.free(req);
     try std.testing.expect(std.mem.indexOf(u8, req, "\"run_server_command\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req, "\"parallel_tool_calls\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"tool_choice\":\"auto\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req, "\"response_format\"") == null);
+}
+
+test "Chat rejects native tool calls without complete provider identity" {
+    var missing_id = State.initWithMode(std.testing.allocator, .native_function, false);
+    defer missing_id.deinit();
+    try missing_id.consume(.{ .name = "message", .data = "{\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"type\":\"function\",\"function\":{\"name\":\"run_server_command\",\"arguments\":\"{\\\"command\\\":\\\"df -h\\\",\\\"explanation\\\":\\\"Inspect disk use.\\\",\\\"destructive\\\":false,\\\"needs_sudo\\\":false}\"}}]},\"finish_reason\":\"tool_calls\"}]}" });
+    try std.testing.expectError(error.MalformedChunk, missing_id.consume(.{ .name = "message", .data = "[DONE]" }));
+
+    var missing_type = State.initWithMode(std.testing.allocator, .native_function, false);
+    defer missing_type.deinit();
+    try missing_type.consume(.{ .name = "message", .data = "{\"id\":\"chatcmpl-2\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_2\",\"function\":{\"name\":\"run_server_command\",\"arguments\":\"{\\\"command\\\":\\\"df -h\\\",\\\"explanation\\\":\\\"Inspect disk use.\\\",\\\"destructive\\\":false,\\\"needs_sudo\\\":false}\"}}]},\"finish_reason\":\"tool_calls\"}]}" });
+    try std.testing.expectError(error.MalformedChunk, missing_type.consume(.{ .name = "message", .data = "[DONE]" }));
 }
 
 test "Chat stream validates one result at every transport split" {
