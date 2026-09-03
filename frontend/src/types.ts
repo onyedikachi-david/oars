@@ -873,6 +873,7 @@ export interface BackupInstallPlanResult {
 // ============================================================================
 
 export type AiAdapter = "openai_responses" | "openai_chat_completions";
+export type AiToolMode = "native_function" | "structured_result";
 export type AiInstructionRole = "developer" | "system";
 export type AiStructuredOutput = "json_schema" | "json_object";
 export type AiProviderTestStatus = "untested" | "passed" | "failed" | "stale";
@@ -898,6 +899,7 @@ export interface AiProvider {
   id: string;
   name: string;
   adapter: AiAdapter;
+  tool_mode: AiToolMode;
   base_url: string;
   model: string;
   instruction_role: AiInstructionRole | null;
@@ -911,6 +913,7 @@ export interface AiProviderDraft {
   id?: string;
   name: string;
   adapter: AiAdapter;
+  tool_mode?: AiToolMode;
   base_url: string;
   model: string;
   instruction_role?: AiInstructionRole;
@@ -1015,6 +1018,9 @@ export interface AiProposal {
   created_at_ms: number;
   expires_at_ms: number;
   state: "awaiting_approval" | "approved" | "executing" | "completed" | "failed" | "canceled" | "expired" | "recovery_required";
+  tool_mode?: AiToolMode;
+  provider_call_id?: string | null;
+  tool_name?: string | null;
 }
 
 export type AiTurnState =

@@ -2,29 +2,28 @@
 
 > **Target:** Spec 19 — Conversational AI and Reviewed Tools
 >
-> **Status:** Partial
+> **Status:** Partial — implementation complete locally; release evidence incomplete
 >
-> **Prepared:** 2026-08-31 against `e01c646`
+> **Last reviewed:** 2026-09-01
 
 ## Release posture
 
-Implement the remaining contract in `docs/specs/19-ai-chat-tools.md`. The
-current checkout already has the secure provider boundary, native credential
-entry, durable conversations, assistant messages, reviewed command proposals,
-tracked SSH execution, retained-output summaries, and the chronological chat
-surface. Do not rebuild those foundations.
+The current checkout implements the Spec 19 code contract: explicit provider
+tool modes, strict native tool parsing for both adapters, durable reviewed
+proposals, exact tool-result continuation, restart-safe journal recovery, and
+the chronological chat surface. Provider HTTP, credentials, validation,
+approval, and SSH authority remain native.
 
-Spec 19 is not complete because both provider adapters still reject native tool
-calls. Commands are currently returned through the structured result union
-(`message`, `command`, or `question`), and retained output is sent as a new
-user-style request instead of a provider tool result tied to the original call
-identity.
-The next implementation must close those gaps without moving provider HTTP,
-credentials, validation, approval, or SSH authority into React.
+Spec 19 stays Partial until the external release gates are recorded. The open
+evidence is a real desktop credential lifecycle, real-provider runs for both
+adapters, forced restart checks at the provider boundary, sentinel scans,
+desktop accessibility and visual checks, and packaging. See
+`docs/research/spec-19-release-evidence.md`.
 
-## Confirmed baseline
+## Original implementation baseline
 
-The baseline below is implementation truth at `e01c646`, not planned behavior.
+The baseline below records the starting point at `e01c646`. Later slices in
+this guide and the current implementation supersede these historical gaps.
 
 - `src/ai/responses.zig` sends a strict text-output schema, retains message and
   reasoning items, and rejects every `function_call` item as

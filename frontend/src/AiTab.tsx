@@ -45,7 +45,7 @@ function errorMessage(cause: unknown): string {
   return cause instanceof BridgeError ? cause.message : String(cause);
 }
 
-const defaultDraft: AiProviderDraft = { name: "", adapter: "openai_responses", base_url: "https://api.openai.com/v1", model: "" };
+const defaultDraft: AiProviderDraft = { name: "", adapter: "openai_responses", tool_mode: "structured_result", base_url: "https://api.openai.com/v1", model: "" };
 const terminalTurnStates = new Set<AiTurnState>(["completed", "failed", "canceled", "interrupted", "recovery_required"]);
 const promptStarters = [
   "Why is this server low on disk space?",
@@ -71,12 +71,14 @@ interface ExecutionView extends AiExecutionAdmission {
 }
 
 function snapshotToolState(turn: AiTurnSnapshot): ChatToolState {
-  if (turn.state === "executing" || turn.state === "approved") return "running";
+  if (turn.state === "executing") return "running";
+  if (turn.state === "approved") return "approved";
   if (turn.state === "completed") return turn.exit_status !== null && turn.exit_status !== 0 ? "failed" : "completed";
   if (turn.state === "canceled") return "canceled";
   if (turn.state === "interrupted" || turn.state === "recovery_required") return "recovery-required";
   if (turn.state === "failed") return "failed";
-  return "approval-requested";
+  if (turn.proposal?.state === "expired") return "expired";
+  return "awaiting-approval";
 }
 
 export function AiTab({ serverId, onOpenScriptDraft }: { serverId: string; onOpenScriptDraft?: (command: string, destructive: boolean) => void }) {
@@ -229,9 +231,14 @@ export function AiTab({ serverId, onOpenScriptDraft }: { serverId: string; onOpe
     catch (cause) { setError(errorMessage(cause)); }
   };
 
-  const setAdapter = (adapter: AiAdapter) => setDraft((current) => adapter === "openai_responses"
-    ? { ...current, adapter, instruction_role: undefined, structured_output: undefined }
-    : { ...current, adapter, instruction_role: "system", structured_output: "json_schema" });
+  const setAdapter = (adapter: AiAdapter) => setDraft((current) => {
+    const { instruction_role: _instructionRole, structured_output: _structuredOutput, ...portable } = current;
+    if (adapter === "openai_responses") return { ...portable, adapter };
+    if ((current.tool_mode ?? "structured_result") === "native_function") {
+      return { ...portable, adapter, instruction_role: "system" };
+    }
+    return { ...portable, adapter, instruction_role: "system", structured_output: current.structured_output ?? "json_schema" };
+  });
 
   const reloadProviders = async () => {
     const next = (await api.ai.providerList()).providers;
@@ -257,6 +264,7 @@ export function AiTab({ serverId, onOpenScriptDraft }: { serverId: string; onOpe
       id: item.id,
       name: item.name,
       adapter: item.adapter,
+      tool_mode: item.tool_mode,
       base_url: item.base_url,
       model: item.model,
       ...(item.instruction_role ? { instruction_role: item.instruction_role } : {}),
@@ -535,9 +543,13 @@ export function AiTab({ serverId, onOpenScriptDraft }: { serverId: string; onOpe
   const liveAssistant = turnFeed.assistantMessage && turnFeed.assistantMessage !== latestSnapshot?.assistant_message ? turnFeed.assistantMessage : null;
   const liveQuestion = turnFeed.question && turnFeed.question !== latestSnapshot?.question ? turnFeed.question : null;
   const hasVisibleAssistantResult = Boolean(liveAssistant || liveQuestion || latestSnapshot?.assistant_message || latestSnapshot?.question || latestSnapshot?.proposal);
-  const toolState = turnState === "recovery_required" || turnState === "interrupted" ? "recovery-required" : execution
+  const toolState: ChatToolState = turnState === "recovery_required" || turnState === "interrupted" ? "recovery-required" : execution
     ? execution.eof ? (execution.exit === 0 ? "completed" : "failed") : "running"
-    : proposal?.state === "canceled" ? "canceled" : "approval-requested";
+    : proposal?.state === "canceled" ? "canceled"
+    : proposal?.state === "expired" ? "expired"
+    : turnState === "approved" ? "approved"
+    : turnState === "validating" || turnState === "requesting" || turnState === "streaming" ? "preparing"
+    : "awaiting-approval";
 
   return <div className="ai-workspace ai-chat-workspace" aria-labelledby="ai-workspace-title">
     <header className="ai-chat-header">
@@ -578,9 +590,10 @@ export function AiTab({ serverId, onOpenScriptDraft }: { serverId: string; onOpe
           <details className="ai-chat-details" open={providerSettingsOpen} onToggle={(event) => setProviderSettingsOpen(event.currentTarget.open)}><summary role="button" aria-expanded={providerSettingsOpen} aria-controls="ai-provider-settings-form" aria-label={draft.id ? `Edit provider ${draft.name}` : "Manage providers"}><span className="ai-chat-details-icon" aria-hidden><Settings2 /></span><span className="ai-chat-details-copy"><strong>{draft.id ? `Editing ${draft.name}` : "Manage providers"}</strong><small>{draft.id ? "Update this endpoint and model" : "Add or edit an endpoint and model"}</small></span><ChevronDown className="ai-chat-details-chevron" aria-hidden /></summary><div className="ai-provider-form" id="ai-provider-settings-form">
             <label className="ai-form-field"><span>Provider name</span><input aria-label="Provider name" value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} /></label>
             <label className="ai-form-field"><span>API adapter</span><OarsSelect aria-label="Provider adapter" value={draft.adapter} onValueChange={(value) => setAdapter(value as AiAdapter)} options={[{ value: "openai_responses", label: "OpenAI Responses" }, { value: "openai_chat_completions", label: "Chat Completions" }]} /></label>
+            <label className="ai-form-field"><span>Tool capability</span><OarsSelect aria-label="Tool capability" value={draft.tool_mode ?? "structured_result"} onValueChange={(value) => setDraft((current) => ({ ...current, tool_mode: value as "native_function" | "structured_result", ...(value === "native_function" && current.adapter === "openai_chat_completions" ? { structured_output: undefined } : {}) }))} options={[{ value: "native_function", label: "Native function tools" }, { value: "structured_result", label: "Structured result fallback" }]} /></label>
             <label className="ai-form-field"><span>Base URL</span><input aria-label="Provider base URL" value={draft.base_url} onChange={(event) => setDraft((current) => ({ ...current, base_url: event.target.value }))} /></label>
             <label className="ai-form-field"><span>Model</span><input aria-label="Provider model" value={draft.model} onChange={(event) => setDraft((current) => ({ ...current, model: event.target.value }))} /></label>
-            {draft.adapter === "openai_chat_completions" && <><label className="ai-form-field"><span>Instruction role</span><OarsSelect aria-label="Instruction role" value={draft.instruction_role ?? "system"} onValueChange={(value) => setDraft((current) => ({ ...current, instruction_role: value as "developer" | "system" }))} options={[{ value: "developer", label: "Developer" }, { value: "system", label: "System" }]} /></label><label className="ai-form-field"><span>Structured output</span><OarsSelect aria-label="Structured output mode" value={draft.structured_output ?? "json_schema"} onValueChange={(value) => setDraft((current) => ({ ...current, structured_output: value as "json_schema" | "json_object" }))} options={[{ value: "json_schema", label: "JSON Schema" }, { value: "json_object", label: "JSON object" }]} /></label></>}
+            {draft.adapter === "openai_chat_completions" && <><label className="ai-form-field"><span>Instruction role</span><OarsSelect aria-label="Instruction role" value={draft.instruction_role ?? "system"} onValueChange={(value) => setDraft((current) => ({ ...current, instruction_role: value as "developer" | "system" }))} options={[{ value: "developer", label: "Developer" }, { value: "system", label: "System" }]} /></label>{(draft.tool_mode ?? "structured_result") === "structured_result" && <label className="ai-form-field"><span>Structured output</span><OarsSelect aria-label="Structured output mode" value={draft.structured_output ?? "json_schema"} onValueChange={(value) => setDraft((current) => ({ ...current, structured_output: value as "json_schema" | "json_object" }))} options={[{ value: "json_schema", label: "JSON Schema" }, { value: "json_object", label: "JSON object" }]} /></label>}</>}
             <div className="ai-chat-compact-actions"><Button size="sm" onClick={() => void saveProvider()} disabled={!draft.name.trim() || !draft.model.trim()}>Save provider</Button>{draft.id && <Button size="sm" variant="ghost" onClick={() => { setDraft(defaultDraft); setProviderSettingsOpen(false); }}>Cancel</Button>}</div>
             {selectedProvider && <div className="ai-provider-secondary-actions"><Button size="xs" variant="ghost" onClick={() => editProvider(selectedProvider)}><Settings2 />Edit selected</Button>{credentialStatus === "configured" && <Button size="xs" variant="ghost" onClick={() => void deleteCredential(selectedProvider)}>Remove credential</Button>}<Button className="ai-danger-action" size="xs" variant="ghost" onClick={() => void deleteProvider(selectedProvider)}><Trash2 />Delete</Button></div>}
           </div></details>

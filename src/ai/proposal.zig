@@ -38,12 +38,19 @@ pub const Validated = struct {
     model_destructive: bool,
     local_destructive: bool,
     needs_sudo: bool,
+    tool_mode: types.ToolMode = .structured_result,
+    provider_call_id: ?[]u8 = null,
+    tool_name: ?[]u8 = null,
+    preamble: ?[]u8 = null,
 
     pub fn deinit(self: *Validated, allocator: std.mem.Allocator) void {
         if (self.message) |value| allocator.free(value);
         if (self.command) |value| allocator.free(value);
         if (self.question) |value| allocator.free(value);
         allocator.free(self.explanation);
+        if (self.provider_call_id) |value| allocator.free(value);
+        if (self.tool_name) |value| allocator.free(value);
+        if (self.preamble) |value| allocator.free(value);
     }
 };
 

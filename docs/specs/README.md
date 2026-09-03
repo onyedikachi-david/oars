@@ -29,7 +29,7 @@ already exists.
 | 16 | [Themes & Terminal Appearance](16-themes.md) | 📋 (Oars+) |
 | 17 | [Export / Import (Vault)](17-export-import.md) | ✅ backend in (UI pending): AES-256-GCM vault + plain JSON export/import, merge preview, credential-binding conflicts, atomic write-back |
 | 18 | [SSH Agent & Jump Hosts](18-agent-jump-hosts.md) | 📋 (Oars+) |
-| 19 | [Conversational AI and Reviewed Tools](19-ai-chat-tools.md) | Partial: normal assistant messages and the chat projection are in progress; native provider tool-call parsing, result continuation, and final integration evidence remain |
+| 19 | [Conversational AI and Reviewed Tools](19-ai-chat-tools.md) | Partial: local implementation is complete; real credential/provider, restart-boundary, sentinel, desktop, accessibility, visual, and packaging evidence remains |
 
 ## Template used by every spec
 

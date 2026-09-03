@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AiTab } from "./AiTab";
 import type { AiProvider } from "./types";
@@ -9,6 +10,7 @@ const provider: AiProvider = {
   id: "aip-0123456789abcdef",
   name: "Primary",
   adapter: "openai_responses",
+  tool_mode: "structured_result",
   base_url: "https://api.openai.com/v1",
   model: "gpt-test",
   instruction_role: null,
@@ -72,6 +74,34 @@ describe("AiTab credentials", () => {
     expect((screen.getByLabelText("Provider name") as HTMLInputElement).value).toBe("Secondary");
     expect(details.open).toBe(true);
     expect(manage.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("does not add structured output when native tools switch to Chat Completions", async () => {
+    const user = userEvent.setup();
+    window.zero = {
+      invoke: vi.fn(async (command: string, payload?: unknown) => {
+        calls.push({ command, payload });
+        if (command === "oars.ai.provider.list") return { ok: true, providers: [] };
+        if (command === "oars.ai.context.get") return { ok: true, state: "missing", context: null, stale: true };
+        if (command === "oars.ai.provider.save") return { ok: true, provider };
+        throw new Error(`unexpected command: ${command}`);
+      }),
+    };
+
+    render(<AiTab serverId="server-one" />);
+    await user.click(await screen.findByRole("button", { name: /manage providers/i }));
+    fireEvent.change(await screen.findByLabelText("Provider name"), { target: { value: "Native Chat" } });
+    fireEvent.change(screen.getByLabelText("Provider model"), { target: { value: "tool-model" } });
+    await user.click(screen.getByRole("combobox", { name: "Tool capability" }));
+    await user.click(await screen.findByRole("option", { name: "Native function tools" }));
+    await user.click(screen.getByRole("combobox", { name: "Provider adapter" }));
+    await user.click(await screen.findByRole("option", { name: "Chat Completions" }));
+    await user.click(screen.getByRole("button", { name: "Save provider" }));
+
+    await waitFor(() => expect(calls.some((call) => call.command === "oars.ai.provider.save")).toBe(true));
+    const saved = calls.find((call) => call.command === "oars.ai.provider.save");
+    expect(saved?.payload).toMatchObject({ provider: { adapter: "openai_chat_completions", tool_mode: "native_function", instruction_role: "system" } });
+    expect((saved?.payload as { provider: Record<string, unknown> }).provider).not.toHaveProperty("structured_output");
   });
 
   it("opens native credential management without putting a secret in WebView state or bridge payloads", async () => {
@@ -237,5 +267,87 @@ describe("AiTab credentials", () => {
     await screen.findByRole("region", { name: "Run server command: Completed" });
     expect(screen.getByText("df -h")).toBeTruthy();
     expect(await screen.findByText("/dev/sda1 56% /", { exact: false })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Explain this result" })).toBeTruthy();
+  });
+
+  it("renders preamble message above tool proposal and triggers Explain this result", async () => {
+    const readyProvider: AiProvider = { ...provider, tool_mode: "native_function", test_status: "passed", tested_at_ms: 10 };
+    credentialStatus = "configured";
+    let turnPollCount = 0;
+    let summarized = false;
+    window.zero = {
+      invoke: vi.fn(async (command: string, payload?: unknown) => {
+        calls.push({ command, payload });
+        if (command === "oars.ai.provider.list") return { ok: true, providers: [readyProvider] };
+        if (command === "oars.ai.credential.status") return { ok: true, status: "configured" };
+        if (command === "oars.ai.context.get") return { ok: true, state: "ready", stale: false, updated_at_ms: 10, context: { server_id: "server-one", os: "Linux", hostname: "fixture", monitor: {}, active_logs: [], partial: false, errors: [], updated_at_ms: 10 } };
+        if (command === "oars.ai.context.refresh") return { ok: true, operation_id: "context-refresh", state: "queued" };
+        if (command === "oars.ai.context.poll") return { ok: true, stream_id: "context-refresh", cursor: 1, dropped: 0, finished: true, state: "ready", events: [] };
+        if (command === "oars.servers.list") return { servers: [{ id: "server-one", name: "Fixture", host: "example.test", port: 22, user: "root", auth_method: "key", key_path: "", key_has_passphrase: false, host_fingerprint: null, group: "", tags: [], via_server_id: null, created_at: 1, updated_at: 1 }] };
+        if (command === "oars.ai.thread.list") return { ok: true, threads: [{ id: "ait-1", revision: 1, server_id: "server-one", provider_id: readyProvider.id, model: readyProvider.model, title: "Check disk", state: "completed", turn_count: 1, updated_at_ms: 10 }] };
+        if (command === "oars.ai.thread.get") return {
+          ok: true,
+          thread: { id: "ait-1", revision: 1, server_id: "server-one", provider_id: readyProvider.id, adapter: readyProvider.adapter, model: readyProvider.model, title: "Check disk", created_at_ms: 1, updated_at_ms: 10 },
+          turns: [{ id: "air-1", operation_id: "turn-1", state: "completed", message: "Check disk usage", context_hash: "a".repeat(64), provider_revision: 1, connection_id: 7, execution_id: "aiexec-1", channel: 9, execution_cursor: 20, exit_status: 0, proposal: { id: "aiprop-1", turn_id: "air-1", revision: 1, server_id: "server-one", provider_id: readyProvider.id, provider_revision: 1, context_hash: "a".repeat(64), command: "df -h", command_sha256: "b".repeat(64), explanation: "Inspect mounted disk usage.", model_destructive: false, local_destructive: false, needs_sudo: false, created_at_ms: 10, expires_at_ms: Date.now() + 60_000, state: "completed" }, assistant_message: "I will check disk usage for you.", question: null, question_explanation: null }],
+          turns_start: 0,
+          turn_count: 1,
+          active_proposal: null,
+        };
+        if (command === "oars.ssh.poll") {
+          const request = payload as { cursors?: Array<{ channel: number; cursor: number }> };
+          return request.cursors?.length
+            ? { ok: true, status: "ready", connection_id: 7, channels: [{ id: 9, kind: "exec", command: "df -h", cursor: 20, dropped: 0, pending: 0, eof: true, exit: 0, data: "/dev/sda1 85% /\n" }] }
+            : { ok: true, status: "ready", connection_id: 7, channels: [] };
+        }
+        if (command === "oars.ai.turn.start") return { ok: true, thread_id: "ait-1", turn_id: "air-1", state: "queued" };
+        if (command === "oars.ai.turn.poll") {
+          turnPollCount += 1;
+          if (turnPollCount === 1) {
+            return {
+              ok: true, stream_id: "air-1", cursor: 1, dropped: 0, finished: false, state: "awaiting_approval",
+              events: [
+                { version: 1, sequence: 0, stream_id: "air-1", type: "assistant.message", payload: { message: "I will check disk usage for you.", explanation: "" } },
+                { version: 1, sequence: 1, stream_id: "air-1", type: "proposal.ready", payload: { proposal: { id: "aiprop-1", turn_id: "air-1", revision: 1, server_id: "server-one", provider_id: readyProvider.id, provider_revision: 1, context_hash: "a".repeat(64), command: "df -h", command_sha256: "b".repeat(64), explanation: "Inspect mounted disk usage.", model_destructive: false, local_destructive: false, needs_sudo: false, created_at_ms: 10, expires_at_ms: Date.now() + 60_000, state: "awaiting_approval", tool_mode: "native_function", provider_call_id: "call_1", tool_name: "run_server_command" } } },
+              ],
+            };
+          }
+          if (turnPollCount === 2) return { ok: true, stream_id: "air-1", cursor: 2, dropped: 0, finished: true, state: "completed", events: [] };
+          return {
+            ok: true, stream_id: "air-2", cursor: 1, dropped: 0, finished: true, state: "completed",
+            events: [{ version: 1, sequence: 0, stream_id: "air-2", type: "assistant.message", payload: { message: "Your root partition is 85% full.", explanation: "" } }],
+          };
+        }
+        if (command === "oars.ai.proposal.run") return { ok: true, execution_id: "aiexec-1", connection_id: 7, channel: 9, state: "executing" };
+        if (command === "oars.ai.turn.summarize") {
+          summarized = true;
+          return { ok: true, thread_id: "ait-1", turn_id: "air-2", state: "queued" };
+        }
+        throw new Error(`unexpected command: ${command}`);
+      }),
+    };
+
+    render(<AiTab serverId="server-one" />);
+    const request = await screen.findByRole("textbox", { name: "AI terminal request" });
+    fireEvent.change(request, { target: { value: "Check disk usage" } });
+    fireEvent.click(screen.getByRole("checkbox", { name: "I reviewed this exact selection" }));
+    fireEvent.click(screen.getByRole("button", { name: "Ask" }));
+
+    // Verify preamble is displayed
+    await screen.findByText("I will check disk usage for you.");
+    // Run proposal
+    const runBtn = await screen.findByRole("button", { name: "Run exact command" });
+    fireEvent.click(runBtn);
+
+    // Wait for execution completion
+    const explainBtn = await screen.findByRole("button", { name: "Explain this result" });
+    fireEvent.click(explainBtn);
+
+    await waitFor(() => expect(summarized).toBe(true));
+    const summarizeCall = calls.find((c) => c.command === "oars.ai.turn.summarize");
+    expect(summarizeCall?.payload).toMatchObject({
+      thread_id: "ait-1",
+      execution_id: "aiexec-1",
+      output_selection: { start_cursor: 0, end_cursor: 20 },
+    });
   });
 });

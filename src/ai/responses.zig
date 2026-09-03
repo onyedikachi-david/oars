@@ -3,6 +3,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const proposal = @import("proposal.zig");
+const tool_call = @import("tool_call.zig");
 const sse = @import("sse.zig");
 
 pub const endpoint_suffix = "/responses";
@@ -11,6 +12,7 @@ pub const Error = error{
     InvalidInput,
     RequestTooLarge,
     InvalidJson,
+    InvalidToolName,
     MalformedKnownEvent,
     InconsistentItem,
     ToolCallRejected,
@@ -27,36 +29,112 @@ pub const Error = error{
 };
 
 pub const Terminal = enum { none, completed, refused, incomplete, failed };
+const NativeToolChoice = enum { auto, force };
 
 pub fn buildRequest(allocator: std.mem.Allocator, model: []const u8, instructions: []const u8, user_text: []const u8) Error![]u8 {
-    return buildRequestWithContinuation(allocator, model, instructions, user_text, "[]");
+    return buildRequestWithMode(allocator, model, instructions, user_text, "[]", .structured_result);
 }
 
 pub fn buildRequestWithContinuation(allocator: std.mem.Allocator, model: []const u8, instructions: []const u8, user_text: []const u8, continuation_json: []const u8) Error![]u8 {
+    return buildRequestWithMode(allocator, model, instructions, user_text, continuation_json, .structured_result);
+}
+
+pub fn buildRequestWithMode(allocator: std.mem.Allocator, model: []const u8, instructions: []const u8, user_text: []const u8, continuation_json: []const u8, mode: types.ToolMode) Error![]u8 {
+    return buildRequestWithNativeChoice(allocator, model, instructions, user_text, continuation_json, mode, .auto);
+}
+
+pub fn buildCapabilityTestRequest(allocator: std.mem.Allocator, model: []const u8, instructions: []const u8, user_text: []const u8) Error![]u8 {
+    return buildRequestWithNativeChoice(allocator, model, instructions, user_text, "[]", .native_function, .force);
+}
+
+fn buildRequestWithNativeChoice(allocator: std.mem.Allocator, model: []const u8, instructions: []const u8, user_text: []const u8, continuation_json: []const u8, mode: types.ToolMode, native_choice: NativeToolChoice) Error![]u8 {
     if (!validText(model, 256) or !validText(instructions, types.max_message_bytes) or !validText(user_text, types.max_message_bytes)) return error.InvalidInput;
     if (continuation_json.len > types.max_continuation_bytes) return error.RequestTooLarge;
     var continuation = std.json.parseFromSlice(std.json.Value, allocator, continuation_json, .{}) catch return error.InvalidInput;
     defer continuation.deinit();
     if (continuation.value != .array) return error.InvalidInput;
+
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const writer = &out.writer;
+
     writer.writeAll("{\"model\":") catch return error.OutOfMemory;
     std.json.Stringify.value(model, .{}, writer) catch return error.OutOfMemory;
     writer.writeAll(",\"stream\":true,\"store\":false,\"background\":false,\"include\":[\"reasoning.encrypted_content\"],\"input\":[{\"role\":\"developer\",\"content\":[{\"type\":\"input_text\",\"text\":") catch return error.OutOfMemory;
     std.json.Stringify.value(instructions, .{}, writer) catch return error.OutOfMemory;
     writer.writeAll("}]}") catch return error.OutOfMemory;
+
     for (continuation.value.array.items) |item| {
         writer.writeAll(",") catch return error.OutOfMemory;
         std.json.Stringify.value(item, .{}, writer) catch return error.OutOfMemory;
     }
+
     writer.writeAll(",{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":") catch return error.OutOfMemory;
     std.json.Stringify.value(user_text, .{}, writer) catch return error.OutOfMemory;
-    writer.writeAll("}]}],\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(proposal.schema_name, .{}, writer) catch return error.OutOfMemory;
-    writer.writeAll(",\"strict\":true,\"schema\":") catch return error.OutOfMemory;
-    writer.writeAll(proposal.strict_schema_json) catch return error.OutOfMemory;
-    writer.writeAll("}}}") catch return error.OutOfMemory;
+    writer.writeAll("}]}]") catch return error.OutOfMemory;
+
+    switch (mode) {
+        .structured_result => {
+            writer.writeAll(",\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":") catch return error.OutOfMemory;
+            std.json.Stringify.value(proposal.schema_name, .{}, writer) catch return error.OutOfMemory;
+            writer.writeAll(",\"strict\":true,\"schema\":") catch return error.OutOfMemory;
+            writer.writeAll(proposal.strict_schema_json) catch return error.OutOfMemory;
+            writer.writeAll("}}}") catch return error.OutOfMemory;
+        },
+        .native_function => {
+            writer.writeAll(",\"tools\":[") catch return error.OutOfMemory;
+            writer.writeAll(tool_call.responses_tool_json) catch return error.OutOfMemory;
+            writer.writeAll("],\"tool_choice\":") catch return error.OutOfMemory;
+            switch (native_choice) {
+                .auto => writer.writeAll("\"auto\"") catch return error.OutOfMemory,
+                .force => writer.writeAll("{\"type\":\"function\",\"name\":\"run_server_command\"}") catch return error.OutOfMemory,
+            }
+            writer.writeAll(",\"parallel_tool_calls\":false}") catch return error.OutOfMemory;
+        },
+    }
+
+    if (writer.buffered().len > types.max_request_body_bytes) return error.RequestTooLarge;
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+pub fn buildContinuationRequest(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    instructions: []const u8,
+    continuation_json: []const u8,
+    call_id: []const u8,
+    output: []const u8,
+) Error![]u8 {
+    if (!validText(model, 256) or !validText(instructions, types.max_message_bytes) or !validText(call_id, 128)) return error.InvalidInput;
+    if (continuation_json.len > types.max_continuation_bytes or output.len > types.max_structured_output_bytes) return error.RequestTooLarge;
+
+    var continuation = std.json.parseFromSlice(std.json.Value, allocator, continuation_json, .{}) catch return error.InvalidInput;
+    defer continuation.deinit();
+    if (continuation.value != .array) return error.InvalidInput;
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+
+    writer.writeAll("{\"model\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(model, .{}, writer) catch return error.OutOfMemory;
+    writer.writeAll(",\"stream\":true,\"store\":false,\"background\":false,\"include\":[\"reasoning.encrypted_content\"],\"input\":[{\"role\":\"developer\",\"content\":[{\"type\":\"input_text\",\"text\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(instructions, .{}, writer) catch return error.OutOfMemory;
+    writer.writeAll("}]}") catch return error.OutOfMemory;
+
+    for (continuation.value.array.items) |item| {
+        writer.writeAll(",") catch return error.OutOfMemory;
+        std.json.Stringify.value(item, .{}, writer) catch return error.OutOfMemory;
+    }
+
+    writer.writeAll(",{\"type\":\"function_call_output\",\"call_id\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(call_id, .{}, writer) catch return error.OutOfMemory;
+    writer.writeAll(",\"output\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(output, .{}, writer) catch return error.OutOfMemory;
+    writer.writeAll("}],\"tools\":[") catch return error.OutOfMemory;
+    writer.writeAll(tool_call.responses_tool_json) catch return error.OutOfMemory;
+    writer.writeAll("],\"tool_choice\":\"none\",\"parallel_tool_calls\":false}") catch return error.OutOfMemory;
+
     if (writer.buffered().len > types.max_request_body_bytes) return error.RequestTooLarge;
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
@@ -68,6 +146,9 @@ fn validText(value: []const u8, max: usize) bool {
 const Item = struct {
     id: []const u8,
     type: []const u8,
+    call_id: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    arguments: ?[]const u8 = null,
 };
 
 const ItemEvent = struct {
@@ -85,15 +166,30 @@ const TextDone = struct {
     text: []const u8,
 };
 
+const FunctionArgsDelta = struct {
+    type: []const u8,
+    item_id: []const u8,
+    delta: []const u8,
+};
+
+const FunctionArgsDone = struct {
+    type: []const u8,
+    item_id: []const u8,
+    arguments: []const u8,
+};
+
 const Envelope = struct { type: []const u8 };
 
 const ItemIdentity = struct {
     id: []u8,
     kind: []u8,
+    done: bool = false,
 };
 
 pub const State = struct {
     allocator: std.mem.Allocator,
+    tool_mode: types.ToolMode = .structured_result,
+    is_continuation: bool = false,
     output: std.ArrayList(u8) = .empty,
     items: std.ArrayList(ItemIdentity) = .empty,
     continuation_items: std.ArrayList([]u8) = .empty,
@@ -105,8 +201,20 @@ pub const State = struct {
     saw_refusal: bool = false,
     result: ?proposal.Validated = null,
 
+    function_call_count: usize = 0,
+    active_function_call_id: ?[]u8 = null,
+    active_function_call_name: ?[]u8 = null,
+    active_function_call_call_id: ?[]u8 = null,
+    function_call_arguments: std.ArrayList(u8) = .empty,
+    function_call_arguments_done: bool = false,
+    preamble: ?[]u8 = null,
+
     pub fn init(allocator: std.mem.Allocator) State {
-        return .{ .allocator = allocator };
+        return .{ .allocator = allocator, .tool_mode = .structured_result, .is_continuation = false };
+    }
+
+    pub fn initWithMode(allocator: std.mem.Allocator, tool_mode: types.ToolMode, is_continuation: bool) State {
+        return .{ .allocator = allocator, .tool_mode = tool_mode, .is_continuation = is_continuation };
     }
 
     pub fn deinit(self: *State) void {
@@ -119,6 +227,11 @@ pub const State = struct {
         for (self.continuation_items.items) |item| self.allocator.free(item);
         self.continuation_items.deinit(self.allocator);
         if (self.result) |*value| value.deinit(self.allocator);
+        if (self.active_function_call_id) |v| self.allocator.free(v);
+        if (self.active_function_call_name) |v| self.allocator.free(v);
+        if (self.active_function_call_call_id) |v| self.allocator.free(v);
+        self.function_call_arguments.deinit(self.allocator);
+        if (self.preamble) |v| self.allocator.free(v);
     }
 
     pub fn sink(self: *State) sse.Sink {
@@ -144,6 +257,21 @@ pub const State = struct {
             try self.addItem(event.data);
         } else if (std.mem.eql(u8, event_type, "response.output_item.done")) {
             try self.finishItem(event.data);
+        } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.delta")) {
+            if (self.terminal != .none or self.saw_refusal) return error.MalformedKnownEvent;
+            var parsed = std.json.parseFromSlice(FunctionArgsDelta, self.allocator, event.data, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedKnownEvent;
+            defer parsed.deinit();
+            if (self.active_function_call_id == null or !std.mem.eql(u8, self.active_function_call_id.?, parsed.value.item_id)) return error.InconsistentItem;
+            if (self.function_call_arguments_done) return error.InconsistentItem;
+            if (!std.unicode.utf8ValidateSlice(parsed.value.delta) or std.mem.indexOfScalar(u8, parsed.value.delta, 0) != null or self.function_call_arguments.items.len + parsed.value.delta.len > types.max_structured_output_bytes) return error.OutputTooLarge;
+            self.function_call_arguments.appendSlice(self.allocator, parsed.value.delta) catch return error.OutOfMemory;
+        } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.done")) {
+            var parsed = std.json.parseFromSlice(FunctionArgsDone, self.allocator, event.data, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedKnownEvent;
+            defer parsed.deinit();
+            if (self.active_function_call_id == null or !std.mem.eql(u8, self.active_function_call_id.?, parsed.value.item_id)) return error.InconsistentItem;
+            if (self.function_call_arguments_done) return error.InconsistentItem;
+            if (!std.mem.eql(u8, parsed.value.arguments, self.function_call_arguments.items)) return error.InconsistentItem;
+            self.function_call_arguments_done = true;
         } else if (std.mem.eql(u8, event_type, "response.output_text.delta")) {
             if (self.terminal != .none or self.saw_refusal) return error.MalformedKnownEvent;
             var parsed = std.json.parseFromSlice(TextDelta, self.allocator, event.data, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedKnownEvent;
@@ -154,7 +282,7 @@ pub const State = struct {
             var parsed = std.json.parseFromSlice(TextDone, self.allocator, event.data, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedKnownEvent;
             defer parsed.deinit();
             self.text_done_count += 1;
-            if (self.text_done_count > 1) return error.MultipleStructuredOutputs;
+            if (self.text_done_count > 1 and self.tool_mode == .structured_result) return error.MultipleStructuredOutputs;
             if (!std.mem.eql(u8, parsed.value.text, self.output.items)) return error.InconsistentItem;
         } else if (std.mem.startsWith(u8, event_type, "response.refusal.")) {
             if (self.terminal != .none) return error.MalformedKnownEvent;
@@ -166,21 +294,36 @@ pub const State = struct {
         } else if (std.mem.eql(u8, event_type, "response.failed") or std.mem.eql(u8, event_type, "error")) {
             try self.setTerminal(.failed);
         }
-        // Unknown bounded event types are ignored. The known terminal and
-        // structured-output invariants are still required by finish().
     }
 
     fn addItem(self: *State, bytes: []const u8) Error!void {
         var parsed = std.json.parseFromSlice(ItemEvent, self.allocator, bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedKnownEvent;
         defer parsed.deinit();
-        if (parsed.value.item.id.len == 0 or parsed.value.item.type.len == 0) return error.MalformedKnownEvent;
+        if (!validText(parsed.value.item.id, 128) or parsed.value.item.type.len == 0) return error.MalformedKnownEvent;
         for (self.items.items) |item| if (std.mem.eql(u8, item.id, parsed.value.item.id)) return error.InconsistentItem;
-        if (isToolType(parsed.value.item.type)) return error.ToolCallRejected;
-        if (!std.mem.eql(u8, parsed.value.item.type, "message") and !std.mem.eql(u8, parsed.value.item.type, "reasoning")) return error.MalformedKnownEvent;
-        if (std.mem.eql(u8, parsed.value.item.type, "message")) {
+
+        if (std.mem.eql(u8, parsed.value.item.type, "function_call")) {
+            if (self.tool_mode == .structured_result or self.is_continuation) return error.ToolCallRejected;
+            if (self.function_call_count > 0) return error.MultipleStructuredOutputs;
+            const item_name = parsed.value.item.name orelse return error.MalformedKnownEvent;
+            if (!std.mem.eql(u8, item_name, tool_call.tool_name)) return error.InvalidToolName;
+            const call_id = parsed.value.item.call_id orelse return error.MalformedKnownEvent;
+            if (!validText(call_id, 128)) return error.MalformedKnownEvent;
+
+            self.active_function_call_id = try self.allocator.dupe(u8, parsed.value.item.id);
+            self.active_function_call_name = try self.allocator.dupe(u8, item_name);
+            self.active_function_call_call_id = try self.allocator.dupe(u8, call_id);
+            self.function_call_count += 1;
+        } else if (isToolType(parsed.value.item.type)) {
+            return error.ToolCallRejected;
+        } else if (std.mem.eql(u8, parsed.value.item.type, "message")) {
+            if (self.function_call_count > 0) return error.MultipleStructuredOutputs;
             self.message_count += 1;
-            if (self.message_count > 1) return error.MultipleStructuredOutputs;
+            if (self.message_count > 1 and self.tool_mode == .structured_result) return error.MultipleStructuredOutputs;
+        } else if (!std.mem.eql(u8, parsed.value.item.type, "reasoning")) {
+            return error.MalformedKnownEvent;
         }
+
         const id = self.allocator.dupe(u8, parsed.value.item.id) catch return error.OutOfMemory;
         errdefer self.allocator.free(id);
         const kind = self.allocator.dupe(u8, parsed.value.item.type) catch return error.OutOfMemory;
@@ -190,9 +333,27 @@ pub const State = struct {
     fn finishItem(self: *State, bytes: []const u8) Error!void {
         var parsed = std.json.parseFromSlice(ItemEvent, self.allocator, bytes, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedKnownEvent;
         defer parsed.deinit();
-        for (self.items.items) |item| {
+        for (self.items.items) |*item| {
             if (!std.mem.eql(u8, item.id, parsed.value.item.id)) continue;
             if (!std.mem.eql(u8, item.kind, parsed.value.item.type)) return error.InconsistentItem;
+            if (item.done) return error.InconsistentItem;
+
+            if (std.mem.eql(u8, item.kind, "function_call")) {
+                const final_call_id = parsed.value.item.call_id orelse return error.MalformedKnownEvent;
+                const final_name = parsed.value.item.name orelse return error.MalformedKnownEvent;
+                const final_arguments = parsed.value.item.arguments orelse return error.MalformedKnownEvent;
+                if (!validText(final_call_id, 128) or
+                    self.active_function_call_call_id == null or !std.mem.eql(u8, self.active_function_call_call_id.?, final_call_id) or
+                    self.active_function_call_name == null or !std.mem.eql(u8, self.active_function_call_name.?, final_name) or
+                    !self.function_call_arguments_done or !std.mem.eql(u8, self.function_call_arguments.items, final_arguments)) return error.InconsistentItem;
+            }
+
+            if (std.mem.eql(u8, item.kind, "message") and self.tool_mode == .native_function and self.function_call_count == 0) {
+                if (self.output.items.len > 0 and self.preamble == null) {
+                    self.preamble = self.allocator.dupe(u8, self.output.items) catch return error.OutOfMemory;
+                }
+            }
+
             var document = std.json.parseFromSlice(std.json.Value, self.allocator, bytes, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedKnownEvent;
             defer document.deinit();
             const object = if (document.value == .object) document.value.object else return error.MalformedKnownEvent;
@@ -205,6 +366,7 @@ pub const State = struct {
             errdefer self.allocator.free(owned);
             self.continuation_items.append(self.allocator, owned) catch return error.OutOfMemory;
             self.continuation_bytes += owned.len;
+            item.done = true;
             return;
         }
         return error.InconsistentItem;
@@ -215,15 +377,72 @@ pub const State = struct {
             try self.setTerminal(.refused);
             return;
         }
+
+        if (self.function_call_count == 1) {
+            if (!self.created or !self.function_call_arguments_done or self.function_call_arguments.items.len == 0) return error.MissingStructuredOutput;
+            for (self.items.items) |item| if (!item.done) return error.MissingStructuredOutput;
+            var parsed_args = tool_call.parseArguments(self.allocator, self.function_call_arguments.items) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.LimitExceeded => error.OutputTooLarge,
+                else => error.OutputInvalid,
+            };
+            errdefer parsed_args.deinit(self.allocator);
+
+            const provider_call_id = try self.allocator.dupe(u8, self.active_function_call_call_id orelse return error.MissingStructuredOutput);
+            errdefer self.allocator.free(provider_call_id);
+
+            const tool_name_owned = try self.allocator.dupe(u8, tool_call.tool_name);
+            errdefer self.allocator.free(tool_name_owned);
+
+            const preamble = self.preamble;
+            self.preamble = null;
+
+            try self.setTerminal(.completed);
+            self.result = .{
+                .kind = .command,
+                .message = null,
+                .command = parsed_args.command,
+                .question = null,
+                .explanation = parsed_args.explanation,
+                .model_destructive = parsed_args.model_destructive,
+                .local_destructive = parsed_args.local_destructive,
+                .needs_sudo = parsed_args.needs_sudo,
+                .tool_mode = .native_function,
+                .provider_call_id = provider_call_id,
+                .tool_name = tool_name_owned,
+                .preamble = preamble,
+            };
+            return;
+        }
+
         if (!self.created or self.message_count != 1 or self.text_done_count != 1 or self.output.items.len == 0) return error.MissingStructuredOutput;
-        var validated = proposal.parse(self.allocator, self.output.items) catch |err| return switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.LimitExceeded => error.OutputTooLarge,
-            else => error.OutputInvalid,
-        };
-        errdefer validated.deinit(self.allocator);
-        try self.setTerminal(.completed);
-        self.result = validated;
+
+        if (self.tool_mode == .structured_result) {
+            var validated = proposal.parse(self.allocator, self.output.items) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.LimitExceeded => error.OutputTooLarge,
+                else => error.OutputInvalid,
+            };
+            errdefer validated.deinit(self.allocator);
+            try self.setTerminal(.completed);
+            self.result = validated;
+        } else {
+            const msg = self.allocator.dupe(u8, self.output.items) catch return error.OutOfMemory;
+            errdefer self.allocator.free(msg);
+            const exp = self.allocator.dupe(u8, self.output.items) catch return error.OutOfMemory;
+            try self.setTerminal(.completed);
+            self.result = .{
+                .kind = .message,
+                .message = msg,
+                .command = null,
+                .question = null,
+                .explanation = exp,
+                .model_destructive = false,
+                .local_destructive = false,
+                .needs_sudo = false,
+                .tool_mode = .native_function,
+            };
+        }
     }
 
     fn setTerminal(self: *State, terminal: Terminal) Error!void {
@@ -255,12 +474,12 @@ pub const State = struct {
 };
 
 fn isToolType(kind: []const u8) bool {
-    const tool_types = [_][]const u8{ "function_call", "shell_call", "computer_call", "mcp_call", "custom_tool_call", "local_shell_call", "web_search_call", "file_search_call", "code_interpreter_call" };
+    const tool_types = [_][]const u8{ "shell_call", "computer_call", "mcp_call", "custom_tool_call", "local_shell_call", "web_search_call", "file_search_call", "code_interpreter_call" };
     for (tool_types) |tool| if (std.mem.eql(u8, kind, tool)) return true;
     return false;
 }
 
-test "Responses request is stateless strict streamed and tool-free" {
+test "Responses request is stateless strict streamed and tool-free in structured_result mode" {
     const body = try buildRequest(std.testing.allocator, "gpt-5", "Return one safe proposal.", "Inspect the host.");
     defer std.testing.allocator.free(body);
     try std.testing.expect(body.len <= types.max_request_body_bytes);
@@ -272,6 +491,60 @@ test "Responses request is stateless strict streamed and tool-free" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"message\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "previous_response_id") == null);
+}
+
+test "Responses request declares strict run_server_command in native_function mode" {
+    const body = try buildRequestWithMode(std.testing.allocator, "gpt-5", "Return one safe command.", "Inspect disk space.", "[]", .native_function);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(body.len <= types.max_request_body_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"run_server_command\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"parallel_tool_calls\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"json_schema\"") == null);
+}
+
+test "Responses rejects incomplete or changed final function-call identity" {
+    var missing_call_id = State.initWithMode(std.testing.allocator, .native_function, false);
+    defer missing_call_id.deinit();
+    try missing_call_id.consume(.{ .name = "response.created", .data = "{\"type\":\"response.created\"}" });
+    try std.testing.expectError(error.MalformedKnownEvent, missing_call_id.consume(.{
+        .name = "response.output_item.added",
+        .data = "{\"type\":\"response.output_item.added\",\"item\":{\"id\":\"call_missing\",\"type\":\"function_call\",\"name\":\"run_server_command\"}}",
+    }));
+
+    const args = "{\"command\":\"df -h\",\"explanation\":\"Inspect disk use.\",\"destructive\":false,\"needs_sudo\":false}";
+    var changed = State.initWithMode(std.testing.allocator, .native_function, false);
+    defer changed.deinit();
+    try changed.consume(.{ .name = "response.created", .data = "{\"type\":\"response.created\"}" });
+    try changed.consume(.{ .name = "response.output_item.added", .data = "{\"type\":\"response.output_item.added\",\"item\":{\"id\":\"call_1\",\"type\":\"function_call\",\"call_id\":\"provider_call_1\",\"name\":\"run_server_command\"}}" });
+    const delta = try std.fmt.allocPrint(std.testing.allocator, "{{\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"call_1\",\"delta\":{f}}}", .{std.json.fmt(args, .{})});
+    defer std.testing.allocator.free(delta);
+    try changed.consume(.{ .name = "response.function_call_arguments.delta", .data = delta });
+    const done = try std.fmt.allocPrint(std.testing.allocator, "{{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"call_1\",\"arguments\":{f}}}", .{std.json.fmt(args, .{})});
+    defer std.testing.allocator.free(done);
+    try changed.consume(.{ .name = "response.function_call_arguments.done", .data = done });
+    try std.testing.expectError(error.InconsistentItem, changed.consume(.{
+        .name = "response.output_item.done",
+        .data = "{\"type\":\"response.output_item.done\",\"item\":{\"id\":\"call_1\",\"type\":\"function_call\",\"call_id\":\"provider_call_2\",\"name\":\"run_server_command\",\"arguments\":\"{}\"}}",
+    }));
+}
+
+test "Responses rejects a duplicate output_item.done event" {
+    var state = State.initWithMode(std.testing.allocator, .native_function, false);
+    defer state.deinit();
+    try state.consume(.{ .name = "response.created", .data = "{\"type\":\"response.created\"}" });
+    try state.consume(.{ .name = "response.output_item.added", .data = "{\"type\":\"response.output_item.added\",\"item\":{\"id\":\"call_1\",\"type\":\"function_call\",\"call_id\":\"provider_call_1\",\"name\":\"run_server_command\"}}" });
+    const arguments = "{\"command\":\"df -h\",\"explanation\":\"Inspect disk use.\",\"destructive\":false,\"needs_sudo\":false}";
+    const delta = try std.fmt.allocPrint(std.testing.allocator, "{{\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"call_1\",\"delta\":{f}}}", .{std.json.fmt(arguments, .{})});
+    defer std.testing.allocator.free(delta);
+    try state.consume(.{ .name = "response.function_call_arguments.delta", .data = delta });
+    const done = try std.fmt.allocPrint(std.testing.allocator, "{{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"call_1\",\"arguments\":{f}}}", .{std.json.fmt(arguments, .{})});
+    defer std.testing.allocator.free(done);
+    try state.consume(.{ .name = "response.function_call_arguments.done", .data = done });
+    const final_item = try std.fmt.allocPrint(std.testing.allocator, "{{\"type\":\"response.output_item.done\",\"item\":{{\"id\":\"call_1\",\"type\":\"function_call\",\"call_id\":\"provider_call_1\",\"name\":\"run_server_command\",\"arguments\":{f}}}}}", .{std.json.fmt(arguments, .{})});
+    defer std.testing.allocator.free(final_item);
+    try state.consume(.{ .name = "response.output_item.done", .data = final_item });
+    try std.testing.expectError(error.InconsistentItem, state.consume(.{ .name = "response.output_item.done", .data = final_item }));
 }
 
 test "Responses typed stream yields one locally validated proposal at every transport split" {
@@ -298,10 +571,112 @@ test "Responses typed stream yields one locally validated proposal at every tran
     }
 }
 
-test "Responses rejects tools malformed identity duplicate terminals and missing terminal" {
+test "Responses native_function mode parses function call across transport splits" {
+    const args_doc = "{\"command\":\"df -h\",\"explanation\":\"Check disk capacity.\",\"destructive\":false,\"needs_sudo\":false}";
+    const stream = try std.fmt.allocPrint(std.testing.allocator, "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_2\"}}}}\n\n" ++
+        "event: response.output_item.added\ndata: {{\"type\":\"response.output_item.added\",\"item\":{{\"id\":\"call_1\",\"type\":\"function_call\",\"call_id\":\"call_xyz\",\"name\":\"run_server_command\"}}}}\n\n" ++
+        "event: response.function_call_arguments.delta\ndata: {{\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"call_1\",\"delta\":{f}}}\n\n" ++
+        "event: response.function_call_arguments.done\ndata: {{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"call_1\",\"arguments\":{f}}}\n\n" ++
+        "event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"item\":{{\"id\":\"call_1\",\"type\":\"function_call\",\"call_id\":\"call_xyz\",\"name\":\"run_server_command\",\"arguments\":{f}}}}}\n\n" ++
+        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\"}}}}\n\n", .{ std.json.fmt(args_doc, .{}), std.json.fmt(args_doc, .{}), std.json.fmt(args_doc, .{}) });
+    defer std.testing.allocator.free(stream);
+
+    var split: usize = 0;
+    while (split <= stream.len) : (split += 1) {
+        var adapter = State.initWithMode(std.testing.allocator, .native_function, false);
+        defer adapter.deinit();
+        var parser = sse.Parser.init(std.testing.allocator);
+        defer parser.deinit();
+        try parser.feed(stream[0..split], adapter.sink());
+        try parser.feed(stream[split..], adapter.sink());
+        try parser.finish();
+        try adapter.finish();
+        try std.testing.expectEqualStrings("df -h", adapter.result.?.command.?);
+        try std.testing.expectEqualStrings("call_xyz", adapter.result.?.provider_call_id.?);
+        try std.testing.expectEqualStrings("run_server_command", adapter.result.?.tool_name.?);
+    }
+}
+
+test "Responses native_function mode parses preamble text before function call" {
+    const args_doc = "{\"command\":\"free -m\",\"explanation\":\"Check free memory.\",\"destructive\":false,\"needs_sudo\":false}";
+    const stream = try std.fmt.allocPrint(std.testing.allocator, "event: response.created\ndata: {{\"type\":\"response.created\"}}\n\n" ++
+        "event: response.output_item.added\ndata: {{\"type\":\"response.output_item.added\",\"item\":{{\"id\":\"msg_pre\",\"type\":\"message\"}}}}\n\n" ++
+        "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"Let me check the memory usage.\"}}\n\n" ++
+        "event: response.output_text.done\ndata: {{\"type\":\"response.output_text.done\",\"text\":\"Let me check the memory usage.\"}}\n\n" ++
+        "event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"item\":{{\"id\":\"msg_pre\",\"type\":\"message\"}}}}\n\n" ++
+        "event: response.output_item.added\ndata: {{\"type\":\"response.output_item.added\",\"item\":{{\"id\":\"call_2\",\"type\":\"function_call\",\"call_id\":\"call_abc\",\"name\":\"run_server_command\"}}}}\n\n" ++
+        "event: response.function_call_arguments.delta\ndata: {{\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"call_2\",\"delta\":{f}}}\n\n" ++
+        "event: response.function_call_arguments.done\ndata: {{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"call_2\",\"arguments\":{f}}}\n\n" ++
+        "event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"item\":{{\"id\":\"call_2\",\"type\":\"function_call\",\"call_id\":\"call_abc\",\"name\":\"run_server_command\",\"arguments\":{f}}}}}\n\n" ++
+        "event: response.completed\ndata: {{\"type\":\"response.completed\"}}\n\n", .{ std.json.fmt(args_doc, .{}), std.json.fmt(args_doc, .{}), std.json.fmt(args_doc, .{}) });
+    defer std.testing.allocator.free(stream);
+
+    var adapter = State.initWithMode(std.testing.allocator, .native_function, false);
+    defer adapter.deinit();
+    var parser = sse.Parser.init(std.testing.allocator);
+    defer parser.deinit();
+    try parser.feed(stream, adapter.sink());
+    try parser.finish();
+    try adapter.finish();
+
+    try std.testing.expectEqualStrings("free -m", adapter.result.?.command.?);
+    try std.testing.expectEqualStrings("Let me check the memory usage.", adapter.result.?.preamble.?);
+}
+
+test "Responses continuation request builds function_call_output and rejects second tool call" {
+    const continuation_items = "[{\"id\":\"call_1\",\"type\":\"function_call\",\"call_id\":\"call_xyz\",\"name\":\"run_server_command\"}]";
+    const req = try buildContinuationRequest(std.testing.allocator, "gpt-5", "Explain the output.", continuation_items, "call_xyz", "Filesystem 100% full");
+    defer std.testing.allocator.free(req);
+
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"function_call_output\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"call_xyz\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "Filesystem 100% full") != null);
+
+    // If provider tries to return a tool call during continuation, State rejects it
+    var cont_state = State.initWithMode(std.testing.allocator, .native_function, true);
+    defer cont_state.deinit();
+    try std.testing.expectError(error.ToolCallRejected, cont_state.consume(.{
+        .name = "response.output_item.added",
+        .data = "{\"type\":\"response.output_item.added\",\"item\":{\"id\":\"call_nested\",\"type\":\"function_call\",\"call_id\":\"call_nested\",\"name\":\"run_server_command\"}}",
+    }));
+}
+
+test "Responses rejects invalid tool names duplicate tool calls and mismatched arguments" {
+    var state = State.initWithMode(std.testing.allocator, .native_function, false);
+    defer state.deinit();
+    try state.consume(.{ .name = "response.created", .data = "{\"type\":\"response.created\"}" });
+    // Unknown tool name
+    try std.testing.expectError(error.InvalidToolName, state.consume(.{
+        .name = "response.output_item.added",
+        .data = "{\"type\":\"response.output_item.added\",\"item\":{\"id\":\"call_bad\",\"type\":\"function_call\",\"name\":\"unauthorized_tool\"}}",
+    }));
+
+    var state2 = State.initWithMode(std.testing.allocator, .native_function, false);
+    defer state2.deinit();
+    try state2.consume(.{ .name = "response.created", .data = "{\"type\":\"response.created\"}" });
+    try state2.consume(.{ .name = "response.output_item.added", .data = "{\"type\":\"response.output_item.added\",\"item\":{\"id\":\"call_1\",\"type\":\"function_call\",\"call_id\":\"provider_call_1\",\"name\":\"run_server_command\"}}" });
+    // Duplicate tool call
+    try std.testing.expectError(error.MultipleStructuredOutputs, state2.consume(.{
+        .name = "response.output_item.added",
+        .data = "{\"type\":\"response.output_item.added\",\"item\":{\"id\":\"call_2\",\"type\":\"function_call\",\"call_id\":\"provider_call_2\",\"name\":\"run_server_command\"}}",
+    }));
+
+    var state3 = State.initWithMode(std.testing.allocator, .native_function, false);
+    defer state3.deinit();
+    try state3.consume(.{ .name = "response.created", .data = "{\"type\":\"response.created\"}" });
+    try state3.consume(.{ .name = "response.output_item.added", .data = "{\"type\":\"response.output_item.added\",\"item\":{\"id\":\"call_1\",\"type\":\"function_call\",\"call_id\":\"provider_call_1\",\"name\":\"run_server_command\"}}" });
+    try state3.consume(.{ .name = "response.function_call_arguments.delta", .data = "{\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"call_1\",\"delta\":\"{\\\"command\\\":\\\"ls\\\"}\"}" });
+    // Done arguments do not match accumulated delta
+    try std.testing.expectError(error.InconsistentItem, state3.consume(.{
+        .name = "response.function_call_arguments.done",
+        .data = "{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"call_1\",\"arguments\":\"{\\\"command\\\":\\\"other\\\"}\"}",
+    }));
+}
+
+test "Responses rejects tools in structured_result mode and handles missing terminal" {
     var tools = State.init(std.testing.allocator);
     defer tools.deinit();
-    try std.testing.expectError(error.ToolCallRejected, tools.consume(.{ .name = "response.output_item.added", .data = "{\"type\":\"response.output_item.added\",\"item\":{\"id\":\"call_1\",\"type\":\"function_call\"}}" }));
+    try std.testing.expectError(error.ToolCallRejected, tools.consume(.{ .name = "response.output_item.added", .data = "{\"type\":\"response.output_item.added\",\"item\":{\"id\":\"call_1\",\"type\":\"function_call\",\"name\":\"run_server_command\"}}" }));
 
     var identity = State.init(std.testing.allocator);
     defer identity.deinit();

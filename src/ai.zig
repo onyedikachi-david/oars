@@ -19,6 +19,7 @@ pub const provider_domain = @import("ai/provider.zig");
 pub const credentials = @import("ai/credentials.zig");
 pub const sse = @import("ai/sse.zig");
 pub const proposal = @import("ai/proposal.zig");
+pub const tool_call = @import("ai/tool_call.zig");
 pub const responses = @import("ai/responses.zig");
 pub const chat = @import("ai/chat.zig");
 pub const transport = @import("ai/transport.zig");
@@ -35,6 +36,7 @@ comptime {
     _ = credentials;
     _ = sse;
     _ = proposal;
+    _ = tool_call;
     _ = responses;
     _ = chat;
     _ = transport;

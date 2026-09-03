@@ -295,7 +295,6 @@ fn cloneValue(allocator: std.mem.Allocator, value: *const std.json.Value) !std.j
     };
 }
 
-
 fn freeValue(allocator: std.mem.Allocator, value: *std.json.Value) void {
     switch (value.*) {
         .null, .bool, .integer, .float => {},
