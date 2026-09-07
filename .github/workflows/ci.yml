@@ -157,12 +157,14 @@ jobs:
         run: |
           mkdir -p zig-out/release
           ditto -c -k --sequesterRsrc --keepParent zig-out/package/*.app "zig-out/release/oars-${PACKAGE_LABEL}-macos.zip"
+          cp "zig-out/release/oars-${PACKAGE_LABEL}-macos.zip" zig-out/release/oars-macos.zip
       - name: Archive Linux package
         if: runner.os == 'Linux'
         shell: bash
         run: |
           mkdir -p zig-out/release
           tar -C zig-out/package -czf "zig-out/release/oars-${PACKAGE_LABEL}-linux-x86_64.tar.gz" .
+          cp "zig-out/release/oars-${PACKAGE_LABEL}-linux-x86_64.tar.gz" zig-out/release/oars-linux-x86_64.tar.gz
       - name: Upload package
         uses: actions/upload-artifact@v7
         with:
@@ -188,7 +190,7 @@ jobs:
           path: release-assets
           merge-multiple: true
       - name: Generate checksums
-        run: sha256sum release-assets/* > release-assets/SHA256SUMS
+        run: (cd release-assets && sha256sum *) > release-assets/SHA256SUMS
       - name: Upload packages to the generated release
         env:
           GH_TOKEN: ${{ github.token }}

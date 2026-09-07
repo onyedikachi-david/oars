@@ -1,178 +1,167 @@
-# Oars
+<p align="center">
+  <a href="https://getoars.app">
+    <img src="website/public/brand/oars-symbol.png" width="140" height="140" alt="Oars logo">
+  </a>
+</p>
 
-Local-first Linux server management desktop app. Manage servers over SSH from a native desktop window — terminals, files, logs, monitoring, scripts, deployments, backups, and remote desktop — with local credential storage.
+<h1 align="center">Oars</h1>
 
-Built with a Zig core and a React frontend, shelled by the [Native SDK](https://github.com/native-sdk/native-sdk) WebView.
+<p align="center">
+  Operate every Linux server from one local window.<br>
+  Open source server management for macOS and Linux, built around SSH.
+</p>
 
-## Screenshots
+<p align="center">
+  <a href="https://getoars.app">Website</a> ·
+  <a href="#download">Download</a> ·
+  <a href="#get-started">Get started</a> ·
+  <a href="#local-development">Development</a> ·
+  <a href="https://github.com/onyedikachi-david/oars/issues">Issues</a> ·
+  <a href="https://github.com/sponsors/onyedikachi-david">Sponsor</a>
+</p>
 
-Real captures from the desktop app. Private connection details, file names, and
-infrastructure information have been redacted.
+<p align="center">
+  <a href="https://github.com/onyedikachi-david/oars/actions/workflows/ci.yml">
+    <img src="https://github.com/onyedikachi-david/oars/actions/workflows/ci.yml/badge.svg" alt="CI build status">
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/license-MIT-bb9149" alt="MIT license">
+  </a>
+</p>
 
-![Oars remote desktop over SSH](website/public/screenshots/desktop-1600.webp)
+<a href="https://getoars.app">
+  <img src="website/public/screenshots/files-1600.webp" width="1600" height="1000" alt="Oars file manager with local files and a connected Linux server side by side">
+</a>
+
+Oars brings terminals, files, logs, monitoring, deployments, backups, and remote desktops into one desktop app. Connect to your Linux servers over SSH, keep connection credentials in your OS credential store, and move between daily tasks without leaving your workspace.
+
+Use it to investigate a slow server, move files, deploy an application, run scripts across your fleet, or open a remote desktop when you need a graphical interface.
+
+## Why Oars
+
+- **One workspace for your fleet.** Save server profiles, organize groups, and arrange sessions in tabs or split panes.
+- **Start with SSH.** Connect with a password, private key, or SSH agent, including through a jump host. Review host fingerprints before trusting a new server.
+- **See what is happening.** Inspect CPU, memory, disks, and processes, then search or follow logs without installing a monitoring agent.
+- **Work with files and terminals.** Open interactive shells and browse, transfer, edit, and manage remote files over SFTP.
+- **Run repeatable operations.** Save scripts, run them across servers, review deployment plans, and schedule rclone-backed backups.
+- **Manage server access.** Work with SSH keys, authorized users, key rotation, and onboarding or offboarding from the same workspace.
+- **Open a remote desktop.** Connect to VNC through an SSH tunnel, with clipboard controls, scaling, and full-screen mode.
+- **Bring your own AI provider.** Ask about server context and review proposed commands before execution.
+- **Keep a local record.** Search command history and audit events, review outcomes, and export your configuration.
+
+## Download
+
+[**Download for macOS**](https://github.com/onyedikachi-david/oars/releases/latest/download/oars-macos.zip) · [**Download for Linux (x86_64)**](https://github.com/onyedikachi-david/oars/releases/latest/download/oars-linux-x86_64.tar.gz)
+
+These links download the latest release files directly. Public release downloads do not require a GitHub account. See [release notes and checksums](https://github.com/onyedikachi-david/oars/releases) for more details.
+
+## Get started
+
+1. Choose your operating system from the [download links above](#download), or [build from source](#local-development).
+2. Open Oars and select **Add server**. Enter the host, SSH user, and authentication method.
+3. Check the server's host fingerprint against a trusted source, then connect.
+4. Open **Monitor**, **Terminal**, **Logs**, or **Files**, or choose another tool from the server's menu.
+
+Oars runs on macOS and Linux and connects to Linux servers. Windows is not currently supported. Some tools need software on the remote server, such as rclone for backups or a VNC server and desktop environment for remote desktop access.
+
+macOS packages are currently unsigned and not notarized. If macOS blocks a download you trust, follow [Apple's instructions for opening an unidentified app](https://support.apple.com/guide/mac-help/mh40616/mac).
+
+For newer builds, successful [CI runs](https://github.com/onyedikachi-david/oars/actions/workflows/ci.yml) provide `oars-macos` and `oars-linux` artifacts. These are release-optimized builds; downloading workflow artifacts requires a GitHub account.
+
+## In pictures
 
 <details>
-<summary>Explore files, logs, AI assistance, deployments, history, and full screen</summary>
+<summary><strong>Remote desktop</strong> — a Linux desktop inside your SSH workspace</summary>
 
-### Files
-![Local and remote file browsing](website/public/screenshots/files-1600.webp)
-
-### Logs
-![Server log sources and output](website/public/screenshots/logs-1600.webp)
-
-### AI assistance
-![Reviewed commands and server conversations](website/public/screenshots/ai-1600.webp)
-
-### Deployments
-![Preparing a deployment](website/public/screenshots/deploy-1600.webp)
-
-### History
-![Recorded commands and outcomes](website/public/screenshots/history-1600.webp)
-
-### Full-screen desktop
-![Full-screen remote desktop](website/public/screenshots/fullscreen-1600.webp)
+![Oars connected to an XFCE desktop over an SSH tunnel](website/public/screenshots/desktop-1600.webp)
 
 </details>
 
-## Features
+<details>
+<summary><strong>Logs</strong> — discover sources, search output, and follow changes</summary>
 
-- **Server fleet** — save connection profiles (host, port, user, auth) and open each server in its own tab.
-- **SSH terminal** — interactive PTY shell (xterm.js) with resize, scrollback, and concurrent exec channels.
-- **Host-key verification** — `SHA256:` fingerprints, first-connect trust dialog, and mismatch detection.
-- **Auth methods** — password, private key file (including Ed25519), and SSH agent (`SSH_AUTH_SOCK`) with optional jump-host chaining.
-- **Monitoring** — agentless CPU, memory, disk, load and process gauges via remote probes.
-- **Logs** — discover, read, tail, search, download, and truncate remote log files.
-- **File manager** — browse, upload, download, edit, rename, chmod, and archive files over SFTP.
-- **Scripts** — saved shell scripts with single-server and broadcast (multi-server) execution.
-- **Deployments** — app definitions with git-based deploys, run history, and streaming output.
-- **SSH keys** — `authorized_keys` management, key generation, rotation, and deploy keys / roles.
-- **Access management** — identities, onboarding/offboarding, rotation, and export.
-- **Backups** — rclone-backed backup jobs, test, run, history, and cron scheduling.
-- **AI terminal** — provider-configured assistant with context-aware execution (approval-gated).
-- **Remote desktop (VNC)** — tunneled VNC session via WebSocket/noVNC.
-- **History & audit** — bounded local journals of commands and mutating actions with redaction.
-- **Vault** — encrypted (`AES-256-GCM`/`PBKDF2`) and plain-JSON export/import of configuration.
+![Oars server log browser and log output](website/public/screenshots/logs-1600.webp)
 
-## Tech Stack
+</details>
 
-| Layer | Details |
-|---|---|
-| Core | Zig 0.16, hermetic build — no system dependencies |
-| SSH / Crypto | Vendored `libssh2 1.11.1` + `mbedTLS 3.6.2` compiled via `zig cc` (`third_party/`) |
-| Desktop shell | Native SDK WebView (`app.zon` / `build.zig`) |
-| Frontend | React 19 + TypeScript + Vite 8, `xterm 5.3` + `xterm-addon-fit`, `@novnc/novnc 1.7`, Tailwind CSS 4 |
-| Platforms | macOS and Linux (Windows packaging plumbing exists, but the app core is not yet Windows-compatible) |
+<details>
+<summary><strong>AI assistance</strong> — server conversations and reviewed commands</summary>
 
-## Project Structure
+![Oars AI assistant with a configured provider and a reviewed server command](website/public/screenshots/ai-1600.webp)
 
-```
-.
-├── app.zon            # Native SDK manifest (app id, permissions, frontend, window)
-├── build.zig          # Hermetic build: vendored C libs, SDK wiring, frontend steps
-├── build.zig.zon      # Zig package manifest
-├── src/               # Zig core (~33 modules)
-│   ├── main.zig       # App wiring + store initialization
-│   ├── bridge.zig     # oars.* RPC dispatcher (origin + permission gated)
-│   ├── sessions.zig   # Per-server worker threads (own all libssh2 calls)
-│   ├── ssh.zig        # Transport, channels, exec, PTY
-│   ├── openssh.zig    # OpenSSH private-key parsing + AES-CTR decrypt
-│   ├── sftp.zig       # SFTP file operations
-│   ├── monitor.zig    # Probe parsing (CPU deltas, mem/disk/processes)
-│   ├── logs.zig       # Log discovery + follow
-│   ├── scripts.zig / broadcast.zig / deploy.zig
-│   ├── access.zig / sshkeys.zig / keygen.zig
-│   ├── backup.zig / vault.zig / crypto.zig
-│   ├── vnc.zig / ws.zig / ai.zig
-│   ├── history.zig    # Bounded JSONL journals
-│   ├── shellquote.zig # Single shared POSIX quoting for all exec strings
-│   └── runner.zig     # Platform run loop
-├── frontend/
-│   ├── src/           # React app: App.tsx, TerminalTab, FilesTab, MonitorTab, etc.
-│   └── package.json
-├── third_party/
-│   ├── libssh2/       # Vendored, built from source
-│   └── mbedtls/       # Vendored, built from source
-├── scripts/           # Dev helpers (e.g. dockerized sshd for integration tests)
-└── website/           # Product website and sanitized screenshots
-```
+</details>
 
-## Prerequisites
+<details>
+<summary><strong>Deployments</strong> — prepare an application for deployment</summary>
 
-- **Zig 0.16**
-- **Node.js 24** and **npm** (frontend)
-- **Native SDK CLI 0.7.1** (`native`) — set `NATIVE_SDK_PATH` as below, or pass `-Dnative-sdk-path=…`. A local `native-sdk/` checkout is also supported.
-- **macOS:** Xcode Command Line Tools (`xcode-select --install`) for the WebView/ObjC hosts
-- **Linux:** GTK4 and WebKitGTK 6.0 development packages (for Ubuntu: `sudo apt install pkg-config libgtk-4-dev libwebkitgtk-6.0-dev`)
+![Oars application deployment workspace](website/public/screenshots/deploy-1600.webp)
 
-## Quick Start
+</details>
+
+<details>
+<summary><strong>History</strong> — commands, results, and audit events</summary>
+
+![Oars command history with timestamps, exit codes, and replay controls](website/public/screenshots/history-1600.webp)
+
+</details>
+
+<details>
+<summary><strong>Full screen</strong> — more room for your remote desktop</summary>
+
+![Oars remote desktop in full-screen mode](website/public/screenshots/fullscreen-1600.webp)
+
+</details>
+
+## Your data
+
+Server profiles, settings, command history, and audit records are stored on your device. Connection passwords and provider credentials use the OS credential store. Configuration exports exclude stored credentials and can be encrypted with a password.
+
+AI features send the context you choose to the provider you configure. Review that context before sending it. History redaction is best effort: unknown secrets can remain in command text or output. Interactive shell history capture is optional and requires shell integration.
+
+## Local development
+
+Oars uses a Zig core, a React and TypeScript frontend, and the [Native SDK](https://github.com/native-sdk/native-sdk) desktop WebView. SSH and cryptography use vendored libssh2 and mbedTLS sources.
+
+### Requirements
+
+- Zig **0.16**.
+- Node.js **24** and npm.
+- Native SDK CLI **0.7.1**.
+- **macOS:** Xcode Command Line Tools (`xcode-select --install`).
+- **Linux:** GTK4 and WebKitGTK 6.0 development packages. On Ubuntu, run `sudo apt install pkg-config libgtk-4-dev libwebkitgtk-6.0-dev`.
+
+### Run locally
 
 ```sh
-# Install the desktop SDK and point the build at it.
+git clone https://github.com/onyedikachi-david/oars.git
+cd oars
+
 npm install --global @native-sdk/cli@0.7.1
 export NATIVE_SDK_PATH="$(npm root --global)/@native-sdk/cli"
 
-# install frontend deps (also runs automatically via zig build)
-npm install --prefix frontend
-
-# run with live frontend (Vite dev server + native shell)
+npm ci --prefix frontend
 zig build dev
-
-# run the built frontend inside the native shell
-zig build run
-
-# tests
-zig build test
-
-# macOS production package (run on macOS)
-zig build package -Dpackage-target=macos
-
-# Linux production package (run on Linux)
-zig build package -Dpackage-target=linux
-# → zig-out/package/oars-<version>-<target>-ReleaseFast[.app]
-
-# sanity check for the manifest / SDK setup
-native doctor --manifest app.zon
 ```
 
-`zig build dev` starts the Vite dev server from `app.zon` (`http://127.0.0.1:5173`) and launches the shell with `NATIVE_SDK_FRONTEND_URL` once the dev server is ready. Frontend production assets are emitted to `frontend/dist`.
+This starts the Vite development server and the native desktop shell. You can also point `NATIVE_SDK_PATH` at a local SDK checkout or pass `-Dnative-sdk-path=/path/to/native-sdk`.
 
-Run each package command on its matching operating system. `-Dpackage-target` selects the package layout; it does not install or cross-compile the platform WebView dependencies. The GitHub Actions workflow in `.github/workflows/ci.yml` builds both supported targets on native runners and publishes them as workflow artifacts.
+### Common commands
 
-## Downloads and releases
+| Command | Purpose |
+| --- | --- |
+| `zig build dev` | Run the frontend dev server and native shell |
+| `zig build run` | Run the native shell with the built frontend |
+| `zig build test` | Run the Zig tests |
+| `npm --prefix frontend run typecheck` | Check frontend types |
+| `npm --prefix frontend test` | Run the frontend tests |
+| `zig build package -Dpackage-target=macos` | Build a macOS release package on macOS |
+| `zig build package -Dpackage-target=linux` | Build a Linux release package on Linux |
+| `native doctor --manifest app.zon` | Check desktop SDK and platform prerequisites |
 
-Oars uses the application ID `app.getoars`. The runtime
-reads it from `app.zon`, which also supplies the package metadata. Server data
-continues to use the `Oars` data directory. The legacy Keychain service name is
-retained for compatibility with existing saved credentials. macOS window and
-WebView preferences may start fresh after the bundle ID change.
+Packages are written to `zig-out/package/`. Run each package command on its matching operating system; the target option does not provide the other platform's WebView dependencies.
 
-macOS downloads are currently not Developer ID-signed or notarized. A paid Apple
-Developer Program membership is not required to build Oars or publish its ZIP.
-Users who trust the download can follow
-[Apple's instructions for opening an unidentified app](https://support.apple.com/guide/mac-help/mh40616/mac),
-using **System Settings → Privacy & Security → Open Anyway** when offered.
-
-
-Every successful CI run exposes temporary `oars-macos` and `oars-linux` downloads in the **Artifacts** section of that Actions run. GitHub's **Packages** panel is for package registries and is not used for Oars desktop binaries.
-
-Release Please reads Conventional Commits on `main` and automatically maintains a release pull request containing the next SemVer version and a detailed `CHANGELOG.md`. Merge that release PR when it is ready. The same workflow then creates the `vX.Y.Z` tag and GitHub Release, builds both desktop packages, and attaches the macOS ZIP, Linux tarball, and SHA-256 checksums. Do not create release tags manually.
-
-The application version is synchronized through `version.txt`, `app.zon`, and `build.zig`. Repository settings must allow the release bot to write and open pull requests: **Settings → Actions → General → Workflow permissions → Read and write permissions**, then enable **Allow GitHub Actions to create and approve pull requests**.
-
-Use Conventional Commit prefixes so the version and changelog category are calculated correctly: `feat:` for a minor release, `fix:` for a patch, and `feat!:`/`fix!:` or a `BREAKING CHANGE:` footer for a major release.
-
-## Commands
-
-| Command | What it does |
-|---|---|
-| `zig build dev` | Vite dev server + native shell (fast edit loop) |
-| `zig build run` | Native shell with built frontend |
-| `zig build test` | Zig test suite (`std.testing.allocator` leak checks) |
-| `zig build package -Dpackage-target=<macos\|linux>` | Release-optimized package for the current host OS under `zig-out/package/` |
-| `zig build frontend-install` | Explicit `npm install --prefix frontend` |
-| `zig build frontend-build` | Explicit `npm run build` for the frontend |
-| `native doctor --manifest app.zon` | Validate manifest / platform prerequisites |
-| `native cef install` | Fetch CEF runtime for Chromium WebView (macOS) |
+<details>
+<summary><strong>Build options and diagnostics</strong></summary>
 
 Common build options (see `build.zig`):
 
@@ -189,7 +178,20 @@ Diagnostics:
 NATIVE_SDK_LOG_DIR=/tmp/oars-logs NATIVE_SDK_LOG_FORMAT=jsonl zig build run
 ```
 
-## Architecture
+</details>
+
+<details>
+<summary><strong>Project layout and architecture</strong></summary>
+
+| Path | Contents |
+| --- | --- |
+| `src/` | Zig core, SSH sessions, storage, and native bridge |
+| `frontend/` | React interface, terminal, and feature tabs |
+| `website/` | Product website and redacted screenshots |
+| `third_party/` | Vendored libssh2 and mbedTLS sources |
+| `scripts/` | Development helpers and integration test fixtures |
+| `app.zon` | Application identity, permissions, and window configuration |
+| `build.zig` | Native build, frontend steps, and packaging |
 
 - **One worker thread per SSH session** owns every `libssh2` call (the library is not thread-safe). The main thread never blocks on the network.
 - **Bridge RPC** (`oars.*` in `src/bridge.zig`) is `invoke/response` only — no native-to-JS push. The frontend polls `oars.ssh.poll` (and feature-specific `poll` endpoints) with per-channel cursor deltas (`cursor`, `dropped`, `rewind`, 4 MB cap).
@@ -197,22 +199,31 @@ NATIVE_SDK_LOG_DIR=/tmp/oars-logs NATIVE_SDK_LOG_FORMAT=jsonl zig build run
 - **Persistence** — local JSON/JSONL stores (`servers.json`, `history.jsonl`, `audit.jsonl`, …) written atomically via `temp+rename` with `0600` file permissions; corrupt files are quarantined, not silently discarded.
 - **WebView origins** — `zero://app` (packaged) and `zero://inline` plus `http://127.0.0.1:5173` in dev; external navigation is denied. VNC's WebSocket upgrade validates the packaged origin and the `Sec-WebSocket-Key` handshake.
 
-## Security
+</details>
 
-- Secrets (passwords, key passphrases, VNC/AI/backup credentials) are stored in the OS Keychain via `native-sdk.credentials.*` and never written to config files. Export deliberately excludes secrets; import re-prompts on first connect.
-- Every `oars.*` command is origin-gated and, where it touches credentials or dialogs, permission-gated. Dialog and credential policies are declared in both `app.zon` and `src/main.zig`.
-- All values interpolated into remote shell commands go through a single POSIX single-quote routine (`src/shellquote.zig`); file operations that can avoid the shell use SFTP instead.
-- Mutating server actions are approval-gated; destructive operations require explicit confirmation. Executed commands are recorded in the local history/audit journals.
+<details>
+<summary><strong>Release process</strong></summary>
 
-## Frontend Development
+Release Please reads Conventional Commits on `main` and automatically maintains a release pull request containing the next SemVer version and a detailed `CHANGELOG.md`. Merge that release PR when it is ready. The same workflow then creates the `vX.Y.Z` tag and GitHub Release, builds both desktop packages, and attaches the macOS ZIP, Linux tarball, and SHA-256 checksums. Do not create release tags manually.
 
-```sh
-npm --prefix frontend run dev      # Vite dev server alone
-npm --prefix frontend run build    # production build → frontend/dist
-```
+The application version is synchronized through `version.txt`, `app.zon`, and `build.zig`. Repository settings must allow the release bot to write and open pull requests: **Settings → Actions → General → Workflow permissions → Read and write permissions**, then enable **Allow GitHub Actions to create and approve pull requests**.
 
-Frontend routing and tab state live in `frontend/src/App.tsx`; per-feature tabs are `*Tab.tsx` files; the bridge client is `frontend/src/bridge.ts` with shared types in `frontend/src/types.ts`.
+Use Conventional Commit prefixes so the version and changelog category are calculated correctly: `feat:` for a minor release, `fix:` for a patch, and `feat!:`/`fix!:` or a `BREAKING CHANGE:` footer for a major release.
+
+</details>
+
+## Contributing
+
+Bug reports and pull requests are welcome. For a bug, include your operating system, Oars version, reproduction steps, and relevant logs with credentials and private server details removed.
+
+For code changes, explain the problem and the resulting behavior, and run the checks relevant to your change. Use Conventional Commit titles such as `fix:` or `feat:` so releases can generate the changelog.
+
+## Support Oars
+
+If Oars helps you manage your servers, consider [sponsoring its development on GitHub](https://github.com/sponsors/onyedikachi-david). Your support helps fund maintenance and continued development.
+
+You can also help by [starring Oars on GitHub](https://github.com/onyedikachi-david/oars), reporting bugs, contributing fixes, or sharing it with other developers.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Oars is licensed under the [MIT License](LICENSE). Vendored dependencies retain their own licenses.

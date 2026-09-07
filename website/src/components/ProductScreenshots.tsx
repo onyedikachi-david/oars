@@ -1,5 +1,4 @@
 import { useState } from "react";
-import { ArrowUpRightIcon } from "./icons/arrow-up-right";
 
 const screenshots = {
   files: { title: "Files", caption: "Local and remote files, side by side.", alt: "Oars file manager showing local folders alongside a remote Linux filesystem. Private file names are redacted." },
@@ -18,7 +17,7 @@ export function ProductShot({ name, priority = false, caption = true }: { name: 
     <a className="product-shot__image" href={`/screenshots/${name}-2560.webp`} target="_blank" rel="noopener noreferrer" aria-label={`Open ${shot.title.toLowerCase()} screenshot at full size`}>
       <img src={`/screenshots/${name}-1600.webp`} srcSet={`/screenshots/${name}-960.webp 960w, /screenshots/${name}-1600.webp 1600w, /screenshots/${name}-2560.webp 2560w`} sizes="(max-width: 820px) 92vw, 1200px" width="1600" height="1000" alt={shot.alt} loading={priority ? "eager" : "lazy"} decoding="async" fetchPriority={priority ? "high" : "auto"} />
     </a>
-    {caption && <figcaption><span><strong>{shot.title}</strong>{shot.caption}</span><a href={`/screenshots/${name}-2560.webp`} target="_blank" rel="noopener noreferrer">Full size <ArrowUpRightIcon size={14} aria-hidden="true" /></a></figcaption>}
+    {caption && <figcaption><span><strong>{shot.title}</strong>{shot.caption}</span><a href={`/screenshots/${name}-2560.webp`} target="_blank" rel="noopener noreferrer">Full size <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><path d="M7 17 17 7M7 7h10v10" /></svg></a></figcaption>}
   </figure>;
 }
 
@@ -27,6 +26,5 @@ export function ScreenshotGallery() {
   return <div className="product-gallery">
     <div className="product-gallery__bar"><span>Inside Oars</span><div className="product-gallery__choices" role="group" aria-label="Choose a product screenshot">{(Object.keys(screenshots) as ScreenshotName[]).map(name => <button key={name} type="button" aria-pressed={selected === name} aria-controls="product-gallery-image" onClick={() => setSelected(name)}>{screenshots[name].title}</button>)}</div></div>
     <div id="product-gallery-image" className="product-gallery__stage"><ProductShot key={selected} name={selected} /></div>
-    <p className="product-gallery__privacy">Captured in the desktop app. Private details have been redacted.</p>
   </div>;
 }
