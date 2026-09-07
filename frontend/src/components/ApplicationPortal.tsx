@@ -1,4 +1,4 @@
-import { useEffect, useId, useState, type HTMLAttributes, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useId, useState, type HTMLAttributes, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 
 /**
@@ -7,8 +7,17 @@ import { createPortal } from "react-dom";
  * feature can be mounted inside a Mosaic window.
  */
 export function ApplicationPortal({ children }: { children: ReactNode }) {
+  const [fullscreenRoot, setFullscreenRoot] = useState<Element | null>(() => typeof document === "undefined" ? null : document.fullscreenElement);
+  useLayoutEffect(() => {
+    const update = () => setFullscreenRoot(document.fullscreenElement);
+    document.addEventListener("fullscreenchange", update);
+    update();
+    return () => document.removeEventListener("fullscreenchange", update);
+  }, []);
   if (typeof document === "undefined") return null;
-  return createPortal(children, document.body);
+  // Portals outside a fullscreen element are not visible. Keep password and
+  // setup dialogs inside its top-layer subtree while full screen is active.
+  return createPortal(children, fullscreenRoot ?? document.body);
 }
 
 const NOTICE_LAYER_ID = "oars-application-notices";
@@ -26,7 +35,7 @@ function useApplicationOverlayStack() {
   const id = useId();
   const [, render] = useState(0);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const update = () => render((version) => version + 1);
     overlaySubscribers.add(update);
     overlayStack.push(id);
@@ -63,15 +72,16 @@ export function ApplicationNotice({ children }: { children: ReactNode }) {
 
 export function ApplicationOverlay({
   className = "oars-modal-overlay",
+  quiet = false,
   children,
   ...props
-}: HTMLAttributes<HTMLDivElement>) {
+}: HTMLAttributes<HTMLDivElement> & { quiet?: boolean }) {
   const isTopOverlay = useApplicationOverlayStack();
 
   return (
     <ApplicationPortal>
       <div
-        className={className}
+        className={`${className}${quiet ? " preferences-overlay" : ""}`}
         {...props}
         aria-hidden={isTopOverlay ? undefined : true}
         data-overlay-state={isTopOverlay ? "top" : "covered"}

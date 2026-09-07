@@ -51,5 +51,8 @@ RUN apk add --no-cache openssh bash zip unzip git nodejs npm nginx curl shadow s
 # invalidate the much larger desktop/deploy fixture layer above.
 RUN apk add --no-cache dcron util-linux
 
+# Interactive shell-history acceptance fixtures.
+RUN apk add --no-cache zsh fish
+
 EXPOSE 22
 CMD ["/bin/sh", "-c", "/usr/sbin/crond && exec /usr/sbin/sshd -D"]

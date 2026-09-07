@@ -113,6 +113,7 @@ const mockServer: Server = {
 
 describe("Milestone 2 Empirical Challenger Test Suite", () => {
   beforeEach(() => {
+    localStorage.removeItem("oars.palette");
     vi.clearAllMocks();
   });
 

@@ -4,19 +4,42 @@
 
 const std = @import("std");
 
+/// Resolve readable X authorization on the server; never evaluate discovery
+/// output or return cookie data to the client. All consumers share this context.
+pub fn displayContextCommand(allocator: std.mem.Allocator, display: u16) ![]u8 {
+    if (display > max_setup_display) return error.InvalidDisplay;
+    return std.fmt.allocPrint(allocator, "vnc_display=:{d}; display_present=1; display_accessible=1; display_managed=1; " ++
+        "if [ -S /tmp/.X11-unix/X{d} ]; then display_present=0; " ++
+        "if ! DISPLAY=$vnc_display xprop -root >/dev/null 2>&1 && command -v x11vnc >/dev/null 2>&1; then " ++
+        "candidate=$(x11vnc -norc -env FD_XDM=1 -findauth $vnc_display 2>/dev/null | sed -n 's/^XAUTHORITY=//p' | head -n 1); " ++
+        "if [ -n \"$candidate\" ] && [ -r \"$candidate\" ] && XAUTHORITY=\"$candidate\" DISPLAY=$vnc_display xprop -root >/dev/null 2>&1; then XAUTHORITY=$candidate; export XAUTHORITY; fi; fi; " ++
+        "if ! DISPLAY=$vnc_display xprop -root >/dev/null 2>&1; then for vnc_proc in /proc/[0-9]*; do " ++
+        "case \"$(cat \"$vnc_proc/comm\" 2>/dev/null || true)\" in X|Xorg|Xvfb) ;; *) continue ;; esac; " ++
+        "vnc_args=$(tr '\\0' '\\n' <\"$vnc_proc/cmdline\" 2>/dev/null) || continue; " ++
+        "printf '%s\\n' \"$vnc_args\" | grep -Fxq -- \"$vnc_display\" || continue; " ++
+        "candidate=$(printf '%s\\n' \"$vnc_args\" | sed -n '/^-auth$/{{n;p;q;}}'); " ++
+        "if [ -n \"$candidate\" ] && [ -r \"$candidate\" ] && XAUTHORITY=\"$candidate\" DISPLAY=$vnc_display xprop -root >/dev/null 2>&1; then XAUTHORITY=$candidate; export XAUTHORITY; break; fi; done; fi; " ++
+        "if DISPLAY=$vnc_display xprop -root >/dev/null 2>&1; then display_accessible=0; fi; " ++
+        "managed_pid=''; managed_file=\"$HOME/.local/share/oars/vnc/display-{d}.xvfb.pid\"; " ++
+        "if [ -r \"$managed_file\" ]; then IFS= read -r managed_pid <\"$managed_file\" || managed_pid=''; fi; " ++
+        "case \"$managed_pid\" in ''|*[!0-9]*) ;; *) if [ \"$(cat /proc/$managed_pid/comm 2>/dev/null || true)\" = Xvfb ] && tr '\\0' '\\n' </proc/$managed_pid/cmdline 2>/dev/null | grep -Fxq -- \"$vnc_display\"; then display_managed=0; fi ;; esac; fi; ", .{ display, display, display });
+}
+
 pub fn probeCommand(allocator: std.mem.Allocator, display: u16) ![]u8 {
     if (display > max_setup_display) return error.InvalidDisplay;
+    const display_context = try displayContextCommand(allocator, display);
+    defer allocator.free(display_context);
     return std.fmt.allocPrint(
         allocator,
-        "printf '%%BEGIN_VNC_PROBE%%\\n'; command -v x11vnc >/dev/null 2>&1; echo x11vnc=$?; " ++
-            "command -v tigervncserver >/dev/null 2>&1; echo tigervnc=$?; " ++
-            "command -v Xvnc >/dev/null 2>&1; echo xvnc=$?; " ++
-            "if command -v startxfce4 >/dev/null 2>&1 && command -v dbus-run-session >/dev/null 2>&1 && command -v xprop >/dev/null 2>&1; then xfce_status=0; else xfce_status=1; fi; echo xfce=$xfce_status; " ++
-            "command -v gnome-session >/dev/null 2>&1; echo gnome=$?; " ++
-            "command -v startplasma-x11 >/dev/null 2>&1; echo plasma=$?; " ++
-            "command -v mate-session >/dev/null 2>&1; echo mate=$?; " ++
-            "command -v startlxqt >/dev/null 2>&1; echo lxqt=$?; " ++
-            "vnc_display=:{d}; xfce_window_present() {{ class=$1; " ++
+        "PATH=\"${{PATH:+$PATH:}}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"; export PATH; printf '%%BEGIN_VNC_PROBE%%\\n'; if command -v x11vnc >/dev/null 2>&1; then echo x11vnc=0; else echo x11vnc=1; fi; " ++
+            "if command -v tigervncserver >/dev/null 2>&1; then echo tigervnc=0; else echo tigervnc=1; fi; " ++
+            "if command -v Xvnc >/dev/null 2>&1; then echo xvnc=0; else echo xvnc=1; fi; " ++
+            "if command -v startxfce4 >/dev/null 2>&1; then echo xfce=0; else echo xfce=1; fi; if command -v startxfce4 >/dev/null 2>&1 && command -v dbus-run-session >/dev/null 2>&1 && command -v xprop >/dev/null 2>&1; then xfce_status=0; else xfce_status=1; fi; echo xfce_ready=$xfce_status; " ++
+            "if command -v gnome-session >/dev/null 2>&1; then echo gnome=0; else echo gnome=1; fi; " ++
+            "if command -v startplasma-x11 >/dev/null 2>&1; then echo plasma=0; else echo plasma=1; fi; " ++
+            "if command -v mate-session >/dev/null 2>&1; then echo mate=0; else echo mate=1; fi; " ++
+            "if command -v startlxqt >/dev/null 2>&1; then echo lxqt=0; else echo lxqt=1; fi; " ++
+            "{s}echo display_present=$display_present; echo display_accessible=$display_accessible; echo display_managed=$display_managed; xfce_window_present() {{ class=$1; " ++
             "windows=$(DISPLAY=$vnc_display xprop -root _NET_CLIENT_LIST 2>/dev/null | sed -n 's/.*# //p' | tr -d ','); " ++
             "for window in $windows; do DISPLAY=$vnc_display xprop -id $window WM_CLASS 2>/dev/null | grep -Fq $class && return 0; done; return 1; }}; " ++
             "window_manager_present() {{ wm_result=$(DISPLAY=$vnc_display xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null) || return 1; case \"$wm_result\" in *'window id #'*) return 0 ;; *) return 1 ;; esac; }}; " ++
@@ -34,8 +57,8 @@ pub fn probeCommand(allocator: std.mem.Allocator, display: u16) ![]u8 {
             "case \"$setup_process\" in ''|*[!0-9]*) setup_state=failed ;; *) kill -0 \"$setup_process\" 2>/dev/null || setup_state=failed ;; esac; fi; " ++
             "case \"$setup_state\" in installing|installed|ready|failed) ;; *) setup_state=idle ;; esac; " ++
             "echo setup_state=$setup_state; " ++
-            "(ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null || netstat -tln 2>/dev/null || true)",
-        .{display},
+            "if ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null || netstat -tln 2>/dev/null; then echo listeners_checked=0; else echo listeners_checked=1; fi; printf '\\n%%END_VNC_PROBE%%\\n'",
+        .{display_context},
     );
 }
 
@@ -46,6 +69,9 @@ pub const ListeningPort = struct {
 };
 
 pub const ProbeResult = struct {
+    display_present: bool = false,
+    display_accessible: bool = false,
+    display_managed: bool = false,
     x11vnc: bool = false,
     tigervnc: bool = false,
     xfce_ready: bool = false,
@@ -56,6 +82,7 @@ pub const ProbeResult = struct {
     desktop_running: bool = false,
     desktop_name: []const u8 = "",
     setup_state: []const u8 = "idle",
+    listeners_checked: bool = false,
     listening: []ListeningPort = &.{},
 
     pub fn deinit(self: *ProbeResult, allocator: std.mem.Allocator) void {
@@ -65,13 +92,16 @@ pub const ProbeResult = struct {
 
 /// Parses the marker-delimited probe output. `listening` entries with
 /// ports 5900-5999, deduplicated, in output order.
-pub fn parseProbeOutput(allocator: std.mem.Allocator, text: []const u8) ProbeResult {
+pub fn parseProbeOutput(allocator: std.mem.Allocator, text: []const u8) !ProbeResult {
     var result: ProbeResult = .{};
     var listening: std.ArrayList(ListeningPort) = .empty;
     errdefer listening.deinit(allocator);
     var seen: [16]u16 = undefined;
     var seen_count: usize = 0;
     var in_section = false;
+    var complete = false;
+    var fields_seen: u32 = 0;
+    const fields = [_][]const u8{ "x11vnc", "tigervnc", "xvnc", "xfce", "xfce_ready", "gnome", "plasma", "mate", "lxqt", "window_manager_running", "desktop_surface_running", "desktop_panel_running", "desktop_running", "setup_state", "listeners_checked", "display_present", "display_accessible", "display_managed" };
     var tigervnc_server = false;
     var xvnc = false;
     var xfce = false;
@@ -89,6 +119,22 @@ pub fn parseProbeOutput(allocator: std.mem.Allocator, text: []const u8) ProbeRes
             continue;
         }
         if (!in_section) continue;
+        if (std.mem.eql(u8, line, "%END_VNC_PROBE%")) {
+            complete = true;
+            break;
+        }
+        if (std.mem.indexOfScalar(u8, line, '=')) |separator| {
+            for (fields, 0..) |field, index| {
+                if (!std.mem.eql(u8, line[0..separator], field)) continue;
+                const bit = @as(u32, 1) << @intCast(index);
+                if (fields_seen & bit != 0) return error.InvalidProbe;
+                fields_seen |= bit;
+                const value = line[separator + 1 ..];
+                if (!std.mem.eql(u8, field, "setup_state")) {
+                    if (!std.mem.eql(u8, value, "0") and !std.mem.eql(u8, value, "1")) return error.InvalidProbe;
+                } else if (!std.mem.eql(u8, value, "idle") and !std.mem.eql(u8, value, "installing") and !std.mem.eql(u8, value, "installed") and !std.mem.eql(u8, value, "ready") and !std.mem.eql(u8, value, "failed")) return error.InvalidProbe;
+            }
+        }
         if (std.mem.startsWith(u8, line, "x11vnc=")) {
             result.x11vnc = line["x11vnc=".len..].len == 1 and line["x11vnc=".len..][0] == '0';
         } else if (std.mem.startsWith(u8, line, "tigervnc=")) {
@@ -97,6 +143,8 @@ pub fn parseProbeOutput(allocator: std.mem.Allocator, text: []const u8) ProbeRes
             xvnc = line["xvnc=".len..].len == 1 and line["xvnc=".len..][0] == '0';
         } else if (std.mem.startsWith(u8, line, "xfce=")) {
             xfce = line["xfce=".len..].len == 1 and line["xfce=".len..][0] == '0';
+        } else if (std.mem.startsWith(u8, line, "xfce_ready=")) {
+            result.xfce_ready = std.mem.eql(u8, line["xfce_ready=".len..], "0");
         } else if (std.mem.startsWith(u8, line, "gnome=")) {
             gnome = line["gnome=".len..].len == 1 and line["gnome=".len..][0] == '0';
         } else if (std.mem.startsWith(u8, line, "plasma=")) {
@@ -113,6 +161,14 @@ pub fn parseProbeOutput(allocator: std.mem.Allocator, text: []const u8) ProbeRes
             result.desktop_surface_running = line["desktop_surface_running=".len..].len == 1 and line["desktop_surface_running=".len..][0] == '0';
         } else if (std.mem.startsWith(u8, line, "desktop_panel_running=")) {
             result.desktop_panel_running = line["desktop_panel_running=".len..].len == 1 and line["desktop_panel_running=".len..][0] == '0';
+        } else if (std.mem.startsWith(u8, line, "display_present=")) {
+            result.display_present = std.mem.eql(u8, line["display_present=".len..], "0");
+        } else if (std.mem.startsWith(u8, line, "display_accessible=")) {
+            result.display_accessible = std.mem.eql(u8, line["display_accessible=".len..], "0");
+        } else if (std.mem.startsWith(u8, line, "display_managed=")) {
+            result.display_managed = std.mem.eql(u8, line["display_managed=".len..], "0");
+        } else if (std.mem.startsWith(u8, line, "listeners_checked=")) {
+            result.listeners_checked = std.mem.eql(u8, line["listeners_checked=".len..], "0");
         } else if (std.mem.startsWith(u8, line, "setup_state=")) {
             const state = line["setup_state=".len..];
             result.setup_state = if (std.mem.eql(u8, state, "installing"))
@@ -146,8 +202,8 @@ pub fn parseProbeOutput(allocator: std.mem.Allocator, text: []const u8) ProbeRes
             }) catch {};
         }
     }
+    if (!complete or fields_seen != (@as(u32, 1) << fields.len) - 1) return error.IncompleteProbe;
     result.tigervnc = tigervnc_server or xvnc;
-    result.xfce_ready = xfce;
     result.desktop_installed = xfce or gnome or plasma or mate or lxqt or result.desktop_running;
     result.desktop_name = if (xfce)
         "XFCE"
@@ -163,7 +219,7 @@ pub fn parseProbeOutput(allocator: std.mem.Allocator, text: []const u8) ProbeRes
         "Desktop"
     else
         "";
-    result.listening = listening.toOwnedSlice(allocator) catch &.{};
+    result.listening = try listening.toOwnedSlice(allocator);
     return result;
 }
 
@@ -310,7 +366,7 @@ fn desktopStartClause(allocator: std.mem.Allocator, display: u16) ![]u8 {
             "mkdir -p \"$runtime_dir\"; chmod 700 \"$runtime_dir\"; : >\"$desktop_log\"; chmod 600 \"$desktop_log\"; " ++
             "if ! window_manager_present; then " ++
             "if [ -f \"$desktop_pid_file\" ]; then desktop_pid=$(cat \"$desktop_pid_file\" 2>/dev/null || true); " ++
-            "case \"$desktop_pid\" in ''|*[!0-9]*) ;; *) if kill -0 \"$desktop_pid\" 2>/dev/null; then kill \"$desktop_pid\" 2>/dev/null || true; sleep 1; fi ;; esac; fi; " ++
+            "case \"$desktop_pid\" in ''|*[!0-9]*) ;; *) case \"$(cat /proc/$desktop_pid/comm 2>/dev/null || true)\" in dbus-run-sessio|xfce4-session|startxfce4) if tr '\\0' '\\n' </proc/$desktop_pid/environ 2>/dev/null | grep -Fxq -- \"DISPLAY=$vnc_display\"; then kill \"$desktop_pid\" 2>/dev/null || true; sleep 1; fi ;; esac ;; esac; fi; " ++
             "dbus-uuidgen --ensure >/dev/null 2>&1 || true; " ++
             "setsid env DISPLAY=$vnc_display XDG_RUNTIME_DIR=\"$runtime_dir\" dbus-run-session -- startxfce4 </dev/null >>\"$desktop_log\" 2>&1 & " ++
             "desktop_pid=$!; printf '%s\\n' \"$desktop_pid\" >\"$desktop_pid_file\"; fi; " ++
@@ -329,12 +385,16 @@ fn desktopStartClause(allocator: std.mem.Allocator, display: u16) ![]u8 {
 /// and never appears in this command or in the remote process arguments.
 pub fn secureStartCommand(allocator: std.mem.Allocator, display: u16, start_desktop: bool) ![]u8 {
     if (display > max_setup_display) return error.InvalidDisplay;
+    const display_context = try displayContextCommand(allocator, display);
+    defer allocator.free(display_context);
     const port: u32 = 5900 + @as(u32, display);
     const desktop_clause = if (start_desktop) try desktopStartClause(allocator, display) else "";
     defer if (desktop_clause.len > 0) allocator.free(desktop_clause);
     return std.fmt.allocPrint(
         allocator,
-        "set -eu; umask 077; " ++
+        "PATH=\"${{PATH:+$PATH:}}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"; export PATH; set -eu; umask 077; " ++
+            "{s}if [ \"$display_present\" -eq 0 ] && [ \"$display_accessible\" -ne 0 ]; then printf 'Display %s is already in use and requires X authorization; choose an unused display.\\n' \"$vnc_display\"; exit 1; fi; " ++
+            "if [ \"{s}\" = yes ] && [ \"$display_present\" -eq 0 ] && [ \"$display_managed\" -ne 0 ]; then printf 'Display %s belongs to an existing X session; share it without starting XFCE or choose an unused display.\\n' \"$vnc_display\"; exit 1; fi; " ++
             "auth_dir=\"$HOME/.local/share/oars/vnc\"; " ++
             "auth_file=\"$auth_dir/display-{d}.passwd\"; pid_file=\"$auth_dir/display-{d}.pid\"; " ++
             "ready_file=\"$auth_dir/display-{d}.ready\"; log_file=\"$auth_dir/display-{d}.log\"; " ++
@@ -343,7 +403,7 @@ pub fn secureStartCommand(allocator: std.mem.Allocator, display: u16, start_desk
             "x11vnc -storepasswd \"$auth_file\" >/dev/null 2>&1; chmod 600 \"$auth_file\"; " ++
             "if [ -f \"$pid_file\" ]; then pid=$(cat \"$pid_file\" 2>/dev/null || true); " ++
             "case \"$pid\" in ''|*[!0-9]*) ;; *) " ++
-            "if kill -0 \"$pid\" 2>/dev/null && [ \"$(cat \"/proc/$pid/comm\" 2>/dev/null || true)\" = x11vnc ]; " ++
+            "if kill -0 \"$pid\" 2>/dev/null && [ \"$(cat \"/proc/$pid/comm\" 2>/dev/null || true)\" = x11vnc ] && tr '\\0' '\\n' </proc/$pid/cmdline 2>/dev/null | grep -Fxq -- \"$auth_file\"; " ++
             "then kill \"$pid\"; sleep 1; fi ;; esac; rm -f \"$pid_file\"; fi; " ++
             "oars_xvfb=0; if [ -f \"$xvfb_pid_file\" ]; then xvfb_pid=$(cat \"$xvfb_pid_file\" 2>/dev/null || true); " ++
             "case \"$xvfb_pid\" in ''|*[!0-9]*) ;; *) if kill -0 \"$xvfb_pid\" 2>/dev/null && " ++
@@ -356,7 +416,7 @@ pub fn secureStartCommand(allocator: std.mem.Allocator, display: u16, start_desk
             "if [ ! -S /tmp/.X11-unix/X{d} ]; then printf 'Xvfb failed to open display :{d}\\n'; " ++
             "tail -n 8 \"$xvfb_log\" 2>/dev/null || true; exit 1; fi; fi; " ++
             "{s}" ++
-            "auth_args=''; if [ \"$oars_xvfb\" -eq 0 ]; then auth_args='-auth guess'; fi; " ++
+            "auth_args=''; if [ \"$oars_xvfb\" -eq 0 ] && [ -z \"${{XAUTHORITY:-}}\" ]; then auth_args='-auth guess'; fi; " ++
             ": >\"$log_file\"; chmod 600 \"$log_file\"; rm -f \"$ready_file\"; " ++
             "setsid x11vnc -norc -display :{d} $auth_args -rfbport {d} -localhost -forever -shared " ++
             "-rfbauth \"$auth_file\" -flag \"$ready_file\" -o \"$log_file\" </dev/null >/dev/null 2>&1 & " ++
@@ -367,7 +427,7 @@ pub fn secureStartCommand(allocator: std.mem.Allocator, display: u16, start_desk
             "printf 'x11vnc failed to open port {d} for display :{d}\\n'; " ++
             "tail -n 12 \"$log_file\" 2>/dev/null || true; kill \"$pid\" 2>/dev/null || true; " ++
             "rm -f \"$pid_file\" \"$ready_file\"; exit 1; fi",
-        .{ display, display, display, display, display, display, display, display, display, display, display, desktop_clause, display, port, port, display },
+        .{ display_context, if (start_desktop) "yes" else "no", display, display, display, display, display, display, display, display, display, display, display, desktop_clause, display, port, port, display },
     );
 }
 
@@ -484,7 +544,7 @@ test "probe output parses booleans and listening ports (ss + netstat)" {
         "x11vnc=0\n" ++
         "tigervnc=1\n" ++
         "xvnc=0\n" ++
-        "xfce=0\n" ++
+        "xfce=0\nxfce_ready=0\n" ++
         "gnome=1\n" ++
         "plasma=1\n" ++
         "mate=1\n" ++
@@ -499,8 +559,8 @@ test "probe output parses booleans and listening ports (ss + netstat)" {
         "tcp 0 0 0.0.0.0:5902 0.0.0.0:* LISTEN 42766/x11vnc\n" ++
         "tcp 0 0 :::5902 :::* LISTEN 42766/x11vnc\n" ++
         "tcp 0 0 0.0.0.0:22 0.0.0.0:* LISTEN 1/sshd -D [listener\n" ++
-        "LISTEN 0 128 127.0.0.1:2222 0.0.0.0:* users:((\"sshd\",pid=1,fd=3))\n";
-    var result = parseProbeOutput(allocator, text);
+        "LISTEN 0 128 127.0.0.1:2222 0.0.0.0:* users:((\"sshd\",pid=1,fd=3))\nlisteners_checked=0\ndisplay_present=1\ndisplay_accessible=1\ndisplay_managed=1\n%END_VNC_PROBE%\n";
+    var result = try parseProbeOutput(allocator, text);
     defer result.deinit(allocator);
     try std.testing.expect(result.x11vnc);
     try std.testing.expect(result.tigervnc); // Xvnc present
@@ -525,22 +585,22 @@ test "probe output parses booleans and listening ports (ss + netstat)" {
     for (result.listening) |l| try std.testing.expect(l.port >= 5900 and l.port <= 5999);
 }
 
-test "probe output dedupes ports and reports nothing on empty output" {
+test "complete probe output reports missing packages and dedupes ports" {
     const allocator = std.testing.allocator;
     const text =
         "%BEGIN_VNC_PROBE%\n" ++
         "x11vnc=1\n" ++
         "tigervnc=1\n" ++
         "xvnc=1\n" ++
-        "xfce=1\n" ++
+        "xfce=1\nxfce_ready=1\n" ++
         "gnome=1\n" ++
         "plasma=1\n" ++
         "mate=1\n" ++
         "lxqt=1\n" ++
-        "desktop_running=1\n" ++
+        "desktop_running=1\nwindow_manager_running=1\ndesktop_surface_running=1\ndesktop_panel_running=1\nsetup_state=idle\n" ++
         "LISTEN 0 128 127.0.0.1:5901 0.0.0.0:* users:((\"Xvnc\",pid=1,fd=1))\n" ++
-        "LISTEN 0 128 0.0.0.0:5901 0.0.0.0:*\n";
-    var result = parseProbeOutput(allocator, text);
+        "LISTEN 0 128 0.0.0.0:5901 0.0.0.0:*\nlisteners_checked=0\ndisplay_present=1\ndisplay_accessible=1\ndisplay_managed=1\n%END_VNC_PROBE%\n";
+    var result = try parseProbeOutput(allocator, text);
     defer result.deinit(allocator);
     try std.testing.expect(!result.x11vnc);
     try std.testing.expect(!result.tigervnc);
@@ -677,4 +737,33 @@ test "desktop-aware probe command is valid POSIX shell" {
     defer std.testing.allocator.free(result.stdout);
     defer std.testing.allocator.free(result.stderr);
     try std.testing.expect(result.term == .exited and result.term.exited == 0);
+}
+
+test "missing and truncated probes are unknown instead of missing software" {
+    try std.testing.expectError(error.IncompleteProbe, parseProbeOutput(std.testing.allocator, ""));
+    try std.testing.expectError(error.IncompleteProbe, parseProbeOutput(std.testing.allocator, "%BEGIN_VNC_PROBE%\nx11vnc=0\n"));
+    try std.testing.expectError(error.IncompleteProbe, parseProbeOutput(std.testing.allocator, "%BEGIN_VNC_PROBE%\nx11vnc=0\n%END_VNC_PROBE%\n"));
+    try std.testing.expectError(error.InvalidProbe, parseProbeOutput(std.testing.allocator, "%BEGIN_VNC_PROBE%\nx11vnc=unexpected\n"));
+}
+
+test "installed but stopped desktop remains installed and only needs startup" {
+    const allocator = std.testing.allocator;
+    const command = try probeCommand(allocator, 1);
+    defer allocator.free(command);
+    const script = try std.fmt.allocPrint(allocator, "HOME=/nonexistent-oars-probe-test; command() {{ case \"$2\" in x11vnc|startxfce4|dbus-run-session|xprop) return 0 ;; *) return 1 ;; esac; }}; xprop() {{ return 1; }}; ss() {{ :; }}; {s}", .{command});
+    defer allocator.free(script);
+    const output = try std.process.run(allocator, std.testing.io, .{ .argv = &.{ "/bin/sh", "-e", "-c", script } });
+    defer allocator.free(output.stdout);
+    defer allocator.free(output.stderr);
+    try std.testing.expect(output.term == .exited and output.term.exited == 0);
+    var result = try parseProbeOutput(allocator, output.stdout);
+    defer result.deinit(allocator);
+    try std.testing.expect(result.x11vnc and result.desktop_installed and result.xfce_ready);
+    try std.testing.expect(!result.desktop_running);
+    try std.testing.expectEqual(@as(usize, 0), result.listening.len);
+    var plan = setupPlan(allocator, "ID=ubuntu\n", 1, result.x11vnc, result.xfce_ready, result.desktop_running, true);
+    defer plan.deinit(allocator);
+    try std.testing.expectEqualStrings("configure", plan.action);
+    try std.testing.expectEqualStrings("", plan.plan);
+    try std.testing.expectEqualStrings("start", plan.desktop_action);
 }

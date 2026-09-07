@@ -41,8 +41,19 @@ jobs:
         shell: bash
         run: |
           echo "path=$(npm root --global)/@native-sdk/cli" >> "$GITHUB_OUTPUT"
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+      - name: Check frontend types
+        run: npm --prefix frontend run typecheck
+      - name: Test frontend user paths
+        run: npm --prefix frontend test
+      - name: Build frontend
+        run: npm --prefix frontend run build
       - name: Run Zig tests
         run: zig build test -Dplatform=null -Dnative-sdk-path="${{ steps.native-sdk.outputs.path }}"
+      - name: Test disposable SSH and MinIO workflows
+        timeout-minutes: 20
+        run: scripts/integration-test.sh -Dplatform=null -Dnative-sdk-path="${{ steps.native-sdk.outputs.path }}"
 
   release-please:
     name: Prepare release

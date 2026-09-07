@@ -29,8 +29,10 @@ export function validateSetupPasswords(password: string, confirmation: string): 
   return null;
 }
 
-export function desktopProbeLabel(result: Pick<VncProbeResult, "desktop_installed" | "window_manager_running" | "desktop_surface_running" | "desktop_panel_running" | "desktop_running" | "desktop_name">, display: number): string {
+export function desktopProbeLabel(result: Pick<VncProbeResult, "desktop_installed" | "window_manager_running" | "desktop_surface_running" | "desktop_panel_running" | "desktop_running" | "desktop_name" | "display_present" | "display_accessible" | "display_managed">, display: number): string {
   const installed = result.desktop_installed ? `${result.desktop_name || "Desktop"} installed` : "not installed";
+  if (result.display_present && result.display_accessible === false) return `${installed} · display :${display} in use (X authorization required)`;
+  if (result.display_present && result.display_managed === false && !result.desktop_running) return `${installed} · display :${display} active (existing X session)`;
   if (result.desktop_installed && result.window_manager_running && !result.desktop_running) {
     const missing = [
       !result.desktop_surface_running ? "desktop" : null,

@@ -26,6 +26,7 @@ function draftFromServer(server: Server): ServerDraft {
     port: server.port,
     user: server.user,
     auth_method: server.auth_method,
+    history_shell: server.history_shell,
     key_path: server.key_path,
     key_has_passphrase: server.key_has_passphrase,
     group: server.group || undefined,
@@ -183,6 +184,7 @@ export function ServerModal({ server, servers, onClose, onSaved, onDeleted }: Pr
         port: parsedPort,
         user: trimmedUser,
         auth_method: authMethod,
+        history_shell: server && server.host === trimmedHost && server.port === parsedPort && server.user === trimmedUser ? server.history_shell : "off",
         key_path: authMethod === "key" ? keyPath.trim() : "",
         key_has_passphrase: authMethod === "key" && keyPassphrase,
         group: group.trim() || undefined,
@@ -256,10 +258,10 @@ export function ServerModal({ server, servers, onClose, onSaved, onDeleted }: Pr
   };
 
   return (
-    <ApplicationOverlay role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
+    <ApplicationOverlay quiet role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
       <div
         ref={dialogRef}
-        className="oars-modal"
+        className="oars-modal refined-dialog connection-profile-dialog"
         role="dialog"
         aria-modal="true"
         aria-labelledby="oars-modal-title"
@@ -274,7 +276,7 @@ export function ServerModal({ server, servers, onClose, onSaved, onDeleted }: Pr
             <div>
               <h2 id="oars-modal-title">{editing ? "Edit connection profile" : "Add connection profile"}</h2>
               <p id="oars-modal-desc" className="oars-modal-subtitle">
-                {editing ? "Update how Oars connects to this server. Secrets stay in your local Keychain." : "Save a connection profile once. Oars connects over standard SSH — no agent required."}
+                {editing ? "Connection and authentication settings for this server." : "Connect over SSH using a password, key, or local agent."}
               </p>
             </div>
             <Button variant="ghost" size="icon-sm" aria-label="Close" onClick={onClose} disabled={busy} className="oars-modal-close">
@@ -285,7 +287,7 @@ export function ServerModal({ server, servers, onClose, onSaved, onDeleted }: Pr
 
         <form className="oars-modal-body" onSubmit={handleSubmit} noValidate>
           {/* Primary identity */}
-          <div className="oars-field-group">
+          <div className="oars-field-group connection-identity"><h3>Connection</h3>
             <div className="oars-field">
               <label htmlFor="oars-name">Connection name</label>
               <input
@@ -354,9 +356,8 @@ export function ServerModal({ server, servers, onClose, onSaved, onDeleted }: Pr
           </div>
 
           {/* Authentication */}
-          <div className="oars-field-group">
+          <div className="oars-field-group connection-auth"><h3>Authentication</h3>
             <div className="oars-field">
-              <span className="oars-label">Authentication</span>
               <div className="oars-segmented" role="group" aria-label="Authentication method">
                 <button type="button" className={authMethod === "password" ? "is-active" : ""} onClick={() => setAuthMethod("password")}>
                   <ShieldCheck size={14} aria-hidden /> Password
@@ -446,7 +447,7 @@ export function ServerModal({ server, servers, onClose, onSaved, onDeleted }: Pr
           {/* Organisation — progressive disclosure */}
           <div className="oars-field-group oars-field-group-soft">
             <button type="button" className="oars-disclosure" aria-expanded={advancedOpen} onClick={() => setAdvancedOpen((v) => !v)}>
-              <span className="oars-disclosure-title"><Tag size={14} aria-hidden /> Organisation</span>
+              <span className="oars-disclosure-title"><Tag size={14} aria-hidden /> Advanced options</span>
               <span className="oars-disclosure-hint">Group, tags, and jump host <ChevronDown className={advancedOpen ? "" : "is-collapsed"} aria-hidden /></span>
             </button>
 
@@ -467,7 +468,7 @@ export function ServerModal({ server, servers, onClose, onSaved, onDeleted }: Pr
                   <datalist id="oars-group-list">
                     {existingGroups.map((g) => <option key={g} value={g} />)}
                   </datalist>
-                  <span className="oars-hint">One level only — <code>parent</code> or <code>parent/child</code>. Leave blank for Ungrouped.</span>
+                  <span className="oars-hint">Use <code>parent/child</code> for a subgroup. Leave blank for Ungrouped.</span>
                   {fieldErrors.group && <span className="oars-field-error">{fieldErrors.group}</span>}
                 </div>
 
@@ -495,7 +496,7 @@ export function ServerModal({ server, servers, onClose, onSaved, onDeleted }: Pr
                       placeholder={tags.length === 0 ? "web, api — press Enter" : "Add another…"}
                     />
                   </div>
-                  <span className="oars-hint">Free-form labels. Trimmed, deduplicated (case-insensitive), and preserved in your export.</span>
+                  <span className="oars-hint">Press Enter to add a label.</span>
                   {fieldErrors.tags && <span className="oars-field-error">{fieldErrors.tags}</span>}
                 </div>
 

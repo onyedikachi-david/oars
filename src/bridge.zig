@@ -11,6 +11,7 @@ const servers = @import("servers.zig");
 const sessions = @import("sessions.zig");
 const monitor = @import("monitor.zig");
 const history = @import("history.zig");
+const shell_integration = @import("shell_integration.zig");
 const json = @import("json.zig");
 const logs = @import("logs.zig");
 const localfs = @import("localfs.zig");
@@ -34,7 +35,7 @@ const ssh = @import("ssh.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 146;
+const handler_count = 149;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -218,9 +219,12 @@ pub const Context = struct {
             .{ .name = "oars.vnc.poll", .context = self, .invoke_fn = handleVncPoll },
             .{ .name = "oars.history.record", .context = self, .invoke_fn = handleHistoryRecord },
             .{ .name = "oars.history.list", .context = self, .invoke_fn = handleHistoryList },
+            .{ .name = "oars.history.clear", .context = self, .invoke_fn = handleHistoryClear },
             .{ .name = "oars.history.replay", .context = self, .invoke_fn = handleHistoryReplay },
+            .{ .name = "oars.history.shellSetup", .context = self, .invoke_fn = handleShellSetup },
             .{ .name = "oars.audit.list", .context = self, .invoke_fn = handleAuditList },
             .{ .name = "oars.audit.clear", .context = self, .invoke_fn = handleAuditClear },
+            .{ .name = "oars.audit.export", .context = self, .invoke_fn = handleAuditExport },
             .{ .name = "oars.vault.export", .context = self, .invoke_fn = handleVaultExport },
             .{ .name = "oars.vault.import", .context = self, .invoke_fn = handleVaultImport },
             .{ .name = "oars.vault.importConfirm", .context = self, .invoke_fn = handleVaultImportConfirm },
@@ -366,9 +370,12 @@ pub const Context = struct {
             .{ .name = "oars.vnc.poll", .origins = &allowed_origins },
             .{ .name = "oars.history.record", .origins = &allowed_origins },
             .{ .name = "oars.history.list", .origins = &allowed_origins },
+            .{ .name = "oars.history.clear", .origins = &allowed_origins },
             .{ .name = "oars.history.replay", .origins = &allowed_origins },
+            .{ .name = "oars.history.shellSetup", .origins = &allowed_origins },
             .{ .name = "oars.audit.list", .origins = &allowed_origins },
             .{ .name = "oars.audit.clear", .origins = &allowed_origins },
+            .{ .name = "oars.audit.export", .origins = &allowed_origins },
             .{ .name = "oars.vault.export", .origins = &allowed_origins },
             .{ .name = "oars.vault.import", .origins = &allowed_origins },
             .{ .name = "oars.vault.importConfirm", .origins = &allowed_origins },
@@ -437,6 +444,7 @@ const SavePayload = struct {
     auth_method: []const u8,
     key_path: ?[]const u8 = null,
     key_has_passphrase: bool = false,
+    history_shell: ?servers.HistoryShell = null,
     group: ?[]const u8 = null,
     tags: ?[][]const u8 = null,
     via_server_id: ?[]const u8 = null,
@@ -544,6 +552,7 @@ fn handleServersSave(context: *anyopaque, invocation: native_sdk.bridge.Invocati
         .key_path = key_path,
         .key_has_passphrase = payload.key_has_passphrase,
         .host_fingerprint = host_fingerprint,
+        .history_shell = payload.history_shell orelse .off,
         .group = group,
         .tags = tags,
         .via_server_id = payload.via_server_id,
@@ -594,6 +603,8 @@ fn writeServer(writer: anytype, server: servers.Server) !void {
     } else {
         try writer.writeAll("null");
     }
+    try writer.writeAll(",\"history_shell\":");
+    try json.writeJsonString(writer, @tagName(server.history_shell));
     try writer.writeAll(",\"group\":");
     try json.writeJsonString(writer, server.group);
     try writer.writeAll(",\"tags\":[");
@@ -743,6 +754,7 @@ fn handleSshExec(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
 const CloseChannelPayload = struct {
     server_id: []const u8,
     channel: u32,
+    connection_id: ?u64 = null,
 };
 
 /// Explicit channel close (spec 04 follow channels; spec 02 §5): the worker
@@ -753,6 +765,10 @@ fn handleSshCloseChannel(context: *anyopaque, invocation: native_sdk.bridge.Invo
         return respondError(output, "invalid payload");
     };
     defer parsed.deinit();
+    if (parsed.value.connection_id) |expected| {
+        const current = self.manager.connectionIdentity(parsed.value.server_id) catch return respondError(output, "not connected");
+        if (current != expected) return respondError(output, "the command belongs to an earlier connection");
+    }
     self.manager.closeChannel(parsed.value.server_id, parsed.value.channel) catch |err| {
         return respondError(output, switch (err) {
             error.NoSession => "not connected",
@@ -853,6 +869,7 @@ const PollPayload = struct {
     /// e.g. [{"channel":0,"cursor":1200}].
     cursors: ?[]const PollCursor = null,
     rewind: bool = false,
+    status_only: bool = false,
 };
 
 const PollCursor = struct {
@@ -883,7 +900,7 @@ fn handleSshPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
         }
     }
 
-    const polls = self.manager.pollChannels(
+    const polls: []sessions.ChannelPoll = if (parsed.value.status_only) &.{} else self.manager.pollChannels(
         parsed.value.server_id,
         cursors.items,
         parsed.value.rewind,
@@ -900,6 +917,8 @@ fn handleSshPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"ok\":true,\"status\":") catch return output[0..0];
     json.writeJsonString(&writer, info.status.jsonName()) catch return output[0..0];
+    writer.print(",\"forwarding\":{s}", .{if (info.forwarding) "true" else "false"}) catch return output[0..0];
+    writer.print(",\"history_full\":{s},\"history_write_error\":{s}", .{ if (info.history_full) "true" else "false", if (info.history_write_error) "true" else "false" }) catch return output[0..0];
     writer.writeAll(",\"connection_id\":") catch return output[0..0];
     if (self.manager.connectionIdentity(parsed.value.server_id) catch null) |connection_id| {
         writer.print("{d}", .{connection_id}) catch return output[0..0];
@@ -923,6 +942,7 @@ fn handleSshPoll(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
         first = false;
         writer.print("{{\"id\":{d},\"kind\":", .{ch.id}) catch return output[0..0];
         json.writeJsonString(&writer, ch.kind.jsonName()) catch return output[0..0];
+        writer.print(",\"user_visible\":{s}", .{if (ch.user_visible) "true" else "false"}) catch return output[0..0];
         writer.writeAll(",\"command\":") catch return output[0..0];
         json.writeJsonString(&writer, ch.command) catch return output[0..0];
         writer.print(",\"cursor\":{d},\"dropped\":{d},\"pending\":{d},\"eof\":{s},\"exit\":", .{
@@ -1107,7 +1127,8 @@ fn handleVncProbe(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
     defer self.allocator.free(command);
     var outcome = vncExec(self, server_id, command) orelse return respondError(output, "probe failed");
     defer outcome.output.deinit(self.allocator);
-    var result = vncmod.parseProbeOutput(self.allocator, outcome.output.items);
+    if (outcome.limited or outcome.exit != 0) return respondError(output, "VNC status check did not finish. Re-probe after the SSH connection is ready.");
+    var result = vncmod.parseProbeOutput(self.allocator, outcome.output.items) catch return respondError(output, "VNC status is unknown: the server returned an incomplete or invalid probe. Re-probe to try again.");
     defer result.deinit(self.allocator);
     var writer = std.Io.Writer.fixed(output);
     writer.print("{{\"ok\":true,\"x11vnc\":{s},\"tigervnc\":{s},\"desktop_installed\":{s},\"window_manager_running\":{s},\"desktop_surface_running\":{s},\"desktop_panel_running\":{s},\"desktop_running\":{s},\"desktop_name\":", .{
@@ -1120,6 +1141,8 @@ fn handleVncProbe(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
         if (result.desktop_running) "true" else "false",
     }) catch return output[0..0];
     json.writeJsonString(&writer, result.desktop_name) catch return output[0..0];
+    writer.print(",\"display_present\":{s},\"display_accessible\":{s},\"display_managed\":{s}", .{ if (result.display_present) "true" else "false", if (result.display_accessible) "true" else "false", if (result.display_managed) "true" else "false" }) catch return output[0..0];
+    writer.print(",\"listeners_checked\":{s}", .{if (result.listeners_checked) "true" else "false"}) catch return output[0..0];
     writer.writeAll(",\"setup_state\":") catch return output[0..0];
     json.writeJsonString(&writer, result.setup_state) catch return output[0..0];
     writer.writeAll(",\"listening\":[") catch return output[0..0];
@@ -1156,8 +1179,11 @@ fn handleVncSetup(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
     defer self.allocator.free(probe_command);
     var probe_out = vncExec(self, payload.server_id, probe_command) orelse return respondError(output, "cannot inspect the remote desktop");
     defer probe_out.output.deinit(self.allocator);
-    var probe = vncmod.parseProbeOutput(self.allocator, probe_out.output.items);
+    if (probe_out.limited or probe_out.exit != 0) return respondError(output, "VNC setup stopped because the status check did not finish. Re-probe before setup.");
+    var probe = vncmod.parseProbeOutput(self.allocator, probe_out.output.items) catch return respondError(output, "VNC setup stopped because the server returned an incomplete or invalid status check. Re-probe before setup.");
     defer probe.deinit(self.allocator);
+    if (probe.display_present and !probe.display_accessible) return respondError(output, "This display is already in use and requires X authorization. Choose an unused display, such as :1, or connect as the desktop owner.");
+    if (payload.install_desktop and probe.display_present and !probe.display_managed) return respondError(output, "This display belongs to an existing X session. Share it without starting XFCE, or choose an unused display for a separate desktop.");
     var plan = vncmod.setupPlan(
         self.allocator,
         os_out.output.items,
@@ -13696,6 +13722,7 @@ fn handleHistoryReplay(context: *anyopaque, invocation: native_sdk.bridge.Invoca
     if (entry.redacted) {
         return respondError(output, "this command contains redacted secrets; re-enter its secret fields to replay it");
     }
+    const connection_id = self.manager.connectionIdentity(entry.server_id) catch return respondError(output, "not connected");
     const channel_id = self.manager.execTracked(entry.server_id, entry.command, "exec", null, &.{}) catch |err| {
         return respondError(output, switch (err) {
             error.NoSession => "not connected",
@@ -13708,7 +13735,7 @@ fn handleHistoryReplay(context: *anyopaque, invocation: native_sdk.bridge.Invoca
     const detail = std.fmt.bufPrint(&detail_buf, "cmd={s} (replayed from {s})", .{ cmd, entry.id }) catch "ssh.exec";
     sshkeysAudit(self, "ssh.exec", entry.server_id, detail);
     var writer = std.Io.Writer.fixed(output);
-    writer.print("{{\"ok\":true,\"channel\":{d}}}", .{channel_id}) catch return output[0..0];
+    writer.print("{{\"ok\":true,\"channel\":{d},\"connection_id\":{d}}}", .{ channel_id, connection_id }) catch return output[0..0];
     return writer.buffered();
 }
 
@@ -13934,23 +13961,7 @@ fn handleVaultExport(context: *anyopaque, invocation: native_sdk.bridge.Invocati
             return respondError(output, "out of memory");
         };
         defer self.allocator.free(plain);
-        // Atomic write — same pattern as vault/store.
-        const cwd = std.Io.Dir.cwd();
-        if (std.fs.path.dirname(payload.path)) |dir| {
-            cwd.createDirPath(self.io, dir) catch {
-                return respondError(output, "failed to write vault file");
-            };
-        }
-        var file = cwd.createFile(self.io, payload.path, .{}) catch {
-            return respondError(output, "failed to write vault file");
-        };
-        defer file.close(self.io);
-        file.writeStreamingAll(self.io, plain) catch {
-            return respondError(output, "failed to write vault file");
-        };
-        file.sync(self.io) catch {
-            return respondError(output, "failed to write vault file");
-        };
+        vault.writeAtomicParts(self.io, payload.path, &.{plain}) catch return respondError(output, "failed to write vault file");
     }
     var writer = std.Io.Writer.fixed(output);
     writer.print("{{\"ok\":true,\"exported\":{d},\"sections\":{d}}}", .{ vault_payload.sections.count(), n }) catch return output[0..0];
@@ -14029,6 +14040,18 @@ fn handleVaultImportConfirm(context: *anyopaque, invocation: native_sdk.bridge.I
         .keep_local = payload.keep_local orelse &.{},
         .import_as_new = payload.import_as_new orelse &.{},
     };
+    // Journal appends and import write-back share ownership. Reload their indexes
+    // after an import attempt so new records are visible without restarting Oars.
+    while (!self.history.mutex.tryLock()) std.atomic.spinLoopHint();
+    defer {
+        self.history.loaded = false;
+        self.history.mutex.unlock();
+    }
+    while (!self.audit.mutex.tryLock()) std.atomic.spinLoopHint();
+    defer {
+        self.audit.loaded = false;
+        self.audit.mutex.unlock();
+    }
     var result = vault.applyImport(self.io, self.allocator, &vault_payload, sections_buf[0..n], opts) catch |err| {
         return respondError(output, vaultErrorString(err));
     };
@@ -14147,5 +14170,58 @@ fn handleAgentForward(context: *anyopaque, invocation: native_sdk.bridge.Invocat
     }
     var writer = std.Io.Writer.fixed(output);
     std.json.Stringify.value(.{ .ok = true }, .{}, &writer) catch return error.BufferTooSmall;
+    return writer.buffered();
+}
+
+fn handleShellSetup(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(struct { server_id: []const u8, shell: servers.HistoryShell, execute: bool = false, expected_sha256: ?[]const u8 = null, connection_id: ?u64 = null }, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    const payload = parsed.value;
+    if (payload.shell == .off) {
+        if (!payload.execute) return respondError(output, "select Bash, Zsh or Fish");
+        if (self.manager.get(payload.server_id)) |session| {
+            session.history_capture_enabled.store(false, .release);
+            session.history_full.store(false, .release);
+        }
+        return ok_json;
+    }
+    const connection_id = self.manager.connectionIdentity(payload.server_id) catch return respondError(output, "connect the server before setting up shell history");
+    const command = shell_integration.installCommand(self.allocator, @tagName(payload.shell)) catch return respondError(output, "could not build the shell setup plan");
+    defer self.allocator.free(command);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(command, &digest, .{});
+    const hash = std.fmt.bytesToHex(digest, .lower);
+    var writer = std.Io.Writer.fixed(output);
+    if (!payload.execute) {
+        try writer.print("{{\"ok\":true,\"connection_id\":{d},\"sha256\":\"{s}\",\"command\":", .{ connection_id, hash });
+        try json.writeJsonString(&writer, command);
+        try writer.writeAll("}");
+        return writer.buffered();
+    }
+    if (payload.connection_id != connection_id or payload.expected_sha256 == null or !std.mem.eql(u8, payload.expected_sha256.?, &hash)) return respondError(output, "the setup plan or connection changed; preview again");
+    const channel = self.manager.execTracked(payload.server_id, command, "shell.setup", "Install Oars shell history integration v1", &.{}) catch return respondError(output, "could not start shell setup");
+    sshkeysAudit(self, "history.shell.setup", payload.server_id, @tagName(payload.shell));
+    try writer.print("{{\"ok\":true,\"channel\":{d},\"connection_id\":{d}}}", .{ channel, connection_id });
+    return writer.buffered();
+}
+
+fn handleHistoryClear(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(struct { confirm: []const u8 }, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.confirm, "CLEAR")) return respondError(output, "type CLEAR to confirm");
+    self.history.clear(self.io) catch return respondError(output, "command history could not be cleared");
+    return ok_json;
+}
+
+fn handleAuditExport(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = contextOf(context);
+    var parsed = parsePayload(struct { path: []const u8 }, self.allocator, invocation.request.payload) catch return respondError(output, "invalid payload");
+    defer parsed.deinit();
+    if (parsed.value.path.len == 0) return respondError(output, "path is required");
+    const rows = self.audit.exportCsv(self.io, parsed.value.path) catch return respondError(output, "audit journal could not be exported");
+    var writer = std.Io.Writer.fixed(output);
+    try writer.print("{{\"ok\":true,\"rows\":{d}}}", .{rows});
     return writer.buffered();
 }

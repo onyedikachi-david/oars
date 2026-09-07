@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   Archive,
@@ -7,13 +7,13 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
-  CircleHelp,
+  Settings,
   Cloud,
   Command,
-  Database,
-  Gauge,
   HardDrive,
   GripVertical,
+  Maximize2,
+  Minimize2,
   KeyRound,
   LayoutDashboard,
   PanelLeftClose,
@@ -41,6 +41,10 @@ import { Button } from "./components/ui/button";
 import { OarsSelect } from "./components/ui/select";
 import { OarsLoadingState, OarsRefreshStatus } from "./components/OarsLoadingState";
 import { WorkspaceLayoutPicker } from "./components/WorkspaceLayoutPicker";
+import { WorkspacePaneMenu } from "./components/WorkspacePaneMenu";
+import { WorkspacePaneSlot, WorkspaceSurfaces } from "./components/WorkspaceSurfaces";
+import { WorkspaceDockTab, WorkspaceDockTabContext } from "./components/WorkspaceDockTab";
+import { WorkspaceDocking, WorkspaceDragHandle } from "./components/WorkspaceDocking";
 import { ApplicationNotice } from "./components/ApplicationPortal";
 import { api, BridgeError } from "./bridge";
 import type { Server as OarsServer, SessionStatus, Script, ScriptDraft, DeployApp } from "./types";
@@ -50,7 +54,23 @@ import { MonitorTab } from "./MonitorTab";
 import { LogsTab } from "./LogsTab";
 import { FilesTab } from "./FilesTab";
 import { ScriptsTab } from "./ScriptsTab";
-import { CommandPalette } from "./components/CommandPalette";
+import { DataSettings } from "./components/DataSettings";
+import { buildActionRegistry } from "./actions";
+import { PaletteTargetDialog } from "./components/PaletteTargetDialog";
+import { parsePaletteQuery } from "./palette";
+import { FleetList } from "./components/FleetList";
+import { GroupView } from "./components/GroupView";
+import { GroupEditDialog } from "./components/GroupEditDialog";
+import { groupMembers, moveGroupProfiles } from "./fleet";
+import { useFleetMove } from "./useFleetMove";
+import { useAppearance, updateAppearance } from "./appearance";
+import { appShortcut, isMacPlatform } from "./keyboard";
+import { readPaletteState } from "./palette";
+import type { HistoryEntry } from "./types";
+import { ConnectionStatus } from "./components/ConnectionStatus";
+import { auditTitle, journalTime } from "./journal-format";
+import { AppearanceSettings } from "./components/AppearanceSettings";
+import { CommandPalette, type CommandItem } from "./components/CommandPalette";
 import { DeployTab } from "./DeployTab";
 import { KeysTab } from "./KeysTab";
 import { AccessTab } from "./AccessTab";
@@ -59,11 +79,13 @@ import { readBackupPreviewMode } from "./backup-preview";
 import { readAiPreviewMode } from "./ai-preview";
 import { AiTab } from "./AiTab";
 import { HistoryTab } from "./HistoryTab";
-import { VaultTab } from "./VaultTab";
 import { AgentTab } from "./AgentTab";
 import {
   MAX_WORKSPACE_PANES,
   buildWorkspaceLayout,
+  reconcileWorkspaceLayout,
+  activateWorkspacePane,
+  dockWorkspacePane,
   workspaceLayoutKeys,
   type WorkspaceLayoutVariant,
 } from "./workspace-layout";
@@ -74,7 +96,7 @@ const VncTab = lazy(() => import("./VncTab").then((module) => ({ default: module
 // Shell nav
 // ---------------------------------------------------------------------------
 type Section = "Overview" | "Servers" | "Activity" | "Automation" | "Security" | "Backups" | "AI Context";
-type View = "monitor" | "terminal" | "logs" | "files" | "scripts" | "deploy" | "keys" | "backups" | "ai" | "vnc" | "history" | "vault" | "agent";
+type View = "monitor" | "terminal" | "logs" | "files" | "scripts" | "deploy" | "keys" | "backups" | "ai" | "vnc" | "history" | "agent";
 
 interface Tab {
   server: OarsServer;
@@ -94,7 +116,6 @@ const VIEWS: { id: View; label: string }[] = [
   { id: "ai", label: "AI" },
   { id: "vnc", label: "VNC" },
   { id: "history", label: "History" },
-  { id: "vault", label: "Vault" },
   { id: "agent", label: "Agent" },
 ];
 
@@ -109,17 +130,6 @@ const navGroups = [
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
-function sessionStatusClass(s?: SessionStatus) {
-  if (!s || s === "closed") return "closed";
-  return s;
-}
-function fleetDotClass(s?: SessionStatus): string {
-  if (s === "ready") return "fleet-dot fleet-dot-ready";
-  if (s === "connecting" || s === "authenticating") return "fleet-dot fleet-dot-connecting";
-  if (s === "needs_trust") return "fleet-dot fleet-dot-needs_trust";
-  if (s === "error") return "fleet-dot fleet-dot-error";
-  return "fleet-dot fleet-dot-offline";
-}
 function fleetLabel(s?: SessionStatus): string {
   if (!s || s === "closed") return "Offline";
   if (s === "ready") return "Connected";
@@ -169,10 +179,8 @@ function Overview({
     return servers.filter((s) => `${s.name} ${s.host} ${s.group ?? ""}`.toLowerCase().includes(q));
   }, [servers, search]);
 
-  const online = filtered.filter((s) => statuses.get(s.id) === "ready").length;
-  const total = filtered.length;
-  const health = total === 0 ? 0 : Math.round((online / total) * 100);
-  const active = Array.from(statuses.values()).filter((v) => v === "ready").length;
+  const online = servers.filter((s) => statuses.get(s.id) === "ready").length;
+  const total = servers.length;
 
   // recent activity from bridge
   const [activities, setActivities] = useState<{ title: string; detail: string; time: string; icon: any; tone: string }[]>([]);
@@ -185,9 +193,9 @@ function Overview({
         if (cancelled) return;
         if (entries.length > 0) {
           const mapped = entries.slice(0, 5).map((e: any) => ({
-            title: e.action ?? e.type ?? "Activity",
-            detail: e.detail ?? e.server_id ?? "",
-            time: "recent",
+            title: auditTitle(e.action ?? e.type ?? "Activity"),
+            detail: e.target || e.server_id || e.result || "Local workspace",
+            time: journalTime(e.ts),
             icon: Terminal,
             tone: "info",
           }));
@@ -208,7 +216,7 @@ function Overview({
     <div className="content-stack">
       <SectionTitle
         eyebrow="Fleet overview"
-        title="Local infrastructure"
+        title="Overview"
         description={total === 0 ? "No servers yet. Add one to get started." : `${online} of ${total} connection profiles are connected.`}
         action={
           <Button onClick={onAdd}>
@@ -217,24 +225,11 @@ function Overview({
         }
       />
 
-      <div className="metric-grid">
-        {[
-          { label: "Fleet health", value: `${health}%`, helper: `${online} of ${total} servers online`, icon: Gauge, tone: "success" as const },
-          { label: "Active sessions", value: String(active).padStart(2, "0"), helper: `${active} shells · local`, icon: Terminal, tone: "info" as const },
-          { label: "Servers", value: String(total).padStart(2, "0"), helper: `${filtered.length} in fleet`, icon: ListChecks, tone: "warning" as const },
-          { label: "Storage used", value: "—", helper: "Per-server in Monitor", icon: Database, tone: "muted" as const },
-        ].map((item) => (
-          <div className="metric-card" key={item.label}>
-            <div className={`metric-icon tone-${item.tone}`}>
-              <item.icon />
-            </div>
-            <div>
-              <p>{item.label}</p>
-              <strong>{item.value}</strong>
-              <span>{item.helper}</span>
-            </div>
-          </div>
-        ))}
+      <div className="fleet-summary" aria-label="Fleet summary">
+        <span><ConnectionStatus status="ready" /><strong>{online}</strong> connected</span>
+        <span><ConnectionStatus status="closed" /><strong>{servers.filter(server => !statuses.get(server.id) || statuses.get(server.id) === "closed").length}</strong> offline</span>
+        <span><ConnectionStatus status="error" /><strong>{servers.filter(server => statuses.get(server.id) === "error").length}</strong> failed</span>
+        <span><Server size={15} aria-hidden /><strong>{total}</strong> profiles</span>
       </div>
 
       <div className="overview-grid">
@@ -250,7 +245,7 @@ function Overview({
           </div>
           {filtered.length === 0 ? (
             <div style={{ padding: "24px 22px", color: "var(--muted-foreground)", fontSize: 12.5 }}>
-              No servers yet. Add your first one — Oars connects over standard SSH, no agent required.
+              {servers.length === 0 ? "No servers yet. Add your first one — Oars connects over standard SSH, no agent required." : "No servers match your search."}
               <div style={{ marginTop: 12 }}>
                 <Button size="sm" onClick={onAdd}>Add server</Button>
               </div>
@@ -290,7 +285,7 @@ function Overview({
       <div className="quick-actions">
         <div>
           <p className="eyebrow">Quick actions</p>
-          <h2>Keep moving</h2>
+          <h2>Workspace actions</h2>
         </div>
         <div className="action-row">
           {[
@@ -349,7 +344,7 @@ function LiveServerTable({
                 </td>
                 <td>
                   <span className="status-label">
-                    <span className={fleetDotClass(st)} aria-hidden />
+                    <ConnectionStatus status={st} />
                     {fleetLabel(st)}
                   </span>
                 </td>
@@ -446,7 +441,7 @@ function ServersView({
                           <td><div className="server-cell"><span className="server-avatar">{initials(s.name)}</span><div><strong>{s.name}</strong><span>{s.host}:{s.port}</span></div></div></td>
                           <td style={{ color: "var(--muted-foreground)", fontSize: 11 }}>{s.user}</td>
                           <td><span className="pill" style={{ textTransform: "capitalize" }}>{s.auth_method}</span></td>
-                          <td><span className="status-label"><span className={fleetDotClass(st)} aria-hidden />{fleetLabel(st)}</span></td>
+                          <td><span className="status-label"><ConnectionStatus status={st} />{fleetLabel(st)}</span></td>
                           <td style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
                             <Button variant="outline" size="sm" onClick={() => onOpen(s)}>Open <ArrowUpRight data-icon="inline-end" /></Button>
                             <Button variant="ghost" size="sm" onClick={() => onEdit(s)}>Edit</Button>
@@ -478,18 +473,27 @@ export default function App() {
   const [modal, setModal] = useState<{ server?: OarsServer } | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
-  const [paletteQ, setPaletteQ] = useState("");
-  const [theme, setTheme] = useState<string>(() => {
-    try {
-      return localStorage.getItem("oars:theme") ?? "light";
-    } catch {
-      return "light";
-    }
-  });
+  const [paletteQ, setPaletteQ] = useState(() => readPaletteState().query);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [dataOpen, setDataOpen] = useState(false);
+  const closedTabs = useRef<Tab[]>([]);
+  const [historyForPalette, setHistoryForPalette] = useState<HistoryEntry[]>([]);
+  const [historyAction, setHistoryAction] = useState<"clear-audit" | null>(null);
+  const [paletteTarget, setPaletteTarget] = useState<{ title: string; view: View; scriptId?: string; mirror?: boolean } | null>(null);
+  const [pendingHistory, setPendingHistory] = useState<HistoryEntry | null>(null);
+  const appearance = useAppearance();
+  const theme = appearance.theme;
+  const setTheme = useCallback((next: string) => { updateAppearance({ theme: next === "dark" ? "dark" : "light" }); }, []);
   const [search, setSearch] = useState("");
   const [fleetFilter, setFleetFilter] = useState("");
   const fleetCountRef = useRef(0);
-  const [collapsedFleetGroups, setCollapsedFleetGroups] = useState<Set<string>>(new Set());
+  const [collapsedFleetGroups, setCollapsedFleetGroups] = useState<Set<string>>(() => {
+    try { const value: unknown = JSON.parse(localStorage.getItem("oars:fleet-collapsed") ?? "[]"); return new Set(Array.isArray(value) ? value.filter((key): key is string => typeof key === "string") : []); } catch { return new Set(); }
+  });
+  const [activeGroup, setActiveGroup] = useState<string | null>(null);
+  const [moveServer, setMoveServer] = useState<OarsServer | null>(null);
+  const [broadcastGroupIds, setBroadcastGroupIds] = useState<string[] | undefined>();
+  useEffect(() => { try { localStorage.setItem("oars:fleet-collapsed", JSON.stringify([...collapsedFleetGroups])); } catch {} }, [collapsedFleetGroups]);
   const [serverMenuId, setServerMenuId] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState<Section>(() => aiPreviewMode !== null ? "AI Context" : backupPreviewMode === null ? "Overview" : "Backups");
   const [mobileNav, setMobileNav] = useState(false);
@@ -509,6 +513,9 @@ export default function App() {
     }
   });
   const [layoutVariant, setLayoutVariant] = useState<WorkspaceLayoutVariant>(defaultLayoutVariant);
+  const [paneFocused, setPaneFocused] = useState(false);
+  const customLayoutRef = useRef(false);
+  const [workspaceMessage, setWorkspaceMessage] = useState("");
   const [mosaicLayout, setMosaicLayout] = useState<MosaicNode<string> | null>(null);
   const [compactWorkspace, setCompactWorkspace] = useState(() => window.matchMedia("(max-width: 900px)").matches);
   const [toast, setToast] = useState("");
@@ -580,6 +587,7 @@ export default function App() {
   }, []);
 
   useEffect(() => { applyTheme(theme); }, [theme, applyTheme]);
+  useEffect(() => { document.documentElement.dataset.accent = appearance.accent; }, [appearance.accent]);
 
   useEffect(() => {
     try { localStorage.setItem("oars:sidebar-collapsed", String(sidebarCollapsed)); } catch {}
@@ -595,18 +603,16 @@ export default function App() {
 
   const tabKeySignature = tabs.map((tab) => tab.key).join("\u0000");
   useEffect(() => {
-    const keys = tabs.map((tab) => tab.key);
-    setMosaicLayout((current) => {
-      const currentKeys = workspaceLayoutKeys(current);
-      const nextKeys = [
-        ...currentKeys.filter((key) => keys.includes(key)),
-        ...keys.filter((key) => !currentKeys.includes(key)),
-      ];
-      return buildWorkspaceLayout(nextKeys, layoutVariant, compactWorkspace);
-    });
-  }, [tabKeySignature, layoutVariant, compactWorkspace]);
+    const keys = tabKeySignature ? tabKeySignature.split("\u0000") : [];
+    if (keys.length === 0) customLayoutRef.current = false;
+    setMosaicLayout((current) => customLayoutRef.current
+      ? reconcileWorkspaceLayout(current, keys, layoutVariant)
+      : buildWorkspaceLayout(keys, layoutVariant));
+  }, [tabKeySignature, layoutVariant]);
 
-
+  useEffect(() => {
+    if (activeKey) setMosaicLayout((current) => activateWorkspacePane(current, activeKey));
+  }, [activeKey]);
 
   const setStatus = useCallback((serverId: string, status: SessionStatus) => {
     setStatuses((prev) => {
@@ -622,6 +628,23 @@ export default function App() {
   useEffect(() => {
     api.scripts.list().then((r) => setScriptsForPalette(r.scripts)).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (!paletteOpen) return;
+    let active = true;
+    api.history.list({ limit: 500 }).then(result => { if (active) setHistoryForPalette(result.entries); }).catch(() => { if (active) setHistoryForPalette([]); });
+    api.scripts.list().then(result => { if (active) setScriptsForPalette(result.scripts); }).catch(() => {});
+    return () => { active = false; };
+  }, [paletteOpen]);
+
+  useEffect(() => {
+    if (!paletteOpen) return;
+    const parsed = parsePaletteQuery(paletteQ);
+    if (parsed.mode !== "history") return;
+    let active = true;
+    const timer = setTimeout(() => { api.history.list({ limit: 500, q: parsed.text }).then(result => { if (active) setHistoryForPalette(result.entries); }).catch(() => { if (active) setHistoryForPalette([]); }); }, 150);
+    return () => { active = false; clearTimeout(timer); };
+  }, [paletteOpen, paletteQ]);
 
   const [pendingDeployApp, setPendingDeployApp] = useState<{ serverId: string; appId: string } | null>(null);
   const [deployAppsForPalette, setDeployAppsForPalette] = useState<Array<{ id: string; name: string; serverId: string }>>([]);
@@ -703,6 +726,7 @@ export default function App() {
 
   const closeTab = useCallback((key: string) => {
     const tab = tabs.find((item) => item.key === key);
+    if (tab) closedTabs.current = [tab, ...closedTabs.current].slice(0, 10);
     const hasAnotherView = tab ? tabs.some((item) => item.key !== key && item.server.id === tab.server.id) : false;
     setTabs((prev) => prev.filter((item) => item.key !== key));
     setActiveKey((active) => {
@@ -724,6 +748,19 @@ export default function App() {
     setServers((current) => current.map((server) => server.id === saved.id ? saved : server));
     setTabs((current) => current.map((tab) => tab.server.id === saved.id ? { ...tab, server: saved } : tab));
   }, []);
+
+  const updateGroupServers = useCallback((updated: OarsServer[]) => {
+    const changes = new Map(updated.map(server => [server.id, server]));
+    setServers(previous => previous.map(server => changes.get(server.id) ?? server));
+    setTabs(previous => previous.map(tab => ({ ...tab, server: changes.get(tab.server.id) ?? tab.server })));
+  }, []);
+  const fleetMove = useFleetMove((server, group) => {
+    void moveGroupProfiles([server], group).then(result => {
+      updateGroupServers(result.updated);
+      setToast(result.failures.length ? result.failures.map(failure => failure.message).join("; ") : `${server.name} moved to ${group || "Ungrouped"}.`);
+    }).catch(error => setToast(String(error)));
+  });
+  const openGroup = (group: string) => { setActiveGroup(group); setActiveKey(null); setActiveSection("Servers"); };
 
   const handleDeleted = useCallback((id: string, warning?: string) => {
     // Close all tabs for the removed profile and disconnect the session.
@@ -748,42 +785,45 @@ export default function App() {
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        setPaletteOpen((o) => !o);
+      if (e.defaultPrevented || e.isComposing) return;
+      const element = document.activeElement as HTMLElement | null;
+      const inTerminal = !!element?.closest(".terminal-host");
+      const shortcut = appShortcut(e, isMacPlatform(), inTerminal);
+      const overlay = document.querySelector('[role="dialog"][aria-modal="true"]');
+      if (overlay) {
+        if (paletteOpen && shortcut === "palette") { e.preventDefault(); setPaletteOpen(false); }
         return;
       }
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "t") {
-        const active = tabs.find((t) => t.key === activeKey);
-        if (active) {
-          e.preventDefault();
-          openMirrored(active.server);
-          return;
+      if (shortcut) {
+        e.preventDefault();
+        const active = tabs.find(tab => tab.key === activeKey);
+        if (shortcut === "palette") setPaletteOpen(true);
+        else if (shortcut === "settings") setSettingsOpen(true);
+        else if (shortcut === "new") { if (active) openMirrored(active.server); else setModal({}); }
+        else if (shortcut === "close" && activeKey) closeTab(activeKey);
+        else if (shortcut === "reopen") {
+          if (tabs.length >= MAX_WORKSPACE_PANES) { showPaneLimit(); return; }
+          const closed = closedTabs.current.shift();
+          const server = servers.find(item => item.id === closed?.server.id);
+          if (closed && server) openMirrored(server, closed.view);
+        } else if (shortcut === "files" && active) setViewForKey(active.key, "files");
+        else if (shortcut === "logs" && active) {
+          setViewForKey(active.key, "logs");
+          requestAnimationFrame(() => document.querySelector<HTMLInputElement>('.logs-search input')?.focus());
+        } else if (shortcut.startsWith("tab-")) {
+          const tab = tabs[Number(shortcut.slice(4)) - 1];
+          if (tab) setActiveKey(tab.key);
         }
+        return;
       }
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
-        // Fleet search — don't hijack when the terminal or an input is focused.
-        const tag = (document.activeElement?.tagName ?? "").toLowerCase();
-        const inField = tag === "input" || tag === "textarea" || (document.activeElement as HTMLElement | null)?.isContentEditable;
-        if (!inField) {
-          e.preventDefault();
-          fleetSearchRef.current?.focus();
-          return;
-        }
+      const inField = element?.matches("input, textarea, select") || element?.isContentEditable;
+      if (e.key === "/" && !e.metaKey && !e.ctrlKey && !e.altKey && !inField && element?.closest(".sidebar")) {
+        e.preventDefault(); fleetSearchRef.current?.focus();
       }
-      if (e.key === "/" && !e.metaKey && !e.ctrlKey && !e.altKey) {
-        const tag = (document.activeElement?.tagName ?? "").toLowerCase();
-        const inField = tag === "input" || tag === "textarea" || (document.activeElement as HTMLElement | null)?.isContentEditable;
-        if (!inField) {
-          e.preventDefault();
-          fleetSearchRef.current?.focus();
-        }
-      }
-      if (e.key === "Escape" && paletteOpen) setPaletteOpen(false);
     };
-    window.addEventListener("keydown", h);
-    return () => window.removeEventListener("keydown", h);
-  }, [paletteOpen, tabs, activeKey, openMirrored]);
+    window.addEventListener("keydown", h, true);
+    return () => window.removeEventListener("keydown", h, true);
+  }, [paletteOpen, tabs, activeKey, openMirrored, closeTab, servers, setViewForKey, showPaneLimit]);
 
   const activeTab = tabs.find((t) => t.key === activeKey) ?? null;
   const fleetGroups = useMemo(() => {
@@ -804,6 +844,7 @@ export default function App() {
       })
       .map(([group, entries]) => ({
         key: group || "__ungrouped__",
+        path: group,
         label: group || "Ungrouped",
         entries: entries.sort((a, b) => a.name.localeCompare(b.name)),
       }));
@@ -835,11 +876,13 @@ export default function App() {
   }, []);
 
   const applyLayoutVariant = useCallback((variant: WorkspaceLayoutVariant) => {
+    customLayoutRef.current = false;
+    setPaneFocused(false);
     setLayoutVariant(variant);
     setMosaicLayout((current) => {
       const currentKeys = workspaceLayoutKeys(current);
       const keys = currentKeys.length > 0 ? currentKeys : tabs.map((tab) => tab.key);
-      return buildWorkspaceLayout(keys, variant, compactWorkspace);
+      return buildWorkspaceLayout(keys, variant);
     });
   }, [compactWorkspace, tabs]);
 
@@ -882,44 +925,25 @@ export default function App() {
     }
   }
 
-  const paletteItems = (() => {
-    const items: Array<{ label: string; action: () => void }> = [];
-    // sections
-    for (const g of navGroups) for (const it of g.items) items.push({ label: `Go to ${it.label}`, action: () => { setActiveSection(it.label as Section); setActiveKey(null); setPaletteOpen(false); } });
-    for (const s of servers) {
-      items.push({ label: `Open ${s.name} (${s.host})`, action: () => { openServer(s); setPaletteOpen(false); } });
-      items.push({ label: `Mirror ${s.name} in new tab`, action: () => { openMirrored(s); setPaletteOpen(false); } });
-      for (const v of VIEWS) items.push({ label: `${s.name} → ${v.label}`, action: () => { openServerView(s, v.id); setPaletteOpen(false); } });
-    }
-    // Spec 06 palette entry point: pick a saved script and a target
-    // server — opens the server's Scripts view with the script selected.
-    for (const sc of scriptsForPalette) {
-      for (const s of servers) {
-        items.push({
-          label: `Run “${sc.name}” on ${s.name}`,
-          action: () => { openServerView(s, "scripts"); setPendingScriptId(sc.id); setPaletteOpen(false); },
-        });
-      }
-    }
-    // Spec 07 palette: open Deploy for a saved app on a server
-    for (const app of deployAppsForPalette) {
-      const s = servers.find((x) => x.id === app.serverId);
-      if (!s) continue;
-      items.push({
-        label: `Open “${app.name}” deployments on ${s.name}`,
-        action: () => {
-          setPendingDeployApp({ serverId: s.id, appId: app.id });
-          openServerView(s, "deploy");
-          setPaletteOpen(false);
-        },
-      });
-    }
-    items.push({ label: "Add server…", action: () => { setModal({}); setPaletteOpen(false); } });
-    items.push({ label: `Theme: switch to ${theme === "dark" ? "light" : "dark"}`, action: () => { setTheme(theme === "dark" ? "light" : "dark"); setPaletteOpen(false); } });
-    if (!paletteQ) return items.slice(0, 20);
-    const q = paletteQ.toLowerCase();
-    return items.filter((i) => i.label.toLowerCase().includes(q)).slice(0, 20);
-  })();
+  const paletteItems: CommandItem[] = buildActionRegistry({
+    sections: navGroups.flatMap(group => group.items.map(item => item.label)), views: VIEWS,
+    servers, scripts: scriptsForPalette, history: historyForPalette, tabs,
+    navigate: section => { setActiveSection(section as Section); setActiveGroup(null); setBroadcastGroupIds(undefined); setActiveKey(null); },
+    openServer,
+    openView: view => { if (activeTab) openServerView(activeTab.server, view); else setPaletteTarget({ title: `Open ${view}`, view }); },
+    chooseScriptTarget: script => setPaletteTarget({ title: `Run “${script.name}”`, scriptId: script.id, view: "scripts" }),
+    openGroup,
+    reviewHistory: entry => { setPendingHistory(entry); setActiveSection("Activity"); setActiveKey(null); },
+    data: () => setDataOpen(true),
+    activateTab: setActiveKey, addServer: () => setModal({}), appearance: () => setSettingsOpen(true),
+    mirror: () => { if (activeTab) openMirrored(activeTab.server); else setPaletteTarget({ title: "New mirrored terminal", view: "terminal", mirror: true }); },
+    closeTab: () => { if (activeKey) closeTab(activeKey); },
+    clearAudit: () => { setHistoryAction("clear-audit"); setActiveSection("Activity"); setActiveKey(null); },
+    theme, toggleTheme: () => setTheme(theme === "dark" ? "light" : "dark"),
+  }).concat(deployAppsForPalette.flatMap(app => {
+    const server = servers.find(item => item.id === app.serverId);
+    return server ? [{ id: `deploy:${app.id}:${server.id}`, title: `Open “${app.name}” deployments on ${server.name}`, category: "Deployments", run: () => { setPendingDeployApp({ serverId: server.id, appId: app.id }); openServerView(server, "deploy"); } }] : [];
+  }));
 
   const activeStatus = activeTab ? statuses.get(activeTab.server.id) : undefined;
   const connectedCount = Array.from(statuses.values()).filter((status) => status === "ready").length;
@@ -935,75 +959,31 @@ export default function App() {
         ? `${connectedCount} connected`
         : servers.length === 0 ? "No servers" : "Fleet idle";
 
-  const renderServerPane = (key: string, path: MosaicPath) => {
+  const renderPaneContent = (key: string) => {
     const tab = tabs.find((item) => item.key === key);
-    if (!tab) return <div />;
+    if (!tab) return null;
     const status = statuses.get(tab.server.id);
     const viewConnecting = CONNECTION_VIEWS.has(tab.view)
       && (!status || status === "connecting" || status === "authenticating");
-    const isMirror = tab.key.includes("#");
-
     return (
-      <MosaicWindow<string>
-        className={`oars-mosaic-window ${tab.key === activeKey ? "is-active" : ""}`}
-        path={path}
-        title={tab.server.name}
-        draggable
-        renderToolbar={() => (
-          <div
-            className="workspace-pane-toolbar"
-            onPointerDown={() => setActiveKey(tab.key)}
-          >
-            <div className="workspace-pane-drag" title="Drag to move this pane">
-              <GripVertical aria-hidden />
-              <span className={`dot ${sessionStatusClass(status)}`} aria-hidden />
-              <strong>{tab.server.name}{isMirror ? " · mirror" : ""}</strong>
-              <span className="workspace-pane-address">{tab.server.user}@{tab.server.host}:{tab.server.port}</span>
-            </div>
-            <div className="workspace-pane-actions">
-              <span className="workspace-pane-status">{fleetLabel(status)}</span>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                aria-label={`Edit ${tab.server.name}`}
-                title="Edit profile"
-                onPointerDown={(event) => event.stopPropagation()}
-                onClick={() => setModal({ server: tab.server })}
-              >
-                <Pencil />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                aria-label={`Close ${tab.server.name}${isMirror ? " mirror" : ""}`}
-                title="Close pane"
-                onPointerDown={(event) => event.stopPropagation()}
-                onClick={() => closeTab(tab.key)}
-              >
-                <X />
-              </Button>
-            </div>
-          </div>
-        )}
-      >
         <section
           className="workspace-pane"
           aria-label={`${tab.server.name} workspace`}
           onPointerDownCapture={() => setActiveKey(tab.key)}
+          onFocusCapture={() => setActiveKey(tab.key)}
         >
-          <nav className="subnav workspace-pane-subnav" role="tablist" aria-label={`${tab.server.name} views`}>
-            {VIEWS.map((view) => (
-              <button
-                key={view.id}
-                role="tab"
-                aria-selected={tab.view === view.id}
-                className={`subnav-item ${tab.view === view.id ? "active" : ""}`}
-                onClick={() => setViewForKey(tab.key, view.id)}
-              >
-                {view.label}
-              </button>
-            ))}
-          </nav>
+          <div className="workspace-pane-navigation">
+            <nav className="subnav workspace-pane-subnav" aria-label={`${tab.server.name} quick views`}>
+              {VIEWS.filter((view) => ["monitor", "terminal", "files", "logs"].includes(view.id)).map((view) => (
+                <button type="button" key={view.id} aria-current={tab.view === view.id ? "page" : undefined}
+                  className={`subnav-item ${tab.view === view.id ? "active" : ""}`}
+                  onClick={() => setViewForKey(tab.key, view.id)}>{view.label}</button>
+              ))}
+            </nav>
+            <OarsSelect value={tab.view} options={VIEWS.map((view) => ({ value: view.id, label: view.label }))}
+              aria-label={`${tab.server.name} all views`} className="workspace-view-select"
+              onValueChange={(value) => setViewForKey(tab.key, value as View)} />
+          </div>
 
           <div className="workspace-pane-scroll" hidden={tab.view === "terminal"}>
             <div className="content workspace-pane-content">
@@ -1036,9 +1016,8 @@ export default function App() {
                     <VncTab key={tab.key} serverId={tab.server.id} />
                   </Suspense>
                 )
-                : tab.view === "history" ? <HistoryTab key={tab.key} />
-                : tab.view === "vault" ? <VaultTab key={tab.key} />
-                : tab.view === "agent" ? <AgentTab key={tab.key} />
+                : tab.view === "history" ? <HistoryTab key={tab.key} serverId={tab.server.id} />
+                : tab.view === "agent" ? <AgentTab key={tab.key} server={tab.server} />
                 : <div className="empty"><h3>{VIEWS.find((view) => view.id === tab.view)?.label}</h3><p className="muted">Coming in the next spec — backend is ready.</p></div>}
             </div>
           </div>
@@ -1047,8 +1026,54 @@ export default function App() {
             <TerminalTab server={tab.server} onStatus={setStatus} onServerUpdated={handleServerUpdated} />
           </div>
         </section>
-      </MosaicWindow>
     );
+  };
+
+  const togglePaneFocus = (key: string) => {
+    setActiveKey(key);
+    setPaneFocused((current) => !current);
+    requestAnimationFrame(() => document.querySelector<HTMLButtonElement>('[data-pane-focus="true"]')?.focus());
+  };
+
+  const renderServerPane = (key: string, path: MosaicPath) => {
+    const tab = tabs.find((item) => item.key === key);
+    if (!tab) return <div />;
+    const status = statuses.get(tab.server.id);
+    const name = `${tab.server.name}${tab.key.includes("#") ? " · mirror" : ""}`;
+    return <MosaicWindow<string>
+      className={`oars-mosaic-window ${tab.key === activeKey ? "is-active" : ""}`}
+      path={path} title={name} draggable={false}
+      renderToolbar={() => (
+        <div className="workspace-pane-toolbar" data-workspace-pane={key} onPointerDown={() => setActiveKey(key)}>
+          <WorkspaceDragHandle paneKey={key} onFocusPane={() => togglePaneFocus(key)}>
+            <GripVertical aria-hidden />
+            <ConnectionStatus status={status} />
+            <div className="workspace-pane-identity"><strong>{name}</strong>
+              <span className="workspace-pane-address">{tab.server.user}@{tab.server.host}:{tab.server.port}</span>
+            </div>
+          </WorkspaceDragHandle>
+          <div className="workspace-pane-actions" draggable={false}
+            onDragStart={(event) => { event.preventDefault(); event.stopPropagation(); }}>
+            <span className="workspace-pane-status">{fleetLabel(status)}</span>
+            {!compactWorkspace && tabs.length > 1 && <Button variant="ghost" size="icon-sm"
+              data-pane-focus={key === activeKey}
+              aria-label={paneFocused ? "Restore pane layout" : `Focus ${name}`} title={paneFocused ? "Restore layout" : "Focus pane"}
+              onClick={() => togglePaneFocus(key)}>
+              {paneFocused ? <Minimize2 /> : <Maximize2 />}
+            </Button>}
+            <WorkspacePaneMenu name={name} canDuplicate={tabs.length < MAX_WORKSPACE_PANES}
+              peers={tabs.filter((peer) => peer.key !== key).map((peer) => ({ key: peer.key, label: `${peer.server.name}${peer.key.includes("#") ? " · mirror" : ""}` }))}
+              onDock={(target, position) => {
+                customLayoutRef.current = true;
+                setMosaicLayout((current) => dockWorkspacePane(current, key, target, position));
+                setActiveKey(key); setPaneFocused(false); setWorkspaceMessage(`${name} moved.`);
+              }} onDuplicate={() => openMirrored(tab.server, tab.view)}
+              onEdit={() => setModal({ server: tab.server })} onClose={() => closeTab(key)} />
+            <Button variant="ghost" size="icon-sm" aria-label={`Close ${name}`} title="Close pane" onClick={() => closeTab(key)}><X /></Button>
+          </div>
+        </div>
+      )}
+    ><WorkspacePaneSlot paneKey={key} /></MosaicWindow>;
   };
 
   return (
@@ -1082,7 +1107,7 @@ export default function App() {
                 <button
                   key={item.label}
                   className={`nav-item ${!activeTab && activeSection === item.label ? "nav-active" : ""}`}
-                  onClick={() => { setActiveSection(item.label as Section); setActiveKey(null); setMobileNav(false); }}
+                  onClick={() => { setActiveSection(item.label as Section); setActiveGroup(null); setBroadcastGroupIds(undefined); setActiveKey(null); setMobileNav(false); }}
                   title={item.label}
                 >
                   <item.icon />
@@ -1102,30 +1127,25 @@ export default function App() {
             <input ref={fleetSearchRef} value={fleetFilter} onChange={(e) => setFleetFilter(e.target.value)} placeholder="Filter by name, host or group" aria-label="Filter fleet" />
             {fleetFilter && <button type="button" aria-label="Clear filter" onClick={() => setFleetFilter("")} style={{ border: 0, background: "transparent", color: "var(--muted-foreground)", cursor: "pointer", padding: 2 }}><X size={12} /></button>}
           </label>
-          <div className="sidebar-fleet-list" role="list">
-            {fleetGroups.length === 0 ? (
-              <div className="sidebar-fleet-empty">{serversLoading ? "Loading profiles…" : servers.length === 0 ? "No connection profiles yet." : "No matches."}</div>
-            ) : fleetGroups.map((group) => {
+          <FleetList groups={fleetGroups} collapsed={collapsedFleetGroups} expandAll={sidebarCollapsed} activeServerId={activeTab?.server.id}
+            empty={serversLoading ? "Loading profiles…" : servers.length === 0 ? "No connection profiles yet." : "No matches."}
+            renderGroup={group => {
               const collapsed = !sidebarCollapsed && collapsedFleetGroups.has(group.key);
-              return (
-                <div className="sidebar-fleet-group" key={group.key}>
-                  <button
-                    type="button"
-                    className="sidebar-fleet-group-toggle"
-                    aria-expanded={!collapsed}
-                    onClick={() => toggleFleetGroup(group.key)}
-                  >
-                    <ChevronDown className={collapsed ? "is-collapsed" : ""} aria-hidden />
-                    <span>{group.label}</span>
-                    <span>{group.entries.length}</span>
-                  </button>
-                  {!collapsed && group.entries.map((s) => {
-                    const st = statuses.get(s.id);
+              return (<div className="sidebar-group-header" data-fleet-group-drop={group.path}>
+                    <Button variant="ghost" size="icon-xs" aria-label={`${collapsed ? "Expand" : "Collapse"} ${group.label}`} aria-expanded={!collapsed} onClick={() => toggleFleetGroup(group.key)}><ChevronDown className={collapsed ? "is-collapsed" : ""} aria-hidden /></Button>
+                    <button type="button" className="sidebar-fleet-group-toggle" onClick={() => openGroup(group.path)}>
+                      <span>{group.label}</span>
+                      <span>{group.entries.filter(server => statuses.get(server.id) === "ready").length} connected · {group.entries.filter(server => statuses.get(server.id) === "error").length} errors · {group.entries.length} total</span>
+                    </button>
+                  </div>);
+            }}
+            renderServer={s => {
+              const st = statuses.get(s.id);
                     const isActive = tabs.some((t) => t.server.id === s.id && t.key === activeKey);
                     return (
                       <div key={s.id} className={`sidebar-fleet-row ${isActive ? "is-active" : ""}`} role="listitem" data-server-menu>
-                        <button type="button" className="sidebar-fleet-open" onClick={() => { openServer(s); setServerMenuId(null); setMobileNav(false); }} title={`${s.name} — ${s.host}:${s.port}`}>
-                          <span className={fleetDotClass(st)} aria-hidden />
+                        <button type="button" className="sidebar-fleet-open" onPointerDown={event => fleetMove.onPointerDown(event, s)} onPointerMove={fleetMove.onPointerMove} onPointerUp={fleetMove.onPointerUp} onPointerCancel={fleetMove.onPointerCancel} onLostPointerCapture={fleetMove.onLostPointerCapture} onClick={() => { if (fleetMove.consumeClick()) return; openServer(s); setServerMenuId(null); setMobileNav(false); }} title={`${s.name} — ${s.host}:${s.port}`}>
+                          <ConnectionStatus status={st} />
                           <span className="sidebar-fleet-meta">
                             <span className="sidebar-fleet-name">{s.name}</span>
                             <span className="sidebar-fleet-host">{s.host}:{s.port} · {s.user}</span>
@@ -1148,30 +1168,30 @@ export default function App() {
                             <div className="sidebar-server-menu" role="menu" aria-label={`Actions for ${s.name}`}>
                               <button type="button" role="menuitem" onClick={() => { openServerView(s, "terminal"); setServerMenuId(null); setMobileNav(false); }}><Terminal /> Open terminal</button>
                               <button type="button" role="menuitem" onClick={() => { openMirrored(s); setServerMenuId(null); setMobileNav(false); }}><Plus /> New mirrored tab</button>
+                              <button type="button" role="menuitem" onClick={() => { setMoveServer(s); setServerMenuId(null); }}>Move to group…</button>
                               <button type="button" role="menuitem" onClick={() => { setModal({ server: s }); setServerMenuId(null); }}><Pencil /> Edit profile</button>
                             </div>
                           )}
                         </div>
+                        {s.tags.length > 0 && <div className="oars-fleet-tags">{s.tags.map(tag => <button key={tag} type="button" onClick={() => setFleetFilter(tag)} aria-label={`Filter fleet by tag ${tag}`}>{tag}</button>)}</div>}
                       </div>
                     );
-                  })}
-                </div>
-              );
-            })}
-          </div>
+            }}
+          />
           <div className="sidebar-fleet-add">
             <Button size="sm" onClick={() => setModal({})} aria-label="Add server" title="Add server"><Plus data-icon="inline-start" /><span>Add server</span></Button>
           </div>
         </div>
         <div className="sidebar-bottom">
+          <button type="button" className="nav-item settings-entry" title="Settings" onClick={() => { setSettingsOpen(true); setMobileNav(false); }}><Settings /><span className="nav-item-label">Settings</span><kbd>{isMacPlatform() ? "⌘," : "Ctrl+,"}</kbd></button>
           <div className="connection-card">
-            <span className="connection-pulse" />
-            <div><strong>Native bridge</strong><span>Connected · zero://app</span></div>
+            <LockKeyhole size={15} aria-hidden />
+            <div><strong>Local workspace</strong><span>Stored on this device</span></div>
           </div>
           <div className="user-row">
             <div className="user-avatar"><UserRound /></div>
             <div><strong>Operator</strong><span>Local profile</span></div>
-            <Button variant="ghost" size="icon-xs" aria-label="Help"><CircleHelp /></Button>
+
           </div>
         </div>
       </aside>
@@ -1210,7 +1230,7 @@ export default function App() {
             >
               <RefreshCw className={serversRefreshing ? "spin" : ""} />
             </Button>
-            <div className="top-status"><span className={fleetDotClass(activeTab ? activeStatus : fleetStatus)} aria-hidden /> {topStatusText}</div>
+            <div className="top-status"><ConnectionStatus status={activeTab ? activeStatus : fleetStatus} /> {topStatusText}</div>
           </div>
         </header>
 
@@ -1229,7 +1249,7 @@ export default function App() {
                       onClick={() => setActiveKey(tab.key)}
                       title={isMirror ? `${tab.server.name} — mirrored view` : tab.server.name}
                     >
-                      <span className={`dot ${sessionStatusClass(statuses.get(tab.server.id))}`} aria-hidden />
+                      <ConnectionStatus status={statuses.get(tab.server.id)} />
                       <span>{tab.server.name}{isMirror ? " · mirror" : ""}</span>
                     </button>
                     <button type="button" className="tab-close" aria-label={`Close ${tab.server.name}${isMirror ? " mirror" : ""}`} title="Close tab" onClick={() => closeTab(tab.key)}><X /></button>
@@ -1238,7 +1258,7 @@ export default function App() {
               })}
             </div>
             <div className="workspace-layout-controls">
-              <span>{tabs.length} of {MAX_WORKSPACE_PANES}</span>
+              <span>{compactWorkspace ? "Single pane" : paneFocused ? "Focused" : `${tabs.length} open`}</span>
               <WorkspaceLayoutPicker
                 value={layoutVariant}
                 defaultValue={defaultLayoutVariant}
@@ -1251,14 +1271,31 @@ export default function App() {
 
         {tabs.length > 0 && (
           <div className="workspace workspace-mosaic-host" hidden={!activeTab}>
+            <WorkspaceSurfaces paneKeys={tabs.map((tab) => tab.key)} renderPane={renderPaneContent}>
+            <WorkspaceDockTabContext.Provider value={{ names: Object.fromEntries(tabs.map((tab) => [tab.key, `${tab.server.name}${tab.key.includes("#") ? " · mirror" : ""}`])), onSelect: setActiveKey }}>
+            <WorkspaceDocking enabled={!paneFocused && !compactWorkspace} onStatus={setWorkspaceMessage}
+              onDock={(source, target, position) => {
+                customLayoutRef.current = true;
+                setMosaicLayout((current) => dockWorkspacePane(current, source, target, position));
+                setActiveKey(source);
+              }}>
             <Mosaic<string>
               className="oars-mosaic"
-              value={mosaicLayout}
-              onChange={setMosaicLayout}
+              value={(paneFocused || compactWorkspace) && activeKey ? activeKey : mosaicLayout}
+              onChange={(next) => { if (!paneFocused && !compactWorkspace) setMosaicLayout(next); }}
+              onRelease={() => { if (!paneFocused && !compactWorkspace) customLayoutRef.current = true; }}
+              renderTabToolbarControls={() => null}
+              canClose={() => "noClose"}
+              renderTabButton={WorkspaceDockTab}
               renderTile={renderServerPane}
-              resize={{ minimumPaneSizePercentage: 18 }}
+              resize={paneFocused || compactWorkspace ? "DISABLED" : { minimumPaneSizePercentage: 18 }}
               zeroStateView={<div />}
             />
+            </WorkspaceDocking>
+            </WorkspaceDockTabContext.Provider>
+            </WorkspaceSurfaces>
+            <div className="workspace-statusbar"><span>{compactWorkspace ? "Select a server above to switch panes." : paneFocused ? "Focus mode · Restore from the pane header." : "Drag a header to split or group · Double-click to focus"}</span>
+              <span role="status" aria-live="polite">{workspaceMessage}</span></div>
             {loadError && <div className="form-error workspace-mosaic-error">{loadError}</div>}
           </div>
         )}
@@ -1268,12 +1305,24 @@ export default function App() {
             <OarsLoadingState title="Loading your workspace" detail="Oars is reading local connection profiles and recent activity." />
           ) : activeSection === "Overview" ? (
             <Overview servers={servers} statuses={statuses} search={search} onAdd={() => setModal({})} onOpenServer={openServer} onAction={onAction} />
+          ) : activeSection === "Servers" && activeGroup !== null ? (
+            <GroupView key={activeGroup} group={activeGroup} servers={groupMembers(servers, activeGroup)} statuses={statuses} onStatus={setStatus} onOpen={openServer} onUpdated={updated => {
+              updateGroupServers(updated);
+              if (updated.length > 0 && updated.length === groupMembers(servers, activeGroup).length && updated.every(server => server.group === updated[0].group)) setActiveGroup(updated[0].group);
+            }} onBack={() => setActiveGroup(null)} onOpenAll={() => {
+              const members = groupMembers(servers, activeGroup);
+              const newMembers = members.filter(server => !tabs.some(tab => tab.server.id === server.id));
+              const available = Math.max(0, MAX_WORKSPACE_PANES - tabs.length);
+              newMembers.slice(0, available).forEach(openServer);
+              if (newMembers.length > available) setToast(`Opened ${available} profiles. The workspace limit is ${MAX_WORKSPACE_PANES}; close panes to open the remaining ${newMembers.length - available}.`);
+              else if (members[0]) openServer(members[0]);
+            }} onRunScript={() => { setBroadcastGroupIds(groupMembers(servers, activeGroup).map(server => server.id)); setActiveSection("Automation"); }} />
           ) : activeSection === "Servers" ? (
             <ServersView servers={servers} statuses={statuses} search={search} onOpen={openServer} onEdit={(s) => setModal({ server: s })} onAdd={() => setModal({})} />
           ) : activeSection === "Activity" ? (
             <div className="content-stack">
               <SectionTitle eyebrow="History & audit" title="Activity" description="A durable local journal of commands, sessions, and system changes."/>
-              <div className="panel" style={{ padding: 0, overflow: "hidden" }}><HistoryTab /></div>
+              <div className="panel" style={{ padding: 0, overflow: "hidden" }}><HistoryTab initialAction={historyAction} onActionConsumed={() => setHistoryAction(null)} reviewEntry={pendingHistory} onReviewConsumed={() => setPendingHistory(null)} /></div>
             </div>
           ) : activeSection === "Automation" ? (
             <div className="content-stack">
@@ -1281,7 +1330,7 @@ export default function App() {
               {servers.length === 0 ? (
                 <div className="panel" style={{ padding: 22 }}><div className="empty-state"><div className="empty-icon"><Zap /></div><h3>No servers yet</h3><p>Add a server to run scripts and deployments.</p><Button onClick={() => setModal({})}>Add server</Button></div></div>
               ) : (
-                <div className="panel" style={{ padding: 0, overflow: "hidden", minHeight: 420 }}><ScriptsTab serverId={null} servers={servers} statuses={statuses} connected={false} onOpenServer={(id) => { const s = servers.find((x) => x.id === id); if (s) openServerView(s, "scripts"); }} /></div>
+                <div className="panel" style={{ padding: 0, overflow: "hidden", minHeight: 420 }}><ScriptsTab initialBroadcastServerIds={broadcastGroupIds} serverId={null} servers={servers} statuses={statuses} connected={false} onOpenServer={(id) => { const s = servers.find((x) => x.id === id); if (s) openServerView(s, "scripts"); }} /></div>
               )}
             </div>
           ) : activeSection === "Security" ? (
@@ -1295,53 +1344,47 @@ export default function App() {
             </div>
           ) : activeSection === "Backups" ? (
             <div className="content-stack">
-              <SectionTitle eyebrow="Data protection" title="Backups" description="Encrypted jobs, vault portability, and restore history without cloud sync."/>
-              <ProtectionGrid>
-                <div className="panel" style={{ padding: 0, overflow: "hidden" }}><VaultTab /></div>
-                <div className="panel" style={{ padding: 0, overflow: "hidden", minHeight: 320 }}>
-                  <ProtectionBackupsPanel servers={servers} statuses={statuses} />
-                </div>
-              </ProtectionGrid>
+              <SectionTitle eyebrow="Data protection" title="Backups" description="Manage server backup jobs, review recent runs, and restore data."/>
+              <ProtectionBackupsPanel servers={servers} statuses={statuses} onAdd={() => setModal({})} />
             </div>
           ) : (
             <div className="content-stack">
               <SectionTitle eyebrow="Remote access & AI" title="AI Context" description="Local provider configuration and the context available to your assistant."/>
-              <div className="panel muted" style={{ padding: 22 }}>
-                Open a server from the Fleet, then choose its AI tab. Oars will not select a server for an AI request automatically.
-              </div>
+              <section className="ai-server-picker" aria-label="Choose an AI server">
+                <header><Bot size={24} aria-hidden /><div><h2>Choose a server to work with</h2><p>Review its context, configure your provider, and start a conversation.</p></div></header>
+                {servers.length === 0 ? <Button onClick={() => setModal({})}><Plus /> Add server</Button> : <div className="ai-server-list">{servers.map(server => <button type="button" key={server.id} onClick={() => openServerView(server, "ai")}><Server size={18} aria-hidden /><span><strong>{server.name}</strong><small>{server.user}@{server.host}</small></span><ConnectionStatus status={statuses.get(server.id)} label /><ArrowUpRight size={16} aria-hidden /></button>)}</div>}
+                <p className="muted">You choose the server and approve commands before they run.</p>
+              </section>
             </div>
           )}
           {loadError && <div className="form-error" style={{ marginTop: 14 }}>{loadError}</div>}
         </div>}
       </section>
 
+      {paletteTarget && <PaletteTargetDialog title={paletteTarget.title} servers={servers} onClose={() => setPaletteTarget(null)} onSelect={server => {
+        if (paletteTarget.mirror) openMirrored(server); else openServerView(server, paletteTarget.view);
+        if (paletteTarget.scriptId) setPendingScriptId(paletteTarget.scriptId);
+        setPaletteTarget(null);
+      }} />}
+      {moveServer && <GroupEditDialog servers={[moveServer]} group={moveServer.group} onUpdated={updateGroupServers} onClose={() => setMoveServer(null)} />}
+      {dataOpen && <DataSettings onClose={() => setDataOpen(false)} onImported={() => void refreshServers()} />}
+      {settingsOpen && <AppearanceSettings onData={() => { setSettingsOpen(false); setDataOpen(true); }} onClose={() => setSettingsOpen(false)} />}
       {modal && <ServerModal server={modal.server} servers={servers} onClose={() => setModal(null)} onSaved={handleSaved} onDeleted={handleDeleted} />}
 
-      <CommandPalette
+      {paletteOpen && <CommandPalette
         isOpen={paletteOpen}
         onClose={() => setPaletteOpen(false)}
-        items={paletteItems}
+        commands={paletteItems}
         query={paletteQ}
         onQueryChange={setPaletteQ}
-      />
+      />}
 
       {toast && <ApplicationNotice><div className="toast"><Check /> {toast}</div></ApplicationNotice>}
     </main>
   );
 }
 
-export function ProtectionGrid({ children }: { children: ReactNode }) {
-  return (
-    <div
-      className="protection-grid"
-      style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 14 }}
-    >
-      {children}
-    </div>
-  );
-}
-
-export function ProtectionBackupsPanel({ servers, statuses }: { servers: OarsServer[]; statuses: Map<string, SessionStatus> }) {
+export function ProtectionBackupsPanel({ servers, statuses, onAdd }: { servers: OarsServer[]; statuses: Map<string, SessionStatus>; onAdd?: () => void }) {
   const previewMode = readBackupPreviewMode();
   const [activeId, setActiveId] = useState(() => previewMode === null ? "" : servers[0]?.id ?? "");
   useEffect(() => {
@@ -1365,32 +1408,28 @@ export function ProtectionBackupsPanel({ servers, statuses }: { servers: OarsSer
 
   return (
     <div className="protection-backups-panel">
-      <div className="protection-backups-picker">
-        <div>
+      {(activeServer !== null || servers.length === 0) && <div className="protection-backups-picker">
+        <div className="protection-backups-picker-copy">
           <label htmlFor="protection-backup-server">Backup server</label>
-          <span>Choose the server whose local jobs and runtime state you want to manage.</span>
+          <span>Choose the server to manage.</span>
         </div>
-        <OarsSelect
+        <div className="protection-backups-picker-control"><OarsSelect
           id="protection-backup-server"
           value={activeId === "" ? null : activeId}
           onValueChange={setActiveId}
           options={options}
           placeholder={servers.length === 0 ? "No servers available" : "Select a server"}
           disabled={servers.length === 0}
-        />
-      </div>
+        /></div>
+      </div>}
       {servers.length === 0 ? (
         <div className="backups-empty backups-empty-compact">
           <Server aria-hidden />
           <h3>No servers available</h3>
-          <p>Add a server before configuring backup jobs.</p>
+          <p>Add a server before configuring backup jobs.</p>{onAdd && <Button size="sm" onClick={onAdd}><Plus /> Add server</Button>}
         </div>
       ) : activeServer === null ? (
-        <div className="backups-empty backups-empty-compact">
-          <Archive aria-hidden />
-          <h3>Select a server</h3>
-          <p>Oars will not choose a server or start a remote operation implicitly.</p>
-        </div>
+        <section className="backup-server-chooser"><header><h3>Select a server</h3><p>Open its backup jobs and run history.</p></header><div className="backup-server-list">{servers.map(server => <button key={server.id} type="button" aria-label={`Open backups for ${server.name}`} onClick={() => setActiveId(server.id)}><Server size={17} aria-hidden /><span><strong>{server.name}</strong><small>{server.user}@{server.host}:{server.port}</small></span><ConnectionStatus status={statuses.get(server.id)} label /><ArrowUpRight size={15} aria-hidden /></button>)}</div></section>
       ) : (
         <BackupsTab key={activeServer.id} serverId={activeServer.id} connected={connected} previewMode={previewMode} />
       )}

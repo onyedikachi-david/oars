@@ -110,6 +110,7 @@ export function ScriptsTab({
   statuses,
   onOpenServer,
   initialScriptId,
+  initialBroadcastServerIds,
   initialDraft,
   onInitialDraftConsumed,
 }: {
@@ -120,6 +121,7 @@ export function ScriptsTab({
   onOpenServer?: (serverId: string) => void;
   /** Command-palette entry point (spec 06): preselect this script. */
   initialScriptId?: string | null;
+  initialBroadcastServerIds?: string[];
   /** AI Terminal handoff: an unsaved exact command for user review. */
   initialDraft?: ScriptDraft | null;
   onInitialDraftConsumed?: () => void;
@@ -473,7 +475,7 @@ export function ScriptsTab({
       setError("Connect at least one server before broadcasting scripts.");
       return;
     }
-    setTargetSelection(new Set());
+    setTargetSelection(new Set((initialBroadcastServerIds ?? []).filter(id => statuses?.get(id) === "ready")));
     setFlowError(null);
     setFlow({ step: "targets", script });
   };
@@ -700,6 +702,7 @@ export function ScriptsTab({
           <div className="empty-state">
             <div className="empty-icon"><Terminal /></div>
             <h3>Save your first script</h3>
+            {initialBroadcastServerIds && <p role="status">Group broadcast: {initialBroadcastServerIds.length} profiles. Choose a script, then Broadcast to review connected targets.</p>}
             <p>A personal library of shell commands with <code>{`{{variables}}`}</code>, run on one server or broadcast across the fleet.</p>
             <Button onClick={() => openEditor({ ...emptyDraft(), name: "Tail error logs", body: "sudo tail -f /var/log/{{service}}/error.log", variables: [{ name: "service", label: "Service", secret_default: false }] })}>
               Start with an example

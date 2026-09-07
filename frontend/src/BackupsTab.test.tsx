@@ -2,10 +2,9 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BackupsTab } from "./BackupsTab";
-import { ProtectionBackupsPanel, ProtectionGrid } from "./App";
+import { ProtectionBackupsPanel } from "./App";
 import type { BackupJob, BackupOperation, BackupPollResult, BackupServerStatus, Server } from "./types";
 
 const PLANNED_JOB: BackupJob = {
@@ -816,19 +815,6 @@ describe("BackupsTab protected workflows", () => {
 });
 
 describe("ProtectionBackupsPanel", () => {
-  it("uses zero-minimum grid tracks so wide backup tables stay inside their own scroller", () => {
-    const view = render(<ProtectionGrid><div>Vault</div><div>Backups</div></ProtectionGrid>);
-    const grid = view.container.querySelector<HTMLElement>(".protection-grid");
-    const css = readFileSync(`${process.cwd()}/src/index.css`, "utf8");
-
-    expect(grid?.style.gridTemplateColumns).toBe("repeat(2, minmax(0, 1fr))");
-    expect(css).toMatch(/\.protection-grid\s*\{[^}]*min-width:\s*0[^}]*max-width:\s*100%/s);
-    expect(css).toMatch(/\.protection-backups-panel\s*\{[^}]*min-width:\s*0[^}]*max-width:\s*100%/s);
-    expect(css).toMatch(/\.backups-workspace\s*>\s*\*\s*\{[^}]*min-width:\s*0/s);
-    expect(css).toMatch(/\.backups-table-wrap\s*\{[^}]*width:\s*100%[^}]*overflow-x:\s*auto/s);
-    expect(css).toMatch(/\.backups-table-wrap\s*\{[^}]*contain:\s*layout inline-size paint/s);
-  });
-
   it("turns the public backups query into an auto-selected R2 editor state", async () => {
     document.documentElement.dataset.previewVariant = "baseline";
     window.history.replaceState({}, "", "/preview.html?backups=editor-r2");
@@ -903,8 +889,7 @@ describe("ProtectionBackupsPanel", () => {
     expect(screen.getByRole("heading", { name: "Select a server" })).toBeTruthy();
     expect(callsFor(calls, "oars.backup.jobs.list")).toHaveLength(0);
 
-    await user.click(screen.getByRole("combobox", { name: "Backup server" }));
-    await user.click(screen.getByRole("option", { name: /Production — prod\.internal · Offline/ }));
+    await user.click(screen.getByRole("button", { name: "Open backups for Production" }));
 
     expect(await screen.findByText("Server disconnected")).toBeTruthy();
     expect(callsFor(calls, "oars.backup.jobs.list")).toHaveLength(1);

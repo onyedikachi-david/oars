@@ -180,6 +180,8 @@ export async function invoke<T = unknown>(
 const secretCache = new Map<string, string>();
 
 export const vault = {
+  // Stable storage namespace, not the application bundle ID. Retain this so
+  // existing installations can still find their saved credentials.
   service: "dev.native_sdk.oars",
   async set(account: string, secret: string): Promise<void> {
     await invoke("native-sdk.credentials.set", {
@@ -303,12 +305,13 @@ export const api = {
     delete: (id: string) => invoke<{ ok: boolean }>("oars.servers.delete", { id }),
   },
   ssh: {
+    status: (serverId: string) => invoke<PollResult>("oars.ssh.poll", { server_id: serverId, status_only: true }),
     connect: (serverId: string, password?: string, passphrase?: string) =>
       invoke("oars.ssh.connect", { server_id: serverId, password, passphrase }),
     disconnect: (serverId: string) => invoke("oars.ssh.disconnect", { server_id: serverId }),
     input: (serverId: string, data: string) => invoke("oars.ssh.input", { server_id: serverId, data }),
     exec: (serverId: string, command: string) => invoke<{ channel: number }>("oars.ssh.exec", { server_id: serverId, command }),
-    closeChannel: (serverId: string, channel: number) => invoke("oars.ssh.closeChannel", { server_id: serverId, channel }),
+    closeChannel: (serverId: string, channel: number, connectionId?: number) => invoke("oars.ssh.closeChannel", { server_id: serverId, channel, ...(connectionId === undefined ? {} : { connection_id: connectionId }) }),
     resize: (serverId: string, cols: number, rows: number) =>
       invoke("oars.ssh.resize", { server_id: serverId, cols, rows }),
     trust: (serverId: string, accept: boolean) => invoke("oars.ssh.trust", { server_id: serverId, accept }),
@@ -703,28 +706,29 @@ export const api = {
       invoke<VncPollResult>("oars.vnc.poll", { server_id: serverId, tunnel_id: tunnelId }),
   },
   history: {
+    clear: (confirm: string) => invoke<{ ok: boolean }>("oars.history.clear", { confirm }),
+    shellDisable: (serverId: string) => invoke<{ ok: boolean }>("oars.history.shellSetup", { server_id: serverId, shell: "off", execute: true }),
+    shellPreview: (serverId: string, shell: "bash" | "zsh" | "fish") => invoke<{ ok: boolean; command: string; sha256: string; connection_id: number }>("oars.history.shellSetup", { server_id: serverId, shell }),
+    shellInstall: (serverId: string, shell: "bash" | "zsh" | "fish", sha256: string, connectionId: number) => invoke<{ ok: boolean; channel: number; connection_id: number }>("oars.history.shellSetup", { server_id: serverId, shell, execute: true, expected_sha256: sha256, connection_id: connectionId }),
     record: (entry: HistoryRecordInput) =>
       invoke<{ ok: boolean }>("oars.history.record", entry),
     list: (filter?: HistoryListFilter) =>
       invoke<HistoryListResult>("oars.history.list", filter ?? {}),
     replay: (idOrEntryId: string) =>
-      invoke<{ ok: boolean; channel: number }>("oars.history.replay", { entry_id: idOrEntryId }),
+      invoke<{ ok: boolean; channel: number; connection_id: number }>("oars.history.replay", { entry_id: idOrEntryId }),
     auditList: (filter?: AuditListFilter) =>
       invoke<AuditListResult>("oars.audit.list", filter ?? {}),
-    auditClear: () =>
-      invoke<{ ok: boolean }>("oars.audit.clear", { confirm: "CLEAR" }),
+    auditExport: (path: string) => invoke<{ ok: boolean; rows: number }>("oars.audit.export", { path }),
+    auditClear: (confirm: string) =>
+      invoke<{ ok: boolean }>("oars.audit.clear", { confirm }),
   },
   vault: {
-    export: (paramsOrPassword: VaultExportParams | string) => {
-      const payload = typeof paramsOrPassword === "string" ? { password: paramsOrPassword } : paramsOrPassword;
-      return invoke<VaultExportResult>("oars.vault.export", payload);
-    },
+    export: (params: VaultExportParams) =>
+      invoke<VaultExportResult>("oars.vault.export", params),
     import: (params: VaultImportParams) =>
       invoke<VaultImportResult>("oars.vault.import", params),
-    importConfirm: (paramsOrToken: VaultImportConfirmParams | string, confirm?: boolean) => {
-      const payload = typeof paramsOrToken === "string" ? { token: paramsOrToken, confirm: Boolean(confirm) } : paramsOrToken;
-      return invoke<VaultImportConfirmResult>("oars.vault.importConfirm", payload);
-    },
+    importConfirm: (params: VaultImportConfirmParams) =>
+      invoke<VaultImportConfirmResult>("oars.vault.importConfirm", params),
   },
   agent: {
     list: (path?: string) =>

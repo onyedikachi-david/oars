@@ -4,6 +4,8 @@ import { ApplicationOverlay } from "../../../components/ApplicationPortal";
 import { useModalFocus } from "../../../components/useModalFocus";
 
 export interface ApprovalDialogProps {
+  className?: string;
+  quietOverlay?: boolean;
   icon: React.ReactNode;
   iconClass: string;
   title: string;
@@ -18,6 +20,8 @@ export interface ApprovalDialogProps {
 }
 
 export function ApprovalDialog({
+  className = "",
+  quietOverlay = true,
   icon,
   iconClass,
   title,
@@ -35,6 +39,7 @@ export function ApprovalDialog({
 
   return (
     <ApplicationOverlay
+      quiet={quietOverlay}
       role="presentation"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget && !busy) onCancel();
@@ -42,7 +47,7 @@ export function ApprovalDialog({
     >
       <div
         ref={dialogRef}
-        className="oars-modal oars-modal-narrow"
+        className={`oars-modal oars-modal-narrow refined-dialog ${className}`}
         role="dialog"
         aria-modal="true"
         aria-labelledby={labelledBy}

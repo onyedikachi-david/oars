@@ -37,6 +37,8 @@ pub const AuthMethod = enum {
     }
 };
 
+pub const HistoryShell = enum { off, bash, zsh, fish };
+
 pub const Server = struct {
     id: []const u8,
     name: []const u8,
@@ -54,6 +56,7 @@ pub const Server = struct {
     /// once the user has trusted the server on first connect. Legacy
     /// 64-hex records are accepted on compare and migrated on verify.
     host_fingerprint: ?[]const u8 = null,
+    history_shell: HistoryShell = .off,
     group: []const u8 = "",
     /// Free-form labels, trimmed and deduplicated at save time.
     tags: [][]const u8 = &.{},
@@ -81,6 +84,7 @@ pub const Server = struct {
             .key_path = try allocator.dupe(u8, self.key_path),
             .key_has_passphrase = self.key_has_passphrase,
             .host_fingerprint = if (self.host_fingerprint) |fp| try allocator.dupe(u8, fp) else null,
+            .history_shell = self.history_shell,
             .group = try allocator.dupe(u8, self.group),
             .tags = tags,
             .via_server_id = if (self.via_server_id) |via| try allocator.dupe(u8, via) else null,

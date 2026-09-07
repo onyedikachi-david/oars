@@ -1,3 +1,4 @@
+import { Activity } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
@@ -750,7 +751,7 @@ export function LogsTab({ server }: { server: Server }) {
           <div className="monitor-title-row">
             <h2>Server logs</h2>
             <span className="logs-health">
-              <span className="monitor-state-dot" aria-hidden />
+              <Activity size={13} aria-hidden />
               {scan.status === "scanning"
                 ? "Scanning"
                 : scan.status === "error"
@@ -908,7 +909,7 @@ export function LogsTab({ server }: { server: Server }) {
             </span>
             {followActive && (
               <span className={`logs-live-badge ${follow.status === "eof" ? "is-ended" : ""}`}>
-                <span className="logs-live-dot" aria-hidden />
+                <Activity size={13} aria-hidden />
                 {follow.status === "starting" ? "Starting" : follow.status === "eof" ? "Ended" : "Live"}
               </span>
             )}

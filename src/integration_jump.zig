@@ -69,3 +69,49 @@ test "disconnecting a jump host cascade-closes the target without deadlock" {
     }
     rig.manager.disconnect("itest-jump-target");
 }
+
+fn toggleForwarding(rig: *TestRig, id: []const u8, enabled: bool) !void {
+    const allocator = std.testing.allocator;
+    const outcome = try allocator.create(sessions.ForwardSetOutcome);
+    outcome.* = .{ .allocator = allocator };
+    rig.manager.setForwarding(id, enabled, outcome) catch |err| {
+        allocator.destroy(outcome);
+        return err;
+    };
+    outcome.wait(std.testing.io, std.Io.Timestamp.now(std.testing.io, .real).nanoseconds + 20 * std.time.ns_per_s);
+    if (!outcome.isDone() and !outcome.abandon()) return error.Timeout;
+    defer allocator.destroy(outcome);
+    if (!outcome.ok) {
+        std.debug.print("forwarding failed: {s}\n", .{outcome.message()});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "integration: isolated agent forwarding replaces shell cursors and closes proxy access on disable" {
+    const env = TestEnv.load();
+    if (!env.active or integration.getEnv("OARS_TEST_AGENT") == null) return;
+    const io = std.testing.io;
+    var rig: TestRig = undefined;
+    try rig.init("forwarding");
+    defer rig.deinit();
+    const id = "forwarding-fixture";
+    const server = servers.Server{ .id = id, .name = "Forwarding fixture", .host = env.host, .port = env.port, .user = env.user, .auth_method = .password };
+    try rig.store.upsert(io, server);
+    _ = try rig.manager.connect(server, env.password, null);
+    try waitForStatus(&rig.manager, id, .needs_trust, 20 * std.time.ns_per_s);
+    try rig.manager.trust(id, true);
+    try waitForStatus(&rig.manager, id, .ready, 20 * std.time.ns_per_s);
+    const original = rig.manager.get(id).?.shell_channel_id;
+    try toggleForwarding(&rig, id, false);
+    try std.testing.expectEqual(original, rig.manager.get(id).?.shell_channel_id);
+    try toggleForwarding(&rig, id, true);
+    try std.testing.expect((try rig.manager.sessionSnapshot(id)).forwarding);
+    const forwarded = rig.manager.get(id).?.shell_channel_id;
+    try std.testing.expect(forwarded != original);
+    try integration.shellReadUntil(&rig.manager, id, "ssh-add -L\n", "oars-forward-test");
+    try std.testing.expectError(error.InvalidChannel, rig.manager.closeChannel(id, forwarded));
+    try toggleForwarding(&rig, id, false);
+    try std.testing.expect(!(try rig.manager.sessionSnapshot(id)).forwarding);
+    try std.testing.expect(rig.manager.get(id).?.shell_channel_id != forwarded);
+    try integration.shellReadUntil(&rig.manager, id, "ssh-add -L >/dev/null 2>&1 || echo forwar\"ding-disabled\"\n", "forwarding-disabled");
+}

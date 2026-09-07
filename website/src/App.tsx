@@ -5,12 +5,13 @@ STORY: Connect a host, establish trust, observe its state, operate directly, and
 FIRST VIEWPORT: A decisive product promise sits beside a linked runbook index, with the GitHub action always visible.
 FORM: Narrative Workflow, position 3, staged as an operations runbook with Operate carrying the focused product view.
 */
-import { ProductMockup } from "./components/ProductMockup";
+import { ProductShot, ScreenshotGallery } from "./components/ProductScreenshots";
 import { ArrowDownIcon } from "./components/icons/arrow-down";
 import { ArrowDownRightIcon } from "./components/icons/arrow-down-right";
 import { ArrowUpRightIcon } from "./components/icons/arrow-up-right";
 import { GithubIcon } from "./components/icons/github";
 import "./workflow.css";
+import "./components/ProductScreenshots.css";
 
 const githubUrl = "https://github.com/onyedikachi-david/oars";
 
@@ -50,7 +51,7 @@ export default function App() {
         <section className="operator-workflow__hero">
           <div className="operator-workflow__hero-copy">
             <h1>Operate every Linux server from one local window.</h1>
-            <p>Terminals, files, logs, monitoring, deployments, access, backups, and remote desktop over SSH. Your credentials stay on your machine.</p>
+            <p>Terminals, files, logs, monitoring, deployments, access, backups, and remote desktop over SSH. Connection credentials are stored in your OS credential store.</p>
             <div className="operator-workflow__hero-actions">
               <a className="operator-workflow__button operator-workflow__button--primary" href={githubUrl}>
                 <GithubIcon className="operator-workflow__icon" size={18} aria-hidden="true" />
@@ -82,6 +83,7 @@ export default function App() {
             <span>Agentless monitoring</span>
             <span>Open source</span>
           </div>
+          <div className="operator-workflow__hero-product"><ProductShot name="desktop" priority /></div>
         </section>
 
         <section className="operator-workflow__stage" id="connect">
@@ -138,18 +140,7 @@ export default function App() {
               <p>Read live resource probes, processes, logs, and service state without installing an agent.</p>
             </div>
 
-            <div className="operator-workflow__proof operator-workflow__monitor" aria-label="Oars resource monitor preview">
-              <div className="operator-workflow__proof-heading">
-                <div><strong>Resource monitor</strong><span>Agentless remote probes</span></div>
-                <span className="operator-workflow__status"><i aria-hidden="true" /> web-01 ready</span>
-              </div>
-              <div className="operator-workflow__metrics">
-                <div><span>CPU</span><strong>12.4%</strong><small>node server.js</small></div>
-                <div><span>Memory</span><strong>148.6 MB</strong><small>stable</small></div>
-                <div><span>Disk pressure</span><strong>18%</strong><small>healthy</small></div>
-              </div>
-              <div className="operator-workflow__monitor-foot"><span>Processes</span><span>Logs</span><span>Service state</span><b>Live over SSH</b></div>
-            </div>
+            <div className="operator-workflow__stage-shot"><ProductShot name="logs" /></div>
           </div>
         </section>
 
@@ -167,8 +158,7 @@ export default function App() {
             </ul>
 
             <div className="operator-workflow__focused-product">
-              <ProductMockup view="terminal" />
-              <p><span>Focused view</span> One SSH connection keeps terminal, files, monitoring, and logs in the same operating context.</p>
+              <ScreenshotGallery />
             </div>
           </div>
         </section>
@@ -185,18 +175,7 @@ export default function App() {
               </a>
             </div>
 
-            <div className="operator-workflow__proof operator-workflow__recovery" aria-label="Oars recovery surfaces preview">
-              <div className="operator-workflow__proof-heading">
-                <div><strong>Recovery record</strong><span>Local evidence and portable state</span></div>
-                <span>On device</span>
-              </div>
-              <dl className="operator-workflow__record-list">
-                <div><dt>Audit journal</dt><dd>Trace mutating operations</dd></div>
-                <div><dt>Vault export</dt><dd>Encrypted recovery copy</dd></div>
-                <div><dt>Backup runs</dt><dd>Review run history</dd></div>
-              </dl>
-              <div className="operator-workflow__recovery-close"><strong>Keep the servers.</strong><span>Lose the tool sprawl.</span></div>
-            </div>
+            <div className="operator-workflow__stage-shot"><ProductShot name="history" /></div>
           </div>
         </section>
       </main>

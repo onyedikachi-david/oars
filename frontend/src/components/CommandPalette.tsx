@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { parsePaletteQuery, rankCommands, readPaletteState, savePaletteState, type PaletteMode } from "../palette";
 import { Search } from "lucide-react";
 import { ApplicationOverlay } from "./ApplicationPortal";
 import { useModalFocus } from "./useModalFocus";
@@ -9,6 +10,8 @@ export interface CommandItem {
   subtitle?: string;
   category?: string;
   keywords?: string[];
+  mode?: PaletteMode;
+  danger?: boolean;
   run: () => void;
 }
 
@@ -35,32 +38,30 @@ export function CommandPalette({
   query: externalQuery,
   onQueryChange,
 }: CommandPaletteProps) {
-  const [internalQuery, setInternalQuery] = useState("");
+  const [internalQuery, setInternalQuery] = useState(() => readPaletteState().query);
+  const [recentIds, setRecentIds] = useState(() => readPaletteState().recentIds);
+  const [armedId, setArmedId] = useState<string | null>(null);
   const currentQuery = externalQuery !== undefined ? externalQuery : internalQuery;
 
   const normalizedCommands = useMemo<CommandItem[]>(() => {
-    if (commands) {
-      const q = currentQuery.trim().toLowerCase();
-      if (!q) return commands;
-      return commands.filter((cmd) => {
-        if (cmd.title.toLowerCase().includes(q)) return true;
-        if (cmd.subtitle?.toLowerCase().includes(q)) return true;
-        if (cmd.category?.toLowerCase().includes(q)) return true;
-        if (cmd.keywords?.some((k) => k.toLowerCase().includes(q))) return true;
-        return false;
-      });
+    const source = commands ?? items?.map((item, index) => ({ id: `item-${index}`, title: item.label, category: item.group, run: item.action })) ?? [];
+    const ranked = rankCommands(source, currentQuery, recentIds);
+    if (parsePaletteQuery(currentQuery).text) return ranked;
+    const grouped = new Map<string, CommandItem[]>();
+    for (const command of ranked) {
+      const group = !currentQuery.trim() && recentIds.includes(command.id) ? "Recent" : command.category ?? "Actions";
+      const entries = grouped.get(group) ?? []; entries.push(command); grouped.set(group, entries);
     }
-    if (items) {
-      return items.map((it, idx) => ({
-        id: `item-${idx}`,
-        title: it.label,
-        subtitle: undefined,
-        category: it.group,
-        run: it.action,
-      }));
-    }
-    return [];
-  }, [commands, items, currentQuery]);
+    return [...grouped.values()].flat();
+  }, [commands, items, currentQuery, recentIds]);
+
+  const execute = (command: CommandItem) => {
+    if (command.danger && armedId !== command.id) { setArmedId(command.id); return; }
+    const recent = [command.id, ...recentIds.filter(id => id !== command.id)].slice(0, 5);
+    setRecentIds(recent); savePaletteState({ recentIds: recent, query: currentQuery });
+    setArmedId(null); onClose(); command.run();
+  };
+  useEffect(() => { setArmedId(null); }, [currentQuery, isOpen]);
 
   const [selectedIndex, setSelectedIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -88,6 +89,9 @@ export function CommandPalette({
   if (!isOpen) return null;
 
   const handleQueryChange = (val: string) => {
+    setSelectedIndex(0);
+    setArmedId(null);
+    savePaletteState({ recentIds, query: val });
     if (onQueryChange) {
       onQueryChange(val);
     } else {
@@ -96,6 +100,7 @@ export function CommandPalette({
   };
 
   const handleInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key !== "Enter") setArmedId(null);
     if (e.key === "ArrowDown") {
       e.preventDefault();
       if (normalizedCommands.length > 0) {
@@ -118,10 +123,18 @@ export function CommandPalette({
       e.preventDefault();
       const target = normalizedCommands[selectedIndex];
       if (target) {
-        target.run();
-        onClose();
+        execute(target);
       }
     }
+  };
+
+  const groupFor = (command: CommandItem) => !currentQuery.trim() && recentIds.includes(command.id) ? "Recent" : command.category ?? "Actions";
+  const highlight = (title: string) => {
+    const query = parsePaletteQuery(currentQuery).text;
+    if (!query) return title;
+    const positions = new Set<number>(); let position = 0;
+    for (const char of query) { const index = title.toLowerCase().indexOf(char, position); if (index < 0) return title; positions.add(index); position = index + 1; }
+    return [...title].map((char, index) => positions.has(index) ? <mark key={index} style={{ color: "inherit", background: "transparent", fontWeight: 750 }}>{char}</mark> : char);
   };
 
   const activeDescendantId =
@@ -176,7 +189,7 @@ export function CommandPalette({
             aria-controls="cmd-palette-listbox"
             aria-activedescendant={activeDescendantId}
             aria-label="Type a command or search"
-            placeholder="Type a command or search…"
+            placeholder="Search · > actions · @ servers · # scripts · / history"
             value={currentQuery}
             onChange={(e) => handleQueryChange(e.target.value)}
             onKeyDown={handleInputKeyDown}
@@ -200,30 +213,30 @@ export function CommandPalette({
             padding: 8,
             display: "grid",
             gap: 2,
-            maxHeight: 380,
+            maxHeight: 360,
           }}
         >
           {normalizedCommands.map((cmd, i) => {
             const isSelected = i === selectedIndex;
             return (
+              <Fragment key={cmd.id || i}>
+              {(i === 0 || groupFor(normalizedCommands[i - 1]) !== groupFor(cmd)) && <div role="presentation" className="muted" style={{ padding: "6px 12px 2px", fontSize: 11 }}>{groupFor(cmd)}</div>}
               <button
-                key={cmd.id || i}
                 id={`cmd-palette-opt-${i}`}
                 type="button"
                 role="option"
                 aria-selected={isSelected}
                 onClick={() => {
-                  cmd.run();
-                  onClose();
+                  execute(cmd);
                 }}
-                onMouseEnter={() => setSelectedIndex(i)}
+                onMouseEnter={() => { setSelectedIndex(i); setArmedId(null); }}
                 style={{
                   textAlign: "left",
                   background: isSelected ? "var(--accent)" : "transparent",
                   border: isSelected
                     ? "1px solid var(--border)"
                     : "1px solid transparent",
-                  color: isSelected ? "var(--primary)" : "var(--foreground)",
+                  color: cmd.danger ? "var(--destructive)" : isSelected ? "var(--primary)" : "var(--foreground)",
                   borderRadius: 6,
                   padding: "8px 12px",
                   fontSize: 12,
@@ -235,7 +248,7 @@ export function CommandPalette({
                 }}
               >
                 <div>
-                  <div style={{ fontWeight: 500 }}>{cmd.title}</div>
+                  <div style={{ fontWeight: 500 }}>{highlight(cmd.title)}{armedId === cmd.id ? " — press Enter again to confirm" : ""}</div>
                   {cmd.subtitle && (
                     <div className="muted" style={{ fontSize: 11 }}>
                       {cmd.subtitle}
@@ -251,6 +264,7 @@ export function CommandPalette({
                   </span>
                 )}
               </button>
+              </Fragment>
             );
           })}
           {normalizedCommands.length === 0 && (
@@ -267,6 +281,7 @@ export function CommandPalette({
             </div>
           )}
         </div>
+        <div className="muted" style={{ padding: "8px 16px", fontSize: 11 }}>↑↓ navigate · Enter open · Escape close</div>
       </div>
     </ApplicationOverlay>
   );

@@ -1,5 +1,5 @@
 .{
-    .id = "dev.native_sdk.oars",
+    .id = "app.getoars",
     .name = "oars",
     .display_name = "Oars",
     .version = "0.1.0", // x-release-please-version

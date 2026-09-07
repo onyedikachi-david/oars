@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import {
   AlertTriangle,
+  Activity,
+  CircleHelp,
   Bot,
   ChevronDown,
   KeyRound,
@@ -10,6 +12,7 @@ import {
   ShieldCheck,
   Trash2,
 } from "lucide-react";
+import { ConnectionStatus } from "./components/ConnectionStatus";
 import { api, BridgeError } from "./bridge";
 import { Button } from "./components/ui/button";
 import { Bubble } from "./components/ui/bubble";
@@ -558,7 +561,7 @@ export function AiTab({ serverId, onOpenScriptDraft }: { serverId: string; onOpe
         <div><h2 id="ai-workspace-title">Ask about {server?.name ?? serverId}</h2><p>{server ? `${server.user}@${server.host}:${server.port}` : "Server profile unavailable"}</p></div>
       </div>
       <div className="ai-chat-header-actions">
-        <span className={`ai-status ${sessionStatus === "ready" ? "is-success" : "is-muted"}`}><i aria-hidden />{sessionStatus === "ready" ? "Connected" : "Disconnected"}</span>
+        <span className={`ai-status ${sessionStatus === "ready" ? "is-success" : "is-muted"}`}><ConnectionStatus status={sessionStatus} />{sessionStatus === "ready" ? "Connected" : "Disconnected"}</span>
         <Button variant="outline" size="sm" onClick={() => void refreshContext()} disabled={refreshing || busy}>{refreshing ? <RefreshCw className="spin" /> : <RefreshCw />}Refresh context</Button>
       </div>
     </header>
@@ -579,7 +582,7 @@ export function AiTab({ serverId, onOpenScriptDraft }: { serverId: string; onOpe
           {providers.length > 0 && <OarsSelect aria-label="AI provider" value={selectedProviderId} onValueChange={setSelectedProviderId} options={providers.map((item) => ({ value: item.id, label: `${item.name} · ${item.model}` }))} />}
           {selectedProvider ? <div className="ai-chat-provider">
             <div><strong>{selectedProvider.name}</strong><span>{selectedProvider.model}</span><code title={selectedProvider.base_url}>{endpointOrigin}</code></div>
-            <div className="ai-provider-statuses"><span className={`ai-status ${credentialStatus === "configured" ? "is-success" : "is-attention"}`}><i />Credential {credentialStatus}</span><span className={`ai-status ${providerStatus === "passed" ? "is-success" : providerStatus === "failed" ? "is-error" : "is-muted"}`}><i />Test {String(providerStatus).replaceAll("_", " ")}</span></div>
+            <div className="ai-provider-statuses"><span className={`ai-status ${credentialStatus === "configured" ? "is-success" : "is-attention"}`}><CircleHelp size={12} aria-hidden />Credential {credentialStatus}</span><span className={`ai-status ${providerStatus === "passed" ? "is-success" : providerStatus === "failed" ? "is-error" : "is-muted"}`}><CircleHelp size={12} aria-hidden />Test {String(providerStatus).replaceAll("_", " ")}</span></div>
           </div> : <p className="ai-chat-sidebar-copy">Add a provider before you start a conversation.</p>}
           {providerTestMessage && <div className="ai-inline-message" role="status">{providerTestMessage}</div>}
           {selectedProvider && <div className="ai-chat-compact-actions">
@@ -645,7 +648,7 @@ export function AiTab({ serverId, onOpenScriptDraft }: { serverId: string; onOpe
               extraActions={onOpenScriptDraft && !execution ? <Button size="sm" variant="ghost" onClick={() => onOpenScriptDraft(proposal.command, destructive)}>Open in Scripts</Button> : null}
             /></MessageContent></Message>}
 
-            {(turnFeed.status || turnFeed.error || turnState) && !hasVisibleAssistantResult && !proposal && <div className={`ai-chat-activity ${turnFeed.error ? "is-error" : ""}`} role={turnFeed.error ? "alert" : "status"}><span className="ai-state-pulse" />{turnFeed.error ?? (turnState ? turnState.replaceAll("_", " ") : turnFeed.status)}</div>}
+            {(turnFeed.status || turnFeed.error || turnState) && !hasVisibleAssistantResult && !proposal && <div className={`ai-chat-activity ${turnFeed.error ? "is-error" : ""}`} role={turnFeed.error ? "alert" : "status"}><Activity size={14} aria-hidden />{turnFeed.error ?? (turnState ? turnState.replaceAll("_", " ") : turnFeed.status)}</div>}
           </MessageScrollerContent>
         </MessageScroller>
 

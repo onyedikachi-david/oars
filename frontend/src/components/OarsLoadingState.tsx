@@ -1,4 +1,4 @@
-import { Radio } from "lucide-react";
+import { Radio, RefreshCw } from "lucide-react";
 
 interface OarsLoadingStateProps {
   title: string;
@@ -42,7 +42,7 @@ export function OarsLoadingState({
 export function OarsRefreshStatus({ label = "Updating" }: { label?: string }) {
   return (
     <span className="oars-refresh-status" role="status" aria-live="polite">
-      <span aria-hidden />
+      <RefreshCw size={13} aria-hidden />
       {label}
     </span>
   );

@@ -25,7 +25,7 @@ pub const StdoutTraceSink = struct {
 pub const RunOptions = struct {
     app_name: []const u8,
     window_title: []const u8 = "",
-    bundle_id: []const u8,
+    bundle_id: []const u8 = app_manifest.id,
     icon_path: []const u8 = "assets/icon.png",
     bridge: ?native_sdk.BridgeDispatcher = null,
     builtin_bridge: native_sdk.BridgePolicy = .{},

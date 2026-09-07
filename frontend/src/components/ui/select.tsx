@@ -55,7 +55,7 @@ export const OarsSelect = forwardRef<HTMLButtonElement, OarsSelectProps>(functio
           alignItemWithTrigger={false}
         >
           <BaseSelect.Popup className="oars-select-popup">
-            <BaseSelect.ScrollUpArrow className="oars-select-scroll-arrow">
+            <BaseSelect.ScrollUpArrow className="oars-select-scroll-arrow" data-scroll-direction="up">
               <ChevronUp aria-hidden />
             </BaseSelect.ScrollUpArrow>
             <BaseSelect.List className="oars-select-list">
@@ -73,7 +73,7 @@ export const OarsSelect = forwardRef<HTMLButtonElement, OarsSelectProps>(functio
                 </BaseSelect.Item>
               ))}
             </BaseSelect.List>
-            <BaseSelect.ScrollDownArrow className="oars-select-scroll-arrow">
+            <BaseSelect.ScrollDownArrow className="oars-select-scroll-arrow" data-scroll-direction="down">
               <ChevronDown aria-hidden />
             </BaseSelect.ScrollDownArrow>
           </BaseSelect.Popup>

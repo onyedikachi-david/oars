@@ -247,13 +247,18 @@ fn appendLine(io: std.Io, path: []const u8, line: []const u8) !void {
 fn rewriteJournal(io: std.Io, path: []const u8, lines: []const []const u8) !void {
     const cwd = std.Io.Dir.cwd();
     if (std.fs.path.dirname(path)) |dir| try cwd.createDirPath(io, dir);
-    var tmp_buf: [2048]u8 = undefined;
-    const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path}) catch return error.PathTooLong;
-    var file = try cwd.createFile(io, tmp, .{});
-    defer file.close(io);
-    for (lines) |line| try file.writeStreamingAll(io, line);
-    try file.sync(io);
-    std.Io.Dir.renameAbsolute(tmp, path, io) catch return error.RenameFailed;
+    var nonce: [12]u8 = undefined;
+    try std.Io.randomSecure(io, &nonce);
+    var tmp_buf: [4096]u8 = undefined;
+    const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp-{s}", .{ path, std.fmt.bytesToHex(nonce, .lower) });
+    var file = try cwd.createFile(io, tmp, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    defer cwd.deleteFile(io, tmp) catch {};
+    {
+        defer file.close(io);
+        for (lines) |line| try file.writeStreamingAll(io, line);
+        try file.sync(io);
+    }
+    try std.Io.Dir.renameAbsolute(tmp, path, io);
 }
 
 // --- history ---------------------------------------------------------------
@@ -330,6 +335,15 @@ pub const HistoryStore = struct {
     pub fn deinit(self: *HistoryStore) void {
         for (self.entries.items) |*e| e.deinit(self.allocator);
         self.entries.deinit(self.allocator);
+    }
+
+    pub fn clear(self: *HistoryStore, io: std.Io) !void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        try self.ensureLoadedLocked(io);
+        try rewriteJournal(io, self.path, &.{});
+        for (self.entries.items) |*entry| entry.deinit(self.allocator);
+        self.entries.clearRetainingCapacity();
     }
 
     fn ensureLoadedLocked(self: *HistoryStore, io: std.Io) !void {
@@ -806,17 +820,54 @@ pub const AuditStore = struct {
     }
 
     /// Truncates the journal (type-to-confirm is the handler's job).
+    pub fn exportCsv(self: *AuditStore, io: std.Io, path: []const u8) !usize {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        try self.ensureLoadedLocked(io);
+        const csv = @import("csv.zig");
+        const cwd = std.Io.Dir.cwd();
+        if (std.fs.path.dirname(path)) |dir| try cwd.createDirPath(io, dir);
+        var nonce: [12]u8 = undefined;
+        try std.Io.randomSecure(io, &nonce);
+        var temp_buf: [4096]u8 = undefined;
+        const temp = try std.fmt.bufPrint(&temp_buf, "{s}.tmp-{s}", .{ path, std.fmt.bytesToHex(nonce, .lower) });
+        var file = try cwd.createFile(io, temp, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+        defer cwd.deleteFile(io, temp) catch {};
+        {
+            defer file.close(io);
+            try file.writeStreamingAll(io, "id,operation_id,timestamp_ns,type,target,commands,result,detail\r\n");
+            for (self.entries.items) |entry| {
+                var row_buf: [256 * 1024]u8 = undefined;
+                var row = std.Io.Writer.fixed(&row_buf);
+                try csv.field(&row, entry.id);
+                try row.writeByte(',');
+                try csv.field(&row, entry.operation_id);
+                try row.print(",{d},", .{entry.ts});
+                try csv.field(&row, entry.type);
+                try row.writeByte(',');
+                try csv.field(&row, entry.target);
+                try row.writeByte(',');
+                try csv.field(&row, entry.commands);
+                try row.writeByte(',');
+                try csv.field(&row, entry.result);
+                try row.writeByte(',');
+                try csv.field(&row, entry.detail);
+                try row.writeAll("\r\n");
+                try file.writeStreamingAll(io, row.buffered());
+            }
+            try file.sync(io);
+        }
+        try std.Io.Dir.renameAbsolute(temp, path, io);
+        return self.entries.items.len;
+    }
+
     pub fn clear(self: *AuditStore, io: std.Io) !void {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
         try self.ensureLoadedLocked(io);
-        for (self.entries.items) |*e| e.deinit(self.allocator);
+        try rewriteJournal(io, self.path, &.{});
+        for (self.entries.items) |*entry| entry.deinit(self.allocator);
         self.entries.clearRetainingCapacity();
-        const cwd = std.Io.Dir.cwd();
-        if (std.fs.path.dirname(self.path)) |dir| try cwd.createDirPath(io, dir);
-        var file = try cwd.createFile(io, self.path, .{ .truncate = true });
-        defer file.close(io);
-        try file.sync(io);
     }
 };
 
@@ -1148,4 +1199,46 @@ test "audit ring compaction keeps the newest entries" {
     try std.testing.expectEqual(@as(usize, 4), all.len);
     try std.testing.expectEqualStrings("n=5", all[0].detail);
     try std.testing.expectEqualStrings("n=2", all[3].detail);
+}
+
+test "history clear persists and failed clear retains the in-memory journal" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var path_buf: [512]u8 = undefined;
+    const path = try testPath("history-clear", &path_buf);
+    defer testCleanup(path);
+    var store = HistoryStore{ .allocator = allocator, .path = path };
+    defer store.deinit();
+    try store.record(io, .{ .id = "", .operation_id = "clear-test", .ts = 1, .server_id = "s", .kind = "exec", .command = "echo test", .exit = 0, .duration_ms = 1, .output_snippet = "test", .redacted = false });
+    var invalid_buf: [1024]u8 = undefined;
+    const invalid = try std.fmt.bufPrint(&invalid_buf, "{s}/not-a-directory", .{path});
+    store.path = invalid;
+    if (store.clear(io)) |_| return error.TestUnexpectedResult else |_| {}
+    store.path = path;
+    try std.testing.expectEqual(@as(usize, 1), store.entries.items.len);
+    try store.clear(io);
+    var reopened = HistoryStore{ .allocator = allocator, .path = path };
+    defer reopened.deinit();
+    const entries = try reopened.list(io, null, null, 10);
+    defer allocator.free(entries);
+    try std.testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+test "audit CSV exports complete rows without exposing spreadsheet formulas" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var path_buf: [512]u8 = undefined;
+    const path = try testPath("audit-export", &path_buf);
+    defer testCleanup(path);
+    var out_buf: [1024]u8 = undefined;
+    const out = try std.fmt.bufPrint(&out_buf, "{s}.csv", .{path});
+    defer std.Io.Dir.cwd().deleteFile(io, out) catch {};
+    var store = AuditStore{ .allocator = allocator, .path = path };
+    defer store.deinit();
+    try store.appendFull(io, "operation", "ssh.exec", "=target", "echo \"a,b\"", "ok", "line1\nline2");
+    try std.testing.expectEqual(@as(usize, 1), try store.exportCsv(io, out));
+    const data = try std.Io.Dir.cwd().readFileAlloc(io, out, allocator, .limited(4096));
+    defer allocator.free(data);
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"'=target\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"line1\nline2\"") != null);
 }

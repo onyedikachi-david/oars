@@ -9,6 +9,8 @@ import { CommandPalette, type CommandItem } from "./components/CommandPalette";
 describe("CommandPalette", () => {
   afterEach(() => {
     cleanup();
+    localStorage.removeItem("oars.palette");
+    vi.clearAllMocks();
   });
 
   const mockCommands: CommandItem[] = [
@@ -135,4 +137,14 @@ describe("CommandPalette", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     expect(onClose).toHaveBeenCalledTimes(1);
   });
+});
+
+it("requires a second activation for danger actions and resets confirmation on query changes", () => {
+  const run = vi.fn(); const close = vi.fn();
+  render(<CommandPalette commands={[{ id: "danger", title: "Clear journal", danger: true, run }]} onClose={close} />);
+  const input = screen.getByRole("combobox");
+  fireEvent.keyDown(input, { key: "Enter" }); expect(run).not.toHaveBeenCalled();
+  fireEvent.change(input, { target: { value: "clear" } });
+  fireEvent.keyDown(input, { key: "Enter" }); expect(run).not.toHaveBeenCalled();
+  fireEvent.keyDown(input, { key: "Enter" }); expect(run).toHaveBeenCalledOnce(); expect(close).toHaveBeenCalledOnce();
 });

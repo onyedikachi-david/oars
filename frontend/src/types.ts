@@ -1,5 +1,7 @@
 // Shared types for the Oars bridge protocol.
 
+export type HistoryShell = "off" | "bash" | "zsh" | "fish";
+
 export type AuthMethod = "password" | "key" | "agent";
 
 export interface Server {
@@ -9,6 +11,7 @@ export interface Server {
   port: number;
   user: string;
   auth_method: AuthMethod;
+  history_shell?: HistoryShell;
   key_path: string;
   key_has_passphrase: boolean;
   host_fingerprint: string | null;
@@ -26,6 +29,7 @@ export interface ServerDraft {
   port: number;
   user: string;
   auth_method: AuthMethod;
+  history_shell?: HistoryShell;
   key_path?: string;
   key_has_passphrase?: boolean;
   group?: string;
@@ -42,6 +46,7 @@ export type SessionStatus =
   | "error";
 
 export interface ChannelInfo {
+  user_visible?: boolean;
   id: number;
   kind: "shell" | "exec" | "log";
   command: string;
@@ -57,6 +62,9 @@ export interface PollResult {
   ok: boolean;
   status: SessionStatus;
   connection_id?: number | null;
+  forwarding?: boolean;
+  history_full?: boolean;
+  history_write_error?: boolean;
   error?: string;
   trust?: { pending: boolean; algorithm?: string; fingerprint?: string };
   channels: ChannelInfo[];
@@ -401,6 +409,10 @@ export interface VncStartResult {
 }
 
 export interface VncProbeResult {
+  display_present?: boolean;
+  display_accessible?: boolean;
+  display_managed?: boolean;
+  listeners_checked?: boolean;
   ok: boolean;
   x11vnc: boolean;
   tigervnc: boolean;
