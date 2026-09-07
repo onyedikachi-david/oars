@@ -14,6 +14,8 @@ pub const c = @cImport({
     @cInclude("sys/socket.h");
     @cInclude("sys/un.h");
     @cInclude("unistd.h");
+    @cInclude("fcntl.h");
+    @cInclude("poll.h");
 });
 
 pub const Error = error{
@@ -155,21 +157,44 @@ pub const Session = struct {
         return error.ConnectionFailed;
     }
 
-    /// Connects the TCP socket and runs the transport handshake with a
-    /// deadline. Blocking connect is acceptable here (worker thread); the
-    /// handshake itself is non-blocking. On failure the caller must still
-    /// call `disconnect` to release partial state.
+    /// TCP establishment and SSH handshake share one deadline after DNS.
+    /// The OS socket stays non-blocking so cancellation reaches every wait.
     pub fn connect(self: *Session, io: std.Io, host: []const u8, port: u16) Error!void {
         const addr = try self.resolveAddress(io, host, port);
-        self.checkStop() catch return error.Canceled;
-        const stream = std.Io.net.IpAddress.connect(&addr, io, .{
-            .mode = .stream,
-            .protocol = .tcp,
-        }) catch return error.ConnectionFailed;
-        self.socket = stream.socket.handle;
+        try self.checkStop();
+        const deadline = deadlineFromNow(io, handshake_timeout_ms);
+        const family = std.Io.Threaded.posixAddressFamily(&addr);
+        const fd = c.socket(family, c.SOCK_STREAM, 0);
+        if (fd < 0) return error.ConnectionFailed;
+        self.socket = fd;
         self.socket_open = true;
-
-        try self.handshake(io);
+        const flags = c.fcntl(fd, c.F_GETFL);
+        if (flags < 0 or c.fcntl(fd, c.F_SETFL, @as(c_int, flags | c.O_NONBLOCK)) < 0) return error.ConnectionFailed;
+        var storage: std.Io.Threaded.PosixAddress = undefined;
+        const length = std.Io.Threaded.addressToPosix(&addr, &storage);
+        const result = c.connect(fd, @ptrCast(&storage.any), length);
+        if (result != 0) {
+            switch (std.posix.errno(result)) {
+                .INPROGRESS, .AGAIN, .INTR => {},
+                else => return error.ConnectionFailed,
+            }
+            while (true) {
+                try checkDeadline(io, deadline);
+                try self.checkStop();
+                var event = c.struct_pollfd{ .fd = fd, .events = c.POLLOUT, .revents = 0 };
+                const ready = c.poll(&event, 1, poll_interval_ms);
+                if (ready < 0) {
+                    if (std.posix.errno(ready) == .INTR) continue;
+                    return error.ConnectionFailed;
+                }
+                if (ready == 0) continue;
+                var socket_error: c_int = 0;
+                var error_size: c.socklen_t = @sizeOf(c_int);
+                if (c.getsockopt(fd, c.SOL_SOCKET, c.SO_ERROR, &socket_error, &error_size) != 0 or socket_error != 0) return error.ConnectionFailed;
+                break;
+            }
+        }
+        try self.handshake(io, deadline);
     }
 
     /// Spec 18: runs the SSH handshake over an existing socket — the
@@ -178,10 +203,12 @@ pub const Session = struct {
     pub fn connectFd(self: *Session, io: std.Io, fd: std.posix.socket_t) Error!void {
         self.socket = fd;
         self.socket_open = true;
-        try self.handshake(io);
+        const flags = c.fcntl(fd, c.F_GETFL);
+        if (flags < 0 or c.fcntl(fd, c.F_SETFL, @as(c_int, flags | c.O_NONBLOCK)) < 0) return error.ConnectionFailed;
+        try self.handshake(io, deadlineFromNow(io, handshake_timeout_ms));
     }
 
-    fn handshake(self: *Session, io: std.Io) Error!void {
+    fn handshake(self: *Session, io: std.Io, deadline: i128) Error!void {
         self.raw = c.libssh2_session_init_ex(null, null, null, null) orelse {
             return error.Protocol;
         };
@@ -189,7 +216,6 @@ pub const Session = struct {
 
         c.libssh2_session_set_blocking(self.raw, 0);
 
-        const deadline = deadlineFromNow(io, handshake_timeout_ms);
         while (true) {
             const rc = c.libssh2_session_handshake(self.raw, @intCast(self.socket));
             if (rc == 0) break;
@@ -581,7 +607,7 @@ pub const Channel = struct {
             const rc = c.libssh2_channel_request_pty_ex(
                 self.raw,
                 "xterm-256color",
-                13,
+                "xterm-256color".len,
                 null,
                 0,
                 cols,
@@ -798,4 +824,24 @@ test "host key algorithms use readable trust-dialog labels" {
     try std.testing.expectEqual(HostKeyAlgorithm.ed25519, HostKeyAlgorithm.fromLibssh2(c.LIBSSH2_HOSTKEY_TYPE_ED25519));
     try std.testing.expectEqualStrings("ECDSA P-256", HostKeyAlgorithm.ecdsa_p256.label());
     try std.testing.expectEqualStrings("Unknown", HostKeyAlgorithm.fromLibssh2(-1).label());
+}
+
+test "TCP accepting non-SSH listener times out within the connection deadline" {
+    initGlobal();
+    const io = std.testing.io;
+    const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+    if (fd < 0) return error.TestUnexpectedResult;
+    defer _ = c.close(fd);
+    const ip = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
+    var address: std.Io.Threaded.PosixAddress = undefined;
+    var length = std.Io.Threaded.addressToPosix(&ip, &address);
+    if (c.bind(fd, @ptrCast(&address.any), length) != 0 or c.listen(fd, 4) != 0) return error.TestUnexpectedResult;
+    if (c.getsockname(fd, @ptrCast(&address.any), &length) != 0) return error.TestUnexpectedResult;
+    const bound = std.Io.Threaded.addressFromPosix(&address);
+    var session = try Session.init(std.testing.allocator);
+    defer session.disconnect(io);
+    const start = nowNs(io);
+    try std.testing.expectError(error.Timeout, session.connect(io, "127.0.0.1", bound.ip4.port));
+    const elapsed_ms = @divTrunc(nowNs(io) - start, std.time.ns_per_ms);
+    try std.testing.expect(elapsed_ms >= 14000 and elapsed_ms < 20000);
 }

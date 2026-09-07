@@ -22,17 +22,19 @@ import { useModalFocus } from "./components/useModalFocus";
 import {
   type GaugeTone,
   type DiskPlan,
-  type MonitorHistory,
   DISK_PLANS,
   gaugeTone,
   toneLabel,
   highestTone,
   bytesToGiB,
   formatUptime,
-  snapshotMilliseconds,
   formatSnapshotAge,
 } from "./monitor-state";
 import type { MonitorSnapshot, Server } from "./types";
+
+import { ResourceChart } from "./components/LazyResourceChart";
+import { appendResourceSample, type ResourceSample } from "./resource-history";
+import { CircleCheck, CircleHelp } from "lucide-react";
 
 type RunStatus = "idle" | "running" | "success" | "error";
 
@@ -64,9 +66,6 @@ function emptyPlans(): PlanStates {
   };
 }
 
-function emptyHistory(): MonitorHistory {
-  return { cpu: [], memory: [], storage: [] };
-}
 
 function messageOf(error: unknown): string {
   return error instanceof BridgeError ? error.message : String(error);
@@ -98,7 +97,7 @@ function ResourceMetric({
       <header className="monitor-metric-header">
         <span className="monitor-metric-icon" aria-hidden><Icon size={17} /></span>
         <span className="monitor-metric-title">{title}</span>
-        <span className="monitor-state"><span className="monitor-state-dot" aria-hidden />{toneLabel(tone)}</span>
+        <span className="monitor-state">{tone === "healthy" ? <CircleCheck size={12} aria-hidden /> : tone === "muted" ? <CircleHelp size={12} aria-hidden /> : <AlertTriangle size={12} aria-hidden />}{toneLabel(tone)}</span>
       </header>
       <div className="monitor-metric-value">
         {percent === null ? <span className="monitor-metric-waiting">{waitingLabel ?? "—"}</span> : <>{percent.toFixed(1)}<small>%</small></>}
@@ -124,65 +123,6 @@ function ResourceMetric({
       </dl>
     </section>
   );
-}
-
-function Sparkline({ series }: { series: Array<{ values: number[]; color: string }> }) {
-  const ref = useRef<HTMLCanvasElement>(null);
-
-  useEffect(() => {
-    const canvas = ref.current;
-    if (!canvas) return;
-
-    const draw = () => {
-      const context = canvas.getContext("2d");
-      if (!context) return;
-      const width = Math.max(1, Math.round(canvas.clientWidth));
-      const height = Math.max(1, Math.round(canvas.clientHeight));
-      const dpr = window.devicePixelRatio || 1;
-      canvas.width = Math.round(width * dpr);
-      canvas.height = Math.round(height * dpr);
-      context.setTransform(dpr, 0, 0, dpr, 0, 0);
-      context.clearRect(0, 0, width, height);
-
-      const styles = getComputedStyle(canvas);
-      const grid = styles.getPropertyValue("--gauge-grid").trim() || "rgba(0,0,0,0.08)";
-      context.strokeStyle = grid;
-      context.lineWidth = 1;
-      context.setLineDash([3, 5]);
-      for (const percent of [60, 90]) {
-        const y = height - (percent / 100) * (height - 10) - 5;
-        context.beginPath();
-        context.moveTo(0, y);
-        context.lineTo(width, y);
-        context.stroke();
-      }
-
-      const sampleSpacing = width / 119;
-      context.setLineDash([]);
-      series.forEach(({ values, color }) => {
-        if (values.length < 2) return;
-        context.strokeStyle = styles.getPropertyValue(color).trim() || "#5a8a7a";
-        context.lineWidth = 2;
-        context.lineJoin = "round";
-        context.lineCap = "round";
-        context.beginPath();
-        values.forEach((value, index) => {
-          const x = width - (values.length - 1 - index) * sampleSpacing;
-          const y = height - (Math.min(100, Math.max(0, value)) / 100) * (height - 10) - 5;
-          if (index === 0) context.moveTo(x, y);
-          else context.lineTo(x, y);
-        });
-        context.stroke();
-      });
-    };
-
-    draw();
-    const observer = new ResizeObserver(draw);
-    observer.observe(canvas);
-    return () => observer.disconnect();
-  }, [series]);
-
-  return <canvas ref={ref} className="monitor-sparkline" role="img" aria-label="Processor, memory, and storage use over the last 120 samples" />;
 }
 
 async function readExecChannel(
@@ -290,7 +230,7 @@ export function MonitorTab({ server }: { server: Server }) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [notReady, setNotReady] = useState(false);
   const [sortBy, setSortBy] = useState<"cpu" | "mem">("cpu");
-  const [history, setHistory] = useState<MonitorHistory>(emptyHistory);
+  const [history, setHistory] = useState<ResourceSample[]>([]);
   const [refreshing, setRefreshing] = useState(false);
   const [storageOpen, setStorageOpen] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -322,14 +262,7 @@ export function MonitorTab({ server }: { server: Server }) {
         setNotReady(false);
         setLoadError(null);
         setSnapshot(result);
-        const cpu = result.cpu?.utilization_pct ?? null;
-        const memory = result.mem && result.mem.total_bytes > 0 ? (result.mem.used_bytes / result.mem.total_bytes) * 100 : null;
-        const storage = result.disk && result.disk.total_bytes > 0 ? (result.disk.used_bytes / result.disk.total_bytes) * 100 : null;
-        setHistory((current) => ({
-          cpu: cpu === null ? current.cpu : [...current.cpu, cpu].slice(-120),
-          memory: memory === null ? current.memory : [...current.memory, memory].slice(-120),
-          storage: storage === null ? current.storage : [...current.storage, storage].slice(-120),
-        }));
+        setHistory(current => appendResourceSample(current, result));
       }
       return result;
     } catch (error) {
@@ -343,7 +276,7 @@ export function MonitorTab({ server }: { server: Server }) {
   useEffect(() => {
     mountedRef.current = true;
     setSnapshot(null);
-    setHistory(emptyHistory());
+    setHistory([]);
     setLoadError(null);
     setNotReady(false);
     setPlans(emptyPlans());
@@ -540,13 +473,8 @@ export function MonitorTab({ server }: { server: Server }) {
     const rightValue = sortBy === "cpu" ? (right.cpu ?? -1) : (right.mem ?? -1);
     return rightValue - leftValue;
   });
-  const historyCount = Math.max(history.cpu.length, history.memory.length, history.storage.length);
-  const historySeries = [
-    { values: history.cpu, color: "--monitor-line-cpu" },
-    { values: history.memory, color: "--monitor-line-memory" },
-    { values: history.storage, color: "--monitor-line-storage" },
-  ];
 
+  const sampleCount = history.filter(sample => sample.cpu !== null || sample.memory !== null || sample.storage !== null).length;
   return (
     <section className="monitor" aria-label="System health">
       <header className="monitor-overview">
@@ -555,7 +483,7 @@ export function MonitorTab({ server }: { server: Server }) {
           <div className="monitor-title-row">
             <h2>Live resource use</h2>
             <span className={`monitor-health monitor-tone-${notReady ? "muted" : overallTone}`}>
-              <span className="monitor-state-dot" aria-hidden />
+              <Activity size={13} aria-hidden />
               {notReady ? "Paused" : snapshot.probe_error ? "Needs attention" : toneLabel(overallTone)}
             </span>
           </div>
@@ -620,20 +548,11 @@ export function MonitorTab({ server }: { server: Server }) {
         <header>
           <div>
             <h3 id="monitor-history-title">Recent resource activity</h3>
-            <p>Up to 120 local samples. Nothing is stored after this view closes.</p>
+            <p>Live samples from this session. Use the chart to inspect a reading.</p>
           </div>
-          <span>{historyCount} of 120 samples</span>
+          <span>{sampleCount} {sampleCount === 1 ? "sample" : "samples"}</span>
         </header>
-        <div className="monitor-history-legend" aria-label="Chart legend">
-          <span className="monitor-legend-cpu">Processor <strong>{cpuPercent === null ? "—" : `${cpuPercent.toFixed(1)}%`}</strong></span>
-          <span className="monitor-legend-memory">Memory <strong>{memoryPercent === null ? "—" : `${memoryPercent.toFixed(1)}%`}</strong></span>
-          <span className="monitor-legend-storage">Storage <strong>{storagePercent === null ? "—" : `${storagePercent.toFixed(1)}%`}</strong></span>
-        </div>
-        <div className="monitor-history-chart">
-          <Sparkline series={historySeries} />
-          {historyCount < 2 && <span>Waiting for the next sample</span>}
-        </div>
-        <div className="monitor-history-scale" aria-hidden><span>0%</span><span>60%</span><span>90%</span><span>100%</span></div>
+        <ResourceChart samples={history} />
       </section>
 
       <section className="panel monitor-processes" aria-labelledby="monitor-processes-title">

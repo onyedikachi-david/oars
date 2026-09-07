@@ -1003,12 +1003,12 @@ export class MockBridge {
     this.setHandler("oars.audit.clear", () => ({ ok: true }));
 
     // 17. oars.vault
-    this.setHandler("oars.vault.export", () => ({ ok: true, payload: "encrypted-vault" }));
-    this.setHandler("oars.vault.import", () => ({ ok: true, token: "tok-1", items_count: 5 }));
-    this.setHandler("oars.vault.importConfirm", () => ({ ok: true, imported: 5 }));
+    this.setHandler("oars.vault.export", () => ({ ok: true, exported: 7, sections: 7 }));
+    this.setHandler("oars.vault.import", () => ({ ok: true, preview: { reports: [], errors: [] } }));
+    this.setHandler("oars.vault.importConfirm", () => ({ ok: true, result: { notes: [] } }));
 
     // 18. oars.agent
-    this.setHandler("oars.agent.list", () => ({ ok: true, agents: [] }));
+    this.setHandler("oars.agent.list", () => ({ ok: true, identities: [] }));
     this.setHandler("oars.agent.forward", () => ({ ok: true }));
   }
 }

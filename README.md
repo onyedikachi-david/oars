@@ -1,8 +1,38 @@
 # Oars
 
-Local-first Linux server management desktop app. Manage servers over SSH from a native desktop window — terminals, files, logs, monitoring, scripts, deployments, backups, and remote desktop — with credentials stored only on your machine.
+Local-first Linux server management desktop app. Manage servers over SSH from a native desktop window — terminals, files, logs, monitoring, scripts, deployments, backups, and remote desktop — with local credential storage.
 
 Built with a Zig core and a React frontend, shelled by the [Native SDK](https://github.com/native-sdk/native-sdk) WebView.
+
+## Screenshots
+
+Real captures from the desktop app. Private connection details, file names, and
+infrastructure information have been redacted.
+
+![Oars remote desktop over SSH](website/public/screenshots/desktop-1600.webp)
+
+<details>
+<summary>Explore files, logs, AI assistance, deployments, history, and full screen</summary>
+
+### Files
+![Local and remote file browsing](website/public/screenshots/files-1600.webp)
+
+### Logs
+![Server log sources and output](website/public/screenshots/logs-1600.webp)
+
+### AI assistance
+![Reviewed commands and server conversations](website/public/screenshots/ai-1600.webp)
+
+### Deployments
+![Preparing a deployment](website/public/screenshots/deploy-1600.webp)
+
+### History
+![Recorded commands and outcomes](website/public/screenshots/history-1600.webp)
+
+### Full-screen desktop
+![Full-screen remote desktop](website/public/screenshots/fullscreen-1600.webp)
+
+</details>
 
 ## Features
 
@@ -63,21 +93,24 @@ Built with a Zig core and a React frontend, shelled by the [Native SDK](https://
 │   ├── libssh2/       # Vendored, built from source
 │   └── mbedtls/       # Vendored, built from source
 ├── scripts/           # Dev helpers (e.g. dockerized sshd for integration tests)
-└── docs/
-    └── specs/         # Feature contracts (01–18)
+└── website/           # Product website and sanitized screenshots
 ```
 
 ## Prerequisites
 
 - **Zig 0.16**
 - **Node.js 24** and **npm** (frontend)
-- **Native SDK CLI** (`native`) — expected at the path in `build.zig` (`default_native_sdk_path`), override with `-Dnative-sdk-path=…` if installed elsewhere
+- **Native SDK CLI 0.7.1** (`native`) — set `NATIVE_SDK_PATH` as below, or pass `-Dnative-sdk-path=…`. A local `native-sdk/` checkout is also supported.
 - **macOS:** Xcode Command Line Tools (`xcode-select --install`) for the WebView/ObjC hosts
 - **Linux:** GTK4 and WebKitGTK 6.0 development packages (for Ubuntu: `sudo apt install pkg-config libgtk-4-dev libwebkitgtk-6.0-dev`)
 
 ## Quick Start
 
 ```sh
+# Install the desktop SDK and point the build at it.
+npm install --global @native-sdk/cli@0.7.1
+export NATIVE_SDK_PATH="$(npm root --global)/@native-sdk/cli"
+
 # install frontend deps (also runs automatically via zig build)
 npm install --prefix frontend
 
@@ -106,6 +139,19 @@ native doctor --manifest app.zon
 Run each package command on its matching operating system. `-Dpackage-target` selects the package layout; it does not install or cross-compile the platform WebView dependencies. The GitHub Actions workflow in `.github/workflows/ci.yml` builds both supported targets on native runners and publishes them as workflow artifacts.
 
 ## Downloads and releases
+
+Oars uses the application ID `app.getoars`. The runtime
+reads it from `app.zon`, which also supplies the package metadata. Server data
+continues to use the `Oars` data directory. The legacy Keychain service name is
+retained for compatibility with existing saved credentials. macOS window and
+WebView preferences may start fresh after the bundle ID change.
+
+macOS downloads are currently not Developer ID-signed or notarized. A paid Apple
+Developer Program membership is not required to build Oars or publish its ZIP.
+Users who trust the download can follow
+[Apple's instructions for opening an unidentified app](https://support.apple.com/guide/mac-help/mh40616/mac),
+using **System Settings → Privacy & Security → Open Anyway** when offered.
+
 
 Every successful CI run exposes temporary `oars-macos` and `oars-linux` downloads in the **Artifacts** section of that Actions run. GitHub's **Packages** panel is for package registries and is not used for Oars desktop binaries.
 

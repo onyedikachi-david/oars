@@ -600,7 +600,7 @@ describe("Empirical Challenger: Modal Focus Management & Dialog A11y Suite", () 
         const title = screen.getByText("Edit connection profile");
         expect(title.getAttribute("id")).toBe("oars-modal-title");
 
-        const subtitle = screen.getByText(/Update how Oars connects to this server/i);
+        const subtitle = screen.getByText(/Connection and authentication settings for this server/i);
         expect(subtitle.getAttribute("id")).toBe("oars-modal-desc");
 
         await waitFor(() => {

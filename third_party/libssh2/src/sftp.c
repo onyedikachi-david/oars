@@ -3920,6 +3920,11 @@ static int sftp_symlink(LIBSSH2_SFTP *sftp, const char *path,
 
     /* this reads a u32 and stores it into a signed 32bit value */
     link_len = _libssh2_ntohu32(data + 9);
+    if(link_len > data_len - 13) {
+        LIBSSH2_FREE(session, data);
+        return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                             "SFTP link response exceeds packet bounds");
+    }
     if(link_len < target_len) {
         memcpy(target, data + 13, link_len);
         target[link_len] = 0;

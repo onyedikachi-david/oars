@@ -22,11 +22,16 @@ const agent = @import("agent.zig");
 // container tests would silently drop out of `zig build test` without
 // this reference.
 comptime {
+    _ = sessions;
+    _ = ssh;
+    _ = history;
     _ = integration;
     _ = deploy;
     _ = vault;
     _ = agent;
 }
+
+extern fn oars_enable_webview_fullscreen() void;
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -93,7 +98,8 @@ const App = struct {
             .data,
             &self.data_dir_buf,
         ) catch null;
-        const base: []const u8 = if (data_dir) |dir| dir else blk: {
+        const data_override = self.env_map.get("OARS_DATA_DIR");
+        const base: []const u8 = if (data_override) |path| path else if (data_dir) |dir| dir else blk: {
             // Last-resort fallback when the OS has no home directory:
             // keep state somewhere writable rather than refusing to run.
             const tmp = process.environ_map.get("TMPDIR") orelse "/tmp";
@@ -216,6 +222,10 @@ const App = struct {
     }
 
     fn start(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
+        const options = @import("build_options");
+        if (comptime std.mem.eql(u8, options.platform, "macos") and std.mem.eql(u8, options.web_engine, "system")) {
+            oars_enable_webview_fullscreen();
+        }
         const self: *App = @ptrCast(@alignCast(context));
         self.ai_registry.credential_facade.install(.{
             .context = runtime,
@@ -264,6 +274,9 @@ const App = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    if (init.environ_map.get("OARS_DATA_DIR")) |path| {
+        if (!std.fs.path.isAbsolute(path)) return error.InvalidDataDirectory;
+    }
     const gpa = init.gpa;
     const app = try gpa.create(App);
     defer {
@@ -275,7 +288,6 @@ pub fn main(init: std.process.Init) !void {
     try runner.runWithOptions(app.app(), .{
         .app_name = "Oars",
         .window_title = "Oars",
-        .bundle_id = "dev.native_sdk.oars",
         .icon_path = "assets/icon.png",
         .bridge = app.bridge_ctx.dispatcher(),
         .builtin_bridge = .{ .enabled = true, .commands = &builtin_policies },

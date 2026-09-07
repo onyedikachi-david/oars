@@ -85,3 +85,10 @@ coverage/
 *.gcov
 callgrind.*
 perf.data*
+
+# Local planning material is excluded from the public source snapshot.
+/docs/
+/PRODUCT.md
+**/.hallmark/
+/native-sdk/
+frontend/dist-operations/

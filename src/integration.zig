@@ -32,6 +32,7 @@ const integration_backup = @import("integration_backup.zig");
 const integration_ai = @import("integration_ai.zig");
 const integration_vnc = @import("integration_vnc.zig");
 const integration_history = @import("integration_history.zig");
+const integration_shell_history = @import("integration_shell_history.zig");
 const integration_jump = @import("integration_jump.zig");
 
 comptime {
@@ -42,11 +43,12 @@ comptime {
     _ = integration_vnc;
     _ = integration_history;
     _ = integration_jump;
+    _ = integration_shell_history;
 }
 
 /// Reads an environment variable from the process environment. The raw
 /// environ pointer is the only env source in 0.16 outside `main(init)`.
-fn getEnv(name: []const u8) ?[]const u8 {
+pub fn getEnv(name: []const u8) ?[]const u8 {
     if (builtin.os.tag == .windows) return null;
     const environ = std.c.environ;
     var i: usize = 0;
@@ -231,16 +233,17 @@ fn shellEchoRoundTrip(manager: *sessions.Manager, server_id: []const u8, marker:
 
 /// Sends a command line to the shell and waits for its output to contain
 /// `want` (used for PTY state checks like `stty size`).
-fn shellReadUntil(manager: *sessions.Manager, server_id: []const u8, command: []const u8, want: []const u8) !void {
+pub fn shellReadUntil(manager: *sessions.Manager, server_id: []const u8, command: []const u8, want: []const u8) !void {
+    const shell_id = manager.get(server_id).?.shell_channel_id;
     try manager.input(server_id, command);
     const deadline = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds + 10 * std.time.ns_per_s;
     var acc: std.ArrayList(u8) = .empty;
     defer acc.deinit(std.testing.allocator);
     var cursor: u64 = 0;
     while (std.Io.Timestamp.now(std.testing.io, .real).nanoseconds < deadline) {
-        const polls = try manager.pollChannels(server_id, &.{.{ .id = 0, .pos = cursor }}, false, 64 * 1024, 64 * 1024);
+        const polls = try manager.pollChannels(server_id, &.{.{ .id = shell_id, .pos = cursor }}, false, 64 * 1024, 64 * 1024);
         for (polls) |*poll| {
-            if (poll.id != 0) continue;
+            if (poll.id != shell_id) continue;
             try acc.appendSlice(std.testing.allocator, poll.data);
             cursor = poll.cursor;
         }

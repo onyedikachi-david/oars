@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "react";
+import { useAppearance, terminalTheme, terminalFont } from "./appearance";
+import { appShortcut, isMacPlatform } from "./keyboard";
 import { Terminal } from "xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "xterm/css/xterm.css";
@@ -6,6 +8,10 @@ import { api, BridgeError, vault } from "./bridge";
 import type { Server, SessionStatus } from "./types";
 import { STATUS_LABEL } from "./types";
 import { AlertTriangle, Copy, ShieldCheck, X } from "lucide-react";
+import { ShellIntegrationDialog } from "./components/ShellIntegrationDialog";
+import { ExecOutput } from "./components/ExecOutput";
+import { ConnectionStatus } from "./components/ConnectionStatus";
+import { OarsSelect } from "./components/ui/select";
 import { Button } from "./components/ui/button";
 import { OarsLoadingState } from "./components/OarsLoadingState";
 import { ApplicationOverlay } from "./components/ApplicationPortal";
@@ -15,32 +21,6 @@ const POLL_MS = 80;
 const INPUT_BUFFER_MAX = 256 * 1024;
 const INPUT_CHUNK_SIZE = 8 * 1024;
 
-// Terminal canvas renders the remote host — ANSI palette stays standard
-// so `ls --color` / editor themes look correct. The chrome around it is
-// the calm mineral-paper studio (see index.css: .terminal-shell).
-const ANSI_THEME = {
-  background: "#0f1318",
-  foreground: "#dbe2ea",
-  cursor: "#7aa8ff",
-  cursorAccent: "#0f1318",
-  selectionBackground: "rgba(122, 168, 255, 0.28)",
-  black: "#1c2128",
-  red: "#ff5f56",
-  green: "#98c379",
-  yellow: "#e5c07b",
-  blue: "#61afef",
-  magenta: "#c678dd",
-  cyan: "#56b6c2",
-  white: "#abb2bf",
-  brightBlack: "#5c6370",
-  brightRed: "#ff6c66",
-  brightGreen: "#b5e890",
-  brightYellow: "#ffd866",
-  brightBlue: "#82b4ff",
-  brightMagenta: "#d98ce0",
-  brightCyan: "#6fd3de",
-  brightWhite: "#e8ecf2",
-};
 
 interface Props {
   server: Server;
@@ -60,6 +40,16 @@ function changedKeyDetails(message: string | null): { oldFingerprint: string; ne
 }
 
 export function TerminalTab({ server, onStatus, onServerUpdated }: Props) {
+  const [shellSetup, setShellSetup] = useState(false);
+  const [historyFull, setHistoryFull] = useState(false);
+  const [historyError, setHistoryError] = useState(false);
+  const appearance = useAppearance();
+  const appearanceRef = useRef(appearance);
+  appearanceRef.current = appearance;
+  const fitRef = useRef<FitAddon | null>(null);
+  const [execChannels, setExecChannels] = useState<Array<{ id: number; command: string; eof: boolean; exit: number | null }>>([]);
+  const [outputChannel, setOutputChannel] = useState<number | null>(null);
+  const [connectionId, setConnectionId] = useState<number | null>(null);
   const hostRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const serverRef = useRef(server);
@@ -96,17 +86,19 @@ export function TerminalTab({ server, onStatus, onServerUpdated }: Props) {
     let disposed = false;
 
     const term = new Terminal({
-      fontFamily: `ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace`,
-      fontSize: 13,
+      fontFamily: terminalFont(appearanceRef.current.font),
+      fontSize: appearanceRef.current.fontSize,
       lineHeight: 1.25,
       cursorBlink: true,
       scrollback: 8000,
-      theme: ANSI_THEME,
+      theme: terminalTheme(appearanceRef.current),
       allowTransparency: false,
     });
     const fit = new FitAddon();
+    fitRef.current = fit;
     term.loadAddon(fit);
     term.open(host);
+    term.attachCustomKeyEventHandler(event => !appShortcut(event, isMacPlatform(), true));
     try { fit.fit(); } catch {}
     termRef.current = term;
     term.focus();
@@ -136,7 +128,7 @@ export function TerminalTab({ server, onStatus, onServerUpdated }: Props) {
 
     // Keyboard: hold Cmd+Shift+K to clear the viewport (client-side only).
     const onWindowKey = (e: KeyboardEvent) => {
-      const mod = e.metaKey || e.ctrlKey;
+      const mod = isMacPlatform() && e.metaKey && !e.ctrlKey;
       if (mod && e.shiftKey && e.key.toLowerCase() === "k") {
         // Only when the terminal is focused — don't hijack Cmd+Shift+K elsewhere.
         if (document.activeElement && host.contains(document.activeElement)) {
@@ -202,6 +194,12 @@ export function TerminalTab({ server, onStatus, onServerUpdated }: Props) {
           setTrust(null);
         }
 
+        setConnectionId(r.connection_id ?? null);
+        setHistoryFull(r.history_full === true);
+        setHistoryError(r.history_write_error === true);
+        const executions = r.channels.filter(channel => channel.kind === "exec" && channel.user_visible === true).map(({ id, command, eof, exit }) => ({ id, command, eof, exit }));
+        setExecChannels(previous => previous.length === executions.length && previous.every((item, index) => item.id === executions[index].id && item.eof === executions[index].eof && item.exit === executions[index].exit) ? previous : executions);
+
         for (const ch of r.channels) {
           // Advance this tab's cursor to the server's response cursor.
           cursorsRef.current.set(ch.id, ch.cursor);
@@ -233,6 +231,7 @@ export function TerminalTab({ server, onStatus, onServerUpdated }: Props) {
       setTrust(null);
       setStatus("connecting");
       cursorsRef.current.clear();
+      setExecChannels([]); setOutputChannel(null);
       inputBuffer = "";
       statusRef.current = "connecting";
       term.reset();
@@ -306,9 +305,23 @@ export function TerminalTab({ server, onStatus, onServerUpdated }: Props) {
       inputDisposable.dispose();
       term.dispose();
       termRef.current = null;
+      fitRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [server.id]);
+
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    term.options.theme = terminalTheme(appearance);
+    term.options.fontFamily = terminalFont(appearance.font);
+    term.options.fontSize = appearance.fontSize;
+    try {
+      fitRef.current?.fit();
+      const dimensions = fitRef.current?.proposeDimensions();
+      if (dimensions) void api.ssh.resize(server.id, dimensions.cols, dimensions.rows).catch(() => {});
+    } catch {}
+  }, [appearance, server.id]);
 
   const handleConnect = () => void connectRef.current();
   const handleDisconnect = async () => {
@@ -374,10 +387,12 @@ export function TerminalTab({ server, onStatus, onServerUpdated }: Props) {
           <span className="terminal-addr">{server.user}@{server.host}:{server.port}</span>
         </div>
         <span className={`terminal-status ${status === "error" ? "is-error" : ""}`}>
-          <span className={`fleet-dot ${status === "ready" ? "fleet-dot-ready" : status === "error" ? "fleet-dot-error" : status === "needs_trust" ? "fleet-dot-needs_trust" : status === "closed" ? "fleet-dot-offline" : "fleet-dot-connecting"}`} aria-hidden />
+          <ConnectionStatus status={status} />
           <span className="terminal-status-label">{status === "error" ? (changedKey ? "Host identity changed" : error ?? "Error") : STATUS_LABEL[status]}</span>
         </span>
         <div className="terminal-actions">
+          <Button variant="ghost" size="xs" onClick={() => setShellSetup(true)}>History: {historyFull ? "full (shell-reported)" : "app commands only"}</Button>
+          {execChannels.length > 0 && <OarsSelect aria-label="Command output" value={outputChannel === null ? "" : String(outputChannel)} onValueChange={value => setOutputChannel(value ? Number(value) : null)} options={[{ value: "", label: `Command results (${execChannels.length})` }, ...execChannels.map(channel => ({ value: String(channel.id), label: `${channel.command?.replace(/\s+/g, " ").slice(0, 64) || "Command"} · ${channel.eof ? channel.exit === null ? "finished" : `exit ${channel.exit}` : "running"}` }))]} />}
           {isConnected ? (
             <Button variant="ghost" size="sm" onClick={handleDisconnect}>Disconnect</Button>
           ) : (
@@ -392,6 +407,9 @@ export function TerminalTab({ server, onStatus, onServerUpdated }: Props) {
         role="application"
         aria-label={`Terminal for ${server.name}`}
       />
+      {historyError && <div role="alert">Command history could not be written. Check available disk space and local journal permissions.</div>}
+      {shellSetup && <ShellIntegrationDialog server={server} connected={isConnected} onClose={() => setShellSetup(false)} onUpdated={updated => onServerUpdated?.(updated)} />}
+      {outputChannel !== null && <div className="terminal-result-drawer"><ExecOutput key={`${connectionId}:${outputChannel}`} serverId={server.id} channel={outputChannel} command={execChannels.find(channel => channel.id === outputChannel)?.command} connectionId={connectionId ?? undefined} onClose={() => setOutputChannel(null)} /></div>}
       {connectionBusy && (
         <OarsLoadingState
           compact
@@ -456,8 +474,8 @@ function RetrustModal({
 }) {
   const dialogRef = useModalFocus(onClose, `#retrust-${server.id}`, !retrustBusy);
   return (
-    <ApplicationOverlay role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !retrustBusy) onClose(); }}>
-      <div ref={dialogRef} className="oars-modal oars-modal-narrow" role="dialog" aria-modal="true" aria-labelledby="retrust-title" aria-describedby="retrust-desc">
+    <ApplicationOverlay quiet role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !retrustBusy) onClose(); }}>
+      <div ref={dialogRef} className="oars-modal oars-modal-narrow refined-dialog" role="dialog" aria-modal="true" aria-labelledby="retrust-title" aria-describedby="retrust-desc">
         <div className="oars-modal-header">
           <div className="oars-modal-title-row">
             <span className="oars-modal-icon oars-modal-icon-danger" aria-hidden><AlertTriangle /></span>
@@ -510,8 +528,8 @@ function TrustModal({
 }) {
   const dialogRef = useModalFocus(() => handleTrust(false));
   return (
-    <ApplicationOverlay role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) handleTrust(false); }}>
-      <div ref={dialogRef} className="oars-modal oars-modal-narrow" role="dialog" aria-modal="true" aria-labelledby="trust-title" aria-describedby="trust-desc" onClick={(e) => e.stopPropagation()}>
+    <ApplicationOverlay quiet role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) handleTrust(false); }}>
+      <div ref={dialogRef} className="oars-modal oars-modal-narrow refined-dialog" role="dialog" aria-modal="true" aria-labelledby="trust-title" aria-describedby="trust-desc" onClick={(e) => e.stopPropagation()}>
         <div className="oars-modal-header">
           <div className="oars-modal-title-row">
             <span className="oars-modal-icon" aria-hidden><ShieldCheck size={16} /></span>

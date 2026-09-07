@@ -45,6 +45,9 @@ const VncSetupResp = struct {
 const VncProbeResp = struct {
     result: struct {
         ok: bool = false,
+        display_present: bool = false,
+        display_accessible: bool = false,
+        display_managed: bool = false,
         x11vnc: bool = false,
         tigervnc: bool = false,
         desktop_installed: bool = false,
@@ -466,6 +469,29 @@ test "integration: vnc setup, framebuffer, pointer, keyboard, tunnel teardown" {
         probe = try dispatchParsed(&rig, VncProbeResp, "{\"id\":\"p1\",\"command\":\"oars.vnc.probe\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\",\"display\":1}}");
     }
 
+    // Simulate the post-reboot stopped state without removing any packages.
+    // These PIDs belong to daemons started above in the disposable fixture.
+    try execWait(&rig.manager, server_id, "kill $(cat $HOME/.local/share/oars/vnc/display-1.pid) $(cat $HOME/.local/share/oars/vnc/display-1.xvfb.pid) 2>/dev/null || true", 0, "");
+    testSleep(1500);
+    var stopped_probe = try dispatchParsed(&rig, VncProbeResp, "{\"id\":\"stopped\",\"command\":\"oars.vnc.probe\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\",\"display\":1}}");
+    defer stopped_probe.deinit();
+    try std.testing.expect(stopped_probe.value.result.ok);
+    try std.testing.expect(stopped_probe.value.result.x11vnc);
+    try std.testing.expect(stopped_probe.value.result.desktop_installed);
+    try std.testing.expect(!stopped_probe.value.result.desktop_running);
+    for (stopped_probe.value.result.listening) |listener| try std.testing.expect(listener.port != vnc_port);
+    try execWait(&rig.manager, server_id, "setsid sleep 600 </dev/null >/dev/null 2>&1 & echo $! >$HOME/.local/share/oars/vnc/stale-target.pid; cp $HOME/.local/share/oars/vnc/stale-target.pid $HOME/.local/share/oars/vnc/display-1.xfce.pid", 0, "");
+    var restart_plan = try dispatchParsed(&rig, VncSetupResp, "{\"id\":\"restart-plan\",\"command\":\"oars.vnc.setup\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\",\"display\":1,\"dry_run\":true,\"install_desktop\":true}}");
+    defer restart_plan.deinit();
+    try std.testing.expect(restart_plan.value.result.ok);
+    try std.testing.expectEqualStrings("configure", restart_plan.value.result.action);
+    try std.testing.expectEqualStrings("", restart_plan.value.result.plan);
+    try std.testing.expectEqualStrings("start", restart_plan.value.result.desktop_action);
+    var restarted = try dispatchParsed(&rig, VncSetupResp, "{\"id\":\"restart\",\"command\":\"oars.vnc.setup\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\",\"display\":1,\"password\":\"oars-test-password\",\"install_desktop\":true}}");
+    defer restarted.deinit();
+    try std.testing.expect(restarted.value.result.ok and restarted.value.result.executed);
+    try execWait(&rig.manager, server_id, "kill -0 $(cat $HOME/.local/share/oars/vnc/stale-target.pid)", 0, "");
+
     // A window manager alone can export a valid but black framebuffer. Remove
     // the XFCE desktop and panel, prove the probe reports an incomplete
     // session, then exercise the setup helper's repair path.
@@ -607,4 +633,49 @@ test "integration: vnc setup, framebuffer, pointer, keyboard, tunnel teardown" {
 
     // --- cleanup ---------------------------------------------------------------
     try execWait(&rig.manager, server_id, "pkill -x xterm 2>/dev/null; pkill -x xfce4-session 2>/dev/null; pkill -x xfwm4 2>/dev/null; pkill -x xfdesktop 2>/dev/null; pkill -x xfce4-panel 2>/dev/null; pkill -x x11vnc 2>/dev/null; pkill -x Xvfb 2>/dev/null; true", 0, "");
+}
+
+test "integration: vnc discovers authorization for an existing protected display" {
+    const env = rig_mod.TestEnv.load();
+    if (!env.active) return; // env-gated
+
+    var rig: TestRig = undefined;
+    try rig.init("vnc-auth");
+    defer rig.deinit();
+    const io = std.testing.io;
+
+    const server = servers.Server{
+        .id = server_id,
+        .name = "dev-sshd",
+        .host = env.host,
+        .port = env.port,
+        .user = env.user,
+        .auth_method = .password,
+    };
+    try rig.store.upsert(io, server);
+    _ = try rig.manager.connect(server, env.password, null);
+    try waitForStatus(&rig.manager, server_id, .needs_trust, 20 * std.time.ns_per_s);
+    try rig.manager.trust(server_id, true);
+    try waitForStatus(&rig.manager, server_id, .ready, 20 * std.time.ns_per_s);
+
+    try execWait(&rig.manager, server_id, "umask 077; mkdir -p $HOME/.local/share/oars/auth-fixture; printf '\\377\\377\\000\\000\\000\\001\\063\\000\\022\\115\\111\\124\\055\\115\\101\\107\\111\\103\\055\\103\\117\\117\\113\\111\\105\\055\\061\\000\\020\\000\\021\\042\\063\\104\\125\\146\\167\\210\\231\\252\\273\\314\\335\\356\\377' >$HOME/.local/share/oars/auth-fixture/Xauthority; setsid Xvfb :3 -screen 0 640x480x24 -nolisten tcp -auth $HOME/.local/share/oars/auth-fixture/Xauthority </dev/null >/dev/null 2>&1 & echo $! >$HOME/.local/share/oars/auth-fixture/pid", 0, "");
+    testSleep(1000);
+    var probe = try dispatchParsed(&rig, VncProbeResp, "{\"id\":\"auth-probe\",\"command\":\"oars.vnc.probe\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\",\"display\":3}}");
+    defer probe.deinit();
+    try std.testing.expect(probe.value.result.ok);
+    try std.testing.expect(probe.value.result.display_present);
+    try std.testing.expect(probe.value.result.display_accessible);
+    try std.testing.expect(!probe.value.result.display_managed);
+    var shared = try dispatchParsed(&rig, VncSetupResp, "{\"id\":\"auth-start\",\"command\":\"oars.vnc.setup\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\",\"display\":3,\"password\":\"oars-test-password\",\"install_desktop\":false}}");
+    defer shared.deinit();
+    try std.testing.expect(shared.value.result.ok and shared.value.result.executed);
+    try execWait(&rig.manager, server_id, "mv $HOME/.local/share/oars/auth-fixture/Xauthority $HOME/.local/share/oars/auth-fixture/hidden-cookie", 0, "");
+    var unavailable = try dispatchParsed(&rig, VncProbeResp, "{\"id\":\"auth-missing\",\"command\":\"oars.vnc.probe\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\",\"display\":3}}");
+    defer unavailable.deinit();
+    try std.testing.expect(unavailable.value.result.ok and unavailable.value.result.display_present);
+    try std.testing.expect(!unavailable.value.result.display_accessible);
+    var blocked = try dispatchParsed(&rig, VncSetupResp, "{\"id\":\"auth-blocked\",\"command\":\"oars.vnc.setup\",\"payload\":{\"server_id\":\"" ++ server_id ++ "\",\"display\":3,\"dry_run\":true,\"install_desktop\":true}}");
+    defer blocked.deinit();
+    try std.testing.expect(!blocked.value.result.ok);
+    try std.testing.expect(std.mem.indexOf(u8, blocked.value.result.@"error", "already in use") != null);
 }

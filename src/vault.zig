@@ -153,17 +153,25 @@ fn readSmallFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, cap
     };
 }
 
-/// Atomic write (temp + rename), the established store pattern.
-fn writeAtomic(io: std.Io, path: []const u8, data: []const u8) !void {
+/// Atomic owner-only writes preserve an existing export on failure.
+pub fn writeAtomicParts(io: std.Io, path: []const u8, parts: []const []const u8) !void {
     const cwd = std.Io.Dir.cwd();
     if (std.fs.path.dirname(path)) |dir| try cwd.createDirPath(io, dir);
-    var tmp_buf: [2048]u8 = undefined;
-    const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path}) catch return error.PathTooLong;
-    var file = try cwd.createFile(io, tmp, .{});
-    defer file.close(io);
-    try file.writeStreamingAll(io, data);
-    try file.sync(io);
-    std.Io.Dir.renameAbsolute(tmp, path, io) catch return error.RenameFailed;
+    var nonce: [12]u8 = undefined;
+    try std.Io.randomSecure(io, &nonce);
+    var tmp_buf: [4096]u8 = undefined;
+    const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp-{s}", .{ path, std.fmt.bytesToHex(nonce, .lower) });
+    var file = try cwd.createFile(io, tmp, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    defer cwd.deleteFile(io, tmp) catch {};
+    {
+        defer file.close(io);
+        for (parts) |part| try file.writeStreamingAll(io, part);
+        try file.sync(io);
+    }
+    try std.Io.Dir.renameAbsolute(tmp, path, io);
+}
+fn writeAtomic(io: std.Io, path: []const u8, data: []const u8) !void {
+    return writeAtomicParts(io, path, &.{data});
 }
 
 // --- payload build / parse ---------------------------------------------------
@@ -400,14 +408,7 @@ pub fn writeVaultFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8
     var tag: [tag_len]u8 = undefined;
     crypto.gcmSeal(&key, &nonce, &header, plaintext, ciphertext, &tag) catch return error.SealFailed;
 
-    const cwd = std.Io.Dir.cwd();
-    if (std.fs.path.dirname(path)) |dir| cwd.createDirPath(io, dir) catch return error.WriteFailed;
-    var file = cwd.createFile(io, path, .{}) catch return error.WriteFailed;
-    defer file.close(io);
-    file.writeStreamingAll(io, &header) catch return error.WriteFailed;
-    file.writeStreamingAll(io, ciphertext) catch return error.WriteFailed;
-    file.writeStreamingAll(io, &tag) catch return error.WriteFailed;
-    file.sync(io) catch return error.WriteFailed;
+    writeAtomicParts(io, path, &.{ &header, ciphertext, &tag }) catch return error.WriteFailed;
 }
 
 /// Reads and authenticates a vault file, returning the plaintext

@@ -13,10 +13,12 @@ import type { Server, AccessPollResponse, SshSnapshotPollResponse, MonitorSnapsh
 vi.mock("xterm", () => ({
   Terminal: function () {
     return {
+      options: {},
       loadAddon: vi.fn(),
       open: vi.fn(),
       write: vi.fn(),
       dispose: vi.fn(),
+      attachCustomKeyEventHandler: vi.fn(),
       onData: vi.fn(() => ({ dispose: vi.fn() })),
       onResize: vi.fn(() => ({ dispose: vi.fn() })),
       clear: vi.fn(),

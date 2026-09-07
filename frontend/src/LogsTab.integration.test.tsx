@@ -101,6 +101,8 @@ describe("LogsTab Integration Suite", () => {
       );
     });
 
+    // The read request starts before the selector is enabled again.
+    await waitFor(() => expect((screen.getByLabelText("Lines to load") as HTMLButtonElement).disabled).toBe(false));
     // Change line count to 500
     await user.click(screen.getByLabelText("Lines to load"));
     await user.click(screen.getByRole("option", { name: "500 lines" }));
@@ -207,6 +209,8 @@ describe("LogsTab Integration Suite", () => {
     fireEvent.click(sourceBtn);
 
     const followBtn = await screen.findByRole("button", { name: /Follow/i });
+    // Follow is unavailable while the selected source is still loading.
+    await waitFor(() => expect((followBtn as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(followBtn);
 
     // EOF status badge and channel closure

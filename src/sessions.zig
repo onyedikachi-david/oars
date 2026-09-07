@@ -21,20 +21,13 @@ const deploy = @import("deploy.zig");
 const preflight = @import("preflight.zig");
 const wsmod = @import("ws.zig");
 const agent = @import("agent.zig");
+const shell_integration = @import("shell_integration.zig");
 
-// fcntl is variadic, so the cImport cannot translate it; declare the exact
-// signature used by the supported POSIX targets. F_SETFL is 4 on both, while
-// O_NONBLOCK is platform-specific.
-extern fn fcntl(fd: c_int, cmd: c_int, flags: c_int) c_int;
-const F_SETFL: c_int = 4;
-const O_NONBLOCK: c_int = switch (builtin.os.tag) {
-    .macos => 0x0004,
-    .linux => 0x0800,
-    else => @compileError("session socket pumps require a supported POSIX target"),
-};
-
-fn configureNonBlockingSocket(fd: std.posix.socket_t) void {
-    _ = fcntl(fd, F_SETFL, O_NONBLOCK);
+// Use the imported variadic C declaration. A fixed third argument uses
+// the wrong ABI on Darwin ARM64 and can leave a supposedly non-blocking fd blocking.
+fn configureNonBlockingSocket(fd: std.posix.socket_t) !void {
+    const flags = ssh.c.fcntl(fd, ssh.c.F_GETFL);
+    if (flags < 0 or ssh.c.fcntl(fd, ssh.c.F_SETFL, @as(c_int, flags | ssh.c.O_NONBLOCK)) < 0) return error.ConnectionFailed;
     if (comptime @hasDecl(ssh.c, "SO_NOSIGPIPE")) {
         var one: c_int = 1;
         _ = ssh.c.setsockopt(fd, ssh.c.SOL_SOCKET, ssh.c.SO_NOSIGPIPE, &one, @sizeOf(c_int));
@@ -1455,7 +1448,18 @@ pub const Session = struct {
     /// The manager that owns this session (for the jump cascade).
     owner: *Manager = undefined,
     /// Spec 18: agent forwarding is enabled for this session's shell.
-    forwarding: bool = false,
+    forwarding: std.atomic.Value(bool) = .init(false),
+    shell_channel_id: u32 = 0,
+    shell_parser: ?shell_integration.Parser = null,
+    history_capture_enabled: std.atomic.Value(bool) = .init(true),
+    history_full: std.atomic.Value(bool) = .init(false),
+    history_write_error: std.atomic.Value(bool) = .init(false),
+    shell_command: [shell_integration.command_cap]u8 = undefined,
+    shell_command_len: usize = 0,
+    shell_started_ns: i128 = 0,
+    shell_snippet: [history.snippet_cap]u8 = undefined,
+    shell_snippet_len: usize = 0,
+    shell_snippet_lines: usize = 0,
     /// Guards forward_queue / forward_active (worker + libssh2 callback).
     forward_mutex: std.atomic.Mutex = .unlocked,
     /// Accepted auth-agent channels awaiting their local agent socket
@@ -2398,23 +2402,24 @@ pub const Manager = struct {
                 self.closeChannel(server_id, channel) catch {};
                 return error.Canceled;
             }
-            const polls = try self.pollChannels(server_id, &.{.{ .id = channel, .pos = cursor }}, false, 64 * 1024, 64 * 1024);
+            const polls = try self.pollSelectedChannels(server_id, &.{.{ .id = channel, .pos = cursor }}, false, 64 * 1024, 64 * 1024, channel);
+            defer {
+                for (polls) |*poll| poll.deinit(self.allocator);
+                self.allocator.free(polls);
+            }
             for (polls) |*poll| {
                 if (poll.id != channel) continue;
+                if (poll.gap > 0) out.limited = true;
                 if (!out.limited) {
                     if (out.output.items.len + poll.data.len > max_bytes) out.limited = true;
                     if (!out.limited) out.output.appendSlice(self.allocator, poll.data) catch return error.OutOfMemory;
                 }
                 cursor = poll.cursor;
-                if (poll.eof) {
+                if (poll.eof and poll.pending <= poll.data.len) {
                     out.exit = poll.exit_status orelse 0;
-                    for (polls) |*p| p.deinit(self.allocator);
-                    self.allocator.free(polls);
                     return out;
                 }
             }
-            for (polls) |*poll| poll.deinit(self.allocator);
-            self.allocator.free(polls);
             if (std.Io.Timestamp.now(self.io, .real).nanoseconds >= deadline) {
                 // The deadline cut the response: honest partial output.
                 out.limited = true;
@@ -2426,10 +2431,15 @@ pub const Manager = struct {
 
     /// Queues an explicit channel close (spec 04's `oars.ssh.closeChannel`):
     /// the worker sends EOF, closes the raw channel, and frees the entry.
-    /// The shell channel (id 0) is never closed this way.
+    /// Shell channels, including replacements, are never closed this way.
     pub fn closeChannel(self: *Manager, server_id: []const u8, channel_id: u32) !void {
         const session = self.get(server_id) orelse return error.NoSession;
-        if (channel_id == 0) return error.InvalidChannel;
+        lockSpin(&session.channels_mutex);
+        const is_shell = for (session.channels.items) |entry| {
+            if (entry.id == channel_id and entry.kind == .shell) break true;
+        } else false;
+        session.channels_mutex.unlock();
+        if (is_shell or channel_id == 0) return error.InvalidChannel;
         lockSpin(&session.ops_mutex);
         defer session.ops_mutex.unlock();
         if (session.worker_done.load(.acquire)) return error.NotReady;
@@ -2499,6 +2509,20 @@ pub const Manager = struct {
         data_budget: usize,
         channel_budget: usize,
     ) ![]ChannelPoll {
+        return self.pollSelectedChannels(server_id, cursors, rewind, data_budget, channel_budget, null);
+    }
+
+    // An internal command waiter must not spend its byte budget on unrelated
+    // retained shell/log output. Public polling still returns all channels.
+    fn pollSelectedChannels(
+        self: *Manager,
+        server_id: []const u8,
+        cursors: []const Cursor,
+        rewind: bool,
+        data_budget: usize,
+        channel_budget: usize,
+        selected_channel: ?u32,
+    ) ![]ChannelPoll {
         const session = self.get(server_id) orelse return error.NoSession;
         const allocator = self.allocator;
         var out: std.ArrayList(ChannelPoll) = .empty;
@@ -2511,6 +2535,7 @@ pub const Manager = struct {
         var budget = data_budget;
         for (session.channels.items) |entry| {
             if (entry.internal) continue; // monitor probes are worker-owned
+            if (selected_channel) |selected| if (entry.id != selected) continue;
             const requested: u64 = if (rewind) 0 else cursorFor(cursors, entry.id) orelse 0;
             const view = entry.stream.view(requested);
             const take = @min(view.pending, @as(u64, @min(channel_budget, budget)));
@@ -2522,21 +2547,26 @@ pub const Manager = struct {
             }
             var command: []u8 = &.{};
             if (entry.command.len > 0) {
-                command = allocator.dupe(u8, entry.command) catch {
+                const safe_command = history.redact(allocator, entry.history_command orelse entry.command, entry.history_secrets orelse &.{}) catch {
                     allocator.free(data);
                     continue;
                 };
+                command = safe_command.text;
             }
             const snap = entry.stream.snapshot();
+            // Output may arrive between the first view and EOF observation.
+            // Include that tail before a waiter decides the command is drained.
+            const latest_view = entry.stream.view(view.from);
             out.append(allocator, .{
                 .id = entry.id,
                 .kind = entry.kind,
+                .user_visible = entry.history_kind != null,
                 .command = command,
                 .eof = snap.eof,
                 .exit_status = snap.exit_status,
-                .gap = view.gap,
+                .gap = @max(view.gap, latest_view.gap),
                 .cursor = view.from + data.len,
-                .pending = view.pending,
+                .pending = latest_view.pending,
                 .data = data,
             }) catch {
                 allocator.free(data);
@@ -2600,6 +2630,9 @@ pub const Manager = struct {
         const status = session.status.load(.acquire);
         return .{
             .status = status,
+            .forwarding = session.forwarding.load(.acquire),
+            .history_full = session.history_full.load(.acquire),
+            .history_write_error = session.history_write_error.load(.acquire),
             .@"error" = if (status == .@"error") session.errorText() else "",
             .trust_pending = session.trustPending(),
             .trust_fingerprint = session.trustFingerprint(),
@@ -2858,6 +2891,9 @@ pub const ExecOutcome = struct {
 
 pub const ChannelPoll = struct {
     id: u32,
+    /// Only tracked operations belong in the terminal run picker. Plumbing
+    /// still remains readable by its owning feature through channel cursors.
+    user_visible: bool = false,
     kind: ChannelKind,
     /// Owned copy of the command text (entries can be evicted or closed
     /// while the poll response is being serialized).
@@ -2881,6 +2917,9 @@ pub const ChannelPoll = struct {
 
 pub const SessionInfo = struct {
     status: Status,
+    forwarding: bool,
+    history_full: bool,
+    history_write_error: bool,
     @"error": []const u8,
     trust_pending: bool,
     trust_fingerprint: []const u8,
@@ -2952,7 +2991,13 @@ fn workerMain(session: *Session) void {
         // on fds[1] (libssh2_session_set_blocking does NOT alter the
         // socket itself). Darwin uses SO_NOSIGPIPE; Linux writes use
         // MSG_NOSIGNAL through socketWriteNoSigpipe.
-        for (&fds) |fd| configureNonBlockingSocket(fd);
+        for (&fds) |fd| configureNonBlockingSocket(fd) catch {
+            _ = ssh.c.close(fds[0]);
+            _ = ssh.c.close(fds[1]);
+            session.status.store(.@"error", .release);
+            session.setError("could not configure the jump tunnel socket");
+            return;
+        };
         var outcome: JumpStartOutcome = .{};
         const host_owned = allocator.dupe(u8, session.server.host) catch {
             _ = ssh.c.close(fds[0]);
@@ -3352,8 +3397,14 @@ fn workerMain(session: *Session) void {
                 if (!dropEntryAt(session, i, entry)) i += 1;
                 continue;
             }
-            switch (entry.raw.read(&read_buf)) {
+            const read_result = if (entry.kind == .shell) entry.raw.readOpenStream(&read_buf) else entry.raw.read(&read_buf);
+            switch (read_result) {
                 .eof => {
+                    if (entry.kind == .shell and session.shell_parser != null) {
+                        var sink_context = ShellHistorySink{ .session = session, .entry = entry };
+                        session.shell_parser.?.flush(sink_context.sink());
+                        session.history_full.store(false, .release);
+                    }
                     if (!entry.eof_seen) {
                         entry.eof_seen = true;
                         lockSpin(&entry.stream.mutex);
@@ -3414,7 +3465,10 @@ fn workerMain(session: *Session) void {
                     i += 1;
                 },
                 .data => |n| {
-                    appendChannelData(entry, read_buf[0..n]);
+                    if (entry.kind == .shell and session.shell_parser != null) {
+                        var sink_context = ShellHistorySink{ .session = session, .entry = entry };
+                        session.shell_parser.?.feed(read_buf[0..n], sink_context.sink());
+                    } else appendChannelData(entry, read_buf[0..n]);
                     if (entry.backup_process) |process| process.append(read_buf[0..n]);
                     i += 1;
                 },
@@ -4373,6 +4427,10 @@ fn processOps(session: *Session) void {
                     continue;
                 };
                 const entry = session.channels.items[i];
+                if (entry.kind == .shell) {
+                    session.channels_mutex.unlock();
+                    continue;
+                }
                 _ = session.channels.orderedRemove(i);
                 session.channels_mutex.unlock();
 
@@ -4851,15 +4909,19 @@ fn tunnelDriveFrames(session: *Session, t: *Tunnel, now_ns: i128) void {
 /// caller (workerMain only — the toggle reopens an already-ready session).
 fn openShellChannel(session: *Session, io: std.Io) bool {
     const allocator = session.allocator;
+    session.history_full.store(false, .release);
+    session.shell_command_len = 0;
+    session.shell_started_ns = 0;
+    session.shell_parser = null;
     const raw_shell = session.transport.openChannel(io) catch {
         session.status.store(.@"error", .release);
         session.setError("failed to open shell channel");
         return false;
     };
-    if (session.forwarding) {
+    if (session.forwarding.load(.acquire)) {
         raw_shell.requestAuthAgent(io) catch {
             raw_shell.close(io);
-            session.forwarding = false;
+            session.forwarding.store(false, .release);
             session.status.store(.@"error", .release);
             session.setError("agent forwarding refused (server policy or unsupported)");
             return false;
@@ -4867,7 +4929,21 @@ fn openShellChannel(session: *Session, io: std.Io) bool {
     }
     raw_shell.requestPty(io, 120, 32) catch {};
     raw_shell.setEnv(io, "TERM", "xterm-256color") catch {};
-    raw_shell.shell(io) catch {
+    const started = if (session.server.history_shell == .off) raw_shell.shell(io) else blk: {
+        var random: [16]u8 = undefined;
+        std.Io.random(io, &random);
+        const nonce = std.fmt.bytesToHex(random, .lower);
+        session.shell_parser = shell_integration.Parser.init(nonce);
+        const shell_name = @tagName(session.server.history_shell);
+        const launch = if (session.server.history_shell == .bash)
+            std.fmt.allocPrint(allocator, "exec env OARS_HISTORY_NONCE={s} bash --rcfile \"$HOME/.config/oars/shell/v1/bash-start.sh\" -i", .{nonce})
+        else
+            std.fmt.allocPrint(allocator, "exec env OARS_HISTORY_NONCE={s} {s} -il", .{ nonce, shell_name });
+        const command = launch catch break :blk error.OutOfMemory;
+        defer allocator.free(command);
+        break :blk raw_shell.exec(io, command);
+    };
+    started catch {
         raw_shell.close(io);
         session.status.store(.@"error", .release);
         session.setError("failed to start shell");
@@ -4883,7 +4959,7 @@ fn openShellChannel(session: *Session, io: std.Io) bool {
         allocator.destroy(shell_stream);
         return false;
     };
-    shell_entry.* = .{ .id = 0, .kind = .shell, .stream = shell_stream, .raw = raw_shell };
+    shell_entry.* = .{ .id = session.shell_channel_id, .kind = .shell, .stream = shell_stream, .raw = raw_shell };
     lockSpin(&session.channels_mutex);
     session.channels.append(allocator, shell_entry) catch {
         session.channels_mutex.unlock();
@@ -4922,31 +4998,64 @@ fn closeShellChannel(session: *Session) void {
 /// Spec 18: the agent-forwarding toggle — resolve + validate the agent
 /// socket once, register the auth-agent callback, and reopen the shell
 /// with (or without) the request.
+fn closeForwardTunnels(session: *Session) void {
+    // Channel.close owns the channel allocation. Release the queue lock before
+    // closing channels because libssh2 close calls may process incoming packets.
+    lockSpin(&session.forward_mutex);
+    var queued = session.forward_queue;
+    session.forward_queue = .empty;
+    var active = session.forward_active;
+    session.forward_active = .empty;
+    session.forward_mutex.unlock();
+    defer queued.deinit(session.allocator);
+    defer active.deinit(session.allocator);
+    for (queued.items) |channel| channel.close(session.io);
+    for (active.items) |tunnel| {
+        _ = ssh.c.close(tunnel.agent_fd);
+        tunnel.channel.close(session.io);
+        tunnel.to_socket_buf.deinit(session.allocator);
+        tunnel.to_channel_buf.deinit(session.allocator);
+        session.allocator.destroy(tunnel);
+    }
+}
+
 fn forwardSetOp(session: *Session, f: anytype) void {
-    closeShellChannel(session);
-    session.forwarding = f.on;
-    if (f.on) {
-        const path = agent.resolveSocket(session.allocator, null) catch {
-            session.forwarding = false;
+    if (session.forwarding.load(.acquire) == f.on) {
+        f.outcome.set(true, "");
+        return;
+    }
+    // Validate before closing a working shell. A missing agent must leave it usable.
+    const path: ?[]const u8 = if (f.on) blk: {
+        const resolved = agent.resolveSocket(session.allocator, null) catch {
             f.outcome.set(false, "no SSH agent — start ssh-agent or set SSH_AUTH_SOCK");
             return;
         };
-        agent.validateSocket(path) catch {
-            session.allocator.free(path);
-            session.forwarding = false;
+        agent.validateSocket(resolved) catch {
+            session.allocator.free(resolved);
             f.outcome.set(false, "the agent socket is missing, not a socket, or not owned by the current user");
             return;
         };
-        session.forward_agent_path = path;
-        session.transport.setAbstract(@ptrCast(session));
-        session.transport.setAuthAgentCallback(authAgentCallback);
-    } else {
-        if (session.forward_agent_path) |p| session.allocator.free(p);
-        session.forward_agent_path = null;
-        session.transport.setAuthAgentCallback(null);
-    }
+        break :blk resolved;
+    } else null;
+    closeShellChannel(session);
+    closeForwardTunnels(session);
+    // A replacement shell has a new cursor namespace for every mirrored tab.
+    session.shell_channel_id = session.next_channel_id.fetchAdd(1, .monotonic);
+    session.forwarding.store(f.on, .release);
+    if (session.forward_agent_path) |old_path| session.allocator.free(old_path);
+    session.forward_agent_path = path;
+    session.transport.setAbstract(@ptrCast(session));
+    // OpenSSH can retain its per-connection agent listener after shell replacement.
+    // Keep accepting-and-closing requests while off; never connect them to a local agent.
+    session.transport.setAuthAgentCallback(authAgentCallback);
     if (!openShellChannel(session, session.io)) {
-        f.outcome.set(false, "could not reopen the shell with agent forwarding");
+        session.forwarding.store(false, .release);
+        session.transport.setAuthAgentCallback(authAgentCallback);
+        if (session.forward_agent_path) |old_path| session.allocator.free(old_path);
+        session.forward_agent_path = null;
+        // Restore a normal shell after forwarding refusal where possible.
+        if (openShellChannel(session, session.io)) session.status.store(.ready, .release);
+        f.outcome.set(false, "could not enable agent forwarding; check the server's AllowAgentForwarding policy and reconnect if needed");
         return;
     }
     f.outcome.set(true, "");
@@ -4971,13 +5080,14 @@ fn authAgentCallback(session_raw: ?*ssh.c.LIBSSH2_SESSION, channel: ?*ssh.c.LIBS
 
 /// Connects to the validated local agent socket for one proxy tunnel.
 fn connectAgentSocket(session: *Session) !std.posix.socket_t {
+    if (!session.forwarding.load(.acquire)) return error.NoAgent;
     const path = session.forward_agent_path orelse return error.NoAgent;
     const fd = ssh.c.socket(ssh.c.AF_UNIX, ssh.c.SOCK_STREAM, 0);
     if (fd < 0) return error.ConnectionFailed;
     errdefer _ = ssh.c.close(fd);
     // Non-blocking from the start (a blocking connect or write would freeze
     // the via worker's run loop); writes suppress SIGPIPE per platform.
-    configureNonBlockingSocket(fd);
+    try configureNonBlockingSocket(fd);
     var addr: ssh.c.sockaddr_un = .{};
     addr.sun_family = ssh.c.AF_UNIX;
     if (@hasField(@TypeOf(addr), "sun_len")) {
@@ -5018,13 +5128,11 @@ fn processForwardChannels(session: *Session, io: std.Io) void {
         session.forward_mutex.unlock();
         const agent_fd = connectAgentSocket(session) catch {
             ch.close(io);
-            allocator.destroy(ch);
             continue;
         };
         const ft = allocator.create(ForwardTunnel) catch {
             _ = ssh.c.close(agent_fd);
             ch.close(io);
-            allocator.destroy(ch);
             continue;
         };
         ft.* = .{ .channel = ch, .agent_fd = agent_fd };
@@ -5081,15 +5189,15 @@ fn processForwardChannels(session: *Session, io: std.Io) void {
         }
         // socket → to_channel_buf (non-blocking; EAGAIN is quiet).
         if (!remove and ft.to_channel_buf.items.len < jump_frame_cap) {
-            const n = std.posix.read(ft.agent_fd, &buf) catch |err| switch (err) {
-                error.WouldBlock => 0,
-                else => {
-                    remove = true;
-                    continue;
-                },
-            };
+            const n = ssh.c.read(ft.agent_fd, &buf, buf.len);
             if (n > 0) {
-                ft.to_channel_buf.appendSlice(allocator, buf[0..n]) catch {};
+                ft.to_channel_buf.appendSlice(allocator, buf[0..@intCast(n)]) catch {
+                    remove = true;
+                };
+            } else if (n == 0) {
+                remove = true;
+            } else if (std.posix.errno(n) != .AGAIN and std.posix.errno(n) != .INTR) {
+                remove = true;
             }
         }
         if (remove) {
@@ -5102,7 +5210,6 @@ fn processForwardChannels(session: *Session, io: std.Io) void {
             ft.to_socket_buf.deinit(allocator);
             ft.to_channel_buf.deinit(allocator);
             allocator.destroy(ft);
-            allocator.destroy(ch);
             continue;
         }
         i += 1;
@@ -7037,6 +7144,7 @@ fn reportKeyAuthError(session: *Session, error_buf: []u8, err: ssh.Error) void {
 /// section, so op-enqueue paths checking the flag under the same mutex
 /// either have their op drained below or reject it.
 fn sessionDone(session: *Session) void {
+    if (session.transport.session_open) session.transport.setAuthAgentCallback(null);
     // Channels first: nulling the shell under channels_mutex makes a
     // concurrent input() fail honestly instead of writing into an entry
     // being destroyed here.
@@ -7109,23 +7217,7 @@ fn sessionDone(session: *Session) void {
     session.tunnels_mutex.unlock();
     if (session.via_name) |n| session.allocator.free(n);
 
-    // Agent forwarding (spec 18): close every accepted agent channel.
-    lockSpin(&session.forward_mutex);
-    for (session.forward_queue.items) |ch| {
-        ch.close(session.io);
-        session.allocator.destroy(ch);
-    }
-    session.forward_queue.clearAndFree(session.allocator);
-    for (session.forward_active.items) |ft| {
-        _ = ssh.c.close(ft.agent_fd);
-        ft.channel.close(session.io);
-        ft.to_socket_buf.deinit(session.allocator);
-        ft.to_channel_buf.deinit(session.allocator);
-        session.allocator.destroy(ft.channel);
-        session.allocator.destroy(ft);
-    }
-    session.forward_active.clearAndFree(session.allocator);
-    session.forward_mutex.unlock();
+    closeForwardTunnels(session);
     if (session.forward_agent_path) |p| session.allocator.free(p);
 
     session.transport.disconnect(session.io);
@@ -8101,4 +8193,193 @@ test "cascadeCloseDependant marks the dependant and tolerates a removed one" {
     }
     manager.teardown(key, target);
     manager.cascadeCloseDependant("t-1", "jump-box");
+}
+
+const ShellHistorySink = struct {
+    session: *Session,
+    entry: *ChannelEntry,
+    fn sink(self: *ShellHistorySink) shell_integration.Sink {
+        return .{ .context = self, .output = output, .event = event };
+    }
+    fn output(context: *anyopaque, bytes: []const u8) void {
+        const self: *ShellHistorySink = @ptrCast(@alignCast(context));
+        appendChannelData(self.entry, bytes);
+        const session = self.session;
+        if (session.shell_started_ns == 0) return;
+        for (bytes) |byte| {
+            if (session.shell_snippet_len == session.shell_snippet.len or session.shell_snippet_lines >= 2) break;
+            session.shell_snippet[session.shell_snippet_len] = byte;
+            session.shell_snippet_len += 1;
+            if (byte == '\n') session.shell_snippet_lines += 1;
+        }
+    }
+    fn event(context: *anyopaque, value: shell_integration.Event) void {
+        const self: *ShellHistorySink = @ptrCast(@alignCast(context));
+        const session = self.session;
+        switch (value) {
+            .coverage => |full| {
+                session.history_full.store(full and session.history_capture_enabled.load(.acquire), .release);
+                if (!full) {
+                    session.shell_started_ns = 0;
+                    session.shell_command_len = 0;
+                }
+            },
+            .command => |command| {
+                @memcpy(session.shell_command[0..command.len], command);
+                session.shell_command_len = command.len;
+                session.shell_started_ns = 0;
+                session.shell_snippet_len = 0;
+                session.shell_snippet_lines = 0;
+            },
+            .start => {
+                if (session.history_full.load(.acquire) and session.shell_command_len > 0) session.shell_started_ns = std.Io.Timestamp.now(session.io, .real).nanoseconds;
+            },
+            .finish => |exit_code| {
+                defer {
+                    session.shell_started_ns = 0;
+                    session.shell_command_len = 0;
+                }
+                if (session.shell_started_ns == 0 or session.shell_command_len == 0 or !session.history_full.load(.acquire)) return;
+                const allocator = session.allocator;
+                const secrets = [_][]const u8{ session.password orelse "", session.passphrase orelse "" };
+                const command = history.redact(allocator, session.shell_command[0..session.shell_command_len], &secrets) catch return;
+                defer allocator.free(command.text);
+                const snippet = history.exactMask(allocator, session.shell_snippet[0..session.shell_snippet_len], &secrets) catch return;
+                defer allocator.free(snippet.text);
+                const now = std.Io.Timestamp.now(session.io, .real).nanoseconds;
+                var id_buf: [96]u8 = undefined;
+                const operation_id = std.fmt.bufPrint(&id_buf, "shell-{d}-{d}-{d}", .{ session.id, session.shell_channel_id, session.history_seq }) catch return;
+                session.history_seq += 1;
+                session.history.record(session.io, .{ .id = "", .operation_id = operation_id, .ts = @intCast(now), .server_id = session.server.id, .kind = "shell", .command = command.text, .exit = exit_code, .duration_ms = @intCast(@max(0, @divTrunc(now - session.shell_started_ns, std.time.ns_per_ms))), .output_snippet = snippet.text, .redacted = command.redacted or snippet.redacted }) catch {
+                    session.history_write_error.store(true, .release);
+                };
+            },
+        }
+    }
+};
+
+test "socket pumps enable non-blocking IO through the variadic fcntl ABI" {
+    var fds: [2]std.posix.socket_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), ssh.c.socketpair(ssh.c.AF_UNIX, ssh.c.SOCK_STREAM, 0, &fds));
+    defer for (fds) |fd| {
+        _ = ssh.c.close(fd);
+    };
+    for (fds) |fd| {
+        try configureNonBlockingSocket(fd);
+        const flags = ssh.c.fcntl(fd, ssh.c.F_GETFL);
+        try std.testing.expect(flags >= 0 and flags & ssh.c.O_NONBLOCK != 0);
+    }
+    var buffer: [1]u8 = undefined;
+    try std.testing.expectError(error.WouldBlock, std.posix.read(fds[0], &buffer));
+}
+
+test "terminal results classify tracked runs without hiding feature-owned output" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var store: servers.Store = .{ .allocator = allocator, .path = "/tmp/oars-range-test-servers.json" };
+    var audit: history.AuditStore = .{ .allocator = allocator, .path = "/tmp/oars-range-test-audit.jsonl" };
+    var history_store: history.HistoryStore = .{ .allocator = allocator, .path = "/tmp/oars-range-test-history.jsonl" };
+    var manager = Manager.init(allocator, io, &store, &audit, &history_store, null);
+    defer manager.deinit();
+
+    var shell_stream = Stream.init(allocator);
+    defer shell_stream.deinit(allocator);
+    try shell_stream.append("shell");
+    var result_stream = Stream.init(allocator);
+    defer result_stream.deinit(allocator);
+    try result_stream.append("result");
+    var shell_entry = ChannelEntry{ .id = 0, .kind = .shell, .stream = &shell_stream, .raw = undefined };
+    var result_entry = ChannelEntry{ .id = 6, .kind = .exec, .stream = &result_stream, .raw = undefined };
+    var session = Session{
+        .id = 1,
+        .server = .{ .id = "range-test", .name = "range-test", .host = "127.0.0.1", .user = "tester" },
+        .allocator = allocator,
+        .threaded = undefined,
+        .io = io,
+        .transport = undefined,
+        .store = &store,
+        .audit = &audit,
+        .history = &history_store,
+    };
+    defer session.channels.deinit(allocator);
+    try session.channels.append(allocator, &shell_entry);
+    try session.channels.append(allocator, &result_entry);
+    try manager.sessions.put("range-test", &session);
+    defer _ = manager.sessions.remove("range-test");
+
+    result_entry.history_kind = "exec";
+    const polls = try manager.pollChannels("range-test", &.{}, false, 1024, 1024);
+    defer {
+        for (polls) |*poll| poll.deinit(allocator);
+        allocator.free(polls);
+    }
+    try std.testing.expectEqual(@as(usize, 2), polls.len);
+    try std.testing.expect(!polls[0].user_visible);
+    try std.testing.expect(polls[1].user_visible);
+    result_entry.history_kind = null;
+    const internal = try manager.pollChannels("range-test", &.{}, false, 1024, 1024);
+    defer {
+        for (internal) |*poll| poll.deinit(allocator);
+        allocator.free(internal);
+    }
+    try std.testing.expect(!internal[1].user_visible);
+    try std.testing.expectEqualStrings("result", internal[1].data);
+}
+
+fn checkExecWaitOutput(unrelated_bytes: usize, result_bytes: usize) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var store: servers.Store = .{ .allocator = allocator, .path = "/tmp/oars-range-test-servers.json" };
+    var audit: history.AuditStore = .{ .allocator = allocator, .path = "/tmp/oars-range-test-audit.jsonl" };
+    var history_store: history.HistoryStore = .{ .allocator = allocator, .path = "/tmp/oars-range-test-history.jsonl" };
+    var manager = Manager.init(allocator, io, &store, &audit, &history_store, null);
+    defer manager.deinit();
+
+    var shell_stream = Stream.init(allocator);
+    defer shell_stream.deinit(allocator);
+    const unrelated = try allocator.alloc(u8, unrelated_bytes);
+    defer allocator.free(unrelated);
+    @memset(unrelated, 'x');
+    try shell_stream.append(unrelated);
+    var result_stream = Stream.init(allocator);
+    defer result_stream.deinit(allocator);
+    const expected = try allocator.alloc(u8, result_bytes);
+    defer allocator.free(expected);
+    @memset(expected, 'v');
+    try result_stream.append(expected);
+    result_stream.eof = true;
+    result_stream.exit_status = 0;
+    var shell_entry = ChannelEntry{ .id = 0, .kind = .shell, .stream = &shell_stream, .raw = undefined };
+    var result_entry = ChannelEntry{ .id = 6, .kind = .exec, .stream = &result_stream, .raw = undefined };
+    var session = Session{
+        .id = 1,
+        .server = .{ .id = "range-test", .name = "range-test", .host = "127.0.0.1", .user = "tester" },
+        .allocator = allocator,
+        .threaded = undefined,
+        .io = io,
+        .transport = undefined,
+        .store = &store,
+        .audit = &audit,
+        .history = &history_store,
+    };
+    defer session.channels.deinit(allocator);
+    try session.channels.append(allocator, &shell_entry);
+    try session.channels.append(allocator, &result_entry);
+    try manager.sessions.put("range-test", &session);
+    defer _ = manager.sessions.remove("range-test");
+
+    var outcome = try manager.waitExec("range-test", 6, 256 * 1024, 100 * std.time.ns_per_ms, .{});
+    defer outcome.deinit(allocator);
+    try std.testing.expect(!outcome.limited);
+    try std.testing.expectEqual(@as(i32, 0), outcome.exit);
+    try std.testing.expectEqual(expected.len, outcome.output.items.len);
+    try std.testing.expect(std.mem.eql(u8, expected, outcome.output.items));
+}
+
+test "exec wait is not starved by retained output from unrelated channels" {
+    try checkExecWaitOutput(128 * 1024, 256);
+}
+
+test "exec wait drains EOF output beyond a single poll budget" {
+    try checkExecWaitOutput(0, 128 * 1024);
 }

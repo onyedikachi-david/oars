@@ -1,8 +1,0 @@
-{
-  "date": "2026-08-21",
-  "framework": "React 19 + Vite 8, matching the Oars desktop frontend",
-  "font_stack": "Geist + IBM Plex Mono, derived from the Oars desktop app",
-  "palette": "Warm graphite surfaces with brass signal accent, derived from frontend/src/index.css",
-  "motion": "motion-cut",
-  "spacing": "4px scale"
-}

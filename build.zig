@@ -32,7 +32,7 @@ const PackageTarget = enum {
     linux,
 };
 
-const default_native_sdk_path = "/Users/onyedikachi/.nvm/versions/node/v24.18.0/lib/node_modules/@native-sdk/cli";
+const default_native_sdk_path = "native-sdk";
 const app_exe_name = "oars";
 const app_version = "0.1.0"; // x-release-please-version
 
@@ -159,7 +159,7 @@ pub fn build(b: *std.Build) void {
             @panic("-Dpackage-target must match the operating system selected by -Dtarget");
         }
     }
-    const native_sdk_path = b.option([]const u8, "native-sdk-path", "Path to the Native SDK framework checkout") orelse default_native_sdk_path;
+    const native_sdk_path = b.option([]const u8, "native-sdk-path", "Path to the Native SDK framework checkout") orelse b.graph.environ_map.get("NATIVE_SDK_PATH") orelse default_native_sdk_path;
     const package_optimize_name = @tagName(package_optimize);
     const selected_platform: PlatformOption = switch (platform_option) {
         .auto => if (target.result.os.tag == .macos) .macos else if (target.result.os.tag == .linux) .linux else if (target.result.os.tag == .windows) .windows else .null,
@@ -234,7 +234,7 @@ pub fn build(b: *std.Build) void {
     linkPlatform(b, target, app_mod, exe, selected_platform, web_engine, web_layer, native_sdk_path, cef_dir, cef_auto_install);
     b.installArtifact(exe);
 
-    const frontend_install = b.addSystemCommand(&.{ "npm", "install", "--prefix", "frontend" });
+    const frontend_install = b.addSystemCommand(&.{ "npm", "ci", "--prefix", "frontend" });
     const frontend_install_step = b.step("frontend-install", "Install frontend dependencies");
     frontend_install_step.dependOn(&frontend_install.step);
 
@@ -454,6 +454,7 @@ fn linkPlatform(b: *std.Build, target: std.Build.ResolvedTarget, app_mod: *std.B
                 const sdk_include = if (b.sysroot) |sysroot| b.fmt("-I{s}/usr/include", .{sysroot}) else "";
                 const flags: []const []const u8 = if (b.sysroot) |sysroot| &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=11.0", "-isysroot", sysroot, sdk_include } else &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=11.0" };
                 app_mod.addCSourceFile(.{ .file = nativeSdkPath(b, native_sdk_path, "src/platform/macos/appkit_host.m"), .flags = flags });
+                app_mod.addCSourceFile(.{ .file = b.path("src/c/webview_fullscreen_macos.m"), .flags = flags });
                 app_mod.linkFramework("WebKit", .{});
             },
             .chromium => {

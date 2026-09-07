@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   ClipboardPaste,
+  Expand,
+  Shrink,
   Keyboard,
   KeyRound,
   Maximize2,
@@ -12,6 +14,7 @@ import {
   X,
 } from "lucide-react";
 import RFB from "@novnc/novnc";
+import { useElementFullscreen } from "./useElementFullscreen";
 import { api, vault, BridgeError } from "./bridge";
 import { Button } from "./components/ui/button";
 import { OarsLoadingState } from "./components/OarsLoadingState";
@@ -49,7 +52,7 @@ interface SecurityFailureDetail { status: number; reason?: string }
 
 type ProbeState =
   | { kind: "idle" }
-  | { kind: "loading" }
+  | { kind: "loading"; data?: import("./types").VncProbeResult }
   | { kind: "ready"; data: import("./types").VncProbeResult }
   | { kind: "error"; message: string };
 
@@ -89,6 +92,7 @@ function bytesLabel(n: number): string {
 const CLIP_LIMIT = 32 * 1024;
 
 export function VncTab({ serverId }: { serverId: string }) {
+  const fullscreen = useElementFullscreen(serverId);
   // ── Display / port selection
   const [display, setDisplay] = useState<number>(() => rememberedDisplay(serverId));
   const [customPortRaw, setCustomPortRaw] = useState<string>(() => String(portFromDisplay(rememberedDisplay(serverId))));
@@ -135,6 +139,9 @@ export function VncTab({ serverId }: { serverId: string }) {
 
   // ── Probe / Setup
   const [probe, setProbe] = useState<ProbeState>({ kind: "idle" });
+  const probeSequence = useRef(0);
+  const probeTarget = useRef("");
+  const [probeCheckedAt, setProbeCheckedAt] = useState<number | null>(null);
   const [setup, setSetup] = useState<SetupState>({ kind: "idle" });
   const [setupApprovalOpen, setSetupApprovalOpen] = useState(false);
   const [setupBusy, setSetupBusy] = useState(false);
@@ -236,36 +243,61 @@ export function VncTab({ serverId }: { serverId: string }) {
 
   // ── Probe
   const runProbe = useCallback(async () => {
-    setProbe({ kind: "loading" });
+    const sequence = ++probeSequence.current;
+    const target = `${serverId}:${display}`;
+    const sameTarget = probeTarget.current === target;
+    probeTarget.current = target;
+    if (!sameTarget) {
+      setProbeCheckedAt(null);
+      setSetup({ kind: "idle" });
+      setSetupApprovalOpen(false);
+      setSetupPassword("");
+      setSetupPasswordConfirm("");
+    }
+    setProbe(previous => ({ kind: "loading", data: sameTarget && (previous.kind === "ready" || previous.kind === "loading") ? previous.data : undefined }));
     try {
-      const r = await api.vnc.probe(serverId, display);
-      setProbe({ kind: "ready", data: r });
-    } catch (e) {
-      setProbe({ kind: "error", message: messageOf(e) });
+      const result = await api.vnc.probe(serverId, display);
+      if (sequence !== probeSequence.current) return null;
+      setProbe({ kind: "ready", data: result });
+      setProbeCheckedAt(Date.now());
+      return result;
+    } catch (error) {
+      if (sequence === probeSequence.current) setProbe({ kind: "error", message: messageOf(error) });
+      return null;
     }
   }, [serverId, display]);
 
-  useEffect(() => { void runProbe(); }, [runProbe]);
+  useEffect(() => { void runProbe(); return () => { ++probeSequence.current; probeTarget.current = ""; }; }, [runProbe]);
 
-  // ── Setup: probe before setup (spec), then dry_run to approval
+  // Refresh before planning; a failed check must never become an install plan.
   const runSetupDry = useCallback(async () => {
-    const installDesktop = probe.kind === "ready" ? !probe.data.desktop_running : true;
+    const target = `${serverId}:${display}`;
     rememberDisplay(serverId, display);
-    setSetupDesktop(installDesktop);
     setSetup({ kind: "loading" });
+    setLifecycleError(null);
+    setLifecycle(current => current === "failed" ? "idle" : current);
+    setSetupAutoConnect(false);
     try {
-      // Re-probe to avoid stale plan (spec says probe before setup)
-      await runProbe();
-      const r = await api.vnc.setup(serverId, { display, dry_run: true, installDesktop });
-      setSetup({ kind: "plan", data: r });
-      setSetupPassword("");
-      setSetupPasswordConfirm("");
+      const fresh = await runProbe();
+      if (!fresh || probeTarget.current !== target) throw new Error("Could not confirm the remote desktop state. Re-probe before setup.");
+      const installDesktop = !fresh.desktop_running && !(fresh.display_present && fresh.display_managed === false);
+      const result = await api.vnc.setup(serverId, { display, dry_run: true, installDesktop });
+      if (probeTarget.current !== target) return;
+      let saved = "";
+      if (result.action === "configure" && !result.plan.trim()) {
+        try { saved = await vault.get(VNC_VAULT_PREFIX + serverId) ?? ""; } catch { /* The user can enter the password in the review dialog. */ }
+      }
+      if (probeTarget.current !== target) return;
+      setSetupDesktop(installDesktop);
+      setSetup({ kind: "plan", data: result });
+      setSetupPassword(saved);
+      setSetupPasswordConfirm(saved);
       setSetupPasswordError(null);
       setSetupApprovalOpen(true);
-    } catch (e) {
-      setSetup({ kind: "error", message: messageOf(e) });
+    } catch (error) {
+      if (probeTarget.current === target) setSetup({ kind: "error", message: messageOf(error) });
     }
-  }, [serverId, display, probe, runProbe]);
+  }, [serverId, display, runProbe]);
 
   const updateDesktopChoice = useCallback(async (installDesktop: boolean) => {
     setSetupDesktop(installDesktop);
@@ -536,8 +568,10 @@ export function VncTab({ serverId }: { serverId: string }) {
 
   const stageBusy = lifecycle === "starting" || lifecycle === "connecting";
 
+  const probeReading = probe.kind === "ready" || probe.kind === "loading" ? probe.data : null;
+
   return (
-    <div className="vnc" data-testid="vnc-tab" style={{ display: "flex", flexDirection: "column", minHeight: 0, flex: 1, gap: 0 }}>
+    <div ref={fullscreen.ref} className="vnc" data-testid="vnc-tab" style={{ display: "flex", flexDirection: "column", minHeight: 0, flex: 1, gap: 0 }}>
       {/* Toolbar (compact, wraps cleanly; no overlapping controls) */}
       <div
         className="vnc-toolbar"
@@ -658,6 +692,19 @@ export function VncTab({ serverId }: { serverId: string }) {
         </div>
 
         <Button
+          data-testid="vnc-fullscreen"
+          variant="outline"
+          size="sm"
+          aria-pressed={fullscreen.active}
+          disabled={fullscreen.busy}
+          onClick={() => void fullscreen.toggle()}
+          title={fullscreen.active ? "Exit full screen (Escape)" : "Show only the remote desktop and its controls"}
+        >
+          {fullscreen.active ? <Shrink data-icon="inline-start" /> : <Expand data-icon="inline-start" />}
+          {fullscreen.active ? "Exit full screen" : "Full screen"}
+        </Button>
+
+        <Button
           data-testid="vnc-ctrlaltdel"
           variant="ghost"
           size="sm"
@@ -731,36 +778,26 @@ export function VncTab({ serverId }: { serverId: string }) {
         )}
       </div>
 
-      {/* Probe + setup helper strip */}
-      <div data-testid="vnc-probe-strip" style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", padding: "8px 12px", borderBottom: "1px solid var(--border)", background: "var(--muted)" }}>
-        {probe.kind === "idle" || probe.kind === "loading" ? (
-          <span style={{ color: "var(--muted-foreground)", fontSize: 11, display: "inline-flex", alignItems: "center", gap: 6 }}>
-            <RefreshCw size={12} className={probe.kind === "loading" ? "spin" : undefined} aria-hidden /> Probing remote VNC…
-          </span>
-        ) : probe.kind === "error" ? (
-          <>
-            <span data-testid="vnc-probe-error" style={{ color: "var(--destructive)", fontSize: 11 }}>{probe.message}</span>
-            <Button size="xs" variant="outline" onClick={() => void runProbe()}>Retry probe</Button>
-          </>
-        ) : (
-          <>
-            <span data-testid="vnc-probe-summary" style={{ fontSize: 11, color: "var(--foreground)" }}>
-              VNC server: {probe.data.x11vnc && probe.data.tigervnc ? "x11vnc + TigerVNC" : probe.data.x11vnc ? "x11vnc" : probe.data.tigervnc ? "TigerVNC" : "not found"} · Desktop: {desktopProbeLabel(probe.data, display)} · listening: {probe.data.listening.length ? probe.data.listening.map((l) => `${l.port}${l.process ? ` (${l.process})` : ""}`).join(", ") : "none"}
-            </span>
-            {probe.data.setup_state === "installing" && (
-              <span data-testid="vnc-setup-running" role="status" style={{ color: "var(--primary)", fontSize: 11, display: "inline-flex", alignItems: "center", gap: 6 }}>
-                <RefreshCw size={12} className="spin" aria-hidden /> Package installation is still running
-              </span>
-            )}
-            {probe.data.setup_state === "failed" && (
-              <span data-testid="vnc-setup-failed-state" role="status" style={{ color: "var(--destructive)", fontSize: 11 }}>Last remote desktop setup failed</span>
-            )}
-            <Button size="xs" variant="ghost" onClick={() => void runProbe()}>Re-probe</Button>
-            <Button data-testid="vnc-setup-cta" size="xs" variant="outline" onClick={() => void runSetupDry()} disabled={probe.data.setup_state === "installing"}>
-              {probe.data.setup_state === "installing" ? "Installing packages" : probe.data.desktop_running ? "Configure server" : probe.data.window_manager_running ? "Repair desktop" : probe.data.desktop_installed && probe.data.desktop_name === "XFCE" ? "Start desktop" : "Set up desktop"}
-            </Button>
-          </>
-        )}
+      {fullscreen.error && <div className="oars-form-error" role="alert" style={{ margin: "8px 12px" }}>{fullscreen.error}</div>}
+
+      {/* Installation and running state are separate; keep refresh feedback visible. */}
+      <div className="vnc-probe-strip" data-testid="vnc-probe-strip" aria-busy={probe.kind === "loading"}>
+        <div className="vnc-probe-copy">
+          {probe.kind === "error" ? <span data-testid="vnc-probe-error" role="alert">Status unknown. {probe.message}</span> : probeReading ? <span data-testid="vnc-probe-summary">
+            VNC server: {probeReading.x11vnc && probeReading.tigervnc ? "x11vnc + TigerVNC installed" : probeReading.x11vnc ? "x11vnc installed" : probeReading.tigervnc ? "TigerVNC installed" : "not found"} · {probeReading.listeners_checked === false ? "listener status unavailable" : probeReading.listening.some(listener => listener.port === portFromDisplay(display)) ? `listening on ${portFromDisplay(display)}` : `not listening on ${portFromDisplay(display)}`}<br />
+            Desktop: {desktopProbeLabel(probeReading, display)}
+          </span> : <span>Checking installed software and display :{display}…</span>}
+          <span className="vnc-probe-feedback" role="status">{probe.kind === "loading" ? "Checking remote VNC…" : probe.kind === "ready" && probeCheckedAt ? `Checked ${new Date(probeCheckedAt).toLocaleTimeString()}` : ""}</span>
+          {probeReading?.setup_state === "installing" && <span data-testid="vnc-setup-running" role="status">Package installation is still running</span>}
+          {probeReading?.setup_state === "failed" && <span data-testid="vnc-setup-failed-state" role="status">Last remote desktop setup failed</span>}
+        </div>
+        <div className="vnc-probe-actions">
+          <Button size="sm" variant="outline" disabled={probe.kind === "loading" || setupBusy || setup.kind === "loading"} onClick={() => void runProbe()}><RefreshCw size={13} className={probe.kind === "loading" ? "spin" : undefined} aria-hidden />{probe.kind === "loading" ? "Checking…" : probe.kind === "error" ? "Retry probe" : "Re-probe"}</Button>
+          {probe.kind === "ready" && probe.data.display_present && probe.data.display_accessible === false && display === 0 && <Button size="sm" variant="outline" onClick={() => { setUseCustomPort(false); setDisplay(1); }}>Check display :1</Button>}
+          {probe.kind === "ready" && !(probe.data.display_present && probe.data.display_accessible === false) && <Button data-testid="vnc-setup-cta" size="sm" variant="outline" onClick={() => void runSetupDry()} disabled={setup.kind === "loading" || setupBusy || probe.data.setup_state === "installing"}>
+            {setup.kind === "loading" ? "Preparing…" : probe.data.setup_state === "installing" ? "Installing packages" : (probe.data.desktop_running || (probe.data.display_present && probe.data.display_managed === false)) ? probe.data.x11vnc && probe.data.listeners_checked !== false && !probe.data.listening.some(listener => listener.port === portFromDisplay(display)) ? "Start VNC server" : "Configure server" : probe.data.window_manager_running ? "Repair desktop" : probe.data.desktop_installed && probe.data.desktop_name === "XFCE" ? "Start desktop" : "Set up desktop"}
+          </Button>}
+        </div>
       </div>
 
       {/* Setup plan states */}
@@ -787,6 +824,7 @@ export function VncTab({ serverId }: { serverId: string }) {
 
       {/* Workspace (noVNC target fills this; unframed inside primary content) */}
       <div
+        className="vnc-canvas"
         data-testid="vnc-canvas"
         style={{
           flex: 1,
@@ -898,7 +936,7 @@ function VncCredentialsModal({
 }) {
   const dialogRef = useModalFocus(closeCredentials, '[data-testid="vnc-password-input"]', !credBusy);
   return (
-    <ApplicationOverlay role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget && !credBusy) closeCredentials(); }}>
+    <ApplicationOverlay quiet role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget && !credBusy) closeCredentials(); }}>
       <div
         ref={dialogRef}
         data-testid="vnc-credentials-dialog"
@@ -906,7 +944,7 @@ function VncCredentialsModal({
         aria-modal="true"
         aria-labelledby="vnc-creds-title"
         aria-describedby="vnc-creds-desc"
-        className="oars-modal oars-modal-narrow"
+        className="oars-modal oars-modal-narrow refined-dialog"
         onClick={(e) => e.stopPropagation()}
       >
         <header className="oars-modal-header">
@@ -1007,7 +1045,7 @@ function VncSetupApprovalModal({
 }) {
   const dialogRef = useModalFocus(onClose, '[data-testid="vnc-setup-run"]', !setupBusy);
   return (
-    <ApplicationOverlay role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget && !setupBusy) onClose(); }}>
+    <ApplicationOverlay quiet role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget && !setupBusy) onClose(); }}>
       <div
         ref={dialogRef}
         data-testid="vnc-setup-approval"
@@ -1015,7 +1053,7 @@ function VncSetupApprovalModal({
         aria-modal="true"
         aria-labelledby="vnc-setup-title"
         aria-describedby="vnc-setup-desc"
-        className="oars-modal oars-modal-narrow"
+        className="oars-modal oars-modal-narrow refined-dialog"
         onClick={(e) => e.stopPropagation()}
       >
         <header className="oars-modal-header">
