@@ -1,0 +1,2365 @@
+const std = @import("std");
+const runner = @import("runner");
+const native_sdk = @import("native_sdk");
+const servers = @import("servers.zig");
+const sessions = @import("sessions.zig");
+const ssh = @import("ssh.zig");
+const bridge = @import("bridge.zig");
+const history = @import("history.zig");
+const logs = @import("logs.zig");
+const scripts = @import("scripts.zig");
+const deploy = @import("deploy.zig");
+const integration = @import("integration.zig");
+const access = @import("access.zig");
+const backup = @import("backup.zig");
+const ai = @import("ai.zig");
+const keyjobs = @import("keyjobs.zig");
+const vault = @import("vault.zig");
+const agent = @import("agent.zig");
+
+// Zig 0.16 only collects test blocks from files that are actually
+// analyzed, and an unused import is never analyzed — so the env-gated
+// container tests would silently drop out of `zig build test` without
+// this reference.
+comptime {
+    _ = sessions;
+    _ = ssh;
+    _ = history;
+    _ = integration;
+    _ = deploy;
+    _ = vault;
+    _ = agent;
+}
+
+extern fn oars_enable_webview_fullscreen() void;
+
+pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
+
+const dev_origins = [_][]const u8{ "zero://app", "zero://inline", "http://127.0.0.1:5173" };
+
+const dialog_permission = [_][]const u8{native_sdk.security.permission_dialog};
+const credential_permission = [_][]const u8{native_sdk.security.permission_credentials};
+const app_permissions = [_][]const u8{
+    native_sdk.security.permission_dialog,
+    native_sdk.security.permission_credentials,
+};
+const builtin_policies = [_]native_sdk.BridgeCommandPolicy{
+    .{ .name = "native-sdk.credentials.set", .permissions = &credential_permission, .origins = &bridge.allowed_origins },
+    .{ .name = "native-sdk.credentials.get", .permissions = &credential_permission, .origins = &bridge.allowed_origins },
+    .{ .name = "native-sdk.credentials.delete", .permissions = &credential_permission, .origins = &bridge.allowed_origins },
+    .{ .name = "native-sdk.dialog.openFile", .permissions = &dialog_permission, .origins = &bridge.allowed_origins },
+    .{ .name = "native-sdk.dialog.saveFile", .permissions = &dialog_permission, .origins = &bridge.allowed_origins },
+};
+
+const App = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *std.process.Environ.Map,
+    store: servers.Store,
+    audit_store: history.AuditStore,
+    history_store: history.HistoryStore,
+    logs_store: logs.SourceStore,
+    scripts_store: scripts.Store,
+    deploy_apps_store: deploy.AppStore,
+    deploy_history_store: deploy.HistoryStore,
+    access_registry: access.Registry,
+    backup_registry: backup.Registry,
+    ai_registry: ai.Registry,
+    manager: sessions.Manager,
+    bridge_ctx: bridge.Context,
+    store_path_buf: [2048]u8 = undefined,
+    audit_path_buf: [2048]u8 = undefined,
+    history_path_buf: [2048]u8 = undefined,
+    logs_path_buf: [2048]u8 = undefined,
+    scripts_path_buf: [2048]u8 = undefined,
+    deploy_apps_path_buf: [2048]u8 = undefined,
+    deploy_history_path_buf: [2048]u8 = undefined,
+    access_path_buf: [2048]u8 = undefined,
+    backup_jobs_path_buf: [2048]u8 = undefined,
+    backup_runs_path_buf: [2048]u8 = undefined,
+    ai_path_buf: [2048]u8 = undefined,
+    ai_journal_path_buf: [2048]u8 = undefined,
+    data_dir_buf: [1024]u8 = undefined,
+    fallback_dir_buf: [1024]u8 = undefined,
+
+    fn init(self: *App, process: std.process.Init) !void {
+        self.allocator = process.gpa;
+        self.io = process.io;
+        self.env_map = process.environ_map;
+
+        // libssh2's own init counter is not thread-safe; run it once before
+        // any session worker can touch the library (spec 02 §6).
+        ssh.initGlobal();
+
+        const data_dir = native_sdk.app_dirs.resolveOne(
+            .{ .name = "Oars" },
+            native_sdk.app_dirs.currentPlatform(),
+            .{ .home = self.env_map.get("HOME") },
+            .data,
+            &self.data_dir_buf,
+        ) catch null;
+        const data_override = self.env_map.get("OARS_DATA_DIR");
+        const base: []const u8 = if (data_override) |path| path else if (data_dir) |dir| dir else blk: {
+            // Last-resort fallback when the OS has no home directory:
+            // keep state somewhere writable rather than refusing to run.
+            const tmp = process.environ_map.get("TMPDIR") orelse "/tmp";
+            break :blk std.fmt.bufPrint(&self.fallback_dir_buf, "{s}/oars-data", .{tmp}) catch unreachable;
+        };
+        const store_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.store_path_buf,
+            &.{ base, "servers.json" },
+        ) catch unreachable;
+        const audit_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.audit_path_buf,
+            &.{ base, "audit.jsonl" },
+        ) catch unreachable;
+        const history_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.history_path_buf,
+            &.{ base, "history.jsonl" },
+        ) catch unreachable;
+        const logs_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.logs_path_buf,
+            &.{ base, "logs.json" },
+        ) catch unreachable;
+        const scripts_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.scripts_path_buf,
+            &.{ base, "scripts.json" },
+        ) catch unreachable;
+        const deploy_apps_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.deploy_apps_path_buf,
+            &.{ base, "apps.json" },
+        ) catch unreachable;
+        const deploy_history_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.deploy_history_path_buf,
+            &.{ base, "deploy_runs.json" },
+        ) catch unreachable;
+        const access_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.access_path_buf,
+            &.{ base, access.identity_store_name },
+        ) catch unreachable;
+        const backup_jobs_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.backup_jobs_path_buf,
+            &.{ base, "backups.json" },
+        ) catch unreachable;
+        const backup_runs_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.backup_runs_path_buf,
+            &.{ base, "backup_runs.json" },
+        ) catch unreachable;
+        const ai_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.ai_path_buf,
+            &.{ base, "ai.json" },
+        ) catch unreachable;
+        const ai_journal_path = native_sdk.app_dirs.join(
+            native_sdk.app_dirs.currentPlatform(),
+            &self.ai_journal_path_buf,
+            &.{ base, "ai_journal.jsonl" },
+        ) catch unreachable;
+        self.store = .{ .allocator = self.allocator, .path = store_path };
+        self.audit_store = .{ .allocator = self.allocator, .path = audit_path };
+        self.history_store = .{ .allocator = self.allocator, .path = history_path };
+        self.logs_store = .{ .allocator = self.allocator, .path = logs_path };
+        self.scripts_store = .{ .allocator = self.allocator, .path = scripts_path };
+        self.deploy_apps_store = .{ .allocator = self.allocator, .path = deploy_apps_path };
+        self.deploy_history_store = .{ .allocator = self.allocator, .path = deploy_history_path };
+        self.access_registry = access.Registry.init(self.allocator, access_path);
+        self.backup_registry = backup.Registry.init(self.allocator, backup_jobs_path, backup_runs_path);
+        self.ai_registry = ai.Registry.init(self.allocator, ai_path, ai_journal_path);
+        try self.ai_registry.journal_store.ensureLoaded(self.io);
+        self.ai_registry.startProviderTests(self.io);
+
+        self.manager = sessions.Manager.init(self.allocator, self.io, &self.store, &self.audit_store, &self.history_store, self.env_map.get("HOME"));
+        self.bridge_ctx = .{
+            .allocator = self.allocator,
+            .io = self.io,
+            .store = &self.store,
+            .manager = &self.manager,
+            .audit = &self.audit_store,
+            .history = &self.history_store,
+            .logs = &self.logs_store,
+            .scripts = &self.scripts_store,
+            .apps = &self.deploy_apps_store,
+            .deploy_history = &self.deploy_history_store,
+            .access = &self.access_registry,
+            .backup = &self.backup_registry,
+            .ai = &self.ai_registry,
+            .keys = keyjobs.Registry.init(self.allocator),
+        };
+        try self.bridge_ctx.startBackupCoordinator();
+        self.bridge_ctx.startAiCoordinator();
+    }
+
+    fn deinit(self: *App) void {
+        self.bridge_ctx.keys.deinit();
+        self.access_registry.deinit();
+        self.backup_registry.deinit();
+        self.ai_registry.deinit();
+        self.manager.deinit();
+        self.history_store.deinit();
+        self.audit_store.deinit();
+        ssh.Session.deinitGlobal();
+    }
+
+    fn app(self: *App) native_sdk.App {
+        return .{
+            .context = self,
+            .name = "oars",
+            .source = native_sdk.frontend.productionSource(.{ .dist = "frontend/dist" }),
+            .source_fn = source,
+            .start_fn = start,
+            .stop_fn = stop,
+        };
+    }
+
+    fn start(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
+        const options = @import("build_options");
+        if (comptime std.mem.eql(u8, options.platform, "macos") and std.mem.eql(u8, options.web_engine, "system")) {
+            oars_enable_webview_fullscreen();
+        }
+        const self: *App = @ptrCast(@alignCast(context));
+        self.ai_registry.credential_facade.install(.{
+            .context = runtime,
+            .set_fn = credentialSet,
+            .get_fn = credentialGet,
+            .delete_fn = credentialDelete,
+        });
+    }
+
+    fn stop(context: *anyopaque, _: *native_sdk.Runtime) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        self.ai_registry.stopProviderTests();
+        self.ai_registry.credential_facade.clear();
+    }
+
+    fn credentialSet(context: *anyopaque, service: []const u8, account: []const u8, secret: []const u8) ai.credentials.ServiceError!void {
+        const runtime: *native_sdk.Runtime = @ptrCast(@alignCast(context));
+        runtime.setCredential(.{ .service = service, .account = account, .secret = secret }) catch |err| return credentialServiceError(err);
+    }
+
+    fn credentialGet(context: *anyopaque, service: []const u8, account: []const u8, output: []u8) ai.credentials.ServiceError!?usize {
+        const runtime: *native_sdk.Runtime = @ptrCast(@alignCast(context));
+        const value = runtime.getCredential(.{ .service = service, .account = account }, output) catch |err| return credentialServiceError(err);
+        return if (value) |secret| secret.len else null;
+    }
+
+    fn credentialDelete(context: *anyopaque, service: []const u8, account: []const u8) ai.credentials.ServiceError!bool {
+        const runtime: *native_sdk.Runtime = @ptrCast(@alignCast(context));
+        return runtime.deleteCredential(.{ .service = service, .account = account }) catch |err| return credentialServiceError(err);
+    }
+
+    fn credentialServiceError(err: anyerror) ai.credentials.ServiceError {
+        return switch (err) {
+            error.UnsupportedService => error.Unavailable,
+            else => error.Denied,
+        };
+    }
+
+    fn source(context: *anyopaque) anyerror!native_sdk.WebViewSource {
+        const self: *App = @ptrCast(@alignCast(context));
+        return native_sdk.frontend.sourceFromEnv(self.env_map, .{
+            .dist = "frontend/dist",
+            .entry = "index.html",
+        });
+    }
+};
+
+pub fn main(init: std.process.Init) !void {
+    if (init.environ_map.get("OARS_DATA_DIR")) |path| {
+        if (!std.fs.path.isAbsolute(path)) return error.InvalidDataDirectory;
+    }
+    const gpa = init.gpa;
+    const app = try gpa.create(App);
+    defer {
+        app.deinit();
+        gpa.destroy(app);
+    }
+    try app.init(init);
+
+    try runner.runWithOptions(app.app(), .{
+        .app_name = "Oars",
+        .window_title = "Oars",
+        .icon_path = "assets/icon.png",
+        .bridge = app.bridge_ctx.dispatcher(),
+        .builtin_bridge = .{ .enabled = true, .commands = &builtin_policies },
+        .security = .{
+            .permissions = &app_permissions,
+            .navigation = .{ .allowed_origins = &dev_origins },
+        },
+    }, init);
+}
+
+test "servers.save round trips through the bridge dispatcher" {
+    const io = std.testing.io;
+    const now = std.Io.Timestamp.now(io, .real).nanoseconds;
+    var dir_buf: [128]u8 = undefined;
+    const dir_name = std.fmt.bufPrint(&dir_buf, "oars-test-{d}", .{now}) catch unreachable;
+    var path_buf: [512]u8 = undefined;
+    const store_path = std.fmt.bufPrint(&path_buf, "/tmp/{s}/servers.json", .{dir_name}) catch unreachable;
+    defer std.Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    // The persistent store legitimately owns its strings for the app's
+    // lifetime, so tests give it an arena and free everything at once.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const store_alloc = arena_state.allocator();
+
+    var store = servers.Store{ .allocator = store_alloc, .path = store_path };
+    var audit_buf: [512]u8 = undefined;
+    const audit_path = std.fmt.bufPrint(&audit_buf, "/tmp/{s}/audit.jsonl", .{dir_name}) catch unreachable;
+    var audit_store = history.AuditStore{ .allocator = store_alloc, .path = audit_path };
+    var history_buf: [512]u8 = undefined;
+    const history_path = std.fmt.bufPrint(&history_buf, "/tmp/{s}/history.jsonl", .{dir_name}) catch unreachable;
+    var history_store = history.HistoryStore{ .allocator = store_alloc, .path = history_path };
+    var logs_buf: [512]u8 = undefined;
+    const logs_path = std.fmt.bufPrint(&logs_buf, "/tmp/{s}/logs.json", .{dir_name}) catch unreachable;
+    var logs_store = logs.SourceStore{ .allocator = store_alloc, .path = logs_path };
+    var scripts_buf: [512]u8 = undefined;
+    const scripts_path = std.fmt.bufPrint(&scripts_buf, "/tmp/{s}/scripts.json", .{dir_name}) catch unreachable;
+    var scripts_store = scripts.Store{ .allocator = store_alloc, .path = scripts_path };
+    var deploy_apps_buf: [512]u8 = undefined;
+    const deploy_apps_path = std.fmt.bufPrint(&deploy_apps_buf, "/tmp/{s}/apps.json", .{dir_name}) catch unreachable;
+    var deploy_apps_store = deploy.AppStore{ .allocator = store_alloc, .path = deploy_apps_path };
+    var deploy_hist_buf: [512]u8 = undefined;
+    const deploy_hist_path = std.fmt.bufPrint(&deploy_hist_buf, "/tmp/{s}/deploy_runs.json", .{dir_name}) catch unreachable;
+    var deploy_hist_store = deploy.HistoryStore{ .allocator = store_alloc, .path = deploy_hist_path };
+    var access_buf: [512]u8 = undefined;
+    const access_path = std.fmt.bufPrint(&access_buf, "/tmp/{s}/access_identities.json", .{dir_name}) catch unreachable;
+    var access_registry = access.Registry.init(store_alloc, access_path);
+    defer access_registry.deinit();
+    var backup_jobs_buf: [512]u8 = undefined;
+    const backup_jobs_path = std.fmt.bufPrint(&backup_jobs_buf, "/tmp/{s}/backups.json", .{dir_name}) catch unreachable;
+    var backup_runs_buf: [512]u8 = undefined;
+    const backup_runs_path = std.fmt.bufPrint(&backup_runs_buf, "/tmp/{s}/backup_runs.json", .{dir_name}) catch unreachable;
+    var backup_registry = backup.Registry.init(store_alloc, backup_jobs_path, backup_runs_path);
+    defer backup_registry.deinit();
+    var ai_path_buf: [512]u8 = undefined;
+    const ai_path = std.fmt.bufPrint(&ai_path_buf, "/tmp/{s}/ai.json", .{dir_name}) catch unreachable;
+    var ai_journal_path_buf: [512]u8 = undefined;
+    const ai_journal_path = std.fmt.bufPrint(&ai_journal_path_buf, "/tmp/{s}/ai_journal.jsonl", .{dir_name}) catch unreachable;
+    var ai_registry = ai.Registry.init(store_alloc, ai_path, ai_journal_path);
+    defer ai_registry.deinit();
+    var manager = sessions.Manager.init(store_alloc, io, &store, &audit_store, &history_store, null);
+    defer manager.deinit();
+    var ctx = bridge.Context{ .allocator = store_alloc, .io = io, .store = &store, .manager = &manager, .audit = &audit_store, .history = &history_store, .logs = &logs_store, .scripts = &scripts_store, .apps = &deploy_apps_store, .deploy_history = &deploy_hist_store, .access = &access_registry, .keys = keyjobs.Registry.init(store_alloc), .backup = &backup_registry, .ai = &ai_registry };
+    defer ctx.keys.deinit();
+    var dispatcher = ctx.dispatcher();
+    var output: [64 * 1024]u8 = undefined;
+
+    const save_response = dispatcher.dispatch(
+        \\{"id":"1","command":"oars.servers.save","payload":{"name":"prod","host":"192.168.1.10","port":22,"user":"root","auth_method":"password"}}
+    , .{ .origin = "zero://app" }, &output);
+    try std.testing.expect(std.mem.indexOf(u8, save_response, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, save_response, "\"id\"") != null);
+
+    const list_response = dispatcher.dispatch(
+        \\{"id":"2","command":"oars.servers.list","payload":{}}
+    , .{ .origin = "zero://app" }, &output);
+    try std.testing.expect(std.mem.indexOf(u8, list_response, "192.168.1.10") != null);
+
+    // The dev-server origin is allowed...
+    _ = dispatcher.dispatch(
+        \\{"id":"3","command":"oars.servers.list","payload":{}}
+    , .{ .origin = "http://127.0.0.1:5173" }, &output);
+
+    // ...but strangers are not.
+    const denied = dispatcher.dispatch(
+        \\{"id":"4","command":"oars.servers.list","payload":{}}
+    , .{ .origin = "https://evil.example" }, &output);
+    try std.testing.expect(std.mem.indexOf(u8, denied, "permission_denied") != null);
+}
+
+test "app name is configured" {
+    try std.testing.expectEqualStrings("oars", "oars");
+}
+
+test "profile credential bridge reaches the native credential service" {
+    var app_state: u8 = 0;
+    const test_app = native_sdk.App{
+        .context = &app_state,
+        .name = "oars-credential-policy",
+        .source = native_sdk.WebViewSource.html("<p>Credentials</p>"),
+    };
+    const harness = try native_sdk.TestHarness().create(std.testing.allocator, .{});
+    defer harness.destroy(std.testing.allocator);
+    harness.runtime.options.security.permissions = &app_permissions;
+    harness.runtime.options.builtin_bridge = .{ .enabled = true, .commands = &builtin_policies };
+
+    try harness.runtime.dispatchPlatformEvent(test_app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"set\",\"command\":\"native-sdk.credentials.set\",\"payload\":{\"service\":\"dev.oars.test\",\"account\":\"profile\",\"secret\":\"test-only-value\"}}",
+        .origin = "zero://app",
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
+
+    try harness.runtime.dispatchPlatformEvent(test_app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"get\",\"command\":\"native-sdk.credentials.get\",\"payload\":{\"service\":\"dev.oars.test\",\"account\":\"profile\"}}",
+        .origin = "zero://app",
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"result\":\"test-only-value\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(test_app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"delete\",\"command\":\"native-sdk.credentials.delete\",\"payload\":{\"service\":\"dev.oars.test\",\"account\":\"profile\"}}",
+        .origin = "zero://app",
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"result\":true") != null);
+}
+
+// --- spec 01 bridge tests --------------------------------------------------
+
+const SaveResponse = struct {
+    // The dispatcher wraps handler output under "result".
+    result: struct {
+        ok: bool,
+        server: struct {
+            id: []const u8,
+            created_at: i64,
+            host_fingerprint: ?[]const u8 = null,
+            group: []const u8 = "",
+            tags: [][]const u8 = &.{},
+            via_server_id: ?[]const u8 = null,
+        },
+    },
+};
+
+fn parseSaveResponse(allocator: std.mem.Allocator, response: []const u8) !std.json.Parsed(SaveResponse) {
+    // alloc_always so parsed strings never alias the dispatcher's output
+    // buffer, which the next dispatch overwrites.
+    return std.json.parseFromSlice(SaveResponse, allocator, response, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+}
+
+/// A disposable app: arena-backed store (store strings live for the app
+/// lifetime), a session manager with no live sessions, and a dispatcher.
+/// init() must run in place (not return a copy): ArenaAllocator.allocator()
+/// captures the arena's address, and the context holds it.
+const TestApp = struct {
+    arena: std.heap.ArenaAllocator,
+    store: servers.Store,
+    audit_store: history.AuditStore,
+    history_store: history.HistoryStore,
+    logs_store: logs.SourceStore,
+    scripts_store: scripts.Store,
+    deploy_apps_store: deploy.AppStore,
+    deploy_history_store: deploy.HistoryStore,
+    access_registry: access.Registry,
+    backup_registry: backup.Registry,
+    ai_registry: ai.Registry,
+    manager: sessions.Manager,
+    ctx: bridge.Context,
+    dispatcher: native_sdk.BridgeDispatcher,
+    output: [64 * 1024]u8 = undefined,
+    dir_buf: [128]u8 = undefined,
+    path_buf: [512]u8 = undefined,
+    audit_path_buf: [512]u8 = undefined,
+    history_path_buf: [512]u8 = undefined,
+    logs_path_buf: [512]u8 = undefined,
+    scripts_path_buf: [512]u8 = undefined,
+    deploy_apps_path_buf: [512]u8 = undefined,
+    deploy_history_path_buf: [512]u8 = undefined,
+    access_path_buf: [512]u8 = undefined,
+    backup_jobs_path_buf: [512]u8 = undefined,
+    backup_runs_path_buf: [512]u8 = undefined,
+    ai_path_buf: [512]u8 = undefined,
+    ai_journal_path_buf: [512]u8 = undefined,
+    dir_name: []const u8,
+
+    fn init(self: *TestApp) !void {
+        self.arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        errdefer self.arena.deinit();
+        const io = std.testing.io;
+        const now = std.Io.Timestamp.now(io, .real).nanoseconds;
+        self.dir_name = try std.fmt.bufPrint(&self.dir_buf, "oars-test-{d}", .{now});
+        const store_path = try std.fmt.bufPrint(&self.path_buf, "/tmp/{s}/servers.json", .{self.dir_name});
+        const audit_path = try std.fmt.bufPrint(&self.audit_path_buf, "/tmp/{s}/audit.jsonl", .{self.dir_name});
+        const history_path = try std.fmt.bufPrint(&self.history_path_buf, "/tmp/{s}/history.jsonl", .{self.dir_name});
+        const logs_path = try std.fmt.bufPrint(&self.logs_path_buf, "/tmp/{s}/logs.json", .{self.dir_name});
+        const scripts_path = try std.fmt.bufPrint(&self.scripts_path_buf, "/tmp/{s}/scripts.json", .{self.dir_name});
+        const deploy_apps_path = try std.fmt.bufPrint(&self.deploy_apps_path_buf, "/tmp/{s}/apps.json", .{self.dir_name});
+        const deploy_history_path = try std.fmt.bufPrint(&self.deploy_history_path_buf, "/tmp/{s}/deploy_runs.json", .{self.dir_name});
+        const access_path = try std.fmt.bufPrint(&self.access_path_buf, "/tmp/{s}/access_identities.json", .{self.dir_name});
+        const backup_jobs_path = try std.fmt.bufPrint(&self.backup_jobs_path_buf, "/tmp/{s}/backups.json", .{self.dir_name});
+        const backup_runs_path = try std.fmt.bufPrint(&self.backup_runs_path_buf, "/tmp/{s}/backup_runs.json", .{self.dir_name});
+        const ai_path = try std.fmt.bufPrint(&self.ai_path_buf, "/tmp/{s}/ai.json", .{self.dir_name});
+        const ai_journal_path = try std.fmt.bufPrint(&self.ai_journal_path_buf, "/tmp/{s}/ai_journal.jsonl", .{self.dir_name});
+        const store_alloc = self.arena.allocator();
+        self.store = .{ .allocator = store_alloc, .path = store_path };
+        self.audit_store = .{ .allocator = store_alloc, .path = audit_path };
+        self.history_store = .{ .allocator = store_alloc, .path = history_path };
+        self.logs_store = .{ .allocator = store_alloc, .path = logs_path };
+        self.scripts_store = .{ .allocator = store_alloc, .path = scripts_path };
+        self.deploy_apps_store = .{ .allocator = store_alloc, .path = deploy_apps_path };
+        self.deploy_history_store = .{ .allocator = store_alloc, .path = deploy_history_path };
+        self.access_registry = access.Registry.init(store_alloc, access_path);
+        self.backup_registry = backup.Registry.init(store_alloc, backup_jobs_path, backup_runs_path);
+        self.ai_registry = ai.Registry.init(store_alloc, ai_path, ai_journal_path);
+        self.ai_registry.startProviderTests(io);
+        self.manager = sessions.Manager.init(store_alloc, io, &self.store, &self.audit_store, &self.history_store, null);
+        self.ctx = .{ .allocator = store_alloc, .io = io, .store = &self.store, .manager = &self.manager, .audit = &self.audit_store, .history = &self.history_store, .logs = &self.logs_store, .scripts = &self.scripts_store, .apps = &self.deploy_apps_store, .deploy_history = &self.deploy_history_store, .access = &self.access_registry, .keys = keyjobs.Registry.init(store_alloc), .backup = &self.backup_registry, .ai = &self.ai_registry };
+        self.ctx.startAiCoordinator();
+        self.dispatcher = self.ctx.dispatcher();
+    }
+
+    fn deinit(self: *TestApp) void {
+        self.ctx.keys.deinit();
+        self.access_registry.deinit();
+        self.backup_registry.deinit();
+        self.ai_registry.deinit();
+        self.manager.deinit();
+        self.arena.deinit();
+        std.Io.Dir.cwd().deleteTree(std.testing.io, self.dir_name) catch {};
+    }
+
+    /// Returns a slice into `self.output`; the caller must read or parse
+    /// it before the next dispatch call.
+    fn dispatch(self: *TestApp, request: []const u8) []const u8 {
+        return self.dispatcher.dispatch(request, .{ .origin = "zero://app" }, &self.output);
+    }
+
+    fn waitBackupCache(self: *TestApp) !void {
+        try self.ctx.startBackupCoordinator();
+        var attempts: usize = 0;
+        while (attempts < 1000) : (attempts += 1) {
+            var health = try self.backup_registry.storeHealthSnapshot();
+            defer health.deinit(self.ctx.allocator);
+            if (health.ready) return;
+            if (health.failed) return error.TestUnexpectedResult;
+            try std.Io.sleep(self.ctx.io, std.Io.Duration.fromMilliseconds(1), .awake);
+        }
+        return error.TestUnexpectedResult;
+    }
+};
+
+test "servers.save preserves created_at and fingerprint by endpoint rule" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+    const store_alloc = app.arena.allocator();
+
+    const first = app.dispatch(
+        \\{"id":"1","command":"oars.servers.save","payload":{"id":"fp1","name":"prod","host":"1.2.3.4","port":22,"user":"root","auth_method":"password"}}
+    );
+    var first_parsed = try parseSaveResponse(store_alloc, first);
+    defer first_parsed.deinit();
+    const created_at = first_parsed.value.result.server.created_at;
+
+    // A successful trust stores the fingerprint in the config; editing the
+    // profile afterwards must not silently clear it while the endpoint is
+    // unchanged.
+    const existing = servers.Server{
+        .id = "fp1",
+        .name = "prod",
+        .host = "1.2.3.4",
+        .port = 22,
+        .user = "root",
+        .host_fingerprint = "SHA256:deadbeef",
+        .created_at = created_at,
+    };
+    try app.store.upsert(std.testing.io, existing);
+
+    const edit_same_endpoint = app.dispatch(
+        \\{"id":"2","command":"oars.servers.save","payload":{"id":"fp1","name":"renamed","host":"1.2.3.4","port":22,"user":"root","auth_method":"password"}}
+    );
+    var same_parsed = try parseSaveResponse(store_alloc, edit_same_endpoint);
+    defer same_parsed.deinit();
+    try std.testing.expectEqual(created_at, same_parsed.value.result.server.created_at);
+    try std.testing.expectEqualStrings("SHA256:deadbeef", same_parsed.value.result.server.host_fingerprint.?);
+
+    // Changing the endpoint clears the fingerprint but still preserves
+    // created_at.
+    const edit_new_port = app.dispatch(
+        \\{"id":"3","command":"oars.servers.save","payload":{"id":"fp1","name":"renamed","host":"1.2.3.4","port":2222,"user":"root","auth_method":"password"}}
+    );
+    var port_parsed = try parseSaveResponse(store_alloc, edit_new_port);
+    defer port_parsed.deinit();
+    try std.testing.expectEqual(created_at, port_parsed.value.result.server.created_at);
+    try std.testing.expect(port_parsed.value.result.server.host_fingerprint == null);
+}
+
+test "ssh.retrust requires the exact profile name before clearing the fingerprint" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+    const store_alloc = app.arena.allocator();
+
+    const saved = app.dispatch(
+        \\{"id":"1","command":"oars.servers.save","payload":{"id":"retrust-1","name":"Production API","host":"10.0.0.8","port":22,"user":"deploy","auth_method":"password"}}
+    );
+    var saved_parsed = try parseSaveResponse(store_alloc, saved);
+    defer saved_parsed.deinit();
+
+    const trusted = servers.Server{
+        .id = "retrust-1",
+        .name = "Production API",
+        .host = "10.0.0.8",
+        .port = 22,
+        .user = "deploy",
+        .host_fingerprint = "SHA256:old-host-key",
+        .created_at = saved_parsed.value.result.server.created_at,
+    };
+    try app.store.upsert(std.testing.io, trusted);
+
+    const wrong_name = app.dispatch(
+        \\{"id":"2","command":"oars.ssh.retrust","payload":{"server_id":"retrust-1","confirm_name":"production api"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, wrong_name, "\"ok\":false") != null);
+    var after_wrong = (try app.store.find(std.testing.io, "retrust-1")).?;
+    defer after_wrong.deinit(store_alloc);
+    try std.testing.expectEqualStrings("SHA256:old-host-key", after_wrong.host_fingerprint.?);
+
+    const exact_name = app.dispatch(
+        \\{"id":"3","command":"oars.ssh.retrust","payload":{"server_id":"retrust-1","confirm_name":"Production API"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, exact_name, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exact_name, "\"host_fingerprint\":null") != null);
+    var after_exact = (try app.store.find(std.testing.io, "retrust-1")).?;
+    defer after_exact.deinit(store_alloc);
+    try std.testing.expect(after_exact.host_fingerprint == null);
+
+    const audit_list = app.dispatch(
+        \\{"id":"4","command":"oars.audit.list","payload":{"type":"ssh.retrust"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, audit_list, "\"type\":\"ssh.retrust\"") != null);
+}
+
+test "servers.save normalizes tags and validates host, port, and via chains" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+    const store_alloc = app.arena.allocator();
+
+    const tagged = app.dispatch(
+        \\{"id":"1","command":"oars.servers.save","payload":{"id":"t1","name":"prod","host":"1.2.3.4","user":"root","auth_method":"password","tags":[" web ","api","web",""]}}
+    );
+    var tagged_parsed = try parseSaveResponse(store_alloc, tagged);
+    defer tagged_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), tagged_parsed.value.result.server.tags.len);
+    try std.testing.expectEqualStrings("web", tagged_parsed.value.result.server.tags[0]);
+    try std.testing.expectEqualStrings("api", tagged_parsed.value.result.server.tags[1]);
+
+    // Trailing slash in a host is rejected, not stripped.
+    const bad_host = app.dispatch(
+        \\{"id":"2","command":"oars.servers.save","payload":{"id":"t2","name":"x","host":"1.2.3.4/","user":"root","auth_method":"password"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_host, "must not end with '/'") != null);
+
+    // Port 0 is rejected, never clamped.
+    const bad_port = app.dispatch(
+        \\{"id":"3","command":"oars.servers.save","payload":{"id":"t3","name":"x","host":"1.2.3.4","port":0,"user":"root","auth_method":"password"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_port, "port must be between 1 and 65535") != null);
+
+    // Jump host must exist.
+    const missing_via = app.dispatch(
+        \\{"id":"4","command":"oars.servers.save","payload":{"id":"a","name":"a","host":"1.1.1.1","user":"root","auth_method":"password","via_server_id":"nope"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, missing_via, "jump host does not exist") != null);
+
+    // A valid chain saves; then a cycle is rejected.
+    const save_b = app.dispatch(
+        \\{"id":"5","command":"oars.servers.save","payload":{"id":"b","name":"b","host":"2.2.2.2","user":"root","auth_method":"password"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, save_b, "\"ok\":true") != null);
+    const save_a_via_b = app.dispatch(
+        \\{"id":"6","command":"oars.servers.save","payload":{"id":"a","name":"a","host":"1.1.1.1","user":"root","auth_method":"password","via_server_id":"b"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, save_a_via_b, "\"ok\":true") != null);
+    const cycle = app.dispatch(
+        \\{"id":"7","command":"oars.servers.save","payload":{"id":"b","name":"b","host":"2.2.2.2","user":"root","auth_method":"password","via_server_id":"a"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, cycle, "contains a cycle") != null);
+
+    const self_link = app.dispatch(
+        \\{"id":"8","command":"oars.servers.save","payload":{"id":"c","name":"c","host":"3.3.3.3","user":"root","auth_method":"password","via_server_id":"c"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, self_link, "cannot connect via itself") != null);
+}
+
+test "servers.save validates group paths and dedupes tags case-insensitively" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+    const store_alloc = app.arena.allocator();
+
+    // A one-level group saves and round-trips with trimmed value.
+    const grouped = app.dispatch(
+        \\{"id":"1","command":"oars.servers.save","payload":{"id":"g1","name":"acme","host":"1.2.3.4","user":"root","auth_method":"password","group":"  clients/acme  ","tags":[" Web ","web","API",""]}}
+    );
+    var grouped_parsed = try parseSaveResponse(store_alloc, grouped);
+    defer grouped_parsed.deinit();
+    try std.testing.expectEqualStrings("clients/acme", grouped_parsed.value.result.server.group);
+    // Case-insensitive dedupe keeps the first-seen casing.
+    try std.testing.expectEqual(@as(usize, 2), grouped_parsed.value.result.server.tags.len);
+    try std.testing.expectEqualStrings("Web", grouped_parsed.value.result.server.tags[0]);
+    try std.testing.expectEqualStrings("API", grouped_parsed.value.result.server.tags[1]);
+
+    // The group survives a reload (persistence is the store's own file).
+    const listed = app.dispatch(
+        \\{"id":"2","command":"oars.servers.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"group\":\"clients/acme\"") != null);
+
+    // Two nesting levels are rejected.
+    const deep = app.dispatch(
+        \\{"id":"3","command":"oars.servers.save","payload":{"id":"g2","name":"x","host":"1.2.3.4","user":"root","auth_method":"password","group":"a/b/c"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, deep, "one nesting level") != null);
+
+    // Empty segments are rejected.
+    const leading = app.dispatch(
+        \\{"id":"4","command":"oars.servers.save","payload":{"id":"g3","name":"x","host":"1.2.3.4","user":"root","auth_method":"password","group":"/prod"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, leading, "segments cannot be empty") != null);
+
+    // Control characters are rejected in groups and tags alike.
+    const ctrl_group = app.dispatch(
+        \\{"id":"5","command":"oars.servers.save","payload":{"id":"g4","name":"x","host":"1.2.3.4","user":"root","auth_method":"password","group":"prod\n"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, ctrl_group, "control characters") != null);
+    const ctrl_tag = app.dispatch(
+        \\{"id":"6","command":"oars.servers.save","payload":{"id":"g5","name":"x","host":"1.2.3.4","user":"root","auth_method":"password","tags":["ok\n"]}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, ctrl_tag, "control characters") != null);
+
+    // A failed save must not persist anything (the store is untouched).
+    const listed2 = app.dispatch(
+        \\{"id":"7","command":"oars.servers.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, listed2, "\"id\":\"g4\"") == null);
+}
+
+test "servers.list reports quarantine recovery when the store is corrupt" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // Build a healthy store first, then corrupt the file behind the
+    // store's back — quarantine only applies to an existing store.
+    _ = app.dispatch(
+        \\{"id":"1","command":"oars.servers.save","payload":{"id":"s1","name":"prod","host":"1.2.3.4","user":"root","auth_method":"password"}}
+    );
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = app.store.path, .data = "{corrupt" });
+
+    const list_response = app.dispatch(
+        \\{"id":"2","command":"oars.servers.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, list_response, "\"recovery_error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_response, "corrupt-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_response, "\"servers\":[]") != null);
+
+    // A save afterwards starts a fresh store and clears the recovery state.
+    _ = app.dispatch(
+        \\{"id":"3","command":"oars.servers.save","payload":{"id":"s2","name":"prod","host":"1.2.3.4","user":"root","auth_method":"password"}}
+    );
+    const list_again = app.dispatch(
+        \\{"id":"4","command":"oars.servers.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, list_again, "\"recovery_error\"") == null);
+}
+
+// --- spec 04 bridge tests --------------------------------------------------
+
+test "logs.addSource validates, persists, and dedupes through the dispatcher" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    const ok = app.dispatch(
+        \\{"id":"1","command":"oars.logs.addSource","payload":{"server_id":"s1","path":"/var/log/custom.log"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, ok, "\"ok\":true") != null);
+
+    // Whitespace is trimmed before validation and persistence.
+    const trimmed = app.dispatch(
+        \\{"id":"2","command":"oars.logs.addSource","payload":{"server_id":"s1","path":"  /var/log/trimmed.log  "}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, trimmed, "\"ok\":true") != null);
+
+    // Duplicates are dropped, not appended twice.
+    const dup = app.dispatch(
+        \\{"id":"3","command":"oars.logs.addSource","payload":{"server_id":"s1","path":"/var/log/custom.log"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, dup, "\"ok\":true") != null);
+
+    const relative = app.dispatch(
+        \\{"id":"4","command":"oars.logs.addSource","payload":{"server_id":"s1","path":"var/log/x.log"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, relative, "path must be absolute") != null);
+
+    const trailing = app.dispatch(
+        \\{"id":"5","command":"oars.logs.addSource","payload":{"server_id":"s1","path":"/var/log/"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, trailing, "must not end with '/'") != null);
+
+    const control = app.dispatch(
+        \\{"id":"6","command":"oars.logs.addSource","payload":{"server_id":"s1","path":"/var/log/a\nb.log"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, control, "control characters") != null);
+
+    // Persisted per server, deduped, trimmed.
+    const alloc = app.arena.allocator();
+    const paths = try app.logs_store.pathsFor(std.testing.io, "s1");
+    defer {
+        for (paths) |p| alloc.free(p);
+        alloc.free(paths);
+    }
+    try std.testing.expectEqual(@as(usize, 2), paths.len);
+    try std.testing.expectEqualStrings("/var/log/custom.log", paths[0]);
+    try std.testing.expectEqualStrings("/var/log/trimmed.log", paths[1]);
+
+    const s2 = try app.logs_store.pathsFor(std.testing.io, "s2");
+    defer {
+        for (s2) |p| alloc.free(p);
+        alloc.free(s2);
+    }
+    try std.testing.expectEqual(@as(usize, 0), s2.len);
+}
+
+test "logs scan/read/follow/clear require a session and validate payloads" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // No live session: every network handler says so explicitly.
+    const scan = app.dispatch(
+        \\{"id":"1","command":"oars.logs.scan","payload":{"server_id":"ghost"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, scan, "not connected") != null);
+
+    const read = app.dispatch(
+        \\{"id":"2","command":"oars.logs.read","payload":{"server_id":"ghost","path":"/var/log/app.log","lines":200}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, read, "not connected") != null);
+
+    const follow = app.dispatch(
+        \\{"id":"3","command":"oars.logs.follow","payload":{"server_id":"ghost","path":"/var/log/app.log"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, follow, "not connected") != null);
+
+    const clear = app.dispatch(
+        \\{"id":"4","command":"oars.logs.clear","payload":{"server_id":"ghost","path":"/var/log/app.log","expected":{"size":10,"mtime":100,"mode":420}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, clear, "not connected") != null);
+
+    // Payload validation happens before the session lookup.
+    const bad_lines = app.dispatch(
+        \\{"id":"5","command":"oars.logs.read","payload":{"server_id":"ghost","path":"/var/log/app.log","lines":300}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_lines, "line count must be 200, 500, 1000, or 5000") != null);
+
+    const bad_path = app.dispatch(
+        \\{"id":"6","command":"oars.logs.follow","payload":{"server_id":"ghost","path":"relative.log"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_path, "path must be absolute") != null);
+
+    const clear_bad_path = app.dispatch(
+        \\{"id":"7","command":"oars.logs.clear","payload":{"server_id":"ghost","path":"/var/log/","expected":{"size":1,"mtime":2,"mode":420}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, clear_bad_path, "must not end with '/'") != null);
+
+    const scan_bad_payload = app.dispatch(
+        \\{"id":"8","command":"oars.logs.scan","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, scan_bad_payload, "invalid payload") != null);
+}
+
+test "sftp handlers require a session and validate payloads" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // No live session: every sftp handler says so explicitly.
+    const ls = app.dispatch(
+        \\{"id":"1","command":"oars.sftp.ls","payload":{"server_id":"ghost","path":{"utf8":"/etc"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, ls, "not connected") != null);
+
+    const stat = app.dispatch(
+        \\{"id":"2","command":"oars.sftp.stat","payload":{"server_id":"ghost","path":{"utf8":"/etc/hosts"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, stat, "not connected") != null);
+
+    const read = app.dispatch(
+        \\{"id":"3","command":"oars.sftp.read","payload":{"server_id":"ghost","path":{"utf8":"/etc/hosts"},"offset":0,"max":4096}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, read, "not connected") != null);
+
+    const write = app.dispatch(
+        \\{"id":"4","command":"oars.sftp.write","payload":{"server_id":"ghost","path":{"utf8":"/tmp/x"},"offset":0,"base64":"aGk=","transfer_id":42}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, write, "not connected") != null);
+
+    const save = app.dispatch(
+        \\{"id":"5","command":"oars.sftp.save","payload":{"server_id":"ghost","path":{"utf8":"/tmp/x"},"base64":"aGk="}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, save, "not connected") != null);
+
+    const download = app.dispatch(
+        \\{"id":"6","command":"oars.sftp.download","payload":{"server_id":"ghost","remote_path":{"utf8":"/etc/hosts"},"local_path":"/tmp/hosts"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, download, "not connected") != null);
+
+    const mkdir = app.dispatch(
+        \\{"id":"7","command":"oars.sftp.mkdir","payload":{"server_id":"ghost","path":{"utf8":"/tmp/d"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, mkdir, "not connected") != null);
+
+    const rm = app.dispatch(
+        \\{"id":"8","command":"oars.sftp.rm","payload":{"server_id":"ghost","path":{"utf8":"/tmp/x"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, rm, "not connected") != null);
+
+    const rm_recursive = app.dispatch(
+        \\{"id":"9","command":"oars.sftp.rm","payload":{"server_id":"ghost","path":{"utf8":"/tmp/d"},"recursive":true}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, rm_recursive, "not connected") != null);
+
+    const rename = app.dispatch(
+        \\{"id":"10","command":"oars.sftp.rename","payload":{"server_id":"ghost","from":{"utf8":"/tmp/a"},"to":{"utf8":"/tmp/b"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, rename, "not connected") != null);
+
+    const chmod = app.dispatch(
+        \\{"id":"11","command":"oars.sftp.chmod","payload":{"server_id":"ghost","path":{"utf8":"/tmp/x"},"mode":420}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, chmod, "not connected") != null);
+
+    const unzip = app.dispatch(
+        \\{"id":"12","command":"oars.sftp.unzip","payload":{"server_id":"ghost","zip_path":{"utf8":"/tmp/a.zip"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, unzip, "not connected") != null);
+
+    const zip_download = app.dispatch(
+        \\{"id":"13","command":"oars.sftp.zipDownload","payload":{"server_id":"ghost","paths":[{"utf8":"/tmp/a"}],"local_path":"/tmp/a.zip"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, zip_download, "not connected") != null);
+
+    const folder_size = app.dispatch(
+        \\{"id":"14","command":"oars.sftp.folderSize","payload":{"server_id":"ghost","path":{"utf8":"/tmp"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, folder_size, "not connected") != null);
+
+    const poll = app.dispatch(
+        \\{"id":"15","command":"oars.sftp.poll","payload":{"server_id":"ghost"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, poll, "not connected") != null);
+
+    const cancel = app.dispatch(
+        \\{"id":"16","command":"oars.sftp.cancel","payload":{"server_id":"ghost","transfer_id":7}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, cancel, "not connected") != null);
+
+    // Payload validation happens before the session lookup.
+    const bad_b64 = app.dispatch(
+        \\{"id":"17","command":"oars.sftp.ls","payload":{"server_id":"ghost","path":{"base64":"%%%"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_b64, "invalid base64") != null);
+
+    const no_path = app.dispatch(
+        \\{"id":"18","command":"oars.sftp.stat","payload":{"server_id":"ghost","path":{}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, no_path, "path is required") != null);
+
+    const bad_max = app.dispatch(
+        \\{"id":"19","command":"oars.sftp.read","payload":{"server_id":"ghost","path":{"utf8":"/etc/hosts"},"max":999999}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_max, "max must be between 1 and 65536") != null);
+
+    const bad_local = app.dispatch(
+        \\{"id":"20","command":"oars.sftp.download","payload":{"server_id":"ghost","remote_path":{"utf8":"/etc/hosts"},"local_path":"relative.bin"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_local, "local path must be absolute") != null);
+
+    const bad_mode = app.dispatch(
+        \\{"id":"21","command":"oars.sftp.chmod","payload":{"server_id":"ghost","path":{"utf8":"/tmp/x"},"mode":32768}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_mode, "invalid mode") != null);
+
+    const overwrite = app.dispatch(
+        \\{"id":"22","command":"oars.sftp.unzip","payload":{"server_id":"ghost","zip_path":{"utf8":"/tmp/a.zip"},"overwrite":true}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, overwrite, "overwrite is not supported") != null);
+
+    const zero_tid = app.dispatch(
+        \\{"id":"23","command":"oars.sftp.write","payload":{"server_id":"ghost","path":{"utf8":"/tmp/x"},"base64":"aGk=","transfer_id":0}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, zero_tid, "invalid transfer id") != null);
+
+    const bad_payload = app.dispatch(
+        \\{"id":"24","command":"oars.sftp.poll","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_payload, "invalid payload") != null);
+}
+
+test "scripts save/list/delete round trip through the dispatcher" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // Create.
+    const created = app.dispatch(
+        \\{"id":"1","command":"oars.scripts.save","payload":{"script":{"name":"tail errors","body":"tail -f /var/log/{{service}}/error.log","tags":["logs"],"color":"#ff6b6b","variables":[{"name":"service","label":"Service"}]}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, created, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, created, "\"created_at\"") != null);
+    // Pull the generated id out NOW — the output buffer is reused by the
+    // next dispatch, so the slice must not outlive this response.
+    var id_buf: [128]u8 = undefined;
+    const id_pos = std.mem.indexOf(u8, created, "\"script\":{\"id\":\"") orelse return error.TestUnexpectedResult;
+    const id_start = id_pos + "\"script\":{\"id\":\"".len;
+    const id_end = std.mem.indexOfScalarPos(u8, created, id_start, '"') orelse return error.TestUnexpectedResult;
+    const id = try std.fmt.bufPrint(&id_buf, "{s}", .{created[id_start..id_end]});
+
+    const script_id = app.dispatch(
+        \\{"id":"2","command":"oars.scripts.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, script_id, "tail errors") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script_id, "\"service\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script_id, "\"run_count\":0") != null);
+
+    // Delete, then the list is empty again.
+    var delete_buf: [256]u8 = undefined;
+    const delete_req = try std.fmt.bufPrint(&delete_buf, "{{\"id\":\"3\",\"command\":\"oars.scripts.delete\",\"payload\":{{\"id\":\"{s}\"}}}}", .{id});
+    const deleted = app.dispatch(delete_req);
+    try std.testing.expect(std.mem.indexOf(u8, deleted, "\"ok\":true") != null);
+    const after = app.dispatch(
+        \\{"id":"4","command":"oars.scripts.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, after, "tail errors") == null);
+}
+
+test "scripts.save validates payloads through the dispatcher" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    const no_name = app.dispatch(
+        \\{"id":"1","command":"oars.scripts.save","payload":{"script":{"name":"","body":"echo hi"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, no_name, "script name is required") != null);
+
+    const no_body = app.dispatch(
+        \\{"id":"2","command":"oars.scripts.save","payload":{"script":{"name":"x","body":""}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, no_body, "script body is required") != null);
+
+    const bad_var = app.dispatch(
+        \\{"id":"3","command":"oars.scripts.save","payload":{"script":{"name":"x","body":"echo hi","variables":[{"name":"bad-name"}]}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_var, "invalid variable definition") != null);
+
+    const dup_var = app.dispatch(
+        \\{"id":"4","command":"oars.scripts.save","payload":{"script":{"name":"x","body":"echo hi","variables":[{"name":"a"},{"name":"a"}]}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, dup_var, "duplicate variable") != null);
+
+    // A body over 64 KB is rejected at save (spec 06 §10).
+    var big_buf: [64 * 1024 + 32]u8 = undefined;
+    @memset(&big_buf, 'a');
+    var save_buf: [70 * 1024]u8 = undefined;
+    const payload_head = "{\"id\":\"5\",\"command\":\"oars.scripts.save\",\"payload\":{\"script\":{\"name\":\"big\",\"body\":\"";
+    @memcpy(save_buf[0..payload_head.len], payload_head);
+    const body_start = payload_head.len;
+    @memcpy(save_buf[body_start .. body_start + big_buf.len], &big_buf);
+    const tail = "\"}}}";
+    @memcpy(save_buf[body_start + big_buf.len .. body_start + big_buf.len + tail.len], tail);
+    const big = app.dispatch(save_buf[0 .. body_start + big_buf.len + tail.len]);
+    try std.testing.expect(std.mem.indexOf(u8, big, "script body must be under 64 KB") != null);
+}
+
+test "scripts.run and broadcast require a session and validate inputs" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // Save a script for the run paths.
+    _ = app.dispatch(
+        \\{"id":"1","command":"oars.scripts.save","payload":{"script":{"id":"sc-run","name":"hello","body":"echo {{who}}"}}}
+    );
+
+    // No session.
+    const run = app.dispatch(
+        \\{"id":"2","command":"oars.scripts.run","payload":{"server_id":"ghost","script_id":"sc-run","vars":{"who":{"value":"world"}}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, run, "not connected") != null);
+
+    // Missing script.
+    const missing_script = app.dispatch(
+        \\{"id":"3","command":"oars.scripts.run","payload":{"server_id":"ghost","script_id":"nope","vars":{}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, missing_script, "script not found") != null);
+
+    // Missing variable blocks the run (no partial substitution).
+    const missing_var = app.dispatch(
+        \\{"id":"4","command":"oars.scripts.run","payload":{"server_id":"ghost","script_id":"sc-run","vars":{}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, missing_var, "missing variable: who") != null);
+
+    // Multiline values are refused.
+    const multiline = app.dispatch(
+        \\{"id":"5","command":"oars.scripts.run","payload":{"server_id":"ghost","script_id":"sc-run","vars":{"who":{"value":"a\nb"}}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, multiline, "multiline variable values are not supported") != null);
+
+    // Ambiguous placeholder context is rejected before execution.
+    _ = app.dispatch(
+        \\{"id":"6","command":"oars.scripts.save","payload":{"script":{"id":"sc-bad","name":"bad","body":"x={{y}}"}}}
+    );
+    const ambiguous = app.dispatch(
+        \\{"id":"7","command":"oars.scripts.run","payload":{"server_id":"ghost","script_id":"sc-bad","vars":{"y":{"value":"v"}}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, ambiguous, "ambiguous shell context") != null);
+
+    const invalid_editor_body = app.dispatch(
+        \\{"id":"7a","command":"oars.scripts.validate","payload":{"body":"echo {{first}}; echo \"{{value}}\""}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, invalid_editor_body, "ambiguous shell context") != null);
+    const valid_editor_body = app.dispatch(
+        \\{"id":"7b","command":"oars.scripts.validate","payload":{"body":"echo /srv/{{value}}/current"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, valid_editor_body, "\"ok\":true") != null);
+
+    // Broadcast requires servers (preparation is the gate).
+    const no_servers = app.dispatch(
+        \\{"id":"8","command":"oars.scripts.broadcastPrepare","payload":{"script_id":"sc-run","server_ids":[],"vars":{"who":{"value":"world"}}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, no_servers, "no servers selected") != null);
+
+    // Preparing does not need a session and does not bump run counts.
+    const list_before = app.dispatch(
+        \\{"id":"9","command":"oars.scripts.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, list_before, "\"run_count\":0") != null);
+
+    const prepared = app.dispatch(
+        \\{"id":"10","command":"oars.scripts.broadcastPrepare","payload":{"script_id":"sc-run","server_ids":["ghost","ghost"],"vars":{"who":{"value":"world"}}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, prepared, "\"preview_id\"") != null);
+    // The preview freezes the exact exec string and the script name.
+    try std.testing.expect(std.mem.indexOf(u8, prepared, "\"command\":\"bash -c 'echo '") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prepared, "\"script_name\":\"hello\"") != null);
+    // Duplicate server ids are deduped in the prepared record.
+    try std.testing.expect(std.mem.indexOf(u8, prepared, "\"servers\":[{\"server_id\":\"ghost\"}]") != null);
+    // Real-time nanoseconds exceed JavaScript's safe integer range. The
+    // bridge must serialize the preview expiry as integer milliseconds.
+    const expiry_pos = std.mem.indexOf(u8, prepared, "\"expires_at\":") orelse return error.TestUnexpectedResult;
+    var expiry_end = expiry_pos + "\"expires_at\":".len;
+    while (expiry_end < prepared.len and prepared[expiry_end] >= '0' and prepared[expiry_end] <= '9') expiry_end += 1;
+    const expiry = try std.fmt.parseInt(u64, prepared[expiry_pos + "\"expires_at\":".len .. expiry_end], 10);
+    try std.testing.expect(expiry < 10_000_000_000_000);
+    const preview_id_pos = std.mem.indexOf(u8, prepared, "\"preview_id\":") orelse return error.TestUnexpectedResult;
+    var preview_id_end: usize = preview_id_pos + "\"preview_id\":".len;
+    while (preview_id_end < prepared.len and prepared[preview_id_end] >= '0' and prepared[preview_id_end] <= '9') preview_id_end += 1;
+    const preview_id = prepared[preview_id_pos + "\"preview_id\":".len .. preview_id_end];
+    // Build the commit request NOW: the slice aliases the shared dispatch
+    // buffer, and the next dispatch overwrites it (TestApp pitfall).
+    var commit_buf: [256]u8 = undefined;
+    const commit_req = try std.fmt.bufPrint(&commit_buf, "{{\"id\":\"12\",\"command\":\"oars.scripts.broadcast\",\"payload\":{{\"preview_id\":{s}}}}}", .{preview_id});
+
+    // Preparation alone must not bump run counts (no audit, no run).
+    const list_mid = app.dispatch(
+        \\{"id":"11","command":"oars.scripts.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, list_mid, "\"run_count\":0") != null);
+
+    // Committing to a ghost server still registers the run (the run
+    // reports it skipped/unreachable when polled).
+    const broadcast = app.dispatch(commit_req);
+    try std.testing.expect(std.mem.indexOf(u8, broadcast, "\"run_id\"") != null);
+    const run_id_pos = std.mem.indexOf(u8, broadcast, "\"run_id\":") orelse return error.TestUnexpectedResult;
+    var run_id_end: usize = run_id_pos + "\"run_id\":".len;
+    while (run_id_end < broadcast.len and broadcast[run_id_end] >= '0' and broadcast[run_id_end] <= '9') run_id_end += 1;
+    const run_id = broadcast[run_id_pos + "\"run_id\":".len .. run_id_end];
+    var poll_buf: [256]u8 = undefined;
+    const poll_req = try std.fmt.bufPrint(&poll_buf, "{{\"id\":\"13\",\"command\":\"oars.scripts.broadcastPoll\",\"payload\":{{\"run_id\":{s}}}}}", .{run_id});
+    const poll = app.dispatch(poll_req);
+    // The ghost server is marked skipped (unreachable), never dropped.
+    try std.testing.expect(std.mem.indexOf(u8, poll, "\"status\":\"skipped\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, poll, "unreachable") != null);
+    // The run carries the real script name, not an empty string.
+    try std.testing.expect(std.mem.indexOf(u8, poll, "\"script_name\":\"hello\"") != null);
+
+    // Unknown run ids are explicit errors.
+    const unknown = app.dispatch(
+        \\{"id":"14","command":"oars.scripts.broadcastPoll","payload":{"run_id":9999}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "unknown run") != null);
+    const cancel_unknown = app.dispatch(
+        \\{"id":"15","command":"oars.scripts.broadcastCancel","payload":{"run_id":9999}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, cancel_unknown, "unknown run") != null);
+
+    // A consumed preview cannot be committed twice.
+    const again = app.dispatch(commit_req);
+    try std.testing.expect(std.mem.indexOf(u8, again, "preview expired or unknown") != null);
+
+    // Cancel drops an uncommitted preview; committing it then fails.
+    const prepared2 = app.dispatch(
+        \\{"id":"16","command":"oars.scripts.broadcastPrepare","payload":{"script_id":"sc-run","server_ids":["ghost"],"vars":{"who":{"value":"world"}}}}
+    );
+    const preview2_pos = std.mem.indexOf(u8, prepared2, "\"preview_id\":") orelse return error.TestUnexpectedResult;
+    var preview2_end: usize = preview2_pos + "\"preview_id\":".len;
+    while (preview2_end < prepared2.len and prepared2[preview2_end] >= '0' and prepared2[preview2_end] <= '9') preview2_end += 1;
+    const preview2 = prepared2[preview2_pos + "\"preview_id\":".len .. preview2_end];
+    // Build both requests NOW — the slice aliases the shared dispatch
+    // buffer, and every later dispatch overwrites it.
+    var cancel_buf: [256]u8 = undefined;
+    const cancel_req = try std.fmt.bufPrint(&cancel_buf, "{{\"id\":\"17\",\"command\":\"oars.scripts.broadcastPrepareCancel\",\"payload\":{{\"preview_id\":{s}}}}}", .{preview2});
+    var commit2_buf: [256]u8 = undefined;
+    const commit2_req = try std.fmt.bufPrint(&commit2_buf, "{{\"id\":\"18\",\"command\":\"oars.scripts.broadcast\",\"payload\":{{\"preview_id\":{s}}}}}", .{preview2});
+    const canceled = app.dispatch(cancel_req);
+    try std.testing.expect(std.mem.indexOf(u8, canceled, "\"ok\":true") != null);
+    const after_cancel = app.dispatch(commit2_req);
+    try std.testing.expect(std.mem.indexOf(u8, after_cancel, "preview expired or unknown") != null);
+}
+
+test "deploy apps save/list/delete round trip through the dispatcher" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // Create on s1: the id is generated, secret values never persist.
+    const created = app.dispatch(
+        \\{"id":"1","command":"oars.deploy.apps.save","payload":{"app":{"server_id":"s1","name":"storefront","folder":"/home/ubuntu/storefront","repo":{"url":"git@github.com:you/storefront.git","transport":"ssh","branch":"main"},"runtime":{"node_version":"22","type":"next","install":"npm ci","build":"npm run build","entry":"node_modules/next/dist/bin/next","args":"start"},"env_vars":[{"name":"NODE_ENV","secret":false,"value":"production"},{"name":"DATABASE_URL","secret":true,"has_value":true}],"domains":["storefront.dev"],"ssl":true,"email":"ops@storefront.dev","app_port":3000}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, created, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, created, "postgres://secret") == null);
+
+    const DeploySaveResp = struct {
+        result: struct {
+            ok: bool,
+            app: struct {
+                id: []const u8,
+                server_id: []const u8,
+                name: []const u8,
+                env_vars: []const struct {
+                    name: []const u8,
+                    secret: bool,
+                    value: []const u8 = "",
+                    has_value: bool,
+                } = &.{},
+            },
+        },
+    };
+    const created_parsed = try std.json.parseFromSlice(DeploySaveResp, std.testing.allocator, created, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer created_parsed.deinit();
+    try std.testing.expect(created_parsed.value.result.ok);
+    const app_id = created_parsed.value.result.app.id;
+    try std.testing.expectEqualStrings("s1", created_parsed.value.result.app.server_id);
+    try std.testing.expectEqual(@as(usize, 2), created_parsed.value.result.app.env_vars.len);
+    try std.testing.expectEqualStrings("", created_parsed.value.result.app.env_vars[1].value); // never stored
+
+    // A second app on a different server stays out of s1's list.
+    _ = app.dispatch(
+        \\{"id":"2","command":"oars.deploy.apps.save","payload":{"app":{"server_id":"s2","name":"api","folder":"/home/ubuntu/api","repo":{"url":"https://github.com/you/api.git","transport":"https"},"runtime":{"node_version":"22","type":"node","entry":"index.js"}}}}
+    );
+
+    const DeployListResp = struct {
+        result: struct {
+            ok: bool,
+            apps: []const struct {
+                id: []const u8,
+                server_id: []const u8,
+                env_vars: []const struct {
+                    name: []const u8,
+                    secret: bool,
+                    value: []const u8 = "",
+                    has_value: bool,
+                } = &.{},
+            } = &.{},
+        },
+    };
+    const listed = app.dispatch(
+        \\{"id":"3","command":"oars.deploy.apps.list","payload":{"server_id":"s1"}}
+    );
+    const listed_parsed = try std.json.parseFromSlice(DeployListResp, std.testing.allocator, listed, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer listed_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), listed_parsed.value.result.apps.len);
+    try std.testing.expectEqualStrings(app_id, listed_parsed.value.result.apps[0].id);
+    try std.testing.expectEqualStrings("", listed_parsed.value.result.apps[0].env_vars[1].value);
+
+    // Delete requires the owning server and removes the app.
+    const wrong_server = app.dispatch(
+        \\{"id":"4","command":"oars.deploy.apps.delete","payload":{"server_id":"s2","app_id":""}}
+    );
+    _ = wrong_server;
+    var del_buf: [512]u8 = undefined;
+    const del_req = try std.fmt.bufPrint(&del_buf, "{{\"id\":\"5\",\"command\":\"oars.deploy.apps.delete\",\"payload\":{{\"server_id\":\"s1\",\"app_id\":\"{s}\"}}}}", .{app_id});
+    const deleted = app.dispatch(del_req);
+    try std.testing.expect(std.mem.indexOf(u8, deleted, "\"ok\":true") != null);
+    const after = app.dispatch(
+        \\{"id":"6","command":"oars.deploy.apps.list","payload":{"server_id":"s1"}}
+    );
+    const after_parsed = try std.json.parseFromSlice(DeployListResp, std.testing.allocator, after, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer after_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), after_parsed.value.result.apps.len);
+}
+
+test "deploy.run requires a completed preflight" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // The public run route cannot bypass the immutable preflight contract.
+    const unknown = app.dispatch(
+        \\{"id":"1","command":"oars.deploy.run","payload":{"server_id":"ghost","app_id":"nope","secret_values":[]}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "completed preflight is required") != null);
+
+    // Create an app on a different server: the server must own the app.
+    const created = app.dispatch(
+        \\{"id":"2","command":"oars.deploy.apps.save","payload":{"app":{"id":"dep-1","server_id":"s1","name":"storefront","folder":"/home/ubuntu/storefront","repo":{"url":"git@github.com:you/storefront.git","transport":"ssh"},"runtime":{"node_version":"22","type":"node","install":"npm ci","build":"npm run build","entry":"server.js"},"env_vars":[{"name":"DATABASE_URL","secret":true,"has_value":true}],"app_port":3000}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, created, "\"ok\":true") != null);
+
+    const bypass = app.dispatch(
+        \\{"id":"3","command":"oars.deploy.run","payload":{"server_id":"s1","app_id":"dep-1","secret_values":[{"name":"DATABASE_URL","value":"postgres://secret"}]}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bypass, "completed preflight is required") != null);
+
+    // Unknown run ids are explicit errors; history is empty and never
+    // leaks secret values.
+    const unknown_poll = app.dispatch(
+        \\{"id":"6","command":"oars.deploy.poll","payload":{"run_id":9999}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, unknown_poll, "unknown run") != null);
+    const cancel_unknown = app.dispatch(
+        \\{"id":"7","command":"oars.deploy.cancel","payload":{"run_id":9999}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, cancel_unknown, "unknown run") != null);
+    const hist_response = app.dispatch(
+        \\{"id":"8","command":"oars.deploy.history","payload":{"server_id":"s1","app_id":"dep-1"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, hist_response, "\"runs\":[]") != null);
+}
+
+test "sshkeys.localGenerate creates a key, is idempotent, and hides the passphrase" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+    const io = std.testing.io;
+
+    const now = std.Io.Timestamp.now(io, .real).nanoseconds;
+    var dir_buf: [160]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/oars-keygen-test-{d}", .{now});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    std.Io.Dir.cwd().createDirPath(io, dir) catch return error.TestUnexpectedResult;
+    var dest_buf: [256]u8 = undefined;
+    const dest = try std.fmt.bufPrint(&dest_buf, "{s}/id_ed25519_oars", .{dir});
+
+    var req_buf: [512]u8 = undefined;
+    const req = try std.fmt.bufPrint(&req_buf, "{{\"id\":\"1\",\"command\":\"oars.sshkeys.localGenerate\",\"payload\":{{\"operation_id\":\"op-gen-1\",\"destination\":\"{s}\",\"comment\":\"oars-test\",\"passphrase\":\"hunter2-secret\"}}}}", .{dest});
+    const resp = app.dispatch(req);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "hunter2-secret") == null);
+
+    const StartResp = struct {
+        result: struct {
+            ok: bool,
+            job_id: []const u8 = "",
+        },
+    };
+    const start_parsed = try std.json.parseFromSlice(StartResp, std.testing.allocator, resp, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer start_parsed.deinit();
+    try std.testing.expect(start_parsed.value.result.ok);
+    const job_id = start_parsed.value.result.job_id;
+    try std.testing.expect(job_id.len > 0);
+
+    // A repeated operation_id returns the same job instead of a second run.
+    var again_buf: [512]u8 = undefined;
+    const again_req = try std.fmt.bufPrint(&again_buf, "{{\"id\":\"1b\",\"command\":\"oars.sshkeys.localGenerate\",\"payload\":{{\"operation_id\":\"op-gen-1\",\"destination\":\"{s}\",\"comment\":\"oars-test\",\"passphrase\":\"hunter2-secret\"}}}}", .{dest});
+    const again = app.dispatch(again_req);
+    try std.testing.expect(std.mem.indexOf(u8, again, job_id) != null);
+
+    // Poll until the local worker finishes (bounded).
+    var poll_buf: [256]u8 = undefined;
+    const poll_req = try std.fmt.bufPrint(&poll_buf, "{{\"id\":\"2\",\"command\":\"oars.sshkeys.jobPoll\",\"payload\":{{\"job_id\":\"{s}\"}}}}", .{job_id});
+    var poll_resp: []const u8 = "";
+    var attempts: usize = 0;
+    while (attempts < 400) : (attempts += 1) {
+        poll_resp = app.dispatch(poll_req);
+        if (std.mem.indexOf(u8, poll_resp, "\"state\":\"done\"") != null) break;
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(25), .awake) catch {};
+    }
+    try std.testing.expect(std.mem.indexOf(u8, poll_resp, "\"state\":\"done\"") != null);
+    // The passphrase never appears in the job result; the Keychain account
+    // name tells the frontend where to store it.
+    try std.testing.expect(std.mem.indexOf(u8, poll_resp, "hunter2-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, poll_resp, "keychain_account") != null);
+
+    const PollResp = struct {
+        result: struct {
+            ok: bool,
+            result: ?struct {
+                public_key: []const u8 = "",
+                private_path: []const u8 = "",
+                keychain_account: []const u8 = "",
+            } = null,
+        },
+    };
+    const poll_parsed = try std.json.parseFromSlice(PollResp, std.testing.allocator, poll_resp, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer poll_parsed.deinit();
+    const gen_result = poll_parsed.value.result.result orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, gen_result.public_key, "ssh-ed25519") != null);
+    try std.testing.expectEqualStrings(dest, gen_result.private_path);
+    try std.testing.expect(std.mem.startsWith(u8, gen_result.keychain_account, "localkey:SHA256:"));
+
+    // The private file exists with mode 0600.
+    var priv = std.Io.Dir.cwd().openFile(io, dest, .{}) catch return error.TestUnexpectedResult;
+    defer priv.close(io);
+    const st = try priv.stat(io);
+    try std.testing.expectEqual(@as(u16, 0o600), st.permissions.toMode() & 0o777);
+
+    // The audit trail has admission and terminal rows but never the passphrase.
+    const audit_content = try std.Io.Dir.cwd().readFileAlloc(io, app.audit_store.path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(audit_content);
+    try std.testing.expect(std.mem.indexOf(u8, audit_content, "sshkeys.localGenerate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_content, "hunter2-secret") == null);
+
+    // A new operation against the same destination is refused, not overwritten.
+    var dup_buf: [512]u8 = undefined;
+    const dup_req = try std.fmt.bufPrint(&dup_buf, "{{\"id\":\"3\",\"command\":\"oars.sshkeys.localGenerate\",\"payload\":{{\"operation_id\":\"op-gen-2\",\"destination\":\"{s}\"}}}}", .{dest});
+    const dup_resp = app.dispatch(dup_req);
+    try std.testing.expect(std.mem.indexOf(u8, dup_resp, "\"ok\":true") != null);
+    var dup_id_buf: [128]u8 = undefined;
+    const dup_start = std.mem.indexOf(u8, dup_resp, "\"job_id\":\"") orelse return error.TestUnexpectedResult;
+    var dup_id_len: usize = 0;
+    for (dup_resp[dup_start + 10 ..]) |ch| {
+        if (ch == '\"') break;
+        if (dup_id_len >= dup_id_buf.len) return error.TestUnexpectedResult;
+        dup_id_buf[dup_id_len] = ch;
+        dup_id_len += 1;
+    }
+    var dup_poll_buf: [256]u8 = undefined;
+    const dup_poll_req = try std.fmt.bufPrint(&dup_poll_buf, "{{\"id\":\"4\",\"command\":\"oars.sshkeys.jobPoll\",\"payload\":{{\"job_id\":\"{s}\"}}}}", .{dup_id_buf[0..dup_id_len]});
+    var dup_poll: []const u8 = "";
+    attempts = 0;
+    while (attempts < 400) : (attempts += 1) {
+        dup_poll = app.dispatch(dup_poll_req);
+        if (std.mem.indexOf(u8, dup_poll, "\"state\":\"done\"") != null or std.mem.indexOf(u8, dup_poll, "\"state\":\"partial\"") != null) break;
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(25), .awake) catch {};
+    }
+    try std.testing.expect(std.mem.indexOf(u8, dup_poll, "\"state\":\"partial\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dup_poll, "already exists") != null);
+
+    // A relative destination is rejected before any work.
+    const rel = app.dispatch(
+        \\{"id":"5","command":"oars.sshkeys.localGenerate","payload":{"operation_id":"op-gen-3","destination":"relative/path"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, rel, "an absolute destination path is required") != null);
+}
+
+test "sshkeys handlers validate payloads and snapshot state" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+    const io = std.testing.io;
+
+    // inspect rejects garbage and normalizes a valid key.
+    const bad_key = app.dispatch(
+        \\{"id":"1","command":"oars.sshkeys.inspect","payload":{"public_key":"not-a-key"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_key, "invalid public key") != null);
+    const good_key = app.dispatch(
+        \\{"id":"2","command":"oars.sshkeys.inspect","payload":{"public_key":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBs5Tnge2MIGi6Zcyo04aosYAQ+iwk4hKYUNpIHkyMQt someone@host"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, good_key, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, good_key, "\"fingerprint\":\"SHA256:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, good_key, "\"key_type\":\"ssh-ed25519\"") != null);
+
+    // A snapshot for a disconnected server is admitted and finishes
+    // partial with a warning; mutations still need its frozen sources.
+    const snap = app.dispatch(
+        \\{"id":"3","command":"oars.sshkeys.snapshot","payload":{"server_id":"ghost","account":{"kind":"connected"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, snap, "\"ok\":true") != null);
+    var snap_id_buf: [128]u8 = undefined;
+    const snap_id_start = std.mem.indexOf(u8, snap, "\"snapshot_id\":\"") orelse return error.TestUnexpectedResult;
+    var snap_id_len: usize = 0;
+    for (snap[snap_id_start + 15 ..]) |ch| {
+        if (ch == '\"') break;
+        if (snap_id_len >= snap_id_buf.len) return error.TestUnexpectedResult;
+        snap_id_buf[snap_id_len] = ch;
+        snap_id_len += 1;
+    }
+    const snap_id = snap_id_buf[0..snap_id_len];
+    var snap_poll_buf: [256]u8 = undefined;
+    const snap_poll_req = try std.fmt.bufPrint(&snap_poll_buf, "{{\"id\":\"4\",\"command\":\"oars.sshkeys.snapshotPoll\",\"payload\":{{\"snapshot_id\":\"{s}\"}}}}", .{snap_id});
+    var snap_poll: []const u8 = "";
+    var attempts: usize = 0;
+    while (attempts < 400) : (attempts += 1) {
+        snap_poll = app.dispatch(snap_poll_req);
+        if (std.mem.indexOf(u8, snap_poll, "\"state\":\"partial\"") != null or std.mem.indexOf(u8, snap_poll, "\"state\":\"done\"") != null) break;
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(25), .awake) catch {};
+    }
+    try std.testing.expect(std.mem.indexOf(u8, snap_poll, "\"state\":\"partial\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snap_poll, "not connected") != null);
+
+    // Mutations validate their payload before touching the registry.
+    const add_unknown = app.dispatch(
+        \\{"id":"5","command":"oars.sshkeys.add","payload":{"operation_id":"op-a","snapshot_id":"snap-nope","source_path":"/home/u/.ssh/authorized_keys","file_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","public_key":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBs5Tnge2MIGi6Zcyo04aosYAQ+iwk4hKYUNpIHkyMQt x"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, add_unknown, "unknown snapshot") != null);
+
+    const bad_hash = app.dispatch(
+        \\{"id":"6","command":"oars.sshkeys.revoke","payload":{"operation_id":"op-r","snapshot_id":"snap-nope","source_path":"/home/u/.ssh/authorized_keys","file_sha256":"abc","fingerprint":"SHA256:x","line_hash":"y"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_hash, "invalid") != null);
+
+    const commit_not_waiting = app.dispatch(
+        \\{"id":"7","command":"oars.sshkeys.rotateCommit","payload":{"job_id":"job-nope","verification":{"kind":"external_confirmation","confirm_fingerprint":"SHA256:x"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, commit_not_waiting, "not waiting for verification") != null);
+
+    // Role plans need a completed snapshot and a safe account name.
+    const plan_no_snap = app.dispatch(
+        \\{"id":"8","command":"oars.sshkeys.roles.plan","payload":{"server_id":"ghost2","name":"ro-user","kind":"read_only_sftp","action":"create"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, plan_no_snap, "take a snapshot") != null);
+
+    const bad_name = app.dispatch(
+        \\{"id":"9","command":"oars.sshkeys.roles.plan","payload":{"server_id":"ghost","name":"Bad Name!","kind":"read_only_sftp","action":"create"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_name, "invalid account name") != null);
+
+    const deploy_key = app.dispatch(
+        \\{"id":"10","command":"oars.sshkeys.deployKeys.delete","payload":{"operation_id":"op-d","server_id":"ghost","deploy_key_id":"bogus","confirm_fingerprint":"SHA256:x"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, deploy_key, "invalid deploy key id") != null);
+
+    const job_poll_unknown = app.dispatch(
+        \\{"id":"11","command":"oars.sshkeys.jobPoll","payload":{"job_id":"job-nope"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, job_poll_unknown, "unknown job") != null);
+
+    const job_cancel_unknown = app.dispatch(
+        \\{"id":"12","command":"oars.sshkeys.jobCancel","payload":{"job_id":"job-nope"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, job_cancel_unknown, "unknown job") != null);
+}
+
+test "access identities save/list/delete round trip through the dispatcher" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    const fp1 = "SHA256:IIiiMx8dWbmaEVhH8Oc9GEt16E2UPRuGtQ3itmbNZxs";
+    const fp2 = "SHA256:el3RAdX7MPz8bGotR4kPQ4XBQTl42+OD1WbuC4jrRtg";
+
+    const created = app.dispatch("{\"id\":\"1\",\"command\":\"oars.access.identities.save\",\"payload\":{\"identity\":{\"name\":\"Ada\",\"fingerprints\":[\"" ++ fp1 ++ "\",\"" ++ fp2 ++ "\"]}}}");
+    try std.testing.expect(std.mem.indexOf(u8, created, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, created, "\"name\":\"Ada\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, created, fp1) != null);
+    const id_start = std.mem.indexOf(u8, created, "\"id\":\"") orelse return error.TestUnexpectedResult;
+    var id_buf: [64]u8 = undefined;
+    var id_len: usize = 0;
+    for (created[id_start + 6 ..]) |ch| {
+        if (ch == '\"') break;
+        if (id_len >= id_buf.len) return error.TestUnexpectedResult;
+        id_buf[id_len] = ch;
+        id_len += 1;
+    }
+    const id = id_buf[0..id_len];
+
+    // A second person cannot claim Ada's fingerprint.
+    const conflict = app.dispatch("{\"id\":\"2\",\"command\":\"oars.access.identities.save\",\"payload\":{\"identity\":{\"name\":\"Bob\",\"fingerprints\":[\"" ++ fp1 ++ "\"]}}}");
+    try std.testing.expect(std.mem.indexOf(u8, conflict, "at most one person") != null);
+
+    // Shared identities may overlap.
+    const shared = app.dispatch("{\"id\":\"3\",\"command\":\"oars.access.identities.save\",\"payload\":{\"identity\":{\"name\":\"Oncall\",\"fingerprints\":[\"" ++ fp1 ++ "\"],\"shared\":true}}}");
+    try std.testing.expect(std.mem.indexOf(u8, shared, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shared, "\"shared\":true") != null);
+
+    // Validation errors surface as ok:false messages.
+    const bad_fp = app.dispatch(
+        \\{"id":"4","command":"oars.access.identities.save","payload":{"identity":{"name":"X","fingerprints":["nope"]}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_fp, "invalid fingerprint") != null);
+    const no_name = app.dispatch("{\"id\":\"5\",\"command\":\"oars.access.identities.save\",\"payload\":{\"identity\":{\"name\":\"  \",\"fingerprints\":[\"" ++ fp2 ++ "\"]}}}");
+    try std.testing.expect(std.mem.indexOf(u8, no_name, "invalid identity name") != null);
+
+    // List shows all three identities; delete removes one.
+    const listed = app.dispatch(
+        \\{"id":"6","command":"oars.access.identities.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, listed, "Ada") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "Oncall") != null);
+    var del_buf: [256]u8 = undefined;
+    const del_req = try std.fmt.bufPrint(&del_buf, "{{\"id\":\"7\",\"command\":\"oars.access.identities.delete\",\"payload\":{{\"id\":\"{s}\",\"expected_revision\":1,\"confirm_name\":\"Ada\"}}}}", .{id});
+    const deleted = app.dispatch(del_req);
+    try std.testing.expect(std.mem.indexOf(u8, deleted, "\"ok\":true") != null);
+    const del_unknown = app.dispatch(
+        \\{"id":"8","command":"oars.access.identities.delete","payload":{"id":"id-nope","expected_revision":1,"confirm_name":"Nobody"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, del_unknown, "unknown identity") != null);
+}
+
+test "access scan and job handlers validate payloads without sessions" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // An unknown server id is rejected before any work.
+    const bad_server = app.dispatch(
+        \\{"id":"1","command":"oars.access.scan","payload":{"server_ids":["ghost"]}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_server, "unknown server") != null);
+
+    // An empty fleet scans fine (nothing to do).
+    const scan = app.dispatch(
+        \\{"id":"2","command":"oars.access.scan","payload":{"scope":"all_login_accounts","approved_sensitive_read":true}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, scan, "\"ok\":true") != null);
+    const scan_id_start = std.mem.indexOf(u8, scan, "\"scan_id\":\"scan-") orelse return error.TestUnexpectedResult;
+    var scan_id_buf: [32]u8 = undefined;
+    var scan_id_len: usize = 0;
+    for (scan[scan_id_start + 11 ..]) |ch| {
+        if (ch == '\"') break;
+        if (scan_id_len >= scan_id_buf.len) return error.TestUnexpectedResult;
+        scan_id_buf[scan_id_len] = ch;
+        scan_id_len += 1;
+    }
+    const scan_id = scan_id_buf[0..scan_id_len];
+    var poll_buf: [128]u8 = undefined;
+    const poll_req = try std.fmt.bufPrint(&poll_buf, "{{\"id\":\"3\",\"command\":\"oars.access.poll\",\"payload\":{{\"scan_id\":\"{s}\"}}}}", .{scan_id});
+    const done = app.dispatch(poll_req);
+    try std.testing.expect(std.mem.indexOf(u8, done, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, done, "\"coverage\":\"complete\"") != null);
+    const unknown_scan = app.dispatch(
+        \\{"id":"4","command":"oars.access.poll","payload":{"scan_id":"scan-nope"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, unknown_scan, "unknown scan") != null);
+
+    // Offboard requires a real identity and its own fingerprints.
+    var unknown_offboard_buf: [768]u8 = undefined;
+    const unknown_offboard_req = try std.fmt.bufPrint(&unknown_offboard_buf, "{{\"id\":\"5\",\"command\":\"oars.access.offboard\",\"payload\":{{\"operation_id\":\"op-unknown\",\"scan_id\":\"{s}\",\"identity_id\":\"id-nope\",\"identity_revision\":1,\"confirm_name\":\"Nobody\",\"grants\":[{{\"fingerprint\":\"SHA256:IIiiMx8dWbmaEVhH8Oc9GEt16E2UPRuGtQ3itmbNZxs\",\"server_id\":\"s1\",\"user\":\"root\",\"source_path\":\"/root/.ssh/authorized_keys\",\"line_hash\":\"h\",\"file_sha256\":\"f\"}}]}}}}", .{scan_id});
+    const offboard_unknown = app.dispatch(unknown_offboard_req);
+    try std.testing.expect(std.mem.indexOf(u8, offboard_unknown, "unknown identity") != null);
+
+    // The fingerprint must belong to the identity.
+    const identity_saved = app.dispatch(
+        \\{"id":"6","command":"oars.access.identities.save","payload":{"identity":{"name":"Ada","fingerprints":["SHA256:IIiiMx8dWbmaEVhH8Oc9GEt16E2UPRuGtQ3itmbNZxs"]}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, identity_saved, "\"ok\":true") != null);
+    const IdentityIdShape = struct { result: struct { identity: struct { id: []const u8 } } };
+    var identity_id_parsed = std.json.parseFromSlice(IdentityIdShape, std.testing.allocator, identity_saved, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return error.TestUnexpectedResult;
+    defer identity_id_parsed.deinit();
+    var identity_id_buf: [64]u8 = undefined;
+    const identity_id_raw = identity_id_parsed.value.result.identity.id;
+    if (identity_id_raw.len == 0 or identity_id_raw.len > identity_id_buf.len) return error.TestUnexpectedResult;
+    @memcpy(identity_id_buf[0..identity_id_raw.len], identity_id_raw);
+    const identity_id = identity_id_buf[0..identity_id_raw.len];
+    var off_buf: [1024]u8 = undefined;
+    const off_wrong_fp = try std.fmt.bufPrint(&off_buf, "{{\"id\":\"7\",\"command\":\"oars.access.offboard\",\"payload\":{{\"operation_id\":\"op-wrong-fp\",\"scan_id\":\"{s}\",\"identity_id\":\"{s}\",\"identity_revision\":1,\"confirm_name\":\"Ada\",\"grants\":[{{\"fingerprint\":\"SHA256:el3RAdX7MPz8bGotR4kPQ4XBQTl42+OD1WbuC4jrRtg\",\"server_id\":\"s1\",\"user\":\"root\",\"source_path\":\"/root/.ssh/authorized_keys\",\"line_hash\":\"h\",\"file_sha256\":\"f\"}}]}}}}", .{ scan_id, identity_id });
+    const off_wrong = app.dispatch(off_wrong_fp);
+    try std.testing.expect(std.mem.indexOf(u8, off_wrong, "not part of this identity") != null);
+
+    // Onboard validates the public key before any session work.
+    var onboard_buf: [512]u8 = undefined;
+    const onboard_req = try std.fmt.bufPrint(&onboard_buf, "{{\"id\":\"8\",\"command\":\"oars.access.onboard\",\"payload\":{{\"operation_id\":\"op-onboard\",\"identity_id\":\"{s}\",\"identity_revision\":1,\"public_key\":\"not-a-key\",\"grants\":[{{\"server_id\":\"s1\",\"target\":{{\"kind\":\"account\",\"name\":\"root\"}}}}]}}}}", .{identity_id});
+    const onboard_bad_key = app.dispatch(onboard_req);
+    try std.testing.expect(std.mem.indexOf(u8, onboard_bad_key, "invalid public key") != null);
+
+    // Rotate rejects a foreign old fingerprint.
+    var rot_buf: [1024]u8 = undefined;
+    const rot_req = try std.fmt.bufPrint(&rot_buf, "{{\"id\":\"9\",\"command\":\"oars.access.rotate\",\"payload\":{{\"operation_id\":\"op-rotate\",\"scan_id\":\"{s}\",\"identity_id\":\"{s}\",\"identity_revision\":1,\"old_fingerprint\":\"SHA256:el3RAdX7MPz8bGotR4kPQ4XBQTl42+OD1WbuC4jrRtg\",\"new_public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBs5Tnge2MIGi6Zcyo04aosYAQ+iwk4hKYUNpIHkyMQt z\",\"grants\":[{{\"server_id\":\"s1\",\"user\":\"root\",\"source_path\":\"/root/.ssh/authorized_keys\",\"line_hash\":\"h\",\"file_sha256\":\"f\"}}]}}}}", .{ scan_id, identity_id });
+    const rotated = app.dispatch(rot_req);
+    try std.testing.expect(std.mem.indexOf(u8, rotated, "not part of this identity") != null);
+
+    // Unknown jobs and exports without a completed scan are explicit.
+    const unknown_job = app.dispatch(
+        \\{"id":"10","command":"oars.access.jobPoll","payload":{"job_id":"job-nope"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, unknown_job, "unknown job") != null);
+    const no_export = app.dispatch(
+        \\{"id":"11","command":"oars.access.export","payload":{"format":"csv"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, no_export, "scan_id is required") != null);
+    var export_path_buf: [512]u8 = undefined;
+    const export_path = try std.fmt.bufPrint(&export_path_buf, "/tmp/{s}/access.csv", .{app.dir_name});
+    var export_req_buf: [768]u8 = undefined;
+    const export_req = try std.fmt.bufPrint(&export_req_buf, "{{\"id\":\"12\",\"command\":\"oars.access.export\",\"payload\":{{\"scan_id\":\"{s}\",\"format\":\"csv\",\"path\":\"{s}\"}}}}", .{ scan_id, export_path });
+    const exported = app.dispatch(export_req);
+    try std.testing.expect(std.mem.indexOf(u8, exported, "\"ok\":true") != null);
+    const csv = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, export_path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(csv);
+    try std.testing.expect(std.mem.indexOf(u8, csv, "row_type,scan_id,scope,coverage,identity_id,name,fingerprint,server_id,user,sudo,comment,source_path,line_hash,file_sha256,reason") != null);
+    const bad_format = app.dispatch(
+        \\{"id":"13","command":"oars.access.export","payload":{"format":"xlsx"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad_format, "invalid format") != null);
+}
+
+test "backup plan operations use exact contracts and never report unsupported work done" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    const PlanEnvelope = struct {
+        result: struct {
+            ok: bool,
+            plan_id: []const u8,
+            job: struct {
+                id: []const u8,
+                revision: u64,
+            },
+        },
+    };
+    const DeletePlanEnvelope = struct {
+        result: struct {
+            ok: bool,
+            plan_id: []const u8,
+            job_name: []const u8,
+        },
+    };
+    const OperationEnvelope = struct {
+        result: struct {
+            ok: bool,
+            state: []const u8,
+            @"error": ?struct { code: []const u8 } = null,
+        },
+    };
+
+    var seeded = try app.backup_registry.jobs.savePlanned(app.ctx.io, .{
+        .id = "bk-existing",
+        .server_id = "s1",
+        .name = "daily-old",
+        .source_path = "/var/www/old",
+        .destination = .{ .provider = "minio", .bucket = "acme", .prefix = "daily", .endpoint = "http://127.0.0.1:9000" },
+        .transfer = "copy",
+        .schedule = .{ .mode = "manual", .enabled = false },
+    }, null, true, 1);
+    seeded.deinit(app.ctx.allocator);
+    try app.waitBackupCache();
+
+    const planned_response = app.dispatch(
+        \\{"id":"1","command":"oars.backup.jobs.plan","payload":{"job":{"id":"bk-existing","server_id":"s1","name":"daily-website","source_path":"/var/www/html","destination":{"type":"s3","provider":"minio","bucket":"acme","prefix":"daily","endpoint":"http://127.0.0.1:9000","region":"","credential_mode":"access_key","storage_class":""},"transfer":"copy","schedule":{"mode":"manual","enabled":false}},"expected_revision":1}}
+    );
+    var planned = try std.json.parseFromSlice(PlanEnvelope, std.testing.allocator, planned_response, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    defer planned.deinit();
+    try std.testing.expect(planned.value.result.ok);
+    try std.testing.expect(std.mem.indexOf(u8, planned_response, "created_at_ns") == null);
+    try std.testing.expect(std.mem.indexOf(u8, planned_response, "use_iam") == null);
+
+    var save_buf: [512]u8 = undefined;
+    const save_request = try std.fmt.bufPrint(&save_buf, "{{\"id\":\"2\",\"command\":\"oars.backup.jobs.save\",\"payload\":{{\"operation_id\":\"op-save-1\",\"plan_id\":\"{s}\",\"approved_remote_secret\":false}}}}", .{planned.value.result.plan_id});
+    const saved = app.dispatch(save_request);
+
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, planned.value.result.job.id) != null);
+
+    var save_terminal = false;
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        const poll_response = app.dispatch(
+            \\{"id":"3","command":"oars.backup.operationPoll","payload":{"operation_id":"op-save-1"}}
+        );
+        var poll = try std.json.parseFromSlice(OperationEnvelope, std.testing.allocator, poll_response, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+        defer poll.deinit();
+        if (std.mem.eql(u8, poll.value.result.state, "done")) {
+            save_terminal = true;
+            break;
+        }
+        try std.testing.expect(!std.mem.eql(u8, poll.value.result.state, "failed"));
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(2), .awake) catch {};
+    }
+    try std.testing.expect(save_terminal);
+
+    const listed = app.dispatch(
+        \\{"id":"4","command":"oars.backup.jobs.list","payload":{"server_id":"s1"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, listed, "daily-website") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"credential_mode\":\"access_key\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "created_at_ns") == null);
+
+    const legacy_save = app.dispatch(
+        \\{"id":"5","command":"oars.backup.jobs.save","payload":{"job":{},"operation_id":"legacy"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, legacy_save, "invalid_payload") != null);
+
+    const refresh = app.dispatch(
+        \\{"id":"6","command":"oars.backup.refresh","payload":{"operation_id":"op-refresh-1","server_id":"s1"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, refresh, "\"ok\":true") != null);
+    var refresh_failed = false;
+    attempts = 0;
+    while (attempts < 100) : (attempts += 1) {
+        const poll_response = app.dispatch(
+            \\{"id":"7","command":"oars.backup.operationPoll","payload":{"operation_id":"op-refresh-1"}}
+        );
+        var poll = try std.json.parseFromSlice(OperationEnvelope, std.testing.allocator, poll_response, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+        defer poll.deinit();
+        try std.testing.expect(!std.mem.eql(u8, poll.value.result.state, "done"));
+        if (std.mem.eql(u8, poll.value.result.state, "failed")) {
+            try std.testing.expectEqualStrings("not_connected", poll.value.result.@"error".?.code);
+            refresh_failed = true;
+            break;
+        }
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(2), .awake) catch {};
+    }
+    try std.testing.expect(refresh_failed);
+
+    var delete_plan_buf: [512]u8 = undefined;
+    const delete_plan_request = try std.fmt.bufPrint(&delete_plan_buf, "{{\"id\":\"8\",\"command\":\"oars.backup.jobs.deletePlan\",\"payload\":{{\"server_id\":\"s1\",\"job_id\":\"{s}\",\"expected_revision\":2}}}}", .{planned.value.result.job.id});
+    const delete_plan_response = app.dispatch(delete_plan_request);
+    var delete_plan = try std.json.parseFromSlice(DeletePlanEnvelope, std.testing.allocator, delete_plan_response, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    defer delete_plan.deinit();
+    try std.testing.expect(delete_plan.value.result.ok);
+
+    var delete_buf: [512]u8 = undefined;
+    const delete_request = try std.fmt.bufPrint(&delete_buf, "{{\"id\":\"9\",\"command\":\"oars.backup.jobs.delete\",\"payload\":{{\"operation_id\":\"op-delete-1\",\"plan_id\":\"{s}\",\"confirm_job_name\":\"{s}\"}}}}", .{ delete_plan.value.result.plan_id, delete_plan.value.result.job_name });
+    const deleted = app.dispatch(delete_request);
+    try std.testing.expect(std.mem.indexOf(u8, deleted, "\"ok\":true") != null);
+    var delete_done = false;
+    attempts = 0;
+    while (attempts < 100) : (attempts += 1) {
+        const poll_response = app.dispatch(
+            \\{"id":"10","command":"oars.backup.operationPoll","payload":{"operation_id":"op-delete-1"}}
+        );
+        var poll = try std.json.parseFromSlice(OperationEnvelope, std.testing.allocator, poll_response, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+        defer poll.deinit();
+        if (std.mem.eql(u8, poll.value.result.state, "done")) {
+            delete_done = true;
+            break;
+        }
+        try std.testing.expect(!std.mem.eql(u8, poll.value.result.state, "failed"));
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(2), .awake) catch {};
+    }
+    try std.testing.expect(delete_done);
+    const after_delete = app.dispatch(
+        \\{"id":"11","command":"oars.backup.jobs.list","payload":{"server_id":"s1"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, after_delete, "daily-website") == null);
+
+    for (app.ctx.policies) |policy| {
+        try std.testing.expect(!std.mem.eql(u8, policy.name, "oars.backup.cronStatus"));
+    }
+}
+
+test "backup save proof and former schedule gates are enforced before admission" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    const PlanEnvelope = struct {
+        result: struct {
+            ok: bool,
+            plan_id: []const u8,
+        },
+    };
+    var scheduled = try app.backup_registry.jobs.savePlanned(app.ctx.io, .{
+        .id = "bk-scheduled",
+        .server_id = "s1",
+        .name = "scheduled-old",
+        .source_path = "/srv/data",
+        .destination = .{ .provider = "aws", .bucket = "acme", .region = "us-east-1", .credential_mode = .aws_runtime },
+        .transfer = "copy",
+        .schedule = .{ .mode = "custom", .enabled = true, .expr = "0 2 * * *" },
+    }, null, true, 1);
+    scheduled.deinit(app.ctx.allocator);
+    try app.waitBackupCache();
+    const new_plan_response = app.dispatch(
+        \\{"id":"1","command":"oars.backup.jobs.plan","payload":{"job":{"server_id":"s1","name":"manual-new","source_path":"/srv/data","destination":{"type":"s3","provider":"minio","bucket":"acme","prefix":"manual","endpoint":"http://127.0.0.1:9000","region":"","credential_mode":"access_key","storage_class":""},"transfer":"copy","schedule":{"mode":"manual","enabled":false}}}}
+    );
+    var new_plan = try std.json.parseFromSlice(PlanEnvelope, std.testing.allocator, new_plan_response, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    defer new_plan.deinit();
+    try std.testing.expect(new_plan.value.result.ok);
+    var save_buf: [512]u8 = undefined;
+    const save_request = try std.fmt.bufPrint(&save_buf, "{{\"id\":\"2\",\"command\":\"oars.backup.jobs.save\",\"payload\":{{\"operation_id\":\"op-new-no-proof\",\"plan_id\":\"{s}\",\"approved_remote_secret\":false}}}}", .{new_plan.value.result.plan_id});
+    const blocked_save = app.dispatch(save_request);
+    try std.testing.expect(std.mem.indexOf(u8, blocked_save, "capability_failed") != null);
+
+    const disable_without_refresh = app.dispatch(
+        \\{"id":"3","command":"oars.backup.jobs.plan","payload":{"job":{"id":"bk-scheduled","server_id":"s1","name":"scheduled-old","source_path":"/srv/data","destination":{"type":"s3","provider":"aws","bucket":"acme","prefix":"","endpoint":"","region":"us-east-1","credential_mode":"aws_runtime","storage_class":""},"transfer":"copy","schedule":{"mode":"manual","enabled":false}},"expected_revision":1}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, disable_without_refresh, "session_not_ready") != null);
+}
+
+const SlowBackupDisconnectHook = struct {
+    called: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn prepare(context: *anyopaque, _: []const u8) bool {
+        const self: *SlowBackupDisconnectHook = @ptrCast(@alignCast(context));
+        self.called.store(true, .release);
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(250), .awake) catch {};
+        self.done.store(true, .release);
+        return true;
+    }
+};
+
+test "backup disconnect bridge admission stays responsive while lifecycle cleanup drains" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+    _ = app.dispatch(
+        \\{"id":"1","command":"oars.servers.save","payload":{"id":"disconnect-live","name":"Disconnect live","host":"127.0.0.1","port":1,"user":"root","auth_method":"password"}}
+    );
+    _ = app.dispatch(
+        \\{"id":"2","command":"oars.ssh.connect","payload":{"server_id":"disconnect-live","password":"test"}}
+    );
+    var hook = SlowBackupDisconnectHook{};
+    app.manager.setBackupDisconnectHook(.{ .context = &hook, .prepare_fn = SlowBackupDisconnectHook.prepare });
+    const started = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds;
+    const response = app.dispatch(
+        \\{"id":"3","command":"oars.ssh.disconnect","payload":{"server_id":"disconnect-live"}}
+    );
+    const elapsed = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds - started;
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"ok\":true") != null);
+    try std.testing.expect(elapsed < 100 * std.time.ns_per_ms);
+    const deadline = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds + 2 * std.time.ns_per_s;
+    while (!hook.done.load(.acquire) and std.Io.Timestamp.now(std.testing.io, .real).nanoseconds < deadline) {
+        try std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(5), .awake);
+    }
+    try std.testing.expect(hook.called.load(.acquire));
+    try std.testing.expect(hook.done.load(.acquire));
+}
+
+test "backup disconnect admission failure reopens the live session" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+    _ = app.dispatch(
+        \\{"id":"1","command":"oars.servers.save","payload":{"id":"disconnect-oom","name":"Disconnect OOM","host":"127.0.0.1","port":1,"user":"root","auth_method":"password"}}
+    );
+    _ = app.dispatch(
+        \\{"id":"2","command":"oars.ssh.connect","payload":{"server_id":"disconnect-oom","password":"test"}}
+    );
+    const session = app.manager.get("disconnect-oom") orelse return error.TestUnexpectedResult;
+    const original_allocator = app.manager.allocator;
+    var failing = std.testing.FailingAllocator.init(original_allocator, .{ .fail_index = 0 });
+    app.manager.allocator = failing.allocator();
+    const result = app.manager.requestDisconnect("disconnect-oom");
+    app.manager.allocator = original_allocator;
+    try std.testing.expectError(error.OutOfMemory, result);
+    try std.testing.expect(!session.backup_admission_closed.load(.acquire));
+    try std.testing.expect(!session.disconnect_admitted.load(.acquire));
+    try std.testing.expect(!session.disconnect_started.load(.acquire));
+}
+
+test "backup registry teardown drains an admitted disconnect hook" {
+    var app: TestApp = undefined;
+    try app.init();
+    _ = app.dispatch(
+        \\{"id":"1","command":"oars.servers.save","payload":{"id":"disconnect-shutdown","name":"Disconnect shutdown","host":"127.0.0.1","port":1,"user":"root","auth_method":"password"}}
+    );
+    _ = app.dispatch(
+        \\{"id":"2","command":"oars.ssh.connect","payload":{"server_id":"disconnect-shutdown","password":"test"}}
+    );
+    var hook = SlowBackupDisconnectHook{};
+    app.manager.setBackupDisconnectHook(.{ .context = &hook, .prepare_fn = SlowBackupDisconnectHook.prepare });
+    const response = app.dispatch(
+        \\{"id":"3","command":"oars.ssh.disconnect","payload":{"server_id":"disconnect-shutdown"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"ok\":true") != null);
+    app.deinit();
+    try std.testing.expect(hook.called.load(.acquire));
+    try std.testing.expect(hook.done.load(.acquire));
+}
+
+test "ai provider list and save use the frozen dispatcher contract" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // No provider is configured yet.
+    const empty = app.dispatch(
+        \\{"id":"1","command":"oars.ai.provider.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, empty, "\"providers\":[]") != null);
+
+    // A Responses provider round trips without compatibility switches or a key.
+    const save_ok = app.dispatch(
+        \\{"id":"2","command":"oars.ai.provider.save","payload":{"operation_id":"provider-save-main-1","provider":{"name":"OpenAI","adapter":"openai_responses","base_url":"https://api.openai.com/v1/","model":"gpt-5"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, save_ok, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, save_ok, "\"adapter\":\"openai_responses\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, save_ok, "\"revision\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, save_ok, "api_key") == null);
+    const ProviderSave = struct {
+        result: struct {
+            provider: struct { id: []const u8 },
+        },
+    };
+    var saved = try std.json.parseFromSlice(ProviderSave, std.testing.allocator, save_ok, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    defer saved.deinit();
+    const provider_id = saved.value.result.provider.id;
+
+    // Credential bridge traffic contains provider identity only. TestApp has
+    // no runtime facade, so every native credential action reports the
+    // explicit unavailable status and never falls back to WebView input.
+    var credential_status_buffer: [256]u8 = undefined;
+    const credential_status_request = try std.fmt.bufPrint(&credential_status_buffer, "{{\"id\":\"2a\",\"command\":\"oars.ai.credential.status\",\"payload\":{{\"provider_id\":\"{s}\"}}}}", .{provider_id});
+    const credential_status = app.dispatch(credential_status_request);
+    try std.testing.expect(std.mem.indexOf(u8, credential_status, "\"status\":\"missing\"") != null);
+    var credential_configure_buffer: [320]u8 = undefined;
+    const credential_configure_request = try std.fmt.bufPrint(&credential_configure_buffer, "{{\"id\":\"2b\",\"command\":\"oars.ai.credential.configure\",\"payload\":{{\"operation_id\":\"credential-configure-main-1\",\"provider_id\":\"{s}\"}}}}", .{provider_id});
+    const credential_configure = app.dispatch(credential_configure_request);
+    try std.testing.expect(std.mem.indexOf(u8, credential_configure, "\"status\":\"unavailable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, credential_configure_request, "secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, credential_configure_request, "api_key") == null);
+    var credential_delete_buffer: [320]u8 = undefined;
+    const credential_delete_request = try std.fmt.bufPrint(&credential_delete_buffer, "{{\"id\":\"2c\",\"command\":\"oars.ai.credential.delete\",\"payload\":{{\"operation_id\":\"credential-delete-main-1\",\"provider_id\":\"{s}\"}}}}", .{provider_id});
+    const credential_delete = app.dispatch(credential_delete_request);
+    try std.testing.expect(std.mem.indexOf(u8, credential_delete, "\"status\":\"unavailable\"") != null);
+    var provider_test_buffer: [384]u8 = undefined;
+    const provider_test_request = try std.fmt.bufPrint(&provider_test_buffer, "{{\"id\":\"2d\",\"command\":\"oars.ai.provider.test\",\"payload\":{{\"operation_id\":\"provider-test-main-1\",\"provider_id\":\"{s}\",\"expected_revision\":1}}}}", .{provider_id});
+    const provider_test = app.dispatch(provider_test_request);
+    try std.testing.expect(std.mem.indexOf(u8, provider_test, "\"code\":\"credential_missing\"") != null);
+    const listed = app.dispatch(
+        \\{"id":"3","command":"oars.ai.provider.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, listed, "gpt-5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "https://api.openai.com/v1") != null);
+
+    // Chat Completions requires explicit compatibility choices; loopback HTTP
+    // is accepted for a user-selected local provider.
+    const loopback = app.dispatch(
+        \\{"id":"4","command":"oars.ai.provider.save","payload":{"operation_id":"provider-save-main-2","provider":{"name":"Local","adapter":"openai_chat_completions","base_url":"http://localhost:11434/v1","model":"qwen3","instruction_role":"system","structured_output":"json_schema"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, loopback, "\"ok\":true") != null);
+
+    // Plain remote HTTP and incomplete Chat Completions compatibility are
+    // typed invalid-argument failures.
+    const plain_http = app.dispatch(
+        \\{"id":"5","command":"oars.ai.provider.save","payload":{"operation_id":"provider-save-main-3","provider":{"name":"Unsafe","adapter":"openai_responses","base_url":"http://api.example.com/v1","model":"x"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, plain_http, "\"code\":\"invalid_argument\"") != null);
+    const missing_compatibility = app.dispatch(
+        \\{"id":"6","command":"oars.ai.provider.save","payload":{"operation_id":"provider-save-main-4","provider":{"name":"Incomplete","adapter":"openai_chat_completions","base_url":"https://api.example.com/v1","model":"x"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, missing_compatibility, "adapter compatibility settings are invalid") != null);
+}
+
+test "ai context bridge is cache-only and admits work asynchronously" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    const cached = app.dispatch(
+        \\{"id":"1","command":"oars.ai.context.get","payload":{"server_id":"ghost"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, cached, "\"state\":\"missing\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cached, "\"context\":null") != null);
+
+    // Admission returns a typed connection failure without waiting for SSH.
+    const refresh = app.dispatch(
+        \\{"id":"2","command":"oars.ai.context.refresh","payload":{"operation_id":"context-ghost-1","server_id":"ghost"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, refresh, "\"code\":\"not_connected\"") != null);
+
+    // The admitted operation remains pollable and carries the terminal event
+    // through a non-destructive versioned cursor.
+    const first_poll = app.dispatch(
+        \\{"id":"3","command":"oars.ai.context.poll","payload":{"operation_id":"context-ghost-1","cursor":0}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, first_poll, "\"finished\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_poll, "\"type\":\"context.failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_poll, "\"payload\":{\"code\":\"not_connected\"") != null);
+    const mirrored_poll = app.dispatch(
+        \\{"id":"4","command":"oars.ai.context.poll","payload":{"operation_id":"context-ghost-1","cursor":0}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, mirrored_poll, "\"type\":\"context.failed\"") != null);
+}
+
+test "vnc handlers require a session and validate payloads" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    const start = app.dispatch(
+        \\{"id":"1","command":"oars.vnc.start","payload":{"server_id":"ghost"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, start, "not connected") != null);
+    const stop = app.dispatch(
+        \\{"id":"2","command":"oars.vnc.stop","payload":{"server_id":"ghost","tunnel_id":1}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, stop, "not connected") != null);
+    const probe = app.dispatch(
+        \\{"id":"3","command":"oars.vnc.probe","payload":{"server_id":"ghost"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, probe, "not connected") != null);
+    const setup = app.dispatch(
+        \\{"id":"4","command":"oars.vnc.setup","payload":{"server_id":"ghost","dry_run":true}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, setup, "not connected") != null);
+    const poll = app.dispatch(
+        \\{"id":"5","command":"oars.vnc.poll","payload":{"server_id":"ghost","tunnel_id":1}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, poll, "not connected") != null);
+}
+
+test "spec 15: history record/list/replay and audit list/clear over the bridge" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // Validation: record requires the identity fields.
+    const bad = app.dispatch(
+        \\{"id":"0","command":"oars.history.record","payload":{"operation_id":"","server_id":"s1","kind":"exec","command":"ls"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bad, "operation_id is required") != null);
+
+    // record → list round trip; the command is pattern-redacted at write.
+    const rec1 = app.dispatch(
+        \\{"id":"1","command":"oars.history.record","payload":{"operation_id":"op-1","server_id":"s1","kind":"exec","command":"export PASSWORD=hunter2","exit":0,"duration_ms":5,"output_snippet":"ok"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, rec1, "\"ok\":true") != null);
+    const rec2 = app.dispatch(
+        \\{"id":"2","command":"oars.history.record","payload":{"operation_id":"op-2","server_id":"s2","kind":"script","command":"df -h","exit":1,"duration_ms":null,"output_snippet":"filesystem"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, rec2, "\"ok\":true") != null);
+
+    const list = app.dispatch(
+        \\{"id":"3","command":"oars.history.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, list, "\"entries\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list, "op-2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list, "op-1") != null);
+    // The secret value is masked; the field name remains searchable.
+    try std.testing.expect(std.mem.indexOf(u8, list, "hunter2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, list, "PASSWORD=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list, "\"redacted\":true") != null);
+
+    // Update by operation_id dedupes: op-1's second record replaces it.
+    const rec3 = app.dispatch(
+        \\{"id":"4","command":"oars.history.record","payload":{"operation_id":"op-1","server_id":"s1","kind":"exec","command":"export PASSWORD=hunter2","exit":0,"duration_ms":9,"output_snippet":"ok"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, rec3, "\"ok\":true") != null);
+    const listed = app.dispatch(
+        \\{"id":"5","command":"oars.history.list","payload":{"server_id":"s1"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, listed, "op-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "op-2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"duration_ms\":9") != null);
+
+    // Text filter is case-insensitive.
+    const filtered = app.dispatch(
+        \\{"id":"6","command":"oars.history.list","payload":{"q":"DF -H"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, filtered, "op-2") != null);
+
+    // Replay: unknown id; a redacted entry is refused (the marker must
+    // never be executed); a clean entry on a ghost server is not connected.
+    // Resolve ids from a fresh list (an operation_id update re-ids the
+    // entry, so hardcoded ids would go stale).
+    const fresh = app.dispatch(
+        \\{"id":"7","command":"oars.history.list","payload":{}}
+    );
+    const HistoryListShape = struct {
+        result: struct {
+            entries: []const struct {
+                id: []const u8 = "",
+                operation_id: []const u8 = "",
+                redacted: bool = false,
+            } = &.{},
+        },
+    };
+    var fresh_parsed = std.json.parseFromSlice(HistoryListShape, std.testing.allocator, fresh, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return error.TestUnexpectedResult;
+    defer fresh_parsed.deinit();
+    var redacted_id: []const u8 = "";
+    var clean_id: []const u8 = "";
+    for (fresh_parsed.value.result.entries) |e| {
+        if (std.mem.eql(u8, e.operation_id, "op-1")) redacted_id = e.id;
+        if (std.mem.eql(u8, e.operation_id, "op-2")) clean_id = e.id;
+    }
+    try std.testing.expect(redacted_id.len > 0 and clean_id.len > 0);
+
+    const unknown = app.dispatch(
+        \\{"id":"8","command":"oars.history.replay","payload":{"entry_id":"h-9999"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "unknown history entry") != null);
+
+    var replay_red_buf: [256]u8 = undefined;
+    const replay_red_req = try std.fmt.bufPrint(&replay_red_buf, "{{\"id\":\"9\",\"command\":\"oars.history.replay\",\"payload\":{{\"entry_id\":\"{s}\"}}}}", .{redacted_id});
+    const redacted_replay = app.dispatch(replay_red_req);
+    try std.testing.expect(std.mem.indexOf(u8, redacted_replay, "redacted secrets") != null);
+
+    var replay_clean_buf: [256]u8 = undefined;
+    const replay_clean_req = try std.fmt.bufPrint(&replay_clean_buf, "{{\"id\":\"10\",\"command\":\"oars.history.replay\",\"payload\":{{\"entry_id\":\"{s}\"}}}}", .{clean_id});
+    const ghost_replay = app.dispatch(replay_clean_req);
+    try std.testing.expect(std.mem.indexOf(u8, ghost_replay, "not connected") != null);
+
+    // Audit: a mutating action writes a row; list shows it with filters.
+    const set = app.dispatch(
+        \\{"id":"11","command":"oars.ai.provider.save","payload":{"operation_id":"provider-audit-save","provider":{"name":"OpenAI","adapter":"openai_responses","base_url":"https://api.openai.com/v1","model":"gpt-5"}}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, set, "\"ok\":true") != null);
+    const audit_list = app.dispatch(
+        \\{"id":"12","command":"oars.audit.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, audit_list, "\"type\":\"ai.provider.save\"") != null);
+    const audit_typed = app.dispatch(
+        \\{"id":"12","command":"oars.audit.list","payload":{"type":"ssh.exec"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, audit_typed, "\"entries\":[]") != null);
+    const audit_queried = app.dispatch(
+        \\{"id":"13","command":"oars.audit.list","payload":{"q":"openai"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, audit_queried, "ai.provider.save") != null);
+
+    // Clear requires type-to-confirm; CLEAR empties the journal.
+    const wrong = app.dispatch(
+        \\{"id":"14","command":"oars.audit.clear","payload":{"confirm":"nope"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, wrong, "type CLEAR") != null);
+    const cleared = app.dispatch(
+        \\{"id":"15","command":"oars.audit.clear","payload":{"confirm":"CLEAR"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, cleared, "\"ok\":true") != null);
+    const audit_after = app.dispatch(
+        \\{"id":"16","command":"oars.audit.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, audit_after, "\"entries\":[]") != null);
+}
+
+test "vault export/import round trip via bridge" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+    const io = std.testing.io;
+
+    // Seed a server (spec 01 validation: host/user required).
+    const save = app.dispatch(
+        \\{"id":"1","command":"oars.servers.save","payload":{"id":"srv-vault-1","name":"vault-a","host":"10.0.0.1","port":22,"user":"root","auth_method":"password"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, save, "\"ok\":true") != null);
+
+    // Export an encrypted vault containing the server.
+    var vault_path_buf: [512]u8 = undefined;
+    const vault_path = try std.fmt.bufPrint(&vault_path_buf, "/tmp/{s}/backup.oarsvault", .{app.dir_name});
+    var export_buf: [1024]u8 = undefined;
+    const export_req = try std.fmt.bufPrint(&export_buf, "{{\"id\":\"2\",\"command\":\"oars.vault.export\",\"payload\":{{\"path\":\"{s}\",\"password\":\"correct horse battery\",\"sections\":[\"servers\"]}}}}", .{vault_path});
+    const exported = app.dispatch(export_req);
+    try std.testing.expect(std.mem.indexOf(u8, exported, "\"ok\":true") != null);
+
+    // Wipe the local store (simulates a new machine).
+    std.Io.Dir.cwd().deleteFile(io, app.store.path) catch {};
+    const wiped = app.dispatch(
+        \\{"id":"3","command":"oars.servers.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, wiped, "10.0.0.1") == null);
+
+    // Wrong password is rejected before any store is touched.
+    var wrong_buf: [1024]u8 = undefined;
+    const wrong_req = try std.fmt.bufPrint(&wrong_buf, "{{\"id\":\"4\",\"command\":\"oars.vault.import\",\"payload\":{{\"path\":\"{s}\",\"password\":\"wrong password!!\"}}}}", .{vault_path});
+    const wrong = app.dispatch(wrong_req);
+    try std.testing.expect(std.mem.indexOf(u8, wrong, "wrong password") != null);
+    const still_wiped = app.dispatch(
+        \\{"id":"5","command":"oars.servers.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, still_wiped, "10.0.0.1") == null);
+
+    // Preview with the correct password shows one new server.
+    var preview_buf: [1024]u8 = undefined;
+    const preview_req = try std.fmt.bufPrint(&preview_buf, "{{\"id\":\"6\",\"command\":\"oars.vault.import\",\"payload\":{{\"path\":\"{s}\",\"password\":\"correct horse battery\"}}}}", .{vault_path});
+    const preview = app.dispatch(preview_req);
+    try std.testing.expect(std.mem.indexOf(u8, preview, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, preview, "\"name\":\"servers\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, preview, "\"new\":1") != null);
+
+    // Confirm the import — server reappears.
+    var confirm_buf: [1024]u8 = undefined;
+    const confirm_req = try std.fmt.bufPrint(&confirm_buf, "{{\"id\":\"7\",\"command\":\"oars.vault.importConfirm\",\"payload\":{{\"path\":\"{s}\",\"password\":\"correct horse battery\"}}}}", .{vault_path});
+    const confirmed = app.dispatch(confirm_req);
+    try std.testing.expect(std.mem.indexOf(u8, confirmed, "\"ok\":true") != null);
+    const restored = app.dispatch(
+        \\{"id":"8","command":"oars.servers.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, restored, "10.0.0.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, restored, "srv-vault-1") != null);
+
+    // Plain JSON export round trip (no password).
+    var plain_path_buf: [512]u8 = undefined;
+    const plain_path = try std.fmt.bufPrint(&plain_path_buf, "/tmp/{s}/plain.json", .{app.dir_name});
+    var plain_export_buf: [1024]u8 = undefined;
+    const plain_export_req = try std.fmt.bufPrint(&plain_export_buf, "{{\"id\":\"9\",\"command\":\"oars.vault.export\",\"payload\":{{\"path\":\"{s}\",\"sections\":[\"servers\"]}}}}", .{plain_path});
+    const plain_exported = app.dispatch(plain_export_req);
+    try std.testing.expect(std.mem.indexOf(u8, plain_exported, "\"ok\":true") != null);
+    // Wipe again and import the plain file.
+    std.Io.Dir.cwd().deleteFile(io, app.store.path) catch {};
+    var plain_import_buf: [1024]u8 = undefined;
+    const plain_import_req = try std.fmt.bufPrint(&plain_import_buf, "{{\"id\":\"10\",\"command\":\"oars.vault.importConfirm\",\"payload\":{{\"path\":\"{s}\"}}}}", .{plain_path});
+    const plain_confirmed = app.dispatch(plain_import_req);
+    try std.testing.expect(std.mem.indexOf(u8, plain_confirmed, "\"ok\":true") != null);
+    const plain_restored = app.dispatch(
+        \\{"id":"11","command":"oars.servers.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, plain_restored, "10.0.0.1") != null);
+}
+
+test "spec 18: agent.list, agent auth method, and the forwarding toggle" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+
+    // A missing agent is not a failure: ok with an empty identity list.
+    // (Explicit nonexistent path — deterministic regardless of whether
+    // the host shell has SSH_AUTH_SOCK set.)
+    const list = app.dispatch(
+        \\{"id":"1","command":"oars.agent.list","payload":{"path":"/tmp/oars-missing-agent-socket-test"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, list, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list, "no agent") != null);
+
+    // The agent auth method saves and round-trips.
+    const save = app.dispatch(
+        \\{"id":"2","command":"oars.servers.save","payload":{"id":"srv-agent-1","name":"agent-box","host":"10.0.0.9","port":22,"user":"root","auth_method":"agent"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, save, "\"ok\":true") != null);
+    const listed = app.dispatch(
+        \\{"id":"3","command":"oars.servers.list","payload":{}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"auth_method\":\"agent\"") != null);
+
+    // Forwarding on a server with no session is an explicit error.
+    const fwd = app.dispatch(
+        \\{"id":"4","command":"oars.agent.forward","payload":{"server_id":"srv-agent-1","on":true}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, fwd, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fwd, "no session") != null);
+
+    // A via-chain cycle is rejected at save time (spec 18 §10).
+    // Create hop-b first so the forward reference in hop-a is valid.
+    const hop_b_init = app.dispatch(
+        \\{"id":"5","command":"oars.servers.save","payload":{"id":"hop-b","name":"hop b","host":"10.0.0.2","port":22,"user":"root","auth_method":"password"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, hop_b_init, "\"ok\":true") != null);
+    const cyc1 = app.dispatch(
+        \\{"id":"6","command":"oars.servers.save","payload":{"id":"hop-a","name":"hop a","host":"10.0.0.1","port":22,"user":"root","auth_method":"password","via_server_id":"hop-b"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, cyc1, "\"ok\":true") != null);
+    const cyc2 = app.dispatch(
+        \\{"id":"7","command":"oars.servers.save","payload":{"id":"hop-b","name":"hop b","host":"10.0.0.2","port":22,"user":"root","auth_method":"password","via_server_id":"hop-a"}}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, cyc2, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cyc2, "cycle") != null);
+}

@@ -1,0 +1,32 @@
+/* Hallmark · shared landing substrate · Oars technical-austere */
+* { box-sizing: border-box; }
+html { overflow-x: clip; scroll-behavior: smooth; background: var(--color-paper); }
+body { min-width: 320px; margin: 0; overflow-x: clip; background: var(--color-paper); color: var(--color-ink); font-family: var(--font-body); font-size: var(--text-base); line-height: 1.6; -webkit-font-smoothing: antialiased; }
+a { color: inherit; text-decoration: none; }
+img, svg { display: block; max-width: 100%; }
+button, input { font: inherit; }
+::selection { background: var(--color-accent); color: var(--color-ink); }
+:focus-visible { outline: var(--rule-bold) solid var(--color-focus); outline-offset: 4px; }
+
+.section-shell { width: min(1180px, calc(100% - clamp(2rem, 7vw, 7rem))); margin-inline: auto; }
+.brand { display: inline-flex; min-width: 0; align-items: center; gap: var(--space-xs); font-weight: 700; letter-spacing: -0.03em; white-space: nowrap; }
+.brand img { width: 28px; height: 28px; border-radius: 7px; }
+.button { display: inline-flex; min-height: 48px; align-items: center; justify-content: center; gap: var(--space-xs); padding: 0 var(--space-lg); border: var(--rule-thin) solid transparent; border-radius: var(--radius-pill); font-size: var(--text-sm); font-weight: 600; line-height: 1; white-space: nowrap; transition: transform var(--dur-fast) var(--ease-out), background-color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out); }
+.button:hover { transform: translateY(-2px); }
+.button:active { transform: translateY(0); }
+.button-primary { background: var(--color-ink); color: var(--color-paper); }
+.button-primary:hover { background: var(--color-ink-soft); }
+.button-secondary { border-color: var(--color-rule); background: var(--color-surface); color: var(--color-ink); }
+.button-secondary:hover { border-color: var(--color-rule-strong); }
+.text-link { display: inline-flex; align-items: center; gap: var(--space-xs); border-bottom: var(--rule-thin) solid currentColor; font-weight: 600; transition: border-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out); }
+.text-link:hover { border-color: var(--color-accent-strong); color: var(--color-accent-strong); }
+
+@media (max-width: 640px) {
+  .section-shell { width: min(100% - 2rem, 1180px); }
+  .button { width: 100%; min-height: 48px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .button, .text-link { transition: none; }
+}

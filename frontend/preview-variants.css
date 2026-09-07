@@ -1,0 +1,149 @@
+/* Preview-only shell concepts. These selectors never load in the shipped app. */
+
+@media (min-width: 901px) {
+  /* Focus rail: global navigation stays available, while fleet switching moves
+     to search and command palette so the active server gets the canvas. */
+  html[data-preview-variant="focus"] .sidebar {
+    width: 184px;
+    flex-basis: 184px;
+  }
+
+  html[data-preview-variant="focus"] .brand { padding-inline: 16px; }
+  html[data-preview-variant="focus"] .workspace-switcher { margin-inline: 10px; }
+  html[data-preview-variant="focus"] .workspace-switcher > div:nth-child(2) span { display: none; }
+  html[data-preview-variant="focus"] .workspace-switcher > svg { display: none; }
+  html[data-preview-variant="focus"] .nav-group { padding-inline: 8px; }
+  html[data-preview-variant="focus"] .nav-item { padding-inline: 10px; }
+  html[data-preview-variant="focus"] .sidebar-fleet { display: none; }
+  html[data-preview-variant="focus"] .connection-card > div,
+  html[data-preview-variant="focus"] .user-row > div:nth-child(2) { display: none; }
+  html[data-preview-variant="focus"] .connection-card,
+  html[data-preview-variant="focus"] .user-row { justify-content: center; }
+  html[data-preview-variant="focus"] .workspace { padding-inline: 40px; }
+  html[data-preview-variant="focus"] .workspace-header { padding-top: 8px; }
+  html[data-preview-variant="focus"] .ws-name { font-size: 27px; }
+  html[data-preview-variant="focus"] .content { padding-top: 24px; }
+
+  /* Fleet rail: the left side becomes a server switcher. Global sections are
+     secondary because the daily job starts with choosing a machine. */
+  html[data-preview-variant="fleet"] .sidebar {
+    width: 294px;
+    flex-basis: 294px;
+  }
+
+  html[data-preview-variant="fleet"] .brand {
+    height: 68px;
+    padding-inline: 18px;
+  }
+
+  html[data-preview-variant="fleet"] .workspace-switcher,
+  html[data-preview-variant="fleet"] .sidebar > nav { display: none; }
+  html[data-preview-variant="fleet"] .sidebar-fleet { padding: 12px 6px; }
+  html[data-preview-variant="fleet"] .sidebar-fleet-head { padding-top: 6px; }
+  html[data-preview-variant="fleet"] .sidebar-fleet-title { color: var(--foreground); font-size: 11px; }
+  html[data-preview-variant="fleet"] .sidebar-fleet-search { height: 36px; margin-bottom: 14px; }
+  html[data-preview-variant="fleet"] .sidebar-fleet-group { margin-bottom: 10px; }
+  html[data-preview-variant="fleet"] .sidebar-fleet-group-toggle { margin-bottom: 5px; }
+  html[data-preview-variant="fleet"] .sidebar-fleet-row { margin-block: 4px; }
+  html[data-preview-variant="fleet"] .sidebar-fleet-open { height: 48px; padding-inline: 9px; }
+  html[data-preview-variant="fleet"] .sidebar-fleet-name { font-size: 13px; }
+  html[data-preview-variant="fleet"] .sidebar-fleet-host { margin-top: 2px; }
+  html[data-preview-variant="fleet"] .topbar { height: 54px; flex-basis: 54px; }
+  html[data-preview-variant="fleet"] .workspace { padding: 28px 34px 42px; }
+  html[data-preview-variant="fleet"] .tabbar { min-height: 42px; }
+
+  /* Operations deck: warm paper-night controls and a vertical contextual tool
+     rail make long server sessions faster to scan. */
+  html[data-preview-variant="ops"] .sidebar {
+    width: 224px;
+    flex-basis: 224px;
+  }
+
+  html[data-preview-variant="ops"] .workspace-switcher { display: none; }
+  html[data-preview-variant="ops"] .sidebar > nav { padding-top: 10px; }
+  html[data-preview-variant="ops"] .sidebar-fleet-search,
+  html[data-preview-variant="ops"] .sidebar-fleet-group-toggle,
+  html[data-preview-variant="ops"] .sidebar-fleet-host,
+  html[data-preview-variant="ops"] .sidebar-fleet-status,
+  html[data-preview-variant="ops"] .sidebar-fleet-add { display: none; }
+  html[data-preview-variant="ops"] .sidebar-fleet-row { margin-inline: 8px; }
+  html[data-preview-variant="ops"] .topbar { height: 54px; flex-basis: 54px; }
+  html[data-preview-variant="ops"] .tabbar { min-height: 40px; padding-block: 5px; }
+  html[data-preview-variant="ops"] .workspace { padding: 24px 28px 34px; }
+  html[data-preview-variant="ops"] .workspace-inner {
+    display: grid;
+    grid-template-columns: 142px minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+    column-gap: 18px;
+  }
+  html[data-preview-variant="ops"] .workspace-header { grid-column: 1 / -1; }
+  html[data-preview-variant="ops"] .subnav {
+    position: sticky;
+    top: 0;
+    grid-column: 1;
+    grid-row: 2;
+    align-self: start;
+    flex-direction: column;
+    align-items: stretch;
+    margin-top: 18px;
+    padding: 6px;
+  }
+  html[data-preview-variant="ops"] .subnav-item { width: 100%; padding: 8px 10px; text-align: left; }
+  html[data-preview-variant="ops"] .content {
+    grid-column: 2;
+    grid-row: 2;
+    padding-top: 18px;
+  }
+}
+
+html[data-preview-variant="ops"] {
+  color-scheme: dark;
+  --background: oklch(0.175 0.012 72) !important;
+  --foreground: oklch(0.92 0.025 88) !important;
+  --card: oklch(0.215 0.015 68) !important;
+  --card-foreground: oklch(0.92 0.025 88) !important;
+  --popover: oklch(0.245 0.017 68) !important;
+  --popover-foreground: oklch(0.92 0.025 88) !important;
+  --primary: oklch(0.75 0.105 78) !important;
+  --primary-foreground: oklch(0.18 0.012 72) !important;
+  --secondary: oklch(0.27 0.014 70) !important;
+  --secondary-foreground: oklch(0.88 0.022 88) !important;
+  --muted: oklch(0.245 0.014 70) !important;
+  --muted-foreground: oklch(0.71 0.022 80) !important;
+  --accent: oklch(0.32 0.042 64) !important;
+  --accent-foreground: oklch(0.92 0.025 88) !important;
+  --border: oklch(0.35 0.018 72) !important;
+  --input: oklch(0.33 0.016 72) !important;
+  --ring: oklch(0.75 0.105 78) !important;
+  --sidebar: oklch(0.14 0.011 72) !important;
+  --sidebar-foreground: oklch(0.92 0.025 88) !important;
+  --sidebar-border: oklch(0.29 0.014 72) !important;
+}
+
+html[data-preview-variant="ops"] .oars-app { background: var(--background) !important; }
+html[data-preview-variant="ops"] .sidebar { background: var(--sidebar) !important; }
+html[data-preview-variant="ops"] .topbar,
+html[data-preview-variant="ops"] .tabbar,
+html[data-preview-variant="ops"] .workspace {
+  border-color: color-mix(in oklch, var(--foreground) 10%, transparent) !important;
+  background: var(--card) !important;
+}
+html[data-preview-variant="ops"] .theme-toggle { display: none; }
+html[data-preview-variant="ops"] .search-box,
+html[data-preview-variant="ops"] .connection-card {
+  border-color: var(--border) !important;
+  background: var(--muted) !important;
+  color: var(--muted-foreground) !important;
+  box-shadow: none !important;
+}
+html[data-preview-variant="ops"] .sidebar-fleet-row.is-active,
+html[data-preview-variant="ops"] .tab.active {
+  border-color: color-mix(in oklch, var(--primary) 24%, var(--border)) !important;
+  background: var(--accent) !important;
+}
+html[data-preview-variant="ops"] .sidebar-fleet-row.is-active .sidebar-fleet-name,
+html[data-preview-variant="ops"] .tab.active { color: var(--foreground) !important; }
+
+@media (max-width: 900px) {
+  html[data-preview-variant] .workspace { padding-inline: 22px; }
+}

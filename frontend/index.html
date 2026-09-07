@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws://127.0.0.1:*; object-src 'none'; base-uri 'none'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f4f1e8" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#332f29" />
+    <title>Oars</title>
+    <script>
+      (function () {
+        try {
+          var settings = JSON.parse(localStorage.getItem("oars.theme") || "{}") || {};
+          var t = settings.theme || localStorage.getItem("oars:theme");
+          if (t !== "light" && t !== "dark") t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+          document.documentElement.dataset.accent = settings.accent || "studio";
+          var html = document.documentElement;
+          var metaLight = document.querySelector('meta[name="theme-color"][media*="light"]');
+          var metaDark = document.querySelector('meta[name="theme-color"][media*="dark"]');
+          function syncMeta(theme) {
+            // Keep PWA / browser chrome in sync with the actual theme, not just media query
+            if (metaLight) metaLight.content = theme === "dark" ? "#332f29" : "#f4f1e8";
+          }
+          if (t === "dark" || t === "light") {
+            html.classList.remove("light", "dark");
+            html.classList.add(t);
+            html.style.colorScheme = t;
+            syncMeta(t);
+          } else {
+            html.classList.add("light");
+            html.style.colorScheme = "light";
+            syncMeta("light");
+          }
+        } catch {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

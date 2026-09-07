@@ -1,0 +1,2142 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Oars UI preview</title>
+    <script>
+      document.documentElement.dataset.previewVariant =
+        new URLSearchParams(window.location.search).get("concept") || "baseline";
+    </script>
+    <link rel="stylesheet" href="/preview-variants.css" />
+    <script>
+      (() => {
+        const now = Date.now();
+        const monitorMode = new URLSearchParams(window.location.search).get("monitor") || "healthy";
+        const logsMode = new URLSearchParams(window.location.search).get("logs") || "default";
+        const vncProbeMode = new URLSearchParams(window.location.search).get("vncProbe") || "ready";
+        const vncSetupMode = new URLSearchParams(window.location.search).get("vncSetup") || "install";
+        const vncDesktopMode = new URLSearchParams(window.location.search).get("vncDesktop") || (vncProbeMode === "ready" ? "running" : "missing");
+        const initialVncSetupState = new URLSearchParams(window.location.search).get("vncSetupState") || "idle";
+        const vncSetupDelay = Math.min(30000, Math.max(0, Number(new URLSearchParams(window.location.search).get("vncSetupDelay")) || 0));
+        const vncPollMode = new URLSearchParams(window.location.search).get("vncPoll") || "listening";
+        const vncCredsMode = new URLSearchParams(window.location.search).get("vncCreds") || "none";
+        const vncTunnelMode = new URLSearchParams(window.location.search).get("vncTunnel") || "ok";
+        const filesMode = new URLSearchParams(window.location.search).get("files") || "default";
+        const scriptsMode = new URLSearchParams(window.location.search).get("scripts") || "populated";
+        const deployMode = new URLSearchParams(window.location.search).get("deploy") || "populated";
+        const accessMode = new URLSearchParams(window.location.search).get("access") || "populated";
+        const keysMode = new URLSearchParams(window.location.search).get("keys") || "populated";
+        // Keep this list byte-for-byte aligned with frontend/src/ai-preview.ts.
+        const AI_PREVIEW_MODES = new Set([
+          "no-server", "no-provider", "credential-missing", "context-disclosure",
+          "provider-test-running", "provider-auth-failed", "assistant-message", "streaming", "question",
+          "refusal", "proposal-safe", "proposal-destructive", "proposal-edited",
+          "execution-running", "cancel-requested", "recovery-required",
+          "summary-disclosure", "long-command",
+        ]);
+        const requestedAiMode = new URLSearchParams(window.location.search).get("ai");
+        const aiMode = requestedAiMode && AI_PREVIEW_MODES.has(requestedAiMode) ? requestedAiMode : null;
+        const backupsMode = (() => {
+          const requested = new URLSearchParams(window.location.search).get("backups") || "populated";
+          const supported = new Set([
+            "populated", "empty", "refreshing", "disconnected", "rclone-missing", "cron-stopped", "partial-import",
+            "editor-aws-key", "editor-aws-iam", "editor-r2", "editor-minio-http-warning",
+            "test-plan", "test-running", "test-cleanup-failed", "schedule-secret-disclosure", "schedule-conflict",
+            "run-copy", "run-sync-confirm", "run-no-changes", "run-failed", "run-cancel-requested", "run-interrupted",
+            "delete-partial-cleanup", "install-plan", "unsupported-target",
+          ]);
+          return supported.has(requested) ? requested : "populated";
+        })();
+        let nextDiagnosticChannel = 900;
+        // Logs fixtures (spec 04): deterministic sources, lines with
+        // repeatable search matches, one very long line, a follow channel
+        // state machine, stale-then-fresh clear, and SFTP transfer
+        // progress. Every call is recorded in `calls` for payload checks.
+        const LOG_BASE = Math.floor(Date.now() / 1000) - 3600;
+        const utf8Encoder = new TextEncoder();
+        const utf8Decoder = new TextDecoder();
+        const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const utf8Length = (value) => utf8Encoder.encode(value).length;
+        const utf8Slice = (value, from) => utf8Decoder.decode(utf8Encoder.encode(value).slice(from));
+        function buildLogLines(count) {
+          const lines = [];
+          for (let i = 0; i < count; i++) {
+            const t = new Date((LOG_BASE - count + i) * 1000).toISOString().replace("T", " ").slice(0, 19);
+            if (i === 42) {
+              lines.push(t + " WARN " + "x".repeat(100000) + " END");
+            } else if (i % 7 === 3) {
+              lines.push(t + " ERROR checkout-error on order " + i + " retrying in 1s");
+            } else {
+              lines.push(t + " INFO request " + i + " handled in " + (i % 40) + "ms");
+            }
+          }
+          return lines;
+        }
+        const LOG_SOURCES = [
+          { path: "/var/log/nginx/access.log", group: "web", name: "Nginx · access", size: 472000, mtime_epoch: LOG_BASE + 15, age_sec: 45, mode: 420, readable: true },
+          { path: "/var/log/nginx/error.log", group: "web", name: "Nginx · error", size: 128000, mtime_epoch: LOG_BASE - 840, age_sec: 900, mode: 420, readable: true },
+          { path: "/var/log/apache2/access.log", group: "web", name: "Apache · access", size: 3100000, mtime_epoch: LOG_BASE - 60, age_sec: 120, mode: 420, readable: true },
+          { path: "/var/log/pm2/app-out.log", group: "runtime", name: "PM2 · app out", size: 86000, mtime_epoch: LOG_BASE + 48, age_sec: 12, mode: 420, readable: true },
+          { path: "/var/log/pm2/app-error.log", group: "runtime", name: "PM2 · app error", size: 2048, mtime_epoch: LOG_BASE - 240, age_sec: 300, mode: 420, readable: true },
+          { path: "/var/log/node/api-stdout.log", group: "runtime", name: "Node · api stdout", size: 500, mtime_epoch: LOG_BASE - 17640, age_sec: 18000, mode: 420, readable: true },
+          { path: "/var/log/syslog", group: "system", name: "syslog", size: 91000000, mtime_epoch: LOG_BASE + 30, age_sec: 30, mode: 384, readable: false },
+          { path: "/var/log/auth.log", group: "system", name: "auth.log", size: 1200000, mtime_epoch: LOG_BASE + 2, age_sec: 58, mode: 384, readable: false },
+          { path: "/var/log/kern.log", group: "system", name: "kern.log", size: 780000, mtime_epoch: LOG_BASE - 540, age_sec: 600, mode: 420, readable: true },
+          { path: "/opt/app/logs/custom-app.log", group: "custom", name: "custom-app.log", size: 999, mtime_epoch: LOG_BASE - 18000, age_sec: 20000, mode: 420, readable: true },
+        ];
+        const logScanState = { sizes: new Map() };
+        function logSources() {
+          return LOG_SOURCES.map((s) => ({ ...s, size: logScanState.sizes.get(s.path) ?? s.size }));
+        }
+        const followState = { channel: 44, emitted: "", polls: 0, closed: false, droppedAt: 5, eofAt: 12 };
+        const clearAttempts = new Map();
+        const dlTransfers = new Map();
+        let dlNextId = 3001;
+        // ── VNC fixtures (spec 12): deterministic probe, start, poll, stop, setup, credentials, disconnected states
+        let vncNextTunnelId = 2001;
+        let vncNextPort = 48181;
+        let vncConfigured = false;
+        let vncDesktopInstalled = vncDesktopMode === "installed" || vncDesktopMode === "incomplete" || vncDesktopMode === "running";
+        let vncDesktopRunning = vncDesktopMode === "running";
+        let vncSetupState = initialVncSetupState;
+        const vncTunnels = new Map(); // tunnel_id -> { port, token, state, bytes_up, bytes_down, error }
+        function vncProbePayload() {
+          const desktop = {
+            desktop_installed: vncDesktopInstalled,
+            window_manager_running: vncDesktopMode === "incomplete" || vncDesktopRunning,
+            desktop_surface_running: vncDesktopRunning,
+            desktop_panel_running: vncDesktopRunning,
+            desktop_running: vncDesktopRunning,
+            desktop_name: vncDesktopInstalled ? "XFCE" : "",
+            setup_state: vncSetupState,
+          };
+          if (vncConfigured) return { ok: true, x11vnc: true, tigervnc: false, ...desktop, listening: [{ port: 5900, process: "x11vnc" }] };
+          if (vncProbeMode === "missing") return { ok: true, x11vnc: false, tigervnc: false, ...desktop, listening: [] };
+          if (vncProbeMode === "partial") return { ok: true, x11vnc: true, tigervnc: false, ...desktop, listening: [{ port: 5901, process: "Xvnc" }] };
+          // ready: x11vnc installed + one listener
+          return { ok: true, x11vnc: true, tigervnc: true, ...desktop, listening: [{ port: 5901, process: "x11vnc" }] };
+        }
+        function vncSetupHint(display, installDesktop) {
+          const port = 5900 + display;
+          const desktop = installDesktop ? "DISPLAY=:" + display + " dbus-run-session -- startxfce4; " : "";
+          return "x11vnc -storepasswd $HOME/.local/share/oars/vnc/display-" + display + ".passwd; " + desktop + "x11vnc -display :" + display + " -rfbport " + port + " -localhost -forever -shared -rfbauth $HOME/.local/share/oars/vnc/display-" + display + ".passwd";
+        }
+        function vncSetupPayload(display, dryRun, password, installDesktop) {
+          const d = display ?? 0;
+          const action = vncSetupMode === "already" || vncConfigured || vncDesktopMode === "incomplete" ? "configure" : "install";
+          const desktopAction = !installDesktop ? "none" : vncDesktopRunning ? "running" : vncDesktopInstalled ? "start" : "install";
+          const desktopName = installDesktop ? "XFCE" : "";
+          const needsVnc = action === "install";
+          const needsDesktop = desktopAction === "install";
+          const installPlan = needsVnc && needsDesktop
+            ? "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y x11vnc xvfb xfce4 dbus-x11 x11-utils"
+            : needsDesktop
+              ? "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 dbus-x11 x11-utils"
+              : needsVnc
+                ? "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y x11vnc xvfb"
+                : "";
+          if (vncSetupMode === "already" && dryRun) return { ok: true, action, plan: installPlan, hint: vncSetupHint(d, installDesktop), desktop_action: desktopAction, desktop_name: desktopName, executed: false };
+          if (vncSetupMode === "manual") return { ok: true, action: "manual", plan: "", hint: "install x11vnc, Xvfb, XFCE, D-Bus, and xprop for this distribution", desktop_action: "manual", desktop_name: desktopName, executed: false };
+          if (vncSetupMode === "fail") {
+            // dry_run preview still returns a plan; installed path would error — emulate as ok:false rejected by handler
+            if (dryRun) return { ok: true, action: "install", plan: installPlan, hint: vncSetupHint(d, installDesktop), desktop_action: desktopAction, desktop_name: desktopName, executed: false };
+            return { ok: false, error: "VNC configuration failed" };
+          }
+          if (dryRun) return { ok: true, action: installPlan ? "install" : action, plan: installPlan, hint: vncSetupHint(d, installDesktop), desktop_action: desktopAction, desktop_name: desktopName, executed: false };
+          if (!password) return { ok: false, error: "enter a VNC password" };
+          vncConfigured = true;
+          if (installDesktop) { vncSetupState = "ready"; vncDesktopInstalled = true; vncDesktopRunning = true; }
+          return { ok: true, action: installPlan ? "install" : action, plan: installPlan, hint: vncSetupHint(d, installDesktop), desktop_action: desktopAction, desktop_name: desktopName, executed: true };
+        }
+
+        const servers = [
+          {
+            id: "prod-api",
+            name: "Production API",
+            host: "api.internal.example",
+            port: 22,
+            user: "deploy",
+            auth_method: "password",
+            key_path: "",
+            key_has_passphrase: false,
+            host_fingerprint: "SHA256:uYNQ7k9gM4xqM+0B8QHxA5z6wEHlDCq3lKl7T0P9f+E",
+            group: "Production/Core",
+            tags: ["api", "critical"],
+            via_server_id: null,
+            created_at: now - 100000,
+            updated_at: now,
+          },
+          {
+            id: "staging-web",
+            name: "Staging Web",
+            host: "10.24.8.17",
+            port: 2222,
+            user: "ubuntu",
+            auth_method: "key",
+            key_path: "~/.ssh/id_ed25519",
+            key_has_passphrase: false,
+            host_fingerprint: null,
+            group: "Staging",
+            tags: ["web"],
+            via_server_id: null,
+            created_at: now - 80000,
+            updated_at: now,
+          },
+          {
+            id: "changed-host",
+            name: "Legacy Database",
+            host: "db-01.internal.example",
+            port: 22,
+            user: "dba",
+            auth_method: "agent",
+            key_path: "",
+            key_has_passphrase: false,
+            host_fingerprint: "SHA256:OLDKEY",
+            group: "Production/Data",
+            tags: ["database"],
+            via_server_id: null,
+            created_at: now - 60000,
+            updated_at: now,
+          },
+        ];
+        if (aiMode === "no-server") servers.splice(0);
+        const calls = [];
+        const polls = new Map();
+        const previewSecrets = new Map();
+        // ── AI Terminal fixtures (spec 11) ───────────────────────────
+        // These values use a fixed clock and the production oars.ai.* wire
+        // contract. Credentials are represented only by status; no key value
+        // exists in this document or crosses the preview bridge.
+        const AI_FIXED_NOW = 1788134400000;
+        const AI_PROVIDER_ID = "aip-0123456789abcdef";
+        const AI_THREAD_ID = "ait-0123456789abcdef";
+        const AI_TURN_ID = "air-0123456789abcdef";
+        const AI_PROPOSAL_ID = "aiprop-0123456789abcdef";
+        const AI_EXECUTION_ID = "aiexec-0123456789abcdef";
+        const AI_EXECUTION_CHANNEL = 901;
+        const AI_CONNECTION_ID = 7001;
+        const AI_CONTEXT_HASH = "c".repeat(64);
+        const AI_COMMAND_HASH = "d".repeat(64);
+        const aiBaseProvider = {
+          id: AI_PROVIDER_ID,
+          name: "Primary OpenAI",
+          adapter: "openai_responses",
+          base_url: "https://api.openai.com/v1",
+          model: "gpt-5.4",
+          instruction_role: null,
+          structured_output: null,
+          revision: 3,
+          tested_at_ms: AI_FIXED_NOW - 60000,
+          test_status: "passed",
+        };
+        let aiProviders = aiMode === "no-provider" ? [] : [{
+          ...aiBaseProvider,
+          ...(aiMode === "provider-test-running" || aiMode === "provider-auth-failed"
+            ? { tested_at_ms: null, test_status: "untested" }
+            : {}),
+        }];
+        let aiCredentialStatus = aiMode === "credential-missing" ? "missing" : "configured";
+        const aiContext = {
+          server_id: "prod-api",
+          os: "Ubuntu 24.04 LTS",
+          hostname: "api.internal.example",
+          monitor: {
+            ts: AI_FIXED_NOW * 1000000,
+            cpu: { utilization_pct: 31.4, cpu_warming: false, load_1: 0.42, load_5: 0.31, load_15: 0.22, uptime_sec: 277200, cores: 4 },
+            mem: { used_bytes: 4509715660, total_bytes: 8375186227, available_bytes: 3328599654, swap_used_bytes: 214748364, swap_total_bytes: 2147483648 },
+            disk: { used_bytes: 16106127360, total_bytes: 31138512896, available_bytes: 15032385536 },
+            processes: [{ pid: 1842, name: "node api.js", cpu: 4.2, mem: 3.1 }],
+            probe_error: null,
+          },
+          active_logs: [
+            { path: "/var/log/nginx/error.log", last_write: AI_FIXED_NOW - 15000 },
+            { path: "/var/log/auth.log", last_write: AI_FIXED_NOW - 45000 },
+          ],
+          partial: false,
+          errors: [],
+          updated_at_ms: AI_FIXED_NOW,
+        };
+        const aiThreadModes = new Set([
+          "assistant-message", "streaming", "question", "refusal", "proposal-safe", "proposal-destructive",
+          "proposal-edited", "execution-running", "cancel-requested", "recovery-required",
+          "summary-disclosure", "long-command",
+        ]);
+        const aiLongCommand = "printf '%s\\n' '" + "x".repeat((64 * 1024) - 32) + "'";
+        let aiTurnPollCount = 0;
+        let aiProviderTestPollCount = 0;
+        let aiExecutionPollCount = 0;
+        let aiManualTurn = false;
+        let aiDeleted = false;
+
+        function aiStateForMode() {
+          if (aiMode === "streaming" || aiMode === "refusal") return aiMode === "streaming" ? "streaming" : "requesting";
+          if (aiMode === "assistant-message" || aiMode === "question" || aiMode === "summary-disclosure") return "completed";
+          if (aiMode === "execution-running") return "executing";
+          if (aiMode === "cancel-requested") return "cancel_requested";
+          if (aiMode === "recovery-required") return "recovery_required";
+          if (aiMode && aiMode.startsWith("proposal-") || aiMode === "long-command") return "awaiting_approval";
+          return "queued";
+        }
+
+        function aiProposalForMode() {
+          if (!(aiMode && (aiMode.startsWith("proposal-") || aiMode === "long-command" || aiMode === "execution-running" || aiMode === "cancel-requested" || aiMode === "summary-disclosure")) && !aiManualTurn) return null;
+          const edited = aiMode === "proposal-edited";
+          const destructive = aiMode === "proposal-destructive";
+          const command = aiMode === "long-command"
+            ? aiLongCommand
+            : destructive
+              ? "rm -rf /var/cache/oars-preview"
+              : edited
+                ? "journalctl --unit api.service --since '30 minutes ago' --no-pager"
+                : "systemctl status api.service --no-pager";
+          return {
+            id: AI_PROPOSAL_ID,
+            turn_id: AI_TURN_ID,
+            revision: edited ? 2 : 1,
+            server_id: "prod-api",
+            provider_id: AI_PROVIDER_ID,
+            provider_revision: 3,
+            context_hash: AI_CONTEXT_HASH,
+            command,
+            command_sha256: AI_COMMAND_HASH,
+            explanation: destructive
+              ? "Remove the selected cache directory and all content below it."
+              : edited
+                ? "Show recent service journal entries without changing the server."
+                : aiMode === "long-command"
+                  ? "Exercise the maximum command display bound without hiding or truncating command bytes."
+                  : "Inspect the service state without changing the server.",
+            model_destructive: destructive,
+            local_destructive: destructive,
+            needs_sudo: false,
+            created_at_ms: AI_FIXED_NOW - 30000,
+            expires_at_ms: AI_FIXED_NOW + 570000,
+            state: aiMode === "summary-disclosure" ? "completed" : aiMode === "execution-running" || aiMode === "cancel-requested" ? "executing" : "awaiting_approval",
+          };
+        }
+
+        function aiThreadSummary() {
+          return {
+            id: AI_THREAD_ID,
+            revision: 2,
+            server_id: "prod-api",
+            provider_id: AI_PROVIDER_ID,
+            model: aiBaseProvider.model,
+            title: "Investigate the API service",
+            state: aiStateForMode(),
+            turn_count: 1,
+            updated_at_ms: AI_FIXED_NOW,
+          };
+        }
+
+        function aiThreadDetail() {
+          const state = aiStateForMode();
+          const hasExecution = aiMode === "execution-running" || aiMode === "cancel-requested" || aiMode === "summary-disclosure";
+          return {
+            ok: true,
+            thread: {
+              id: AI_THREAD_ID,
+              revision: 2,
+              server_id: "prod-api",
+              provider_id: AI_PROVIDER_ID,
+              adapter: "openai_responses",
+              model: aiBaseProvider.model,
+              title: "Investigate the API service",
+              created_at_ms: AI_FIXED_NOW - 120000,
+              updated_at_ms: AI_FIXED_NOW,
+            },
+            turns: [{
+              id: AI_TURN_ID,
+              operation_id: "ai-turn-preview",
+              state,
+              message: "Why is the API service unhealthy?",
+              context_hash: AI_CONTEXT_HASH,
+              provider_revision: 3,
+              connection_id: AI_CONNECTION_ID,
+              execution_id: hasExecution ? AI_EXECUTION_ID : null,
+              channel: hasExecution ? AI_EXECUTION_CHANNEL : null,
+              execution_cursor: hasExecution ? 112 : 0,
+              exit_status: aiMode === "summary-disclosure" ? 0 : null,
+              proposal: aiProposalForMode(),
+              assistant_message: aiMode === "assistant-message"
+                ? "The API service is responding, but its recent restarts and rising memory use suggest a worker leak. I would inspect the service journal before changing anything."
+                : null,
+              question: aiMode === "question" ? "Which deployment introduced the first unhealthy response?" : null,
+              question_explanation: aiMode === "question" ? "The current context has no deployment timestamp." : null,
+            }],
+            turns_start: 0,
+            turn_count: 1,
+            active_proposal: ["awaiting_approval", "approved", "executing"].includes(aiProposalForMode()?.state) ? aiProposalForMode() : null,
+          };
+        }
+
+        function aiEvent(streamId, sequence, type, payload) {
+          return { version: 1, sequence, stream_id: streamId, type, payload };
+        }
+
+        function aiTurnPoll(payload) {
+          aiTurnPollCount += 1;
+          const streamId = String(payload.turn_id || AI_TURN_ID);
+          const cursor = Number(payload.cursor || 0);
+          if (aiMode === "streaming") {
+            const sequence = aiTurnPollCount - 1;
+            const type = sequence === 0 ? "provider.request_started" : sequence === 1 ? "provider.response_created" : "provider.progress";
+            const eventPayload = type === "provider.request_started"
+              ? { client_request_id: "client-preview", provider_id: AI_PROVIDER_ID, provider_revision: 3, state: "requesting" }
+              : type === "provider.response_created"
+                ? { provider_request_id: "resp_preview_001" }
+                : { phase: "Receiving structured response", received_bytes: 1024 + sequence * 256 };
+            return { ok: true, stream_id: streamId, cursor: cursor + 1, dropped: 0, finished: false, state: "streaming", events: [aiEvent(streamId, sequence, type, eventPayload)] };
+          }
+          if (aiMode === "refusal") {
+            return { ok: true, stream_id: streamId, cursor: 1, dropped: 0, finished: true, state: "failed", events: cursor === 0 ? [aiEvent(streamId, 0, "provider.refusal", { state: "failed", reason: "The provider declined to create a command for this request.", finished_at_ms: AI_FIXED_NOW })] : [] };
+          }
+          if (aiMode === "cancel-requested") {
+            return { ok: true, stream_id: streamId, cursor: 1, dropped: 0, finished: false, state: "cancel_requested", events: cursor === 0 ? [aiEvent(streamId, 0, "turn.cancel_requested", { state: "cancel_requested", requested_at_ms: AI_FIXED_NOW - 2000, remote_termination_pending: true })] : [] };
+          }
+          if (aiManualTurn) {
+            const proposal = aiProposalForMode();
+            return { ok: true, stream_id: streamId, cursor: 1, dropped: 0, finished: false, state: "awaiting_approval", events: cursor === 0 && proposal ? [aiEvent(streamId, 0, "proposal.ready", { proposal })] : [] };
+          }
+          return { ok: true, stream_id: streamId, cursor: 1, dropped: 0, finished: true, state: "completed", events: cursor === 0 ? [aiEvent(streamId, 0, "turn.completed", { state: "completed", finished_at_ms: AI_FIXED_NOW })] : [] };
+        }
+
+        function invokeAiFixture(command, payload) {
+          if (command === "oars.ai.provider.list") return { ok: true, providers: aiProviders };
+          if (command === "oars.ai.provider.save") {
+            const input = payload.provider || {};
+            const current = aiProviders.find((item) => item.id === input.id);
+            const provider = {
+              ...aiBaseProvider,
+              ...input,
+              id: input.id || AI_PROVIDER_ID,
+              instruction_role: input.instruction_role ?? null,
+              structured_output: input.structured_output ?? null,
+              revision: current ? current.revision + 1 : 1,
+              tested_at_ms: null,
+              test_status: "untested",
+            };
+            aiProviders = current ? aiProviders.map((item) => item.id === provider.id ? provider : item) : [...aiProviders, provider];
+            return { ok: true, provider };
+          }
+          if (command === "oars.ai.provider.delete") { aiProviders = aiProviders.filter((item) => item.id !== payload.provider_id); return { ok: true }; }
+          if (command === "oars.ai.credential.status") return { ok: true, status: aiCredentialStatus };
+          if (command === "oars.ai.credential.configure") { aiCredentialStatus = "configured"; return { ok: true, status: "configured" }; }
+          if (command === "oars.ai.credential.delete") { aiCredentialStatus = "missing"; return { ok: true, status: "missing" }; }
+          if (command === "oars.ai.provider.test") return { ok: true, operation_id: payload.operation_id, state: "queued" };
+          if (command === "oars.ai.provider.testPoll") {
+            aiProviderTestPollCount += 1;
+            if (aiMode === "provider-auth-failed") return { ok: true, stream_id: payload.operation_id, cursor: 1, dropped: 0, finished: true, state: "failed", events: Number(payload.cursor || 0) === 0 ? [aiEvent(payload.operation_id, 0, "provider.test_failed", { state: "failed", code: "provider_auth", error: "The provider rejected the configured credential." })] : [] };
+            if (aiMode === "provider-test-running") return { ok: true, stream_id: payload.operation_id, cursor: 1, dropped: 0, finished: false, state: "running", events: Number(payload.cursor || 0) === 0 ? [aiEvent(payload.operation_id, 0, "provider.test_started", { state: "running" })] : [] };
+            aiProviders = aiProviders.map((item) => item.id === payload.provider_id ? { ...item, test_status: "passed", tested_at_ms: AI_FIXED_NOW } : item);
+            return { ok: true, stream_id: payload.operation_id, cursor: 1, dropped: 0, finished: true, state: "passed", events: [aiEvent(payload.operation_id, 0, "provider.test_succeeded", { state: "passed", provider_request_id: "resp_preview_test", tested_at_ms: AI_FIXED_NOW })] };
+          }
+          if (command === "oars.ai.provider.testCancel") return { ok: true, state: "cancel_requested" };
+          if (command === "oars.ai.context.get") return { ok: true, state: "ready", context: aiContext, stale: false, updated_at_ms: AI_FIXED_NOW };
+          if (command === "oars.ai.context.refresh") return { ok: true, operation_id: payload.operation_id, state: "queued" };
+          if (command === "oars.ai.context.poll") return { ok: true, stream_id: payload.operation_id, cursor: 1, dropped: 0, finished: true, state: "ready", events: [aiEvent(payload.operation_id, 0, "context.ready", { state: "ready", partial: false, updated_at_ms: AI_FIXED_NOW })] };
+          if (command === "oars.ai.context.cancel") return { ok: true, state: "cancel_requested" };
+          if (command === "oars.ai.thread.list") return { ok: true, threads: !aiDeleted && aiMode && aiThreadModes.has(aiMode) ? [aiThreadSummary()] : [] };
+          if (command === "oars.ai.thread.get") return aiThreadDetail();
+          if (command === "oars.ai.thread.delete") { aiDeleted = true; return { ok: true }; }
+          if (command === "oars.ai.turn.start") { aiManualTurn = true; return { ok: true, thread_id: AI_THREAD_ID, turn_id: AI_TURN_ID, state: "queued" }; }
+          if (command === "oars.ai.turn.poll") return aiTurnPoll(payload);
+          if (command === "oars.ai.turn.cancel") return { ok: true, state: aiMode === "cancel-requested" ? "cancel_requested" : "canceled" };
+          if (command === "oars.ai.turn.summarize") { aiManualTurn = false; return { ok: true, thread_id: AI_THREAD_ID, turn_id: AI_TURN_ID, state: "queued" }; }
+          if (command === "oars.ai.proposal.edit") {
+            const proposal = { ...aiProposalForMode(), command: payload.command, revision: Number(payload.expected_revision) + 1, command_sha256: "e".repeat(64), local_destructive: /(^|[;&|]\s*)rm\s+-rf\b/.test(payload.command) };
+            return { ok: true, proposal };
+          }
+          if (command === "oars.ai.proposal.run") return { ok: true, execution_id: AI_EXECUTION_ID, connection_id: AI_CONNECTION_ID, channel: AI_EXECUTION_CHANNEL, state: "executing" };
+          if (command === "oars.ai.proposal.cancel") return { ok: true, state: "canceled" };
+          return { ok: false, error: "unsupported AI preview command" };
+        }
+        const deployApp = {
+          id: "app-storefront", server_id: "prod-api", name: "Storefront", environment: "production",
+          folder: "/home/deploy/apps/storefront", repo: { url: "git@github.com:acme/storefront.git", transport: "ssh", branch: "main" },
+          runtime: { node_version: "24", type: "next", package_manager: "pnpm", install: "", build: "pnpm build", entry: "node_modules/next/dist/bin/next", args: "start -p 3000", start_command: "", build_folder: ".next" },
+          env_vars: [{ name: "NODE_ENV", secret: false, value: "production", has_value: true }, { name: "DATABASE_URL", secret: true, value: "", has_value: true }],
+          domains: ["storefront.example.com"], ssl: true, email: "ops@example.com", app_port: 3000, revision: 3,
+          created_at_ms: now - 12 * 86400e3, updated_at_ms: now - 45 * 60e3,
+        };
+        let deployApps = deployMode === "empty" ? [] : [{ ...deployApp, repo: { ...deployApp.repo }, runtime: { ...deployApp.runtime }, env_vars: deployApp.env_vars.map((row) => ({ ...row })), domains: [...deployApp.domains] }];
+        let deployPreflightSeq = 40;
+        let deployRunSeq = 90;
+        const deployPreflights = new Map();
+        const deployRuns = new Map();
+        const deployHistory = [{ id: 88, server_id: "prod-api", app_id: "app-storefront", status: "done", action: "update", commit: "52cc437d927a7c9126f22c7fe218ab7dac4c4af0", started_at_ms: now - 45 * 60e3, finished_at_ms: now - 43 * 60e3, steps: [], output: "Deployment completed successfully.\n", truncated: false }];
+        const accessFingerprint = "SHA256:IIiiMx8dWbmaEVhH8Oc9GEt16E2UPRuGtQ3itmbNZxs";
+        const accessNewFingerprint = "SHA256:el3RAdX7MPz8bGotR4kPQ4XBQTl42+OD1WbuC4jrRtg";
+        let accessIdentities = [{ id: "identity-ada", name: "Ada Lovelace", fingerprints: [accessFingerprint], bindings: [{ fingerprint: accessFingerprint, shared: false }], shared: false, created_at_ms: now - 86400e3, revision: 1 }];
+        let accessScanPolls = 0;
+        let accessScanScope = "connected_accounts";
+        let accessJobPolls = 0;
+        // ── SSH key management fixtures (spec 08, async snapshot/job contract) ──
+        const keysSourcePath = "/home/deploy/.ssh/authorized_keys";
+        const keysFileHash = "4f4a43f2c8b1f973b9dd65a7a0c486353449086d0b4b734339cfe2565112f4aa";
+        const keysRoleFingerprint = "SHA256:7cE9mPVmJm7V2HKjp9iY0zBkYi47SuGGq8YVxbDT2pM";
+        const keysDeployFingerprint = "SHA256:3oJb8m0Zr2yXqk0f4u2mJ0Qm0Z1QwHf7oQx6Q1yU0kA";
+        const keysBaseSources = [
+          { path: keysSourcePath, kind: "static", status: "readable", file_sha256: keysFileHash, mode: 0o600, owner: "deploy" },
+        ];
+        const keysBaseKeys = [
+          { source_path: keysSourcePath, line_index: 0, line_hash: "1".repeat(64), parsed: true, options: "", type: "ssh-ed25519", key: "AAAAC3NzaC1lZDI1NTE5AAAAIFleetPreviewAda", comment: "ada@workstation", fingerprint_sha256: accessFingerprint, bits: 256, policy_assessment: { level: "standard", detail: "No key-level restrictions" } },
+          { source_path: keysSourcePath, line_index: 1, line_hash: "2".repeat(64), parsed: true, options: "restrict,command=\"internal-sftp -R\"", type: "ssh-ed25519", key: "AAAAC3NzaC1lZDI1NTE5AAAAIReportsPreview", comment: "reports-automation", fingerprint_sha256: keysRoleFingerprint, bits: 256, policy_assessment: { level: "role_forced", detail: "Forced command with all session features restricted" } },
+        ];
+        let keysJobSeq = 0;
+        const keysJobs = new Map();
+        function keysSnapshotPayload() {
+          const partial = keysMode === "partial";
+          const sources = partial
+            ? [...keysBaseSources, { path: "/usr/libexec/auth-keys-command", kind: "dynamic", status: "transport_error", error: "AuthorizedKeysCommand output cannot be inventoried" }, { path: "/etc/ssh/authorized_keys", kind: "static", status: "denied", error: "Permission denied" }]
+            : keysBaseSources;
+          const keys = keysMode === "empty" ? [] : keysMode === "malformed"
+            ? [keysBaseKeys[0], { source_path: keysSourcePath, line_index: 1, line_hash: "3".repeat(64), parsed: false, raw: "ssh-ed25519 AAAA##truncated", error: "The key blob is not valid base64.", policy_assessment: { level: "weak", detail: "Malformed row: no mutation is allowed" } }]
+            : keysBaseKeys;
+          const roles = keysMode === "empty"
+            ? []
+            : [{ name: "reports", kind: "read_only_sftp", home: "/home/reports", shell: "/bin/bash", policy_state: keysMode === "role-drift" ? "drifted" : "verified", key_fingerprints: [keysRoleFingerprint] }];
+          const deployKeys = keysMode === "deploy-result"
+            ? [{ deploy_key_id: "dk-01ab23cd45ef6789", repository_label: "acme/shopfront", path: "/home/deploy/.ssh/oars_deploy_01ab23cd45ef6789", fingerprint: keysDeployFingerprint, created_at_ms: now - 3600e3 }]
+            : [];
+          return {
+            ok: true,
+            state: partial ? "partial" : "done",
+            server_id: "prod-api",
+            account: { kind: "connected" },
+            scope: partial ? "single_source_fallback" : "effective_policy",
+            created_at_ms: now - 900,
+            finished_at_ms: now,
+            coverage: partial ? "partial" : "complete",
+            capabilities: { privilege: "root", sftp_read_only: true },
+            sources,
+            keys,
+            roles,
+            deploy_keys: deployKeys,
+            warnings: partial ? ["The effective sshd policy could not be evaluated; showing the conventional source only."] : [],
+          };
+        }
+        function keysJobSteps(kind, state) {
+          const names = {
+            add: ["check_source", "write", "verify"],
+            revoke: ["check_source", "write", "verify"],
+            rotate: ["check_source", "stage", "verify_staged", "verify_access", "remove_old", "verify"],
+            roles: ["probe_privilege", "create_account", "install_key", "write_policy", "verify"],
+            deploy: ["read_manifest", "generate", "write_manifest", "verify"],
+            local: ["generate", "verify"],
+          }[kind] || ["work"];
+          return names.map((id, index) => {
+            if (state === "done") return { id, state: "done" };
+            if (state === "waiting") return { id, state: index < 3 ? "done" : index === 3 ? "waiting" : "queued" };
+            if (state === "conflict") return { id, state: index === 0 ? "conflict" : "queued", ...(index === 0 ? { error: "the source changed since the snapshot; refresh and review again" } : {}) };
+            return { id, state: index === 0 ? "done" : index === 1 ? "running" : "queued" };
+          });
+        }
+        function keysJobPayload(job) {
+          job.polls += 1;
+          if (keysMode === "conflict" && (job.kind === "add" || job.kind === "revoke")) {
+            return { ok: true, state: "partial", steps: keysJobSteps(job.kind, "conflict") };
+          }
+          if (job.kind === "rotate" && !job.committed) {
+            if (job.polls < 2) return { ok: true, state: "running", steps: keysJobSteps("rotate", "running") };
+            return { ok: true, state: "waiting_for_verification", steps: keysJobSteps("rotate", "waiting") };
+          }
+          if (job.polls < 2) return { ok: true, state: "running", steps: keysJobSteps(job.kind, "running") };
+          const result = job.kind === "local"
+            ? { public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPreviewGenerated oars-generated", private_path: job.destination || "/tmp/id_ed25519", fingerprint: accessNewFingerprint, keychain_account: "localkey:" + accessNewFingerprint }
+            : job.kind === "deploy"
+              ? { deploy_key_id: "dk-98zx76wv54ut32sr", public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDeployPreview oars-deploy", private_path: "/home/deploy/.ssh/oars_deploy_98zx76wv54ut32sr", fingerprint: keysDeployFingerprint }
+              : job.kind === "rotate"
+                ? { new_fingerprint: accessNewFingerprint }
+                : undefined;
+          return { ok: true, state: "done", steps: keysJobSteps(job.kind, "done"), ...(result ? { result } : {}) };
+        }
+        const accessGrant = { fingerprint: accessFingerprint, server_id: "prod-api", server_name: "Production API", user: "deploy", sudo: "limited", comment: "ada@workstation", line_hash: "line-preview-1", source_path: "/home/deploy/.ssh/authorized_keys", file_sha256: "4f4a43f2c8b1f973b9dd65a7a0c486353449086d0b4b734339cfe2565112f4aa" };
+        function accessPollPayload() {
+          accessScanPolls += 1;
+          const scanning = accessMode === "scanning" && accessScanPolls < 4;
+          const empty = accessMode === "empty";
+          const partial = accessMode === "partial";
+          const server = { server_id: "prod-api", name: "Production API", host: "api.internal.example", phase: scanning ? "read_accounts" : "done", connected_user: "deploy", sudo: "limited", coverage: partial ? "partial" : "complete", coverage_reason: partial ? "AuthorizedKeysCommand is dynamic and cannot be inventoried" : "", error: "", accounts: [{ user: "deploy", home: "/home/deploy", skipped: false, read: true, error: "", sudo: "limited", key_count: empty ? 0 : 1 }], sources: ["authorizedkeysfile .ssh/authorized_keys"] };
+          const rows = empty || scanning ? [] : [{ identity_id: "identity-ada", name: "Ada Lovelace", fingerprints: [accessFingerprint], grants: [accessGrant] }];
+          return { ok: true, scan_id: "scan-preview", state: scanning ? "scanning" : "done", scope: accessScanScope, created_at_ms: now - 1200, ...(scanning ? {} : { finished_at_ms: now }), servers: [server], people_page: { offset: 0, limit: 100, total: rows.length, rows, has_more: false }, unassigned_page: { offset: 0, limit: 100, total: 0, rows: [], has_more: false }, metrics: { people: rows.length, distinct_fingerprints: rows.length, completed_servers: scanning ? 0 : 1, target_servers: 1, observed_grants: rows.length }, coverage: partial ? "partial" : "complete", sync_errors: partial ? [{ server_id: "staging-web", reason: "not connected" }] : [], source_warnings: partial ? [{ server_id: "prod-api", reason: "AuthorizedKeysCommand is dynamic and cannot be inventoried" }] : [] };
+        }
+        // ── Backup fixtures (NEXT-SPEC): fixed wire data and call-count polling ──
+        const BACKUP_FIXTURE_TIME = 1786147200000;
+        const BACKUP_SERVER_ID = "prod-api";
+        const BACKUP_JOB_PLAN_ID = "backup-plan-job-001";
+        const BACKUP_TEST_PLAN_ID = "backup-plan-test-001";
+        const BACKUP_DELETE_PLAN_ID = "backup-plan-delete-001";
+        const BACKUP_INSTALL_PLAN_IDS = {
+          rclone: "backup-plan-install-rclone-001",
+          cron: "backup-plan-install-cron-001",
+          start_cron: "backup-plan-install-start-cron-001",
+        };
+
+        const BACKUP_SENTINEL_OBJECT = "s3://oars-preview-backups/production/documents/.oars-test/00000000-0000-4000-8000-000000000201.sentinel";
+        const BACKUP_STATE_ROOT = "/home/deploy/.local/state/oars/backups/backup-copy-documents";
+        const BACKUP_WRAPPER_PATH = BACKUP_STATE_ROOT + "/run.sh";
+        const BACKUP_META_PATH = BACKUP_STATE_ROOT + "/meta.json";
+        const BACKUP_STAGED_RECORD_PATH = BACKUP_STATE_ROOT + "/runs/run-corrupt-preview.json";
+        const BACKUP_CONFIG_PATH = "/home/deploy/.config/oars/rclone.conf";
+        const cloneBackupFixture = (value) => JSON.parse(JSON.stringify(value));
+        const backupFailure = (code, error, retryable, detail) => ({
+          ok: false,
+          code,
+          error,
+          retryable,
+          ...(detail ? { detail } : {}),
+        });
+        const backupCopyJob = {
+          id: "backup-copy-documents",
+          server_id: BACKUP_SERVER_ID,
+          revision: 3,
+          name: "Nightly documents",
+          source_path: "/home/deploy/documents",
+          destination: {
+            type: "s3",
+            provider: "aws",
+            bucket: "oars-preview-backups",
+            prefix: "production/documents",
+            endpoint: "",
+            region: "us-east-1",
+            credential_mode: "access_key",
+            storage_class: "STANDARD",
+          },
+          transfer: "copy",
+          schedule: { mode: "interval", enabled: true, every: 24, unit: "hours", anchor_epoch_sec: 1786147200 },
+          capability_proof: { id: "backup-proof-copy-001", expires_at_ms: BACKUP_FIXTURE_TIME + 600000, binding_sha256: "0".repeat(64) },
+          created_at_ms: BACKUP_FIXTURE_TIME - 30 * 86400000,
+          updated_at_ms: BACKUP_FIXTURE_TIME - 1800000,
+        };
+        const backupSyncJob = {
+          id: "backup-sync-assets",
+          server_id: BACKUP_SERVER_ID,
+          revision: 5,
+          name: "Assets mirror",
+          source_path: "/srv/assets",
+          destination: {
+            type: "s3",
+            provider: "r2",
+            bucket: "oars-preview-assets",
+            prefix: "mirror",
+            endpoint: "https://r2.preview.invalid",
+            region: "auto",
+            credential_mode: "access_key",
+            storage_class: "",
+          },
+          transfer: "sync",
+          schedule: { mode: "manual", enabled: false },
+          capability_proof: { id: "backup-proof-sync-001", expires_at_ms: BACKUP_FIXTURE_TIME + 600000, binding_sha256: "1".repeat(64) },
+          created_at_ms: BACKUP_FIXTURE_TIME - 20 * 86400000,
+          updated_at_ms: BACKUP_FIXTURE_TIME - 3600000,
+        };
+        const backupEditorModes = new Set(["editor-aws-key", "editor-aws-iam", "editor-r2", "editor-minio-http-warning"]);
+        let backupJobs = backupsMode === "empty" || backupEditorModes.has(backupsMode)
+          ? []
+          : [cloneBackupFixture(backupCopyJob), cloneBackupFixture(backupSyncJob)];
+        const backupRuntime = {
+          rcloneInstalled: backupsMode !== "rclone-missing",
+          cronInstalled: true,
+          cronRunning: backupsMode !== "cron-stopped",
+        };
+        const backupJobPlans = new Map();
+        const backupDeletePlans = new Map();
+        const backupTestPlans = new Map();
+        const backupInstallPlans = new Map();
+        const backupOperations = new Map();
+        const backupRuns = new Map();
+        const backupRunsByOperation = new Map();
+        const backupHistoryLogs = new Map([
+          ["backup-history-copy-success", "Preparing source /home/deploy/documents\nTransferred 48 files (157286400 bytes)\nCleanup complete\n"],
+          ["backup-history-sync-no-changes", "Preparing source /srv/assets\nNo files required transfer\nCleanup complete\n"],
+        ]);
+        const backupHistory = [
+          {
+            run_id: "backup-history-copy-success",
+            server_id: BACKUP_SERVER_ID,
+            job_id: backupCopyJob.id,
+            source: "manual",
+            status: "success",
+            bytes_done: 157286400,
+            bytes_total: 157286400,
+            files_done: 48,
+            files_total: 48,
+            started_at_ms: BACKUP_FIXTURE_TIME - 7200000,
+            finished_at_ms: BACKUP_FIXTURE_TIME - 7080000,
+          },
+          {
+            run_id: "backup-history-sync-no-changes",
+            server_id: BACKUP_SERVER_ID,
+            job_id: backupSyncJob.id,
+            source: "scheduled",
+            status: "no_changes",
+            bytes_done: 0,
+            bytes_total: 0,
+            files_done: 0,
+            files_total: 0,
+            started_at_ms: BACKUP_FIXTURE_TIME - 86400000,
+            finished_at_ms: BACKUP_FIXTURE_TIME - 86370000,
+          },
+        ];
+        function backupStatusPayload() {
+          const warnings = [];
+          if (backupsMode === "partial-import") {
+            warnings.push(`Corrupt staged record remains at ${BACKUP_STAGED_RECORD_PATH}.`);
+            warnings.push(`Staged record ${BACKUP_STATE_ROOT}/runs/run-too-large-preview.json exceeds the import size limit and remains in place.`);
+          }
+          if (backupsMode === "delete-partial-cleanup") warnings.push(`Scheduled wrapper remains at ${BACKUP_WRAPPER_PATH}.`);
+          const unsupported = backupsMode === "unsupported-target";
+          return {
+            observed_at_ms: backupsMode === "disconnected" ? BACKUP_FIXTURE_TIME - 3600000 : BACKUP_FIXTURE_TIME,
+            os: "Linux",
+            arch: unsupported ? "aarch64" : "x86_64",
+            user: "deploy",
+            home: "/home/deploy",
+            timezone: "UTC",
+            rclone_path: backupRuntime.rcloneInstalled ? "/usr/bin/rclone" : "",
+            rclone_version: backupRuntime.rcloneInstalled ? "rclone v1.70.3" : "",
+            crontab_implementation: backupRuntime.cronInstalled ? "crontab" : "missing",
+            cron_installed: backupRuntime.cronInstalled,
+            cron_running: backupRuntime.cronRunning,
+            service_manager: unsupported ? "none" : "systemd",
+            scheduler_supported: backupRuntime.cronInstalled && backupRuntime.rcloneInstalled,
+            process_groups: !unsupported,
+            target: unsupported ? "unknown" : "ubuntu",
+            privilege: unsupported ? "none" : "sudo",
+            warnings,
+          };
+        }
+        function backupRecoveryError() {
+          if (backupsMode !== "partial-import") return undefined;
+          return `Import left a corrupt staged record at ${BACKUP_STAGED_RECORD_PATH} and a too-large staged record at ${BACKUP_STATE_ROOT}/runs/run-too-large-preview.json; both remain available for cleanup.`;
+        }
+        function backupRemoteBlocker(requireProcessGroups = false) {
+          if (backupsMode === "disconnected") return backupFailure("not_connected", "The server is disconnected. Cached backup data remains available.", true);
+          if (!backupRuntime.rcloneInstalled) return backupFailure("rclone_missing", "rclone is not installed on this server.", true, { path: "/usr/bin/rclone" });
+          if (requireProcessGroups && backupsMode === "unsupported-target") return backupFailure("unsupported_target", "This target cannot provide verifiable process-group cancellation.", false, { step: "process_group_probe" });
+          return null;
+        }
+        function backupPlannedJob(payload) {
+          const draft = payload.job || {};
+          const destinationInput = draft.destination || {};
+          const existing = backupJobs.find((job) => job.id === draft.id);
+          const provider = backupsMode === "editor-r2"
+            ? "r2"
+            : backupsMode === "editor-minio-http-warning"
+              ? "minio"
+              : backupsMode === "editor-aws-key" || backupsMode === "editor-aws-iam"
+                ? "aws"
+                : destinationInput.provider || "aws";
+          const credentialMode = backupsMode === "editor-aws-iam" || backupsMode === "schedule-conflict" ? "aws_runtime" : destinationInput.credential_mode || "access_key";
+          const endpoint = backupsMode === "editor-r2"
+            ? "https://r2.preview.invalid"
+            : backupsMode === "editor-minio-http-warning"
+              ? "http://minio.preview.invalid:9000"
+              : typeof destinationInput.endpoint === "string" ? destinationInput.endpoint : "";
+          const region = provider === "r2" ? "auto" : destinationInput.region || "us-east-1";
+          const scheduleInput = draft.schedule || {};
+          const forceScheduled = backupsMode === "schedule-secret-disclosure" || backupsMode === "schedule-conflict";
+          const scheduleMode = forceScheduled ? "interval" : scheduleInput.mode || "manual";
+          let schedule;
+          if (scheduleMode === "interval") {
+            schedule = {
+              mode: "interval",
+              enabled: forceScheduled ? true : scheduleInput.enabled !== false,
+              every: Number(scheduleInput.every) > 0 ? Number(scheduleInput.every) : 24,
+              unit: scheduleInput.unit === "days" ? "days" : "hours",
+              anchor_epoch_sec: Number.isInteger(scheduleInput.anchor_epoch_sec) ? scheduleInput.anchor_epoch_sec : 1786147200,
+            };
+          } else if (scheduleMode === "custom") {
+            schedule = { mode: "custom", enabled: scheduleInput.enabled !== false, expr: scheduleInput.expr || "17 2 * * *" };
+          } else {
+            schedule = { mode: "manual", enabled: false };
+          }
+          const names = {
+            "editor-aws-key": "AWS access-key backup",
+            "editor-aws-iam": "AWS runtime backup",
+            "editor-r2": "R2 documents backup",
+            "editor-minio-http-warning": "MinIO documents backup",
+            "schedule-secret-disclosure": "Scheduled documents backup",
+            "schedule-conflict": "Scheduled documents backup",
+          };
+          return {
+            id: draft.id || "backup-job-planned",
+            server_id: draft.server_id || BACKUP_SERVER_ID,
+            revision: existing ? existing.revision + 1 : 1,
+            name: String(draft.name || names[backupsMode] || "Documents backup"),
+            source_path: String(draft.source_path || "/home/deploy/documents"),
+            destination: {
+              type: "s3",
+              provider,
+              bucket: String(destinationInput.bucket || "oars-preview-backups"),
+              prefix: String(destinationInput.prefix || "production/documents"),
+              endpoint,
+              region,
+              credential_mode: credentialMode,
+              storage_class: provider === "aws" ? String(destinationInput.storage_class || "STANDARD") : "",
+            },
+            transfer: draft.transfer === "sync" ? "sync" : "copy",
+            schedule,
+            created_at_ms: existing ? existing.created_at_ms : BACKUP_FIXTURE_TIME,
+            updated_at_ms: BACKUP_FIXTURE_TIME,
+          };
+        }
+        function backupJobPlanPayload(payload) {
+          const job = backupPlannedJob(payload);
+          const scheduledSecret = job.schedule.enabled && job.destination.credential_mode === "access_key";
+          const warnings = [];
+          if (backupsMode === "editor-minio-http-warning") warnings.push("The MinIO endpoint uses cleartext HTTP. Credentials and backup data would cross the network without TLS.");
+          if (backupsMode === "schedule-secret-disclosure") warnings.push("An unattended schedule requires sending credentials to this server to write a mode 0600 rclone config. Approve this disclosure before Save.");
+          if (backupsMode === "schedule-conflict") warnings.push("The current crontab hash is frozen in this plan. Save stops without merging if the crontab changes.");
+          const effects = ["persist local backup job"];
+          if (job.schedule.enabled) effects.push("write verified remote config/wrapper/metadata", "replace exact Oars crontab block");
+          const schedulePreview = job.schedule.enabled ? {
+            timezone: "UTC",
+            crontab_block: `# oars:backup=${job.id} schema=1\n17 * * * * ${BACKUP_WRAPPER_PATH}\n# oars:end`,
+          } : undefined;
+          const plan = {
+            ok: true,
+            plan_id: BACKUP_JOB_PLAN_ID,
+            expires_at_ms: BACKUP_FIXTURE_TIME + 600000,
+            job,
+            requires_connection_test: !job.capability_proof,
+            requires_remote_secret: scheduledSecret,
+            effects,
+            warnings,
+            ...(schedulePreview ? { schedule_preview: schedulePreview } : {}),
+          };
+          backupJobPlans.set(plan.plan_id, cloneBackupFixture(plan));
+          return plan;
+        }
+        function backupOperationSteps(kind) {
+          return {
+            refresh: ["probe_runtime", "import_staged_records", "verify_cleanup"],
+            test: ["list", "write", "read", "delete", "cleanup_verify"],
+            save: ["write_remote_config", "write_wrapper", "install_schedule", "write_local_job"],
+            delete: ["remove_schedule", "remove_wrapper", "remove_config_section", "remove_local_job"],
+            install: ["verify_target", "install", "verify"],
+            cleanup: ["remove_leftover", "verify_absent"],
+          }[kind] || ["work"];
+        }
+        function startBackupOperation(kind, payload, extra = {}) {
+          const operationId = payload.operation_id;
+          const prior = backupOperations.get(operationId);
+          if (prior) return prior;
+          const operation = {
+            operationId,
+            kind,
+            polls: 0,
+            canceled: false,
+            terminal: false,
+            applied: false,
+            ...extra,
+          };
+          backupOperations.set(operationId, operation);
+          return operation;
+        }
+        function runningBackupOperation(operation) {
+          operation.polls += 1;
+          const longRunning = (operation.kind === "refresh" && backupsMode === "refreshing") || (operation.kind === "test" && backupsMode === "test-running");
+          const terminalAt = longRunning ? 6 : 2;
+          const ids = backupOperationSteps(operation.kind);
+          if (operation.canceled) {
+            operation.terminal = true;
+            return {
+              ok: true,
+              operation_id: operation.operationId,
+              kind: operation.kind,
+              state: "canceled",
+              steps: ids.map((id, index) => ({ id, state: index === 0 ? "canceled" : "skipped" })),
+              started_at_ms: BACKUP_FIXTURE_TIME + 10000,
+              finished_at_ms: BACKUP_FIXTURE_TIME + 20000,
+              error: backupFailure("canceled", "The operation was canceled.", false),
+            };
+          }
+          if (operation.polls < terminalAt) {
+            const queued = operation.polls === 1 && longRunning;
+            const activeIndex = Math.min(Math.max(operation.polls - (longRunning ? 2 : 1), 0), ids.length - 1);
+            return {
+              ok: true,
+              operation_id: operation.operationId,
+              kind: operation.kind,
+              state: queued ? "queued" : "running",
+              steps: ids.map((id, index) => ({ id, state: queued ? "pending" : index < activeIndex ? "done" : index === activeIndex ? "running" : "pending" })),
+              started_at_ms: BACKUP_FIXTURE_TIME + 10000,
+            };
+          }
+          operation.terminal = true;
+          const doneSteps = ids.map((id) => ({ id, state: "done" }));
+          let state = "done";
+          let result;
+          let error;
+          let steps = doneSteps;
+          if (operation.kind === "test") {
+            if (backupsMode === "test-cleanup-failed") {
+              error = backupFailure("cleanup_failed", "The test object could not be removed; Save remains blocked.", true, { step: "cleanup_verify", remote_object: BACKUP_SENTINEL_OBJECT });
+              state = "partial";
+              steps = ids.map((id) => ({ id, state: id === "delete" || id === "cleanup_verify" ? "failed" : "done", ...(id === "cleanup_verify" ? { error } : {}) }));
+              result = {
+                cleanup: "required",
+                retry_action: "operationCancel",
+                needs_credentials: true,
+                job_id: "backup-job-planned",
+              };
+              operation.cleanupRequired = true;
+              operation.cleanupNeedsCredentials = true;
+              operation.cleanupRemoteObject = BACKUP_SENTINEL_OBJECT;
+            } else {
+              result = {
+                checks: { list: "passed", write: "passed", read: "passed", delete: "passed", cleanup_verify: "passed" },
+                capability_proof: { id: "backup-proof-test-001", expires_at_ms: BACKUP_FIXTURE_TIME + 600000, binding_sha256: "2".repeat(64) },
+              };
+            }
+          } else if (operation.kind === "save") {
+            if (backupsMode === "schedule-conflict") {
+              error = backupFailure("conflict", "The crontab changed after planning; no unseen edits were merged.", true, { step: "install_schedule" });
+              state = "partial";
+              steps = ids.map((id) => ({ id, state: id === "install_schedule" ? "conflict" : id === "write_local_job" ? "skipped" : "done", ...(id === "install_schedule" ? { error } : {}) }));
+              result = { cleanup: "required", retry_action: "operationCancel", needs_credentials: false, job_id: operation.job.id };
+              operation.cleanupRequired = true;
+              operation.cleanupNeedsCredentials = false;
+            } else {
+              result = { job_id: operation.job.id };
+            }
+          } else if (operation.kind === "delete") {
+            if (backupsMode === "delete-partial-cleanup") {
+              error = backupFailure("cleanup_failed", "The scheduled wrapper remains and requires cleanup.", true, { step: "remove_wrapper", path: BACKUP_WRAPPER_PATH });
+              state = "partial";
+              steps = ids.map((id) => ({ id, state: id === "remove_wrapper" ? "failed" : id === "remove_local_job" ? "skipped" : "done", ...(id === "remove_wrapper" ? { error } : {}) }));
+              result = { cleanup: "required", retry_action: "operationCancel", needs_credentials: false, job_id: operation.job.id };
+              operation.cleanupRequired = true;
+              operation.cleanupNeedsCredentials = false;
+            } else {
+              result = { job_id: operation.job.id, leftovers: [] };
+            }
+          } else if (operation.kind === "refresh") {
+            const status = backupStatusPayload();
+            result = { status, imported: 0, warnings: status.warnings.length };
+          } else if (operation.kind === "install") {
+            if (operation.plan.manual) {
+              error = backupFailure("unsupported_target", "Automatic installation is unsupported for this unverified target; use the manual plan.", false, { step: "install" });
+              state = "failed";
+              steps = ids.map((id) => ({ id, state: id === "install" ? "failed" : id === "verify" ? "skipped" : "done", ...(id === "install" ? { error } : {}) }));
+            } else {
+              result = { target: operation.plan.target, what: operation.plan.what, partial_effects: false };
+            }
+          } else if (operation.kind === "cleanup") {
+            result = { cleanup: "complete", ...(operation.cleanupRemoteObject ? { remote_object: operation.cleanupRemoteObject } : {}) };
+          }
+          if (!operation.applied && state === "done") {
+            operation.applied = true;
+            if (operation.kind === "save") {
+              const at = backupJobs.findIndex((job) => job.id === operation.job.id);
+              if (at >= 0) backupJobs[at] = cloneBackupFixture(operation.job); else backupJobs.push(cloneBackupFixture(operation.job));
+            }
+            if (operation.kind === "delete") backupJobs = backupJobs.filter((job) => job.id !== operation.job.id);
+            if (operation.kind === "install") {
+              if (operation.plan.what === "rclone") backupRuntime.rcloneInstalled = true;
+              if (operation.plan.what === "cron") backupRuntime.cronInstalled = true;
+              if (operation.plan.what === "start_cron") backupRuntime.cronRunning = true;
+            }
+
+          }
+          return {
+            ok: true,
+            operation_id: operation.operationId,
+            kind: operation.kind,
+            state,
+            steps,
+            started_at_ms: BACKUP_FIXTURE_TIME + 10000,
+            finished_at_ms: BACKUP_FIXTURE_TIME + 20000,
+            ...(result !== undefined ? { result } : {}),
+            ...(error ? { error } : {}),
+          };
+        }
+        function backupRunMode(job) {
+          if (["run-copy", "run-sync-confirm", "run-no-changes", "run-failed", "run-cancel-requested", "run-interrupted"].includes(backupsMode)) return backupsMode;
+          return job.transfer === "sync" ? "run-sync-confirm" : "run-copy";
+        }
+        function backupRunPollPayload(run, payload) {
+          run.polls += 1;
+          if (run.cancelRequested) run.cancelPolls += 1;
+          const mode = run.mode;
+          let status;
+          if (run.terminalStatus) status = run.terminalStatus;
+          else if (run.cancelRequested) status = run.cancelPolls < 4 ? "cancel_requested" : "canceled";
+          else if (mode === "run-no-changes") status = run.polls === 1 ? "queued" : run.polls === 2 ? "running" : "no_changes";
+          else if (mode === "run-failed") status = run.polls === 1 ? "preparing" : run.polls === 2 ? "running" : "failed";
+          else if (mode === "run-interrupted") status = run.polls === 1 ? "queued" : run.polls === 2 ? "running" : "interrupted";
+          else status = run.polls === 1 ? "queued" : run.polls === 2 ? "preparing" : run.polls < 5 ? "running" : "success";
+          const terminal = ["success", "no_changes", "failed", "canceled", "interrupted", "partial"].includes(status);
+          const progress = status === "success" ? 1 : status === "running" ? Math.min(0.75, run.polls * 0.2) : status === "failed" ? 0.34 : status === "canceled" || status === "cancel_requested" ? 0.25 : 0;
+          const noChanges = status === "no_changes";
+          const bytesTotal = noChanges ? 0 : 157286400;
+          const filesTotal = noChanges ? 0 : 48;
+          const bytesDone = Math.floor(bytesTotal * progress);
+          const filesDone = Math.floor(filesTotal * progress);
+          const phase = status === "queued" ? "queued" : status === "preparing" ? "preparing" : status === "cancel_requested" ? "cancel_requested" : terminal ? "finished" : "running";
+          const logParts = ["Preparing source " + run.job.source_path + "\n"];
+          if (run.polls >= 2) logParts.push(`${run.job.transfer === "sync" ? "Sync" : "Copy"} transfer admitted\n`);
+          if (run.polls >= 3) logParts.push(noChanges ? "No files required transfer\n" : `Transferred ${filesDone} of ${filesTotal} files\n`);
+          if (terminal) logParts.push(status === "failed" ? "Transfer stopped after a transport error\n" : status === "interrupted" ? "Connection ended before process termination could be verified\n" : status === "canceled" ? "Process group stopped; cleanup complete\n" : "Cleanup complete\n");
+          const fullLog = logParts.join("");
+          run.lastLog = fullLog;
+          if (terminal) run.terminalStatus = status;
+          const requestedCursor = Math.max(0, Number(payload.log_cursor) || 0);
+          const cursor = Math.min(requestedCursor, fullLog.length);
+          let error;
+          if (status === "failed") error = backupFailure("transport_error", "The remote transfer ended after a transport error.", true, { step: "transfer" });
+          if (status === "interrupted") error = backupFailure("interrupted", "The connection ended before process termination could be verified.", true, { step: "verify_process_group" });
+          return {
+            ok: true,
+            run_id: run.runId,
+            status,
+            phase,
+            bytes_done: bytesDone,
+            bytes_total: bytesTotal,
+            files_done: filesDone,
+            files_total: filesTotal,
+            speed_bps: status === "running" ? 12582912 : 0,
+            eta_sec: status === "running" ? 8 : 0,
+            started_at_ms: BACKUP_FIXTURE_TIME + 30000,
+            ...(terminal ? { finished_at_ms: BACKUP_FIXTURE_TIME + 150000 } : {}),
+            log_cursor: fullLog.length,
+            log_delta: fullLog.slice(cursor),
+            dropped: 0,
+            cleanup_state: terminal ? "complete" : "pending",
+            ...(error ? { error } : {}),
+          };
+        }
+        function backupInstallPlan(what) {
+          const commands = {
+            rclone: "sudo -n /usr/bin/apt-get update && sudo -n /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y rclone",
+            cron: "sudo -n /usr/bin/apt-get update && sudo -n /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y cron",
+            start_cron: "sudo -n /usr/sbin/service cron start",
+          };
+          if (!commands[what]) return null;
+          const manual = backupsMode === "unsupported-target";
+          const plan = {
+            ok: true,
+            plan_id: BACKUP_INSTALL_PLAN_IDS[what],
+            expires_at_ms: BACKUP_FIXTURE_TIME + 300000,
+            target: manual ? "unknown" : "ubuntu",
+            privilege: manual ? "none" : "sudo",
+            commands: manual ? [] : [commands[what]],
+            effects: [manual ? "follow the target installation guide manually" : what],
+            rollback: [],
+            manual,
+          };
+          backupInstallPlans.set(plan.plan_id, { ...cloneBackupFixture(plan), what });
+          return plan;
+        }
+        function invokeBackupFixture(command, payload) {
+          if (command === "oars.backup.jobs.list") {
+            const jobs = payload.server_id === BACKUP_SERVER_ID ? backupJobs : [];
+            const recoveryError = backupRecoveryError();
+            return { ok: true, jobs: cloneBackupFixture(jobs), ...(recoveryError ? { recovery_error: recoveryError } : {}) };
+          }
+          if (command === "oars.backup.status") {
+            if (payload.server_id !== BACKUP_SERVER_ID) return { ok: true, status: null, stale: true };
+            const recoveryError = backupRecoveryError();
+            return { ok: true, status: cloneBackupFixture(backupStatusPayload()), stale: backupsMode === "disconnected", ...(recoveryError ? { recovery_error: recoveryError } : {}) };
+          }
+          if (command === "oars.backup.refresh") {
+            if (!payload.operation_id || !payload.server_id) return backupFailure("invalid_payload", "A server ID and operation ID are required to refresh backups.", false);
+            if (backupsMode === "disconnected") return backupFailure("not_connected", "The server is disconnected. Refresh cannot probe it.", true);
+            const operation = startBackupOperation("refresh", payload, { serverId: payload.server_id || BACKUP_SERVER_ID });
+            return { ok: true, operation_id: operation.operationId };
+          }
+          if (command === "oars.backup.jobs.plan") return backupJobPlanPayload(payload);
+          if (command === "oars.backup.jobs.save") {
+            const plan = backupJobPlans.get(payload.plan_id);
+            if (!plan || !payload.operation_id) return backupFailure("invalid_payload", "A current job plan and operation ID are required.", false);
+            const blocker = backupRemoteBlocker();
+            if (blocker) return blocker;
+            if (plan.requires_remote_secret && payload.approved_remote_secret !== true) return backupFailure("invalid_payload", "Approve the remote-secret disclosure before saving this schedule.", false);
+            if (plan.requires_remote_secret && (!payload.schedule_credentials || !payload.schedule_credentials.access_key || !payload.schedule_credentials.secret_key)) return backupFailure("invalid_credentials", "Both schedule credential fields are required.", false);
+            if (plan.job.transfer === "sync" && plan.job.schedule.enabled && plan.job.schedule.mode !== "manual" && payload.confirm_job_name !== plan.job.name) return backupFailure("invalid_payload", "Scheduled Sync requires the exact reviewed job name.", false);
+            const operation = startBackupOperation("save", payload, { planId: plan.plan_id, job: cloneBackupFixture(plan.job) });
+            return { ok: true, operation_id: operation.operationId, job_id: plan.job.id };
+          }
+          if (command === "oars.backup.jobs.deletePlan") {
+            const job = backupJobs.find((item) => item.id === payload.job_id && item.server_id === payload.server_id);
+            if (!job) return backupFailure("not_found", "Backup job not found for this server.", false);
+            if (payload.expected_revision !== job.revision) return backupFailure("conflict", "The backup job changed; refresh before deleting it.", true);
+            const plan = {
+              ok: true,
+              plan_id: BACKUP_DELETE_PLAN_ID,
+              expires_at_ms: BACKUP_FIXTURE_TIME + 600000,
+              job_name: job.name,
+              effects: ["remove local backup job"],
+              leftovers: job.schedule.enabled ? ["remote schedule artifacts and exact crontab marker are removed transactionally"] : [],
+            };
+            backupDeletePlans.set(plan.plan_id, { ...plan, job: cloneBackupFixture(job) });
+            return cloneBackupFixture(plan);
+          }
+          if (command === "oars.backup.jobs.delete") {
+            const plan = backupDeletePlans.get(payload.plan_id);
+            if (!plan || !payload.operation_id) return backupFailure("invalid_payload", "A current delete plan and operation ID are required.", false);
+            if (payload.confirm_job_name !== plan.job_name) return backupFailure("invalid_payload", "Type the exact backup job name to confirm deletion.", false);
+            if (backupsMode === "disconnected") return backupFailure("not_connected", "The server is disconnected. Remote backup artifacts cannot be removed.", true);
+            const operation = startBackupOperation("delete", payload, { planId: plan.plan_id, job: cloneBackupFixture(plan.job) });
+            return { ok: true, operation_id: operation.operationId };
+          }
+          if (command === "oars.backup.operationPoll") {
+            const operation = backupOperations.get(payload.operation_id);
+            if (!operation) return backupFailure("not_found", "Backup operation not found.", false);
+            return runningBackupOperation(operation);
+          }
+          if (command === "oars.backup.operationCancel") {
+            const operation = backupOperations.get(payload.operation_id);
+            if (!operation) return backupFailure("not_found", "Backup operation not found.", false);
+            if (operation.terminal && operation.cleanupRequired) {
+              if (operation.cleanupNeedsCredentials && (!payload.credentials || !payload.credentials.access_key || !payload.credentials.secret_key)) {
+                return backupFailure("invalid_credentials", "Fresh credentials are required for this access-key cleanup retry.", false);
+              }
+              operation.kind = "cleanup";
+              operation.polls = 0;
+              operation.terminal = false;
+              operation.cleanupRequired = false;
+              operation.canceled = false;
+            } else if (!operation.terminal) operation.canceled = true;
+            return { ok: true };
+          }
+          if (command === "oars.backup.history") {
+            const ownsJob = payload.server_id === BACKUP_SERVER_ID && [backupCopyJob.id, backupSyncJob.id].includes(payload.job_id);
+            if (!ownsJob) return backupFailure("not_found", "Backup history not found for this server and job.", false);
+            const requestedLimit = payload.limit === undefined ? 20 : Number(payload.limit);
+            const limit = Math.min(20, Math.max(0, Number.isFinite(requestedLimit) ? requestedLimit : 20));
+            const runs = backupsMode === "empty" ? [] : backupHistory.filter((run) => run.server_id === payload.server_id && run.job_id === payload.job_id).slice(0, limit);
+            const recoveryError = backupRecoveryError();
+            return { ok: true, runs: cloneBackupFixture(runs), ...(recoveryError ? { recovery_error: recoveryError } : {}) };
+          }
+          if (command === "oars.backup.historyLog") {
+            if (payload.server_id !== BACKUP_SERVER_ID) return backupFailure("not_found", "Backup run log not found for this server.", false);
+            const stored = backupHistoryLogs.get(payload.run_id) || (backupRuns.has(payload.run_id) ? backupRuns.get(payload.run_id).lastLog || "" : null);
+            if (stored === null) return backupFailure("not_found", "Backup run log not found for this server.", false);
+            const from = Math.min(Math.max(0, Number(payload.cursor) || 0), stored.length);
+            const max = Math.min(65536, Math.max(1, Number(payload.max) || 32768));
+            const delta = stored.slice(from, from + max);
+            return { ok: true, cursor: from + delta.length, delta, eof: from + delta.length >= stored.length, dropped: 0 };
+          }
+          if (command === "oars.backup.test.plan") {
+            const jobPlan = backupJobPlans.get(payload.job_plan_id);
+            if (!jobPlan) return backupFailure("plan_expired", "The backup job plan is unknown or expired.", true);
+            const plan = {
+              ok: true,
+              test_plan_id: BACKUP_TEST_PLAN_ID,
+              expires_at_ms: BACKUP_FIXTURE_TIME + 600000,
+              remote_object: BACKUP_SENTINEL_OBJECT,
+              checks: ["list", "write", "read", "delete", "cleanup_verify"],
+              mutates: true,
+            };
+            backupTestPlans.set(plan.test_plan_id, { ...plan, job_plan_id: jobPlan.plan_id });
+            return cloneBackupFixture(plan);
+          }
+          if (command === "oars.backup.test") {
+            if (!payload.operation_id || !backupTestPlans.has(payload.test_plan_id)) return backupFailure("invalid_payload", "A current test plan and operation ID are required.", false);
+            const blocker = backupRemoteBlocker();
+            if (blocker) return blocker;
+            const operation = startBackupOperation("test", payload, { testPlanId: payload.test_plan_id });
+            return { ok: true, operation_id: operation.operationId };
+          }
+          if (command === "oars.backup.run") {
+            if (!payload.operation_id) return backupFailure("invalid_payload", "An operation ID is required to start a backup run.", false);
+            const blocker = backupRemoteBlocker(true);
+            if (blocker) return blocker;
+            const job = backupJobs.find((item) => item.id === payload.job_id && item.server_id === payload.server_id);
+            if (!job) return backupFailure("not_found", "Backup job not found for this server.", false);
+            if (payload.expected_revision !== job.revision) return backupFailure("conflict", "The backup job changed; refresh before running it.", true);
+            if (job.transfer === "sync" && payload.confirm_job_name !== job.name) return backupFailure("invalid_payload", "Type the exact sync job name before running it.", false);
+            const priorRunId = backupRunsByOperation.get(payload.operation_id);
+            if (priorRunId) return { ok: true, run_id: priorRunId };
+            const mode = backupRunMode(job);
+            const runId = {
+              "run-copy": "backup-run-copy-001",
+              "run-sync-confirm": "backup-run-sync-001",
+              "run-no-changes": "backup-run-no-changes-001",
+              "run-failed": "backup-run-failed-001",
+              "run-cancel-requested": "backup-run-cancel-001",
+              "run-interrupted": "backup-run-interrupted-001",
+            }[mode];
+            backupRuns.set(runId, { runId, mode, job: cloneBackupFixture(job), polls: 0, cancelRequested: mode === "run-cancel-requested", cancelPolls: 0, lastLog: "" });
+            backupRunsByOperation.set(payload.operation_id, runId);
+            return { ok: true, run_id: runId };
+          }
+          if (command === "oars.backup.poll") {
+            const run = backupRuns.get(payload.run_id);
+            if (!run) return backupFailure("not_found", "Backup run not found.", false);
+            return backupRunPollPayload(run, payload);
+          }
+          if (command === "oars.backup.cancel") {
+            const run = backupRuns.get(payload.run_id);
+            if (!run) return backupFailure("not_found", "Backup run not found.", false);
+            if (!run.terminalStatus) {
+              run.cancelRequested = true;
+              run.cancelPolls = 0;
+            }
+            return { ok: true };
+          }
+          if (command === "oars.backup.install.plan") {
+            const plan = backupInstallPlan(payload.what);
+            return plan || backupFailure("invalid_payload", "Unknown backup install target.", false);
+          }
+          if (command === "oars.backup.install") {
+            if (!payload.operation_id || !backupInstallPlans.has(payload.plan_id)) return backupFailure("invalid_payload", "A current install plan and operation ID are required.", false);
+            if (backupsMode === "disconnected") return backupFailure("not_connected", "The server is disconnected. Installation cannot start.", true);
+            const plan = backupInstallPlans.get(payload.plan_id);
+            const operation = startBackupOperation("install", payload, { planId: plan.plan_id, plan: cloneBackupFixture(plan) });
+            return { ok: true, operation_id: operation.operationId };
+          }
+          return backupFailure("invalid_payload", `Unsupported backup preview command: ${command}.`, false);
+        }
+        function backupCredentialFixtureJson() {
+          return JSON.stringify({ version: 1, access_key: "OARS_FIXTURE_ACCESS_KEY_NOT_A_SECRET", secret_key: "OARS_FIXTURE_SECRET_KEY_NOT_A_SECRET" });
+        }
+        function redactBackupCallPayload(value, key = "") {
+          if (Array.isArray(value)) return value.map((item) => redactBackupCallPayload(item));
+          if (!value || typeof value !== "object") {
+            if (typeof value === "string" && ["access_key", "secret_key", "secret_access_key", "session_token", "token", "password", "secret", "credentials", "schedule_credentials"].includes(key)) return "<redacted>";
+            return value;
+          }
+          return Object.fromEntries(Object.entries(value).map(([childKey, childValue]) => [childKey, redactBackupCallPayload(childValue, childKey)]));
+        }
+        function recordCall(command, payload) {
+          let recorded = payload;
+          if (command.startsWith("oars.backup.")) recorded = redactBackupCallPayload(payload);
+          if (command === "native-sdk.credentials.set" && payload && "secret" in payload) recorded = { ...payload, secret: "<redacted>" };
+          if (command === "oars.vnc.setup" && payload && "password" in payload) recorded = { ...payload, password: "<redacted>" };
+          if ((command === "oars.sftp.write" || command === "oars.sftp.save") && payload && "base64" in payload) {
+            let byteLength = 0;
+            try { byteLength = atob(payload.base64).length; } catch { /* malformed payload stays length zero */ }
+            recorded = { ...payload, base64: `<file-content:${byteLength}-bytes>` };
+          }
+          // Scripts (spec 06): run-time variable values are secrets in
+          // the call inspector — never record real or fixture values.
+          if ((command === "oars.scripts.run" || command === "oars.scripts.broadcastPrepare") && payload && payload.vars) {
+            recorded = { ...payload, vars: Object.fromEntries(Object.entries(payload.vars).map(([k, v]) => [k, { ...v, value: "***" }])) };
+          }
+          calls.push({ command, payload: recorded, at: command.startsWith("oars.backup.") ? BACKUP_FIXTURE_TIME + calls.length : performance.now() });
+          document.documentElement.dataset.oarsCalls = JSON.stringify(calls);
+        }
+        window.__oarsMock = { calls, servers };
+        // Capture runtime errors for the preview harness (React unmounts
+        // on uncaught render errors; the record survives for inspection).
+        window.__oarsErrors = [];
+        window.addEventListener("error", (e) => {
+          window.__oarsErrors.push(String((e.error && (e.error.stack || e.error.message)) || e.message));
+        });
+        window.addEventListener("unhandledrejection", (e) => {
+          window.__oarsErrors.push("REJECTION: " + String((e.reason && (e.reason.stack || e.reason.message)) || e.reason));
+        });
+        {
+          const origError = console.error.bind(console);
+          console.error = (...args) => {
+            window.__oarsErrors.push(args.map((a) => { try { return typeof a === "string" ? a : (a && (a.stack || a.message)) || String(a); } catch { return String(a); } }).join(" "));
+            origError(...args);
+          };
+        }
+        // ── File manager fixtures (spec 05) ──────────────────────────
+        // A tiny deterministic remote filesystem. Entry names are
+        // `{utf8}|{base64}` exactly like the backend; keys use latin-1
+        // byte strings so non-UTF-8 names round-trip byte-exact.
+        const textEncoder = new TextEncoder();
+        const b64Bytes = (bytes) => { let bin = ""; for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000)); return btoa(bin); };
+        const textContent = (s) => textEncoder.encode(s);
+        const pathKey = (rp) => {
+          if (!rp) return "";
+          if (rp.utf8 !== undefined) return rp.utf8;
+          if (rp.base64 !== undefined) {
+            const bin = atob(rp.base64);
+            let out = "";
+            for (let i = 0; i < bin.length; i++) out += String.fromCharCode(bin.charCodeAt(i));
+            return out;
+          }
+          return "";
+        };
+        const BIN_NAME = "\xff\xfe.bin"; // raw bytes 0xff 0xfe — not valid UTF-8
+        // Fixture names are latin-1 byte strings: charCode & 0xff gives the
+        // exact bytes (TextEncoder would UTF-8-encode code points > 0x7f).
+        const latin1Bytes = (s) => { const b = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i) & 0xff; return b; };
+        function entry(name, kind, size, mtime, extra) {
+          const bytes = latin1Bytes(name);
+          let isUtf8 = true;
+          let display = name;
+          try { display = new TextDecoder("utf-8").decode(bytes); } catch { isUtf8 = false; }
+          try { new TextDecoder("utf-8", { fatal: true }).decode(bytes); } catch { isUtf8 = false; }
+          return {
+            name: isUtf8 ? { utf8: name } : { base64: b64Bytes(bytes) },
+            display,
+            kind,
+            size,
+            mtime,
+            mode: extra?.mode || (kind === "dir" ? "drwxr-xr-x" : "-rw-r--r--"),
+            uid: extra?.uid ?? 0,
+            gid: extra?.gid ?? 0,
+            link_target: extra?.link_target ?? null,
+          };
+        }
+        const CONTENT = {
+          "/etc/hostname": textContent("preview-host\n"),
+          "/etc/nginx/nginx.conf": textContent("server {\n  listen 80;\n}\n"),
+          "/var/www/index.html": textContent("<h1>hello</h1>\n"),
+          "/app.js": textContent("const answer = 42;\n"),
+          "/.env": textContent("SECRET=preview-value\n"),
+          ["/srv/" + BIN_NAME]: new Uint8Array([0xff, 0xfe, 0x00, 0x01, 0x02, 0x7f]),
+        };
+        const FSTREE = {
+          "/": [
+            entry("etc", "dir", 0, now / 1000 - 3600),
+            entry("var", "dir", 0, now / 1000 - 7200),
+            entry("srv", "dir", 0, now / 1000 - 1800),
+            entry("app.js", "file", 15, now / 1000 - 60),
+            entry("release.zip", "file", 2048, now / 1000 - 300),
+            entry(".env", "file", 20, now / 1000 - 90),
+            entry(BIN_NAME, "file", 6, now / 1000 - 120),
+            entry("link-to-etc", "symlink", 0, now / 1000 - 500, { link_target: "/etc" }),
+          ],
+          "/etc": [entry("nginx", "dir", 0, now / 1000 - 3600), entry("hostname", "file", 13, now / 1000 - 600)],
+          "/etc/nginx": [entry("nginx.conf", "file", 28, now / 1000 - 200)],
+          "/var": [entry("www", "dir", 0, now / 1000 - 7200)],
+          "/var/www": [entry("index.html", "file", 15, now / 1000 - 100)],
+          "/srv": [entry(BIN_NAME, "file", 6, now / 1000 - 120)],
+        };
+        const LOCAL_ROOT = "/Users/preview/Documents";
+        const LOCAL_TREE = {
+          [LOCAL_ROOT]: [
+            { name: "Projects", path: LOCAL_ROOT + "/Projects", kind: "dir", size: 0, mtime: now / 1000 - 900 },
+            { name: "release-notes.md", path: LOCAL_ROOT + "/release-notes.md", kind: "file", size: 4280, mtime: now / 1000 - 180 },
+            { name: "brand-assets.zip", path: LOCAL_ROOT + "/brand-assets.zip", kind: "file", size: 1854000, mtime: now / 1000 - 320 },
+          ],
+          [LOCAL_ROOT + "/Projects"]: [
+            { name: "oars-roadmap.txt", path: LOCAL_ROOT + "/Projects/oars-roadmap.txt", kind: "file", size: 8192, mtime: now / 1000 - 60 },
+          ],
+        };
+        function fsResolve(key) {
+          if (key === "/") return null;
+          const parent = key.slice(0, key.lastIndexOf("/")) || "/";
+          const name = key.slice(key.lastIndexOf("/") + 1);
+          const list = FSTREE[parent];
+          if (!list) return null;
+          for (const e of list) {
+            if (pathKey(e.name) === name) {
+              const content = CONTENT[key];
+              if (e.kind === "file" && content) return { entry: e, content };
+              return { entry: e, content: e.kind === "dir" ? new Uint8Array(0) : CONTENT[key] || new Uint8Array(e.size) };
+            }
+          }
+          return null;
+        }
+        const fsState = { conflictArmed: filesMode === "conflict", uploads: new Map() };
+        window.zero = {
+          async invoke(command, payload = {}) {
+            recordCall(command, payload);
+            if (command === "oars.servers.list") return { servers };
+            if (command === "oars.servers.save") {
+              const current = servers.find((server) => server.id === payload.id);
+              const saved = { ...(current || servers[0]), ...payload, id: payload.id || "new-profile", updated_at: Date.now() };
+              if (current) Object.assign(current, saved); else servers.push(saved);
+              return { server: saved };
+            }
+            if (command === "oars.servers.delete") return { ok: true };
+            if (command.startsWith("native-sdk.credentials.")) {
+              const account = String(payload.account || "");
+              const backupAccount = account.startsWith("backup:") || account.startsWith("backup-pending:");
+              if (command.endsWith(".set")) {
+                previewSecrets.set(payload.account, backupAccount ? backupCredentialFixtureJson() : payload.secret);
+                return { ok: true };
+              }
+              if (command.endsWith(".delete")) { previewSecrets.delete(payload.account); return { ok: true }; }
+              if (command.endsWith(".get")) {
+                if (backupAccount) return previewSecrets.get(payload.account) || backupCredentialFixtureJson();
+                if (previewSecrets.has(payload.account)) return previewSecrets.get(payload.account);
+                if (vncCredsMode === "none" && account.startsWith("vnc:")) return null;
+                return "preview-secret";
+              }
+              return { ok: true };
+            }
+            if (command.startsWith("oars.backup.")) return invokeBackupFixture(command, payload);
+            if (command.startsWith("oars.ai.")) return invokeAiFixture(command, payload);
+            if (command === "oars.ssh.connect" || command === "oars.ssh.disconnect" || command === "oars.ssh.resize" || command === "oars.ssh.input" || command === "oars.ssh.trust") return { ok: true };
+            if (command === "oars.ssh.retrust") {
+              const server = servers.find((item) => item.id === payload.server_id);
+              server.host_fingerprint = null;
+              return { server };
+            }
+            if (command === "oars.ssh.poll") {
+              const aiCursor = payload.cursors && payload.cursors.find((item) => item.channel === AI_EXECUTION_CHANNEL);
+              if (aiMode && aiCursor) {
+                aiExecutionPollCount += 1;
+                const output = "$ systemctl status api.service --no-pager\n● api.service - Preview API\n   Active: active (running)\n";
+                const from = Number(aiCursor.cursor || 0);
+                const cursor = utf8Length(output);
+                const eof = aiMode === "summary-disclosure" || (aiMode !== "execution-running" && aiMode !== "cancel-requested" && aiExecutionPollCount >= 2);
+                return {
+                  ok: true,
+                  status: "ready",
+                  connection_id: AI_CONNECTION_ID,
+                  channels: [{
+                    id: AI_EXECUTION_CHANNEL,
+                    kind: "exec",
+                    command: "systemctl status api.service --no-pager",
+                    cursor,
+                    dropped: 0,
+                    pending: 0,
+                    eof,
+                    exit: eof ? 0 : null,
+                    data: utf8Slice(output, from),
+                  }],
+                };
+              }
+              if (aiMode && (!payload.cursors || payload.cursors.length === 0)) {
+                return { ok: true, status: "ready", connection_id: AI_CONNECTION_ID, channels: [] };
+              }
+              // Script run channel (spec 06): deterministic output per
+              // `scripts` mode — cumulative deltas, then EOF + exit.
+              const cur = payload.cursors && payload.cursors[0];
+              if (cur && cur.channel === 77) {
+                recordCall(command, payload);
+                const p = (polls.get("script-run") || 0) + 1;
+                polls.set("script-run", p);
+                const from = cur.cursor || 0;
+                let data = "";
+                let eof = false;
+                let exit = null;
+                let dropped = 0;
+                if (scriptsMode === "run-gap" && p === 2) dropped = 4096;
+                if (scriptsMode === "run-fail") {
+                  if (p === 1) data = "error: boom\n";
+                  if (p >= 2) eof = true;
+                  exit = 2;
+                } else if (scriptsMode === "run-fail-check") {
+                  if (p === 1) data = "bash: line 1: syntax error near unexpected token `fi'\n";
+                  if (p >= 2) eof = true;
+                  exit = 2;
+                } else {
+                  if (p === 1) data = "hello ";
+                  if (p === 2) data = "world\n";
+                  if (p >= 3) eof = true;
+                  exit = 0;
+                }
+                const emitted = "hello world\n";
+                return {
+                  ok: true,
+                  status: "ready",
+                  channels: [{
+                    id: 77,
+                    kind: "exec",
+                    command: "bash -c 'echo hello world'",
+                    cursor: eof ? utf8Length(emitted) : Math.min(from + utf8Length(data), utf8Length(emitted)),
+                    dropped,
+                    pending: 0,
+                    eof,
+                    exit,
+                    data: data.slice(Math.max(0, from - (eof ? utf8Length(emitted) : 0))),
+                  }],
+                };
+              }
+              const count = (polls.get(payload.server_id) || 0) + 1;
+              polls.set(payload.server_id, count);
+              if (payload.server_id === "staging-web") {
+                return { ok: true, status: "needs_trust", trust: { pending: true, algorithm: "Ed25519", fingerprint: "SHA256:zxM8slJ7bI2bSWWi0i7o8eHIKnTe0iT5Qq6Vt8jz6LQ" }, channels: [] };
+              }
+              if (payload.server_id === "changed-host") {
+                return { ok: true, status: "error", error: "host key changed (old: SHA256:OLDKEY, new: SHA256:NEWKEY); connection blocked", channels: [] };
+              }
+              if (count < 20) return { ok: true, status: "connecting", channels: [] };
+              return {
+                ok: true,
+                status: "ready",
+                channels: [
+                  { id: 0, kind: "shell", command: "", cursor: 73, dropped: 0, pending: 0, eof: false, exit: null, data: count === 20 ? "Last login: Fri Aug 7 12:58:04\r\ndeploy@prod-api:~$ " : "" },
+                  { id: 8, kind: "exec", command: "uptime", cursor: 22, dropped: 0, pending: 0, eof: true, exit: 0, data: "EXEC_MUST_NOT_RENDER" },
+                ],
+              };
+            }
+            if (command === "oars.monitor.poll") {
+              const c = (polls.get(payload.server_id + ":mon") || 0) + 1;
+              polls.set(payload.server_id + ":mon", c);
+              if (monitorMode === "not-ready") return { ok: true, status: "not_ready" };
+              if (monitorMode === "sampling") {
+                return { ok: true, ts: 0, cpu: null, mem: null, disk: null, processes: [], probe_error: "no sample yet" };
+              }
+              if (payload.server_id === "changed-host") {
+                return { ok: true, ts: 0, cpu: null, mem: null, disk: null, processes: [], probe_error: "no /proc readable (loadavg empty)" };
+              }
+              const warming = c < 2;
+              const degraded = monitorMode === "degraded";
+              const cpuPct = warming ? null : degraded ? 92.4 : 24 + Math.sin(c / 5) * 8;
+              return {
+                ok: true,
+                ts: Date.now() * 1000000,
+                cpu: { utilization_pct: cpuPct, cpu_warming: warming, load_1: 0.42, load_5: 0.31, load_15: 0.22, uptime_sec: 86400*3 + 3600*5, cores: 4 },
+                mem: degraded
+                  ? { used_bytes: 7.1*1024**3, total_bytes: 7.8*1024**3, available_bytes: 0.7*1024**3, swap_used_bytes: 1.4*1024**3, swap_total_bytes: 2*1024**3 }
+                  : { used_bytes: 4.2*1024**3, total_bytes: 7.8*1024**3, available_bytes: 3.1*1024**3, swap_used_bytes: 0.2*1024**3, swap_total_bytes: 2*1024**3 },
+                disk: degraded
+                  ? { used_bytes: 25.7*1024**3, total_bytes: 29*1024**3, available_bytes: 3.3*1024**3 }
+                  : { used_bytes: 15*1024**3, total_bytes: 29*1024**3, available_bytes: 14*1024**3 },
+                processes: [
+                  { pid: 1842, name: "node", cpu: 4.2, mem: 3.1 },
+                  { pid: 912, name: "postgres", cpu: 2.8, mem: 5.4 },
+                  { pid: 441, name: "nginx", cpu: 0.6, mem: 0.8 },
+                  { pid: 2011, name: "oars", cpu: cpuPct ?? 0.2, mem: 1.2 },
+                ],
+                probe_error: degraded ? "Process details are incomplete because one /proc entry could not be read." : null,
+              };
+            }
+            if (command === "oars.monitor.probe") {
+              polls.set(payload.server_id + ":mon", (polls.get(payload.server_id + ":mon")||0)+1);
+              return { ok: true };
+            }
+            // ── Server key and role fixtures (spec 08) ──────────────
+            if (command === "oars.sshkeys.inspect") {
+              const text = String(payload.public_key || "").trim();
+              if (!text.startsWith("ssh-")) return { ok: false, error: "invalid public key" };
+              return { ok: true, normalized_public_key: text, fingerprint: accessNewFingerprint, key_type: "ssh-ed25519", bits: 256, comment: payload.comment || "preview" };
+            }
+            if (command === "oars.sshkeys.snapshot") {
+              if (keysMode === "disconnected") return { ok: false, error: "not connected" };
+              return { ok: true, snapshot_id: "snap-preview" };
+            }
+            if (command === "oars.sshkeys.snapshotPoll") return keysSnapshotPayload();
+            if (command === "oars.sshkeys.snapshotCancel") return { ok: true };
+            if (command === "oars.sshkeys.add" || command === "oars.sshkeys.revoke" || command === "oars.sshkeys.rotate") {
+              const kind = command.split(".").pop();
+              const jobId = `job-preview-${++keysJobSeq}`;
+              keysJobs.set(jobId, { kind, polls: 0, committed: false });
+              return { ok: true, job_id: jobId, ...(kind === "add" ? { fingerprint: accessNewFingerprint } : {}), ...(kind === "rotate" ? { new_fingerprint: accessNewFingerprint } : {}) };
+            }
+            if (command === "oars.sshkeys.rotateCommit") {
+              const job = keysJobs.get(payload.job_id);
+              if (!job) return { ok: false, error: "the job is not waiting for verification" };
+              if (payload.verification?.kind === "external_confirmation" && payload.verification?.confirm_fingerprint !== accessNewFingerprint) return { ok: false, error: "the typed fingerprint does not match the staged key; both keys remain" };
+              job.committed = true;
+              return { ok: true };
+            }
+            if (command === "oars.sshkeys.jobPoll") {
+              const job = keysJobs.get(payload.job_id);
+              if (!job) return { ok: false, error: "unknown job" };
+              return keysJobPayload(job);
+            }
+            if (command === "oars.sshkeys.jobCancel") return { ok: true };
+            if (command === "oars.sshkeys.localGenerate") {
+              const jobId = `job-preview-${++keysJobSeq}`;
+              keysJobs.set(jobId, { kind: "local", polls: 0, committed: false, destination: payload.destination });
+              return { ok: true, job_id: jobId };
+            }
+            if (command === "oars.sshkeys.roles.plan") {
+              const name = String(payload.name || "role");
+              const action = payload.action || "create";
+              const commands = action === "create" ? [`useradd -m -s /bin/bash -p '' ${name}`] : action === "delete" ? [`userdel ${name}`] : [];
+              const effects = action === "create"
+                ? [`Create the account '${name}' with a home directory; password login stays disabled`, `Record '${name}' in the Oars role policy manifest`]
+                : action === "delete"
+                  ? [`Delete the account '${name}'; the home directory is left on disk`, `Remove '${name}' from the Oars role policy manifest`]
+                  : [`Re-verify the account, home, shell, and key source for '${name}'`, `Rewrite the Oars role policy entry for '${name}'`];
+              return { ok: true, plan_id: `plan-preview-${action}`, expires_at_ms: now + 300000, account: name, home: `/home/${name}`, commands, effects };
+            }
+            if (command === "oars.sshkeys.roles.commit") {
+              const jobId = `job-preview-${++keysJobSeq}`;
+              keysJobs.set(jobId, { kind: "roles", polls: 0, committed: false });
+              return { ok: true, job_id: jobId };
+            }
+            if (command === "oars.sshkeys.deployKeys.generate") {
+              const jobId = `job-preview-${++keysJobSeq}`;
+              keysJobs.set(jobId, { kind: "deploy", polls: 0, committed: false });
+              return { ok: true, job_id: jobId };
+            }
+            if (command === "oars.sshkeys.deployKeys.delete") {
+              if (payload.confirm_fingerprint !== keysDeployFingerprint) return { ok: false, error: "invalid confirmation fingerprint" };
+              const jobId = `job-preview-${++keysJobSeq}`;
+              keysJobs.set(jobId, { kind: "deploy", polls: 0, committed: false });
+              return { ok: true, job_id: jobId };
+            }
+            if (command === "oars.monitor.cleanDiskEstimate" || command === "oars.monitor.cleanDisk" || command === "oars.monitor.dropCaches") {
+              const ch = nextDiagnosticChannel++;
+              if (!window.__oarsMock.diagChannels) window.__oarsMock.diagChannels = new Map();
+              const label = command.includes("cleanDiskEstimate")
+                ? payload.plan === "journal"
+                  ? "Archived and active journals take up 1.2G in the file system.\n"
+                  : "356515840 /var/cache/apt\n"
+                : command.includes("cleanDisk")
+                  ? payload.plan === "journal"
+                    ? "Vacuuming done, freed 1.1G of archived journals.\n"
+                    : "APT package cache cleaned.\n"
+                  : "sync complete; wrote drop_caches level "+payload.level+".\n";
+              window.__oarsMock.diagChannels.set(ch, { label, done: false });
+              return { ok: true, channel: ch };
+            }
+            // ── Fleet access fixtures (spec 09) ────────────────────
+            if (command === "oars.access.identities.list") return { ok: true, identities: accessIdentities };
+            if (command === "oars.access.identities.save") {
+              const input = payload.identity;
+              const existing = accessIdentities.find((item) => item.id === input.id);
+              const bindings = input.bindings || [];
+              const saved = { id: input.id || "identity-preview-" + (accessIdentities.length + 1), name: input.name, fingerprints: bindings.map((item) => item.fingerprint), bindings, shared: bindings.some((item) => item.shared), created_at_ms: existing?.created_at_ms || now, revision: (existing?.revision || 0) + 1 };
+              if (existing) Object.assign(existing, saved); else accessIdentities.push(saved);
+              return { ok: true, identity: saved };
+            }
+            if (command === "oars.access.identities.delete") {
+              accessIdentities = accessIdentities.filter((item) => item.id !== payload.id);
+              return { ok: true };
+            }
+            if (command === "oars.access.key.inspect") return { ok: true, normalized_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBs5Tnge2MIGi6Zcyo04aosYAQ+iwk4hKYUNpIHkyMQt preview", fingerprint: accessNewFingerprint, key_type: "ssh-ed25519", comment: "preview" };
+            if (command === "oars.access.scan") { accessScanPolls = 0; accessScanScope = payload.scope || "connected_accounts"; return { ok: true, scan_id: "scan-preview" }; }
+            if (command === "oars.access.scanCancel") return { ok: true };
+            if (command === "oars.access.poll") return accessPollPayload();
+            if (command === "oars.access.offboard" || command === "oars.access.onboard" || command === "oars.access.rotate") {
+              accessJobPolls = 0;
+              return { ok: true, job_id: "job-preview", ...(command === "oars.access.onboard" ? { fingerprint: accessNewFingerprint } : {}), ...(command === "oars.access.rotate" ? { new_fingerprint: accessNewFingerprint } : {}) };
+            }
+            if (command === "oars.access.jobPoll") {
+              accessJobPolls += 1;
+              const terminal = accessJobPolls > 2;
+              const failed = accessMode === "job-error" && terminal;
+              return { ok: true, state: terminal ? (failed ? "partial" : "done") : "running", results: [{ server_id: "prod-api", user: "deploy", source_path: accessGrant.source_path, state: terminal ? (failed ? "conflict" : "done") : "running", ...(failed ? { error: "authorized_keys changed since the preview; refresh and retry" } : {}) }] };
+            }
+            if (command === "oars.access.jobCancel") return { ok: true };
+            if (command === "oars.access.export") return { ok: true, format: payload.format, path: payload.path, rows: accessMode === "empty" ? 0 : 1, formula_safe: payload.format === "csv" };
+            // ── Deployment fixtures (spec 07) ───────────────────────
+            if (command === "oars.deploy.apps.list") return { ok: true, apps: deployApps.filter((app) => app.server_id === payload.server_id) };
+            if (command === "oars.deploy.apps.save") {
+              const input = payload.app;
+              const prior = deployApps.find((app) => app.id === input.id);
+              const saved = { ...input, id: input.id || "app-preview-" + (deployApps.length + 1), revision: (prior?.revision || 0) + 1, created_at_ms: prior?.created_at_ms || now, updated_at_ms: Date.now(), env_vars: (input.env_vars || []).map((row) => ({ ...row, value: row.secret ? "" : row.value, has_value: row.secret ? (prior?.env_vars.find((old) => old.name === row.name && old.secret)?.has_value || false) : Boolean(row.value) })) };
+              if (prior) Object.assign(prior, saved); else deployApps.push(saved);
+              return { ok: true, app: saved };
+            }
+            if (command === "oars.deploy.apps.secretPresence") {
+              const app = deployApps.find((item) => item.id === payload.app_id);
+              if (!app) return { ok: false, error: "app not found" };
+              app.env_vars = app.env_vars.map((row) => payload.names.includes(row.name) && row.secret ? { ...row, has_value: payload.present } : row);
+              app.revision += 1;
+              return { ok: true, app };
+            }
+            if (command === "oars.deploy.apps.delete") { deployApps = deployApps.filter((app) => !(app.id === payload.app_id && app.server_id === payload.server_id)); return { ok: true }; }
+            if (command === "oars.deploy.history") return { ok: true, runs: deployHistory.filter((run) => run.server_id === payload.server_id && run.app_id === payload.app_id).slice(0, payload.limit || 20) };
+            if (command === "oars.deploy.preflight") {
+              const app = deployApps.find((item) => item.id === payload.app_id && item.server_id === payload.server_id);
+              if (!app) return { ok: false, error: "app not found" };
+              const id = deployPreflightSeq++;
+              const rec = { id, polls: 0, app };
+              deployPreflights.set(id, rec);
+              return { ok: true, preflight: { id, server_id: app.server_id, app_id: app.id, app_revision: app.revision, status: "gathering", action: "update", target_fingerprint: 0, created_at_ms: now, expires_at_ms: now + 600e3, facts: { os: "", arch: "", libc: "", user: "", home: "", privilege: "", repository_commit: "", lockfiles: "" }, blockers: [], warnings: [], approvals: [], configs: { env: "", pm2: "", nginx: "" }, steps: [] } };
+            }
+            if (command === "oars.deploy.preflightPoll") {
+              const rec = deployPreflights.get(payload.preflight_id);
+              if (!rec) return { ok: false, error: "preflight expired or unknown" };
+              rec.polls += 1;
+              const blocked = deployMode === "blocked";
+              const failed = deployMode === "preflight-failed";
+              const gathering = rec.polls < 2;
+              const status = gathering ? "gathering" : failed ? "failed" : blocked ? "blocked" : "ready";
+              const commit = "52cc437d927a7c9126f22c7fe218ab7dac4c4af0";
+              return { ok: true, preflight: {
+                id: rec.id, server_id: rec.app.server_id, app_id: rec.app.id, app_revision: rec.app.revision, status, action: "update", target_fingerprint: 984321,
+                created_at_ms: now, expires_at_ms: now + 600e3, error: failed ? "The Node release metadata probe failed." : undefined,
+                facts: { os: "Ubuntu 24.04 LTS", arch: "x86_64", libc: "glibc", user: "deploy", home: "/home/deploy", privilege: "sudo", repository_commit: commit, lockfiles: "pnpm-lock.yaml" },
+                blockers: blocked ? [{ id: "foreign_nginx", message: "The existing nginx site is not owned by Oars. Remove it or choose another domain." }] : [],
+                warnings: [{ id: "nat_unproven", message: "Public port 80 cannot be proved from inside this server." }],
+                approvals: blocked || failed || gathering ? [] : [{ id: "install_node", label: "Install Node v24.7.0", detail: "Download the official linux-x64 archive and verify its SHA-256 checksum." }],
+                configs: { env: "NODE_ENV=production\nDATABASE_URL=***\n", pm2: "{\n  name: 'oars-app-storefront',\n  interpreter: '/home/deploy/.local/share/oars/node/v24.7.0/bin/node'\n}\n", nginx: "# oars:app=app-storefront schema=1\nserver { listen 80; server_name storefront.example.com; }\n" },
+                steps: gathering ? [] : [
+                  { id: "clone", label: "Update exact commit", mutation: "files", command: "git fetch origin main && git checkout --detach " + commit, skipped: false, files: [], guards: ["the checkout is clean and the remote commit is unchanged"], rollback: "the current checkout remains unchanged on failure" },
+                  { id: "install", label: "Install dependencies", mutation: "files", command: "pnpm install --frozen-lockfile", skipped: false, files: [{ path: "/home/deploy/apps/storefront/.env", mode: 384 }], guards: ["pnpm-lock.yaml is unchanged"], rollback: "the next run reinstalls dependencies" },
+                  { id: "build", label: "Build application", mutation: "files", command: "pnpm build", skipped: false, files: [], guards: [], rollback: "the running process stays unchanged" },
+                  { id: "pm2", label: "Start or reload process", mutation: "process", command: "pm2 startOrReload .oars-pm2.json", skipped: false, files: [{ path: "/home/deploy/apps/storefront/.oars-pm2.json", mode: 384 }], guards: ["no foreign process owns this name"], rollback: "the prior process generation remains active" },
+                  { id: "nginx", label: "Configure nginx", mutation: "service", command: "sudo -n nginx -t && sudo -n systemctl reload nginx", skipped: false, files: [{ path: "/etc/nginx/sites-available/oars-app-storefront", mode: 420 }], guards: ["the existing site is Oars-owned"], rollback: "restore the prior site and reload nginx" },
+                  { id: "certbot", label: "Issue SSL certificate", mutation: "certificate", command: "sudo -n certbot --nginx -d storefront.example.com", skipped: false, files: [], guards: ["DNS answers are unchanged"], rollback: "restore the prior nginx configuration" },
+                ], commit,
+              } };
+            }
+            if (command === "oars.deploy.preflightCancel") { deployPreflights.delete(payload.preflight_id); return { ok: true }; }
+            if (command === "oars.deploy.run") {
+              const rec = deployPreflights.get(payload.preflight_id);
+              if (!rec) return { ok: false, error: "preflight expired or unknown" };
+              deployPreflights.delete(payload.preflight_id);
+              const runId = deployRunSeq++;
+              deployRuns.set(runId, { polls: 0, canceled: false, app: rec.app });
+              return { ok: true, run_id: runId };
+            }
+            if (command === "oars.deploy.cancel") { const run = deployRuns.get(payload.run_id); if (!run) return { ok: false, error: "unknown run" }; run.canceled = true; return { ok: true }; }
+            if (command === "oars.deploy.poll") {
+              const run = deployRuns.get(payload.run_id); if (!run) return { ok: false, error: "unknown run" };
+              run.polls += 1;
+              const canceled = run.canceled && run.polls >= 3;
+              const failure = deployMode === "run-failed" && run.polls >= 3;
+              const done = canceled || failure || run.polls >= 5;
+              const status = canceled ? "canceled" : failure ? "failed" : run.canceled ? "cancel_requested" : done ? "done" : run.polls === 1 ? "queued" : "running";
+              const ids = ["clone", "install", "build", "pm2", "nginx", "certbot"];
+              const labels = ["Update exact commit", "Install dependencies", "Build application", "Start or reload process", "Configure nginx", "Issue SSL certificate"];
+              const active = Math.min(Math.max(run.polls - 1, 0), ids.length - 1);
+              const steps = ids.map((id, index) => ({ id, label: labels[index], state: index < active ? "success" : index === active && !done ? "running" : done && index <= active ? (failure && index === active ? "failed" : canceled && index === active ? "canceled" : "success") : "pending", channel: index <= active ? 700 + index : undefined, exit: failure && index === active ? 1 : done && index <= active ? 0 : undefined, error: failure && index === active ? "command failed" : "", cursor: index <= active ? 38 : 0, gap: 0, eof: done || index < active, data: index === active && !done ? labels[index] + "…\n" : "" }));
+              if (done && !run.recorded) { run.recorded = true; deployHistory.unshift({ id: payload.run_id, server_id: run.app.server_id, app_id: run.app.id, status, action: "update", commit: "52cc437d927a7c9126f22c7fe218ab7dac4c4af0", started_at_ms: now, finished_at_ms: Date.now(), steps: [], output: failure ? "build failed\n" : "deployment complete\n", truncated: false }); }
+              return { ok: true, run_id: payload.run_id, status, canceled, steps, done };
+            }
+            // ── Scripts (spec 06) fixtures ───────────────────────────
+            const scriptFixtures = [
+              { id: "sc-tail", name: "Tail error logs", description: "Follow the error log of a service", tags: ["logs", "diagnostics"], color: "#3f6d7a", body: "sudo tail -f /var/log/{{service}}/error.log", variables: [{ name: "service", label: "Service", secret_default: false }], created_at: now, updated_at: now, run_count: 12, last_run_at: now - 3600e3 },
+              { id: "sc-cleanup", name: "Disk cleanup", description: "Vacuum journals and clear the APT cache", tags: ["destructive", "maintenance"], color: "#d97757", body: "journalctl --vacuum-size={{size}}; apt-get clean", variables: [{ name: "size", label: "Keep under (MB)", secret_default: false }], created_at: now - 86400e3, updated_at: now - 3600e3, run_count: 3, last_run_at: now - 86400e3 },
+              { id: "sc-hello", name: "Hello fleet", description: "Announce across the fleet", tags: [], color: "", body: "echo hello from {{who}}", variables: [{ name: "who", label: "Who", secret_default: false }], created_at: now - 172800e3, updated_at: now - 172800e3, run_count: 0, last_run_at: null },
+              { id: "sc-deploy-check", name: "Deploy health check", description: "Check the storefront is serving", tags: ["deploy"], color: "#5d7a52", body: "curl -fsS https://storefront.dev/health && echo OK", variables: [], created_at: now - 300000e3, updated_at: now - 700e3, run_count: 27, last_run_at: now - 700e3 },
+            ];
+            let scriptStore = scriptsMode === "empty" ? [] : scriptsMode === "recovery" ? [] : scriptFixtures.map((s) => ({ ...s, variables: s.variables.map((v) => ({ ...v })) }));
+            const scriptPreviews = new Map();
+            const broadcastRuns = new Map();
+            let scriptPreviewSeq = 1;
+            let scriptRunSeq = 1;
+            const expandFixture = (script, vars, redact = false) => (script.body || "").replace(/\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}/g, (_, name) => {
+              const value = vars && vars[name];
+              const definition = (script.variables || []).find((variable) => variable.name === name);
+              if (redact && (value?.secret || definition?.secret_default)) return "***";
+              return value?.value ?? `{{${name}}}`;
+            });
+            const previewCommand = (script, vars, redact = false) => `bash -c '${expandFixture(script, vars, redact)}'`;
+            const makeBroadcast = (script, serverIds) => {
+              const runId = scriptRunSeq++;
+              const servers = serverIds.map((id) => ({ server_id: id, status: "queued", exit: null, error: "", emitted: "", cursor: 0 }));
+              const run = { runId, scriptName: script.name, servers, canceled: false, done: false, polls: 0 };
+              broadcastRuns.set(runId, run);
+              return runId;
+            };
+            const broadcastRows = (run) => run.servers.map((s) => ({
+              server_id: s.server_id,
+              status: s.status,
+              exit: s.exit,
+              error: s.error,
+              cursor: s.cursor,
+              gap: 0,
+              eof: s.status === "done" || s.status === "failed" || s.status === "canceled" || s.status === "skipped",
+              data: s.status === "done" || s.status === "failed" ? s.emitted : "",
+            }));
+            if (command === "oars.scripts.list") {
+              return { ok: true, scripts: scriptStore, ...(scriptsMode === "recovery" ? { recovery_error: "scripts.json was unreadable and was moved to scripts.json.corrupt-1234; the script library starts fresh" } : {}) };
+            }
+            if (command === "oars.scripts.validate") {
+              const body = String(payload?.body || "");
+              if (/(["'`]|\$\(|\$\{)[^\n]*\{\{/.test(body) || /^\s*\{\{/.test(body)) {
+                return { ok: false, error: "a placeholder appears in an ambiguous shell context (quotes, redirection, assignment, or command name)" };
+              }
+              return { ok: true };
+            }
+            if (command === "oars.scripts.save") {
+              const input = payload.script;
+              const existing = scriptStore.find((s) => s.id === input.id);
+              const saved = {
+                id: input.id || "sc-new",
+                name: input.name,
+                description: input.description || "",
+                tags: input.tags || [],
+                color: input.color || "",
+                body: input.body,
+                variables: input.variables || [],
+                created_at: existing ? existing.created_at : now,
+                updated_at: now,
+                run_count: existing ? existing.run_count : 0,
+                last_run_at: existing ? existing.last_run_at : null,
+              };
+              if (existing) Object.assign(existing, saved);
+              else scriptStore.push(saved);
+              return { ok: true, script: saved };
+            }
+            if (command === "oars.scripts.delete") {
+              scriptStore = scriptStore.filter((s) => s.id !== payload.id);
+              return { ok: true };
+            }
+            if (command === "oars.scripts.run") {
+              const script = scriptStore.find((s) => s.id === payload.script_id);
+              if (!script) return { ok: false, error: "script not found" };
+              if (scriptsMode === "run-fail-check") return { ok: false, error: "syntax check failed (exit 2): bash: line 1: syntax error" };
+              return { ok: true, channel: 77 };
+            }
+            if (command === "oars.scripts.broadcastPrepare") {
+              const script = scriptStore.find((s) => s.id === payload.script_id);
+              if (!script) return { ok: false, error: "script not found" };
+              const ids = [...new Set(payload.server_ids || [])];
+              if (ids.length === 0) return { ok: false, error: "no servers selected" };
+              const destructive = (scriptsMode === "destructive") || (script.tags || []).some((t) => t.toLowerCase() === "destructive");
+              const previewId = scriptPreviewSeq++;
+              if (scriptsMode !== "expired") scriptPreviews.set(previewId, { script, ids });
+              return {
+                ok: true,
+                preview_id: previewId,
+                script_id: script.id,
+                script_name: script.name,
+                command: previewCommand(script, payload.vars),
+                redacted_command: previewCommand(script, payload.vars, true),
+                servers: ids.map((server_id) => ({ server_id })),
+                destructive,
+                expires_at: now + 600e3,
+              };
+            }
+            if (command === "oars.scripts.broadcast") {
+              const rec = scriptPreviews.get(payload.preview_id);
+              if (!rec) return { ok: false, error: "preview expired or unknown — prepare again" };
+              scriptPreviews.delete(payload.preview_id);
+              const runId = makeBroadcast(rec.script, rec.ids);
+              if (scriptsMode === "unreachable") {
+                const run = broadcastRuns.get(runId);
+                if (run.servers.length > 1) {
+                  run.servers[1].status = "skipped";
+                  run.servers[1].error = "unreachable";
+                }
+              }
+              return { ok: true, run_id: runId };
+            }
+            if (command === "oars.scripts.broadcastPrepareCancel") {
+              scriptPreviews.delete(payload.preview_id);
+              return { ok: true };
+            }
+            if (command === "oars.scripts.broadcastPoll") {
+              const run = broadcastRuns.get(payload.run_id);
+              if (!run) return { ok: false, error: "unknown run" };
+              run.polls += 1;
+              const p = run.polls;
+              for (const s of run.servers) {
+                if (s.status === "queued") s.status = "checking";
+                else if (s.status === "checking") {
+                  s.status = "running";
+                  if (scriptsMode === "broadcast-fail" && s.server_id === "prod-db") s.emitted = "traceback: connection refused\n";
+                  else s.emitted = "hello fleet from preview\n";
+                  s.cursor = utf8Length(s.emitted);
+                } else if (s.status === "running" && run.canceled) {
+                  s.status = "canceled";
+                  s.error = "cancel requested";
+                } else if (s.status === "running" && p >= 3) {
+                  if (scriptsMode === "broadcast-cancel") {
+                    s.emitted += "still sleeping...\n";
+                    s.cursor = utf8Length(s.emitted);
+                  } else if (scriptsMode === "broadcast-fail" && s.server_id === "prod-db") {
+                    s.status = "failed";
+                    s.exit = 1;
+                    s.error = "exit 1";
+                  } else {
+                    s.status = "done";
+                    s.exit = 0;
+                  }
+                }
+              }
+              run.done = run.servers.every((s) => s.status === "done" || s.status === "failed" || s.status === "canceled" || s.status === "skipped");
+              return { ok: true, run_id: run.runId, script_name: run.scriptName, canceled: run.canceled, done: run.done, servers: broadcastRows(run) };
+            }
+            if (command === "oars.scripts.broadcastCancel") {
+              const run = broadcastRuns.get(payload.run_id);
+              if (!run) return { ok: false, error: "unknown run" };
+              run.canceled = true;
+              for (const s of run.servers) {
+                if (s.status === "queued") s.status = "canceled";
+                else if (s.status === "running" || s.status === "checking") { s.status = "canceled"; s.error = "cancel requested"; }
+              }
+              return { ok: true };
+            }
+            // ── Logs (spec 04) fixtures ──────────────────────────────
+            if (command === "oars.logs.scan") {
+              if (logsMode === "empty") return { ok: true, sources: [], partial: false, reason: "" };
+              const srcs = logSources();
+              if (logsMode === "partial") {
+                return { ok: true, sources: srcs, partial: true, reason: "entry limit reached at 500 files; some paths were not scanned" };
+              }
+              return { ok: true, sources: srcs, partial: false, reason: "" };
+            }
+            if (command === "oars.logs.read") {
+              if (logsMode === "stale-read" && payload.path === "/var/log/nginx/access.log") await delay(500);
+              const binary = logsMode === "binary" && payload.path === "/var/log/nginx/access.log";
+              const lines = binary ? [] : buildLogLines(payload.lines);
+              if (lines.length > 0) lines[0] = `${lines[0]} SOURCE=${payload.path}`;
+              return {
+                ok: true,
+                path: payload.path,
+                lines,
+                limited: logsMode === "limited" || payload.lines === 5000,
+                binary,
+              };
+            }
+            if (command === "oars.logs.follow") {
+              if (logsMode === "stale-follow") await delay(500);
+              followState.channel = 44;
+              followState.emitted = buildLogLines(100).join("\n") + "\n2026-08-07T10:00:59Z INFO café worker ready 🚀\n";
+              followState.polls = 0;
+              followState.closed = false;
+              return { ok: true, channel: 44 };
+            }
+            if (command === "oars.logs.clear") {
+              const n = clearAttempts.get(payload.path) || 0;
+              clearAttempts.set(payload.path, n + 1);
+              if (n === 0) {
+                logScanState.sizes.set(payload.path, 512000);
+                return { ok: false, error: "file changed since preview; re-scan before clearing" };
+              }
+              logScanState.sizes.set(payload.path, 0);
+              return { ok: true, before_size: payload.expected.size, after_size: 0 };
+            }
+            if (command === "oars.logs.addSource") {
+              LOG_SOURCES.push({
+                path: payload.path,
+                group: "custom",
+                name: payload.path.split("/").pop(),
+                size: 1024,
+                mtime_epoch: LOG_BASE - 60,
+                age_sec: 60,
+                mode: 420,
+                readable: true,
+              });
+              logScanState.sizes.clear();
+              return { ok: true };
+            }
+            if (command === "oars.sftp.download") {
+              const id = dlNextId++;
+              dlTransfers.set(id, { id, kind: "download", path: pathKey(payload.remote_path), bytes: 0, total: 472000, status: "running", error: "" });
+              return { ok: true, op_id: id };
+            }
+            if (command === "oars.local.ls") {
+              const entries = LOCAL_TREE[payload.path];
+              if (!entries) return { ok: false, error: "local folder not found" };
+              return { ok: true, entries, truncated: false };
+            }
+            if (command === "oars.sftp.uploadLocal") {
+              const id = dlNextId++;
+              const local = Object.values(LOCAL_TREE).flat().find((item) => item.path === payload.local_path);
+              dlTransfers.set(id, { id, kind: "upload", path: pathKey(payload.remote_path), bytes: 0, total: local?.size || 65536, status: "running", error: "" });
+              return { ok: true, op_id: id };
+            }
+            // ── File manager fixtures (spec 05) ──────────────────────
+            if (command === "oars.sftp.ls") {
+              const p = pathKey(payload.path);
+              if (filesMode === "empty" && p === "/") return { ok: true, entries: [], truncated: false };
+              if (filesMode === "slow" && p === "/etc") await delay(700);
+              if (filesMode === "unreadable" && p === "/var") return { ok: false, error: "permission denied (13) — the account cannot read this folder" };
+              const entries = FSTREE[p];
+              if (entries === undefined) return { ok: false, error: "no such directory: " + p };
+              if (filesMode === "truncated" && p === "/") return { ok: true, entries: entries.slice(0, 3), truncated: true };
+              return { ok: true, entries, truncated: false };
+            }
+            if (command === "oars.sftp.stat") {
+              const found = fsResolve(pathKey(payload.path));
+              if (!found) return { ok: false, error: "no such file" };
+              return { ok: true, entry: found.entry };
+            }
+            if (command === "oars.sftp.read") {
+              const found = fsResolve(pathKey(payload.path));
+              if (!found) return { ok: false, error: "no such file" };
+              const bytes = found.content;
+              const start = Math.min(payload.offset || 0, bytes.length);
+              const slice = bytes.subarray(start, start + (payload.max || 65536));
+              return { ok: true, base64: b64Bytes(slice), eof: start + slice.length >= bytes.length };
+            }
+            if (command === "oars.sftp.write") {
+              const rec = fsState.uploads.get(payload.transfer_id) || {
+                id: payload.transfer_id,
+                kind: "upload",
+                path: pathKey(payload.path),
+                bytes: 0,
+                total: payload.total || 0,
+                status: "running",
+                error: "",
+              };
+              if (filesMode === "upload-fail" && rec.bytes === 0) {
+                return { ok: false, error: "write failed: permission denied" };
+              }
+              const chunkBytes = atob(payload.base64).length;
+              rec.bytes = (payload.offset || 0) + chunkBytes;
+              const done = rec.total > 0 ? rec.bytes >= rec.total : true;
+              if (done) rec.status = "done";
+              fsState.uploads.set(payload.transfer_id, rec);
+              return { ok: true, written: rec.bytes, done };
+            }
+            if (command === "oars.sftp.save") {
+              if (filesMode === "conflict" && fsState.conflictArmed && (payload.expected_size !== undefined || payload.expected_sha256 !== undefined)) {
+                // The editor's conflict preflight refuses once; a reload
+                // (fresh identity) or "keep my version" then succeeds.
+                fsState.conflictArmed = false;
+                return { ok: false, error: "conflict: the file changed on the server (size); reload and review before saving" };
+              }
+              fsState.conflictArmed = filesMode === "conflict";
+              return { ok: true };
+            }
+            if (command === "oars.sftp.mkdir") {
+              const key = pathKey(payload.path);
+              if (FSTREE[key] !== undefined) return { ok: false, error: "already exists" };
+              FSTREE[key] = [];
+              const parent = key.slice(0, key.lastIndexOf("/")) || "/";
+              const name = key.slice(key.lastIndexOf("/") + 1);
+              if (FSTREE[parent]) FSTREE[parent].push(entry(name, "dir", 0, now / 1000, {}));
+              return { ok: true };
+            }
+            if (command === "oars.sftp.rename") {
+              const from = pathKey(payload.from);
+              const to = pathKey(payload.to);
+              const parent = to.slice(0, to.lastIndexOf("/")) || "/";
+              const name = to.slice(to.lastIndexOf("/") + 1);
+              const entries = FSTREE[from.slice(0, from.lastIndexOf("/")) || "/"];
+              const idx = entries ? entries.findIndex((e) => e.name.utf8 === from.slice(from.lastIndexOf("/") + 1)) : -1;
+              if (idx >= 0) entries[idx] = entry(name, entries[idx].kind, entries[idx].size, entries[idx].mtime, { link_target: entries[idx].link_target });
+              if (FSTREE[from] !== undefined) { FSTREE[to] = FSTREE[from]; delete FSTREE[from]; }
+              return { ok: true };
+            }
+            if (command === "oars.sftp.chmod") return { ok: true };
+            if (command === "oars.sftp.rm") {
+              const key = pathKey(payload.path);
+              if (payload.recursive) {
+                const id = dlNextId++;
+                dlTransfers.set(id, { id, kind: "rm", path: key, bytes: 0, total: 8, status: "running", error: "" });
+                return { ok: true, op_id: id };
+              }
+              const parent = key.slice(0, key.lastIndexOf("/")) || "/";
+              const name = key.slice(key.lastIndexOf("/") + 1);
+              const list = FSTREE[parent] || [];
+              const idx = list.findIndex((e) => e.name.utf8 === name);
+              if (idx >= 0) list.splice(idx, 1);
+              delete FSTREE[key];
+              return { ok: true };
+            }
+            if (command === "oars.sftp.unzip") {
+              const id = dlNextId++;
+              dlTransfers.set(id, { id, kind: "unzip", path: pathKey(payload.zip_path), bytes: 0, total: 2048, status: "running", error: "" });
+              return { ok: true, op_id: id };
+            }
+            if (command === "oars.sftp.zipDownload") {
+              const id = dlNextId++;
+              dlTransfers.set(id, { id, kind: "zip_download", path: payload.paths.map(pathKey).join(", "), bytes: 0, total: 65536, status: "running", error: "" });
+              return { ok: true, op_id: id };
+            }
+            if (command === "oars.sftp.folderSize") {
+              return { ok: true, size: 1234567 };
+            }
+            if (command === "oars.sftp.poll") {
+              for (const t of dlTransfers.values()) {
+                if (t.status !== "running") continue;
+                if ((filesMode === "dlfail" || logsMode === "dlfail") && t.kind === "download") { t.status = "failed"; t.error = "permission denied"; continue; }
+                t.bytes = Math.min(t.total, t.bytes + 110000);
+                if (t.bytes >= t.total) t.status = "done";
+              }
+              for (const t of fsState.uploads.values()) {
+                if (t.status !== "running") continue;
+                t.bytes = Math.min(t.total, t.bytes + 240000);
+                if (t.bytes >= t.total) t.status = "done";
+              }
+              return { ok: true, transfers: [...dlTransfers.values(), ...fsState.uploads.values()] };
+            }
+            if (command === "oars.sftp.cancel") {
+              const t = dlTransfers.get(payload.transfer_id) || fsState.uploads.get(payload.transfer_id);
+              if (t && t.status === "running") t.status = "canceled";
+              return { ok: true };
+            }
+            // ── VNC fixtures (spec 12) ────────────────────────────────
+            if (command === "oars.vnc.probe") {
+              if (vncProbeMode === "error") return { ok: false, error: "probe failed" };
+              return vncProbePayload();
+            }
+            if (command === "oars.vnc.setup") {
+              if (!payload.dry_run && vncSetupDelay) await delay(vncSetupDelay);
+              const result = vncSetupPayload(payload.display ?? 0, !!payload.dry_run, payload.password, !!payload.install_desktop);
+              if (result.ok === false) return result;
+              return result;
+            }
+            if (command === "oars.vnc.start") {
+              if (vncTunnelMode === "fail") return { ok: false, error: "tunnel start failed" };
+              if (vncTunnelMode === "timeout") { await delay(2500); return { ok: false, error: "tunnel start timed out" }; }
+              if (vncTunnelMode === "slow") { await delay(30000); return { ok: false, error: "tunnel start timed out" }; }
+              const tid = vncNextTunnelId++;
+              const port = vncNextPort++;
+              const token = Array.from({length:32}, () => Math.floor(Math.random()*16).toString(16)).join("");
+              vncTunnels.set(tid, { port, token, state: vncPollMode, bytes_up: 0, bytes_down: 0, error: vncTunnelMode === "closed" ? "no VNC server on 127.0.0.1:" + (payload.port ?? 5900) + " — try the setup helper" : "" });
+              // simulate byte growth on subsequent polls
+              return { ok: true, tunnel_id: tid, ws_port: port, token };
+            }
+            if (command === "oars.vnc.poll") {
+              const entry = vncTunnels.get(payload.tunnel_id);
+              if (!entry) return { ok: false, error: "unknown tunnel" };
+              // advance bytes on each poll call to exercise the footer counter
+              entry.bytes_up += 2048;
+              entry.bytes_down += entry.state === "connected" ? 8192 : 0;
+              // honor ?vncPoll=connected / listening / closed / error
+              if (vncPollMode === "closed") entry.state = "closed";
+              if (vncPollMode === "error") { entry.state = "closed"; entry.error = "channel open failed"; }
+              return { ok: true, state: entry.state, bytes_up: entry.bytes_up, bytes_down: entry.bytes_down, error: entry.error };
+            }
+            if (command === "oars.vnc.stop") {
+              const entry = vncTunnels.get(payload.tunnel_id);
+              if (entry) entry.state = "closed";
+              return { ok: true };
+            }
+            if (command === "native-sdk.dialog.saveFile") {
+              if (logsMode === "nodialog") return null;
+              return "/Users/preview/Downloads/" + (payload.defaultName || "download.log");
+            }
+            if (command === "native-sdk.dialog.openFile" && payload.allowDirectories) {
+              return [payload.defaultPath && LOCAL_TREE[payload.defaultPath] ? payload.defaultPath : LOCAL_ROOT];
+            }
+            if (command === "oars.ssh.closeChannel") {
+              if (payload.channel === followState.channel) followState.closed = true;
+              return { ok: true };
+            }
+            return { ok: true };
+          },
+        };
+        // Wrap ssh.poll to stream diag + follow channel output
+        (() => {
+          const origInvoke = window.zero.invoke.bind(window.zero);
+          window.zero.invoke = async (command, payload={}) => {
+            if (command === "oars.ssh.poll") {
+              const cur = payload.cursors && payload.cursors[0];
+              const chId = cur ? cur.channel : null;
+              // Follow channel (spec 04): absolute cursor protocol — the
+              // response carries the delta from the requested cursor.
+              if (chId === followState.channel && !followState.closed) {
+                recordCall(command, payload);
+                if (logsMode === "follow-error") {
+                  return { ok: false, error: "simulated follow poll failure" };
+                }
+                followState.polls += 1;
+                const p = followState.polls;
+                if (p === 3) {
+                  followState.emitted += "2026-08-07T10:01:00Z INFO follow chunk A\n2026-08-07T10:01:01Z INFO request 101 handled in 12ms\n2026-08-07T10:01:02Z INFO follow chunk A end\n";
+                }
+                if (p === 5) {
+                  followState.emitted += "tail: '/var/log/nginx/access.log' has been replaced; following new file\n2026-08-07T10:01:30Z INFO rotation chunk B line 1\n2026-08-07T10:01:31Z INFO rotation chunk B line 2\n";
+                }
+                if (p === 8) {
+                  followState.emitted += "2026-08-07T10:02:00Z ERROR checkout-error on order 777\n2026-08-07T10:02:01Z INFO retry in 1s\n";
+                }
+                const eof = p >= followState.eofAt;
+                const from = cur ? cur.cursor : 0;
+                const cursor = utf8Length(followState.emitted);
+                return {
+                  ok: true,
+                  status: "ready",
+                  channels: [{
+                    id: followState.channel,
+                    kind: "log",
+                    command: "tail -n 100 -F /var/log/nginx/access.log",
+                    cursor,
+                    dropped: p === followState.droppedAt ? 4096 : 0,
+                    pending: 0,
+                    eof,
+                    exit: null,
+                    data: utf8Slice(followState.emitted, from),
+                  }],
+                };
+              }
+              if (chId !== null && window.__oarsMock.diagChannels && window.__oarsMock.diagChannels.has(chId)) {
+                const entry = window.__oarsMock.diagChannels.get(chId);
+                if (!entry.done) {
+                  entry.done = true;
+                  return { ok: true, status: "ready", channels: [{ id: chId, kind: "exec", command: "diag", cursor: entry.label.length, dropped: 0, pending: 0, eof: true, exit: 0, data: entry.label }] };
+                }
+                return { ok: true, status: "ready", channels: [{ id: chId, kind: "exec", command: "diag", cursor: entry.label.length, dropped: 0, pending: 0, eof: true, exit: 0, data: "" }] };
+              }
+            }
+            return origInvoke(command, payload);
+          };
+        })();
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
