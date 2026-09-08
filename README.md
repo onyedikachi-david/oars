@@ -29,6 +29,10 @@
   </a>
 </p>
 
+<p align="center">
+  <a href="https://www.producthunt.com/products/oars?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-oars" target="_blank" rel="noopener noreferrer"><img alt="Oars - Your Linux servers, together in one local workspace | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1244223&amp;theme=light&amp;t=1788819703482"></a>
+</p>
+
 <a href="https://getoars.app">
   <img src="website/public/screenshots/files-1600.webp" width="1600" height="1000" alt="Oars file manager with local files and a connected Linux server side by side">
 </a>

@@ -81,6 +81,8 @@ h3 { font-size: 19px; font-weight: 600; letter-spacing: -.025em; }
 .community-panel h3 { font-size: 29px; line-height: 1.2; font-weight: 500; }
 .community-panel p { font-size: 15px; margin: 20px 0 26px; }
 .community-panel .inline-link { display: flex; width: fit-content; margin-top: 22px; }
+.product-hunt-badge { display: block; width: 250px; max-width: 100%; margin-top: 26px; }
+.product-hunt-badge img { width: 100%; height: auto; }
 .faq-section { display: grid; grid-template-columns: 1fr 1.2fr; gap: 90px; padding: 20px 0 100px; }
 .faq-section > div > .inline-link { margin-top: 25px; }
 .faq-list details { border-bottom: 1px solid var(--landing-line); }
