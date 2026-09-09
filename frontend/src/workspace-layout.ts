@@ -1,6 +1,7 @@
 import type { MosaicNode } from "react-mosaic-component";
 
-export const MAX_WORKSPACE_PANES = 4;
+export const MAX_WORKSPACE_PANES = 16;
+export const WORKSPACE_PAGE_SIZE = 4;
 
 export type WorkspaceLayoutVariant = "balanced" | "columns" | "focus";
 
@@ -41,6 +42,13 @@ export function buildWorkspaceLayout(
 ): MosaicNode<string> | null {
   const panes = keys.slice(0, MAX_WORKSPACE_PANES);
   if (panes.length === 0) return null;
+  if (panes.length > WORKSPACE_PAGE_SIZE) {
+    const pages: MosaicNode<string>[] = [];
+    for (let offset = 0; offset < panes.length; offset += WORKSPACE_PAGE_SIZE) {
+      pages.push(buildWorkspaceLayout(panes.slice(offset, offset + WORKSPACE_PAGE_SIZE), variant, compact)!);
+    }
+    return combineWorkspacePages(pages);
+  }
   if (panes.length === 1) return panes[0];
 
   if (variant === "columns" && !compact) {
@@ -73,9 +81,33 @@ export function workspaceLayoutKeys(node: MosaicNode<string> | null): string[] {
   return node.children.flatMap(workspaceLayoutKeys);
 }
 
+/** Each scroll section retains its own split sizes and grouped tabs. */
+export function workspaceLayoutPages(node: MosaicNode<string> | null): MosaicNode<string>[] {
+  const groups = workspaceVisibleGroups(node);
+  const pages: MosaicNode<string>[] = [];
+  for (let offset = 0; offset < groups.length; offset += WORKSPACE_PAGE_SIZE) {
+    const page = retainWorkspacePanes(node, groups.slice(offset, offset + WORKSPACE_PAGE_SIZE).flat());
+    if (page !== null) pages.push(page);
+  }
+  return pages;
+}
+
+function workspaceVisibleGroups(node: MosaicNode<string> | null): string[][] {
+  if (node === null) return [];
+  if (typeof node === "string") return [[node]];
+  if (node.type === "tabs") return [node.tabs];
+  return node.children.flatMap(workspaceVisibleGroups);
+}
+
+export function combineWorkspacePages(pages: MosaicNode<string>[]): MosaicNode<string> | null {
+  if (pages.length === 0) return null;
+  return pages.length === 1 ? pages[0] : split("column", pages);
+}
+
 /** Keep custom splits and tab selection when a pane closes. */
 export function retainWorkspacePanes(node: MosaicNode<string> | null, keys: readonly string[]): MosaicNode<string> | null {
   if (node === null) return null;
+  if (workspaceLayoutKeys(node).every(key => keys.includes(key))) return node;
   if (typeof node === "string") return keys.includes(node) ? node : null;
   if (node.type === "tabs") {
     const tabs = node.tabs.filter((key) => keys.includes(key));
@@ -90,11 +122,18 @@ export function retainWorkspacePanes(node: MosaicNode<string> | null, keys: read
 }
 
 export function reconcileWorkspaceLayout(node: MosaicNode<string> | null, keys: string[], variant: WorkspaceLayoutVariant): MosaicNode<string> | null {
-  const retained = retainWorkspacePanes(node, keys);
-  if (retained === null) return buildWorkspaceLayout(keys, variant);
+  const admitted = keys.slice(0, MAX_WORKSPACE_PANES);
+  const retained = retainWorkspacePanes(node, admitted);
+  if (retained === null) return buildWorkspaceLayout(admitted, variant);
   const existing = workspaceLayoutKeys(retained);
-  return keys.filter((key) => !existing.includes(key)).reduce<MosaicNode<string>>(
-    (current, key) => split("row", [current, key], typeof current === "string" ? [50, 50] : [65, 35]), retained,
+  return admitted.filter((key) => !existing.includes(key)).reduce<MosaicNode<string>>(
+    (current, key) => {
+      const pages = workspaceLayoutPages(current);
+      const last = pages[pages.length - 1];
+      if (workspaceVisibleGroups(last).length === WORKSPACE_PAGE_SIZE) pages.push(key);
+      else pages[pages.length - 1] = split("row", [last, key], typeof last === "string" ? [50, 50] : [65, 35]);
+      return combineWorkspacePages(pages)!;
+    }, retained,
   );
 }
 

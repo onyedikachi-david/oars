@@ -1,3 +1,4 @@
+import { WorkspacePages } from "./components/WorkspacePages";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
@@ -36,14 +37,14 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { Mosaic, MosaicWindow, type MosaicNode, type MosaicPath } from "react-mosaic-component";
+import { MosaicWindow, type MosaicNode, type MosaicPath } from "react-mosaic-component";
 import { Button } from "./components/ui/button";
 import { OarsSelect } from "./components/ui/select";
 import { OarsLoadingState, OarsRefreshStatus } from "./components/OarsLoadingState";
 import { WorkspaceLayoutPicker } from "./components/WorkspaceLayoutPicker";
 import { WorkspacePaneMenu } from "./components/WorkspacePaneMenu";
 import { WorkspacePaneSlot, WorkspaceSurfaces } from "./components/WorkspaceSurfaces";
-import { WorkspaceDockTab, WorkspaceDockTabContext } from "./components/WorkspaceDockTab";
+import { WorkspaceDockTabContext } from "./components/WorkspaceDockTab";
 import { WorkspaceDocking, WorkspaceDragHandle } from "./components/WorkspaceDocking";
 import { ApplicationNotice } from "./components/ApplicationPortal";
 import { api, BridgeError } from "./bridge";
@@ -514,6 +515,7 @@ export default function App() {
   });
   const [layoutVariant, setLayoutVariant] = useState<WorkspaceLayoutVariant>(defaultLayoutVariant);
   const [paneFocused, setPaneFocused] = useState(false);
+  const [workspaceNavigationRevision, setWorkspaceNavigationRevision] = useState(0);
   const customLayoutRef = useRef(false);
   const [workspaceMessage, setWorkspaceMessage] = useState("");
   const [mosaicLayout, setMosaicLayout] = useState<MosaicNode<string> | null>(null);
@@ -612,7 +614,7 @@ export default function App() {
 
   useEffect(() => {
     if (activeKey) setMosaicLayout((current) => activateWorkspacePane(current, activeKey));
-  }, [activeKey]);
+  }, [activeKey, tabKeySignature, layoutVariant]);
 
   const setStatus = useCallback((serverId: string, status: SessionStatus) => {
     setStatuses((prev) => {
@@ -657,7 +659,7 @@ export default function App() {
   }, []);
 
   const showPaneLimit = useCallback(() => {
-    setToast(`A workspace can show up to ${MAX_WORKSPACE_PANES} server panes.`);
+    setToast(`A workspace can keep up to ${MAX_WORKSPACE_PANES} server views open. Close a view before opening another.`);
     window.setTimeout(() => setToast(""), 2800);
   }, []);
 
@@ -1246,7 +1248,7 @@ export default function App() {
                       className="tab-select"
                       role="tab"
                       aria-selected={tab.key === activeKey}
-                      onClick={() => setActiveKey(tab.key)}
+                      onClick={() => { setActiveKey(tab.key); setWorkspaceNavigationRevision(revision => revision + 1); }}
                       title={isMirror ? `${tab.server.name} — mirrored view` : tab.server.name}
                     >
                       <ConnectionStatus status={statuses.get(tab.server.id)} />
@@ -1279,22 +1281,12 @@ export default function App() {
                 setMosaicLayout((current) => dockWorkspacePane(current, source, target, position));
                 setActiveKey(source);
               }}>
-            <Mosaic<string>
-              className="oars-mosaic"
-              value={(paneFocused || compactWorkspace) && activeKey ? activeKey : mosaicLayout}
-              onChange={(next) => { if (!paneFocused && !compactWorkspace) setMosaicLayout(next); }}
-              onRelease={() => { if (!paneFocused && !compactWorkspace) customLayoutRef.current = true; }}
-              renderTabToolbarControls={() => null}
-              canClose={() => "noClose"}
-              renderTabButton={WorkspaceDockTab}
-              renderTile={renderServerPane}
-              resize={paneFocused || compactWorkspace ? "DISABLED" : { minimumPaneSizePercentage: 18 }}
-              zeroStateView={<div />}
-            />
+            <WorkspacePages layout={mosaicLayout} activeKey={activeKey} focused={paneFocused || compactWorkspace} navigationRevision={workspaceNavigationRevision}
+              onChange={setMosaicLayout} onRelease={() => { customLayoutRef.current = true; }} renderTile={renderServerPane} />
             </WorkspaceDocking>
             </WorkspaceDockTabContext.Provider>
             </WorkspaceSurfaces>
-            <div className="workspace-statusbar"><span>{compactWorkspace ? "Select a server above to switch panes." : paneFocused ? "Focus mode · Restore from the pane header." : "Drag a header to split or group · Double-click to focus"}</span>
+            <div className="workspace-statusbar"><span>{compactWorkspace ? "Select a server above to switch panes." : paneFocused ? "Focus mode · Restore from the pane header." : tabs.length > 4 ? "Scroll for more servers · Four panes per section · Double-click to focus" : "Drag a header to split or group · Double-click to focus"}</span>
               <span role="status" aria-live="polite">{workspaceMessage}</span></div>
             {loadError && <div className="form-error workspace-mosaic-error">{loadError}</div>}
           </div>
