@@ -1909,6 +1909,11 @@ html.light .workspace {
   scrollbar-gutter: auto;
 }
 .workspace-mosaic-host[hidden] { display: none; }
+.workspace-pages { position: relative; height: 100%; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.workspace-page { height: 100%; min-height: 0; padding-bottom: 10px; }
+.workspace-page:last-child { padding-bottom: 0; }
+.workspace-page > .oars-mosaic { height: 100%; }
+
 .oars-mosaic { position: relative; min-width: 0; min-height: 0; }
 .oars-mosaic .mosaic-root { inset: 0; }
 .oars-mosaic .mosaic-tile { margin: 5px; }

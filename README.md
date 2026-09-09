@@ -31,6 +31,7 @@
 
 <p align="center">
   <a href="https://www.producthunt.com/products/oars?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-oars" target="_blank" rel="noopener noreferrer"><img alt="Oars - Your Linux servers, together in one local workspace | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1244223&amp;theme=light&amp;t=1788819703482"></a>
+  <a href="https://smollaunchpad.com/projects/oars?utm_source=badge" target="_blank" rel="noopener noreferrer"><img src="https://smollaunchpad.com/smollaunchpad/images/badges/featured-on-light.svg" alt="Featured on Smol LaunchPad" width="150" height="44"></a>
 </p>
 
 <a href="https://getoars.app">
@@ -43,7 +44,7 @@ Use it to investigate a slow server, move files, deploy an application, run scri
 
 ## Why Oars
 
-- **One workspace for your fleet.** Save server profiles, organize groups, and arrange sessions in tabs or split panes.
+- **One workspace for your fleet.** Save server profiles, organize groups, and keep up to 16 server views open, with up to four panes per scroll section.
 - **Start with SSH.** Connect with a password, private key, or SSH agent, including through a jump host. Review host fingerprints before trusting a new server.
 - **See what is happening.** Inspect CPU, memory, disks, and processes, then search or follow logs without installing a monitoring agent.
 - **Work with files and terminals.** Open interactive shells and browse, transfer, edit, and manage remote files over SFTP.

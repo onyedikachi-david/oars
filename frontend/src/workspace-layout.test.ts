@@ -8,6 +8,8 @@ import {
   reconcileWorkspaceLayout,
   dockWorkspacePane,
   activateWorkspacePane,
+  workspaceLayoutPages,
+  combineWorkspacePages,
 } from "./workspace-layout";
 
 describe("workspace layouts", () => {
@@ -33,6 +35,38 @@ describe("workspace layouts", () => {
   it("never creates more than the supported pane limit", () => {
     const keys = Array.from({ length: MAX_WORKSPACE_PANES + 2 }, (_, index) => String(index));
     expect(workspaceLayoutKeys(buildWorkspaceLayout(keys, "columns"))).toHaveLength(MAX_WORKSPACE_PANES);
+  });
+
+  it("keeps fifteen servers in four scroll sections without losing a view", () => {
+    const keys = Array.from({ length: 15 }, (_, index) => `server-${index}`);
+    for (const variant of ["balanced", "columns", "focus"] as const) {
+      const layout = buildWorkspaceLayout(keys, variant);
+      const pages = workspaceLayoutPages(layout);
+      expect(pages.map(page => workspaceLayoutKeys(page).length)).toEqual([4, 4, 4, 3]);
+      expect(workspaceLayoutKeys(combineWorkspacePages(pages))).toEqual(keys);
+    }
+  });
+
+  it("adds scroll sections to a custom workspace and preserves its earlier splits", () => {
+    const keys = Array.from({ length: 15 }, (_, index) => `server-${index}`);
+    const first = buildWorkspaceLayout(keys.slice(0, 4), "focus");
+    let layout = first;
+    for (let count = 5; count <= keys.length; count++) layout = reconcileWorkspaceLayout(layout, keys.slice(0, count), "balanced");
+    expect(workspaceLayoutPages(layout)[0]).toEqual(first);
+    expect(workspaceLayoutPages(layout).map(page => workspaceLayoutKeys(page).length)).toEqual([4, 4, 4, 3]);
+    expect(workspaceLayoutKeys(layout)).toEqual(keys);
+    const closed = retainWorkspacePanes(layout, keys.filter(key => key !== "server-5"));
+    expect(workspaceLayoutKeys(closed)).toHaveLength(14);
+    expect(workspaceLayoutPages(closed).every(page => workspaceLayoutKeys(page).length <= 4)).toBe(true);
+  });
+
+  it("keeps a docked tab group together across a former scroll boundary", () => {
+    const layout = buildWorkspaceLayout(["a", "b", "c", "d", "e"], "balanced");
+    const grouped = dockWorkspacePane(layout, "e", "d", "tab");
+    const pages = workspaceLayoutPages(grouped);
+    expect(pages).toHaveLength(1);
+    expect(workspaceLayoutKeys(pages[0])).toEqual(["a", "b", "c", "d", "e"]);
+    expect(JSON.stringify(pages[0])).toContain('"tabs":["d","e"]');
   });
 
   it("stacks two panes at narrow widths", () => {
