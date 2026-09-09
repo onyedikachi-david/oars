@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0](https://github.com/onyedikachi-david/oars/compare/v0.3.0...v0.4.0) (2026-09-09)
+
+
+### Added
+
+* add scrollable server workspace and Smol LaunchPad badge ([a759efc](https://github.com/onyedikachi-david/oars/commit/a759efcc460d679f9890821673830862b67f965f))
+* add scrollable server workspace and Smol LaunchPad badge ([17e7abc](https://github.com/onyedikachi-david/oars/commit/17e7abcdf276fad9b350f9fd19fe26ebb80098a6))
+
 ## [0.3.0](https://github.com/onyedikachi-david/oars/compare/v0.2.0...v0.3.0) (2026-09-08)
 
 

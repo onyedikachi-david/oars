@@ -34,7 +34,7 @@ const PackageTarget = enum {
 
 const default_native_sdk_path = "native-sdk";
 const app_exe_name = "oars";
-const app_version = "0.3.0"; // x-release-please-version
+const app_version = "0.4.0"; // x-release-please-version
 
 // ---------------------------------------------------------------------------
 // Vendored C libraries (built with zig cc, hermetic, no system deps):
