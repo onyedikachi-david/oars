@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.0](https://github.com/onyedikachi-david/oars/compare/v0.4.0...v0.5.0) (2026-09-10)
+
+
+### Added
+
+* **website:** add measured memory benchmark chart ([41b43e3](https://github.com/onyedikachi-david/oars/commit/41b43e37db4451c62b012c2650ed3a4fd49ca161))
+* **website:** add measured memory benchmark chart ([60fc5bc](https://github.com/onyedikachi-david/oars/commit/60fc5bcb5703bc25555e59f09053ae32dfdce3f7))
+
 ## [0.4.0](https://github.com/onyedikachi-david/oars/compare/v0.3.0...v0.4.0) (2026-09-09)
 
 
