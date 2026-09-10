@@ -1,0 +1,55 @@
+.memory-section { display: grid; grid-template-columns: .8fr 1.2fr; align-items: center; gap: 60px; padding-block: 45px 65px; }
+.memory-copy { min-width: 0; }
+.memory-copy p { max-width: 365px; }
+.memory-chart { padding: 34px; border-radius: 18px; background: #edf2f8; color: var(--landing-ink); min-width: 0; }
+.memory-chart__heading { display: flex; justify-content: space-between; align-items: start; gap: 16px; }
+.memory-chart__heading h3 { font-size: 18px; }
+.memory-chart__heading p { margin-block-start: 3px; color: var(--landing-muted); font-size: 12px; }
+.memory-chart__version { flex-shrink: 0; padding: 3px 9px; border: 1px solid #d6dfe9; border-radius: 6px; color: var(--landing-muted); font-size: 11px; background: #ffffff80; font-variant-numeric: tabular-nums; }
+.memory-chart__rows { list-style: none; margin: 32px 0 20px; padding: 0; }
+.memory-chart__row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 12px 16px; margin-block: 24px; }
+.memory-chart__label strong { display: block; font-size: 14px; font-weight: 550; }
+.memory-chart__label span { display: block; margin-block-start: 1px; color: var(--landing-muted); font-size: 11px; line-height: 1.5; }
+.memory-chart__value { align-self: center; white-space: nowrap; text-align: end; font-size: 22px; font-weight: 500; line-height: 1.3; font-variant-numeric: tabular-nums; letter-spacing: -.035em; }
+.memory-chart__value small { color: var(--landing-muted); font-size: 11px; font-weight: 400; letter-spacing: 0; }
+.memory-chart__track { grid-column: 1 / -1; height: 22px; border-radius: 4px; background: #dfe7f0; }
+.memory-chart__marks { position: relative; height: 100%; transform-origin: left; }
+.memory-chart__marks--replay { animation: memory-bar-reveal .6s cubic-bezier(.2, 0, 0, 1) both; }
+.memory-chart__fill { height: 100%; border-radius: 4px; background: #aabed4; }
+.memory-chart__range { position: absolute; top: 50%; min-width: 1px; height: 1px; background: #183956; }
+.memory-chart__range::before, .memory-chart__range::after { content: ""; position: absolute; top: -4px; width: 1px; height: 9px; background: #183956; }
+.memory-chart__range::before { inset-inline-start: 0; }
+.memory-chart__range::after { inset-inline-end: 0; }
+.memory-chart__row--highlight .memory-chart__label strong, .memory-chart__row--highlight .memory-chart__value { color: var(--landing-blue); }
+.memory-chart__row--highlight .memory-chart__fill { background: var(--landing-blue); }
+.memory-chart__row--highlight .memory-chart__range, .memory-chart__row--highlight .memory-chart__range::before, .memory-chart__row--highlight .memory-chart__range::after { background: #17212c; }
+.memory-chart__axis { position: relative; height: 28px; margin-inline: 1px; color: #637386; font-size: 10px; font-variant-numeric: tabular-nums; }
+.memory-chart__axis span { position: absolute; top: 2px; transform: translateX(-50%); }
+.memory-chart__axis span:first-child { transform: none; }
+.memory-chart__axis span:last-child { transform: translateX(-100%); }
+.memory-chart__caption { padding-block-start: 16px; border-block-start: 1px solid #d6dfe9; color: var(--landing-muted); font-size: 11px; }
+.memory-chart__actions { display: flex; justify-content: space-between; align-items: start; gap: 16px; margin-block-start: 8px; }
+.memory-chart__actions details { min-width: 0; }
+.memory-chart__actions summary { display: flex; align-items: center; gap: 7px; min-height: 40px; cursor: pointer; list-style: none; color: #245aa1; font-size: 12px; font-weight: 500; width: fit-content; }
+.memory-chart__actions summary::-webkit-details-marker { display: none; }
+.memory-chart__actions summary::before { content: "+"; font-size: 15px; }
+.memory-chart__actions details[open] summary::before { content: "−"; }
+.memory-chart__actions details p { margin-block: 4px 0; line-height: 1.8; }
+.memory-chart__replay { display: inline-flex; flex-shrink: 0; align-items: center; justify-content: center; gap: 7px; min-height: 40px; padding: 8px 12px; border: 1px solid #d6dde4; border-radius: 8px; background: #fff; color: #245aa1; cursor: pointer; font-size: 12px; transition: background .15s ease, scale .15s ease; }
+.memory-chart__replay:hover { background: #f6f8fa; }
+.memory-chart__replay:active { scale: .96; }
+.memory-chart__sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+@keyframes memory-bar-reveal { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+@media (max-width: 1000px) { .memory-section { gap: 30px; } .memory-chart { padding: 26px; } }
+@media (max-width: 760px) {
+  .memory-section { grid-template-columns: 1fr; gap: 28px; padding-block: 35px 40px; }
+  .memory-copy p { max-width: 460px; }
+  .memory-chart { padding: 26px 22px; }
+}
+@media (max-width: 360px) {
+  .memory-chart { padding: 22px 18px; }
+  .memory-chart__value { font-size: 20px; }
+  .memory-chart__row { column-gap: 10px; }
+  .memory-chart__heading { flex-wrap: wrap; gap: 8px; }
+}
+@media (prefers-reduced-motion: reduce) { .memory-chart__marks--replay { animation: none; } .memory-chart__replay { transition: none; } }

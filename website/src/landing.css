@@ -75,6 +75,7 @@ h3 { font-size: 19px; font-weight: 600; letter-spacing: -.025em; }
 .product-shot figcaption strong { color: var(--landing-ink); margin-right: 12px; }
 .product-shot figcaption a { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
 .ownership { display: grid; grid-template-columns: 1fr .8fr; gap: 100px; align-items: center; padding: 110px 0; }
+.ownership > div { min-width: 0; }
 .ownership p { margin-top: 22px; color: var(--landing-muted); max-width: 550px; }
 .community-panel { background: #eef3f9; padding: 40px; border-radius: 16px; }
 .community-panel > svg { width: 28px; height: 28px; color: #3671b5; margin-bottom: 24px; }

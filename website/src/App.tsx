@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { ProductShot, ScreenshotGallery } from "./components/ProductScreenshots";
+import { MemoryBenchmark } from "./components/MemoryBenchmark";
 import { downloads, githubUrl, sponsorUrl } from "./downloads";
 import "./landing.css";
 
@@ -47,6 +48,8 @@ export default function App() {
         <div className="section-heading"><h2>Less switching.<br />More getting things done.</h2><p>Connect once and keep the whole job in view. Follow a log, move a file, run a command, or check on another server without losing your place.</p></div>
         <div className="feature-strip"><div><Icon name="terminal" /><h3>Connect your way</h3><p>SSH keys, passwords, agents, and jump hosts. Your existing servers, ready to work.</p></div><div><Icon name="files" /><h3>Keep the tools together</h3><p>Interactive shells, SFTP, live metrics, logs, scripts, deployments, and backups.</p></div><div><Icon name="desktop" /><h3>Make room for your fleet</h3><p>Organize servers into groups and arrange sessions in tabs or split panes.</p></div></div>
       </section>
+
+      <MemoryBenchmark />
 
       <section className="feature-section section">
         <div className="feature-copy"><span className="section-label">See what’s happening</span><h2>Go from “what broke?”<br />to the useful details.</h2><p>Check CPU, memory, disks, and processes. Find the right log, search its output, and follow new lines as they arrive.</p><ul><li>Agentless server monitoring</li><li>Searchable logs and local command history</li><li>Saved scripts for repeatable operations</li></ul><a className="inline-link" href="#pictures">Explore the workspace <Icon name="arrow" /></a></div>
