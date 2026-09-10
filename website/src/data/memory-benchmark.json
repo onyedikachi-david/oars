@@ -1,0 +1,40 @@
+{
+  "version": "0.4.0",
+  "build": "ReleaseFast",
+  "date": "2026-09-09",
+  "hardware": "Apple M1",
+  "ramGiB": 8,
+  "os": "macOS 15.5",
+  "unit": "MiB",
+  "warmupSeconds": 30,
+  "sampleWindowSeconds": 60,
+  "rows": [
+    {
+      "id": "startup",
+      "label": "No connections",
+      "detail": "App open, no SSH sessions",
+      "median": 133.77337646484375,
+      "min": 133.64837646484375,
+      "max": 133.82025146484375,
+      "sampleCount": 12
+    },
+    {
+      "id": "idle15",
+      "label": "15 connections",
+      "detail": "Idle SSH \u00b7 four panes visible",
+      "median": 291.32940673828125,
+      "min": 285.00909423828125,
+      "max": 300.99346923828125,
+      "sampleCount": 12
+    },
+    {
+      "id": "monitor15",
+      "label": "With monitoring",
+      "detail": "15 SSH \u00b7 one live monitor",
+      "median": 396.3062438964844,
+      "min": 366.64996337890625,
+      "max": 409.50933837890625,
+      "sampleCount": 12
+    }
+  ]
+}
