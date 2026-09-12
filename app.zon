@@ -2,7 +2,7 @@
     .id = "app.getoars",
     .name = "oars",
     .display_name = "Oars",
-    .version = "0.5.0", // x-release-please-version
+    .version = "0.6.0", // x-release-please-version
     .icons = .{"assets/icon.png"},
     .platforms = .{ "macos", "linux" },
     .permissions = .{ "dialog", "credentials" },
