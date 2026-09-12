@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/onyedikachi-david/oars/compare/v0.5.0...v0.6.0) (2026-09-12)
+
+
+### Added
+
+* add Intel macOS releases and Homebrew platform support ([#13](https://github.com/onyedikachi-david/oars/issues/13)) ([a6404e0](https://github.com/onyedikachi-david/oars/commit/a6404e054cff66835ca36abba0ea4d16fee940f8))
+
 ## [0.5.0](https://github.com/onyedikachi-david/oars/compare/v0.4.0...v0.5.0) (2026-09-10)
 
 
