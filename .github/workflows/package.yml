@@ -1,0 +1,114 @@
+name: Build desktop package
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        type: string
+        required: true
+      target:
+        type: string
+        required: true
+      arch:
+        type: string
+        required: true
+      source-ref:
+        type: string
+        required: true
+      label:
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    env:
+      PACKAGE_LABEL: ${{ inputs.label }}
+      PACKAGE_TARGET: ${{ inputs.target }}
+      PACKAGE_ARCH: ${{ inputs.arch }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source-ref }}
+          persist-credentials: false
+      - name: Resolve package version
+        shell: bash
+        run: |
+          VERSION="$(tr -d '\r\n' < version.txt)"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [ -z "$PACKAGE_LABEL" ]; then
+            echo "PACKAGE_LABEL=v$VERSION" >> "$GITHUB_ENV"
+          else
+            test "$PACKAGE_LABEL" = "v$VERSION"
+          fi
+      - name: Get package validation scripts
+        uses: actions/checkout@v7
+        with:
+          path: .release-tools
+          sparse-checkout: scripts
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes pkg-config libgtk-4-dev libwebkitgtk-6.0-dev xvfb xdotool dbus-x11
+      - name: Install Native SDK
+        run: npm install --global @native-sdk/cli@0.7.1
+      - name: Resolve Native SDK path
+        id: native-sdk
+        shell: bash
+        run: echo "path=$(npm root --global)/@native-sdk/cli" >> "$GITHUB_OUTPUT"
+      - name: Test native code on macOS
+        if: runner.os == 'macOS'
+        run: zig build test -Dplatform=null -Dnative-sdk-path="${{ steps.native-sdk.outputs.path }}"
+      - name: Build package
+        run: zig build package -Dpackage-target="$PACKAGE_TARGET" -Dnative-sdk-path="${{ steps.native-sdk.outputs.path }}"
+      - name: Validate and launch macOS package
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          APP=(zig-out/package/*.app)
+          test "$(lipo -archs "${APP[0]}/Contents/MacOS/oars")" = "$PACKAGE_ARCH"
+          python3 .release-tools/scripts/package-smoke.py "${APP[0]}/Contents/MacOS/oars"
+      - name: Validate and launch Linux package
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          APP=(zig-out/package/*/bin/oars)
+          file "${APP[0]}" | grep 'ELF 64-bit.*x86-64'
+          bash .release-tools/scripts/enable-webkit-sandbox.sh "${APP[0]}"
+          xvfb-run -a dbus-run-session -- python3 .release-tools/scripts/package-smoke.py "${APP[0]}"
+      - name: Archive macOS package
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p zig-out/release
+          SUFFIX=macos
+          if [ "$PACKAGE_ARCH" = x86_64 ]; then SUFFIX=macos-x86_64; fi
+          ditto -c -k --sequesterRsrc --keepParent zig-out/package/*.app "zig-out/release/oars-${PACKAGE_LABEL}-${SUFFIX}.zip"
+          cp "zig-out/release/oars-${PACKAGE_LABEL}-${SUFFIX}.zip" "zig-out/release/oars-${SUFFIX}.zip"
+      - name: Archive Linux package
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p zig-out/release
+          tar -C zig-out/package -czf "zig-out/release/oars-${PACKAGE_LABEL}-linux-x86_64.tar.gz" .
+          cp "zig-out/release/oars-${PACKAGE_LABEL}-linux-x86_64.tar.gz" zig-out/release/oars-linux-x86_64.tar.gz
+      - uses: actions/upload-artifact@v7
+        with:
+          name: oars-${{ inputs.target }}-${{ inputs.arch }}
+          path: zig-out/release/
+          if-no-files-found: error
+          compression-level: 0

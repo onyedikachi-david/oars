@@ -26,6 +26,7 @@
 //! links libc on every platform.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ssh = @import("ssh.zig");
 
 const libc = @cImport({
@@ -84,11 +85,19 @@ pub fn resolveSocket(allocator: std.mem.Allocator, explicit: ?[]const u8) Error!
 /// anywhere; with it, a symlink is rejected as not-a-socket).
 pub fn validateSocket(path: []const u8) Error!void {
     const path_z = std.posix.toPosixPath(path) catch return error.NoAgent;
-    var st: libc.struct_stat = undefined;
-    const rc = libc.fstatat(libc.AT_FDCWD, @ptrCast(&path_z), &st, libc.AT_SYMLINK_NOFOLLOW);
-    if (rc != 0) return error.NoAgent;
-    if (st.st_mode & libc.S_IFMT != libc.S_IFSOCK) return error.NotASocket;
-    if (st.st_uid != libc.geteuid()) return error.NotOwned;
+    const metadata = if (builtin.os.tag == .macos) blk: {
+        // On Intel macOS the 64-bit struct requires fstatat$INODE64.
+        // Zig's libc binding selects that symbol; cImport loses the header alias.
+        var st: std.c.Stat = undefined;
+        if (std.c.fstatat(std.c.AT.FDCWD, &path_z, &st, std.c.AT.SYMLINK_NOFOLLOW) != 0) return error.NoAgent;
+        break :blk .{ .mode = st.mode, .uid = st.uid };
+    } else blk: {
+        var st: libc.struct_stat = undefined;
+        if (libc.fstatat(libc.AT_FDCWD, @ptrCast(&path_z), &st, libc.AT_SYMLINK_NOFOLLOW) != 0) return error.NoAgent;
+        break :blk .{ .mode = st.st_mode, .uid = st.st_uid };
+    };
+    if (metadata.mode & libc.S_IFMT != libc.S_IFSOCK) return error.NotASocket;
+    if (metadata.uid != libc.geteuid()) return error.NotOwned;
 }
 
 /// `SHA256:` + unpadded base64 of a public-key blob — the canonical
@@ -243,6 +252,14 @@ test "validateSocket rejects non-sockets and accepts an owned bound socket" {
         return;
     }
     try validateSocket(sock_path);
+
+    // The ABI-correct stat call must still reject symlinks to valid sockets.
+    var link_buf: [512]u8 = undefined;
+    const link_path = try std.fmt.bufPrint(&link_buf, "{s}.link", .{sock_path});
+    const sock_z = try std.posix.toPosixPath(sock_path);
+    const link_z = try std.posix.toPosixPath(link_path);
+    try testing.expectEqual(@as(c_int, 0), libc.symlink(&sock_z, &link_z));
+    try testing.expectError(error.NotASocket, validateSocket(link_path));
 
     // A missing path is NoAgent.
     try testing.expectError(error.NoAgent, validateSocket("/tmp/definitely-not-a-socket-oars"));
