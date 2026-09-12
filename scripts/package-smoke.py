@@ -1,11 +1,50 @@
-"""Launch a packaged app outside the checkout and require a visible window."""
+"""Launch a packaged app outside the checkout and require an app window."""
 
+import ctypes
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import time
+
+
+def mac_has_window(pid):
+    """Read CoreGraphics directly so a cold Swift compiler cannot time out."""
+    cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+    pointer = ctypes.c_void_p
+    cg.CGWindowListCopyWindowInfo.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    cg.CGWindowListCopyWindowInfo.restype = pointer
+    cf.CFArrayGetCount.argtypes = [pointer]
+    cf.CFArrayGetCount.restype = ctypes.c_long
+    cf.CFArrayGetValueAtIndex.argtypes = [pointer, ctypes.c_long]
+    cf.CFArrayGetValueAtIndex.restype = pointer
+    cf.CFDictionaryGetValue.argtypes = [pointer, pointer]
+    cf.CFDictionaryGetValue.restype = pointer
+    cf.CFNumberGetValue.argtypes = [pointer, ctypes.c_long, pointer]
+    cf.CFNumberGetValue.restype = ctypes.c_bool
+    cf.CFRelease.argtypes = [pointer]
+    cf.CFRelease.restype = None
+    owner_key = pointer.in_dll(cg, "kCGWindowOwnerPID")
+    layer_key = pointer.in_dll(cg, "kCGWindowLayer")
+
+    def number(window, key):
+        ref = cf.CFDictionaryGetValue(window, key)
+        value = ctypes.c_int()
+        return value.value if ref and cf.CFNumberGetValue(ref, 9, ctypes.byref(value)) else None
+
+    windows = cg.CGWindowListCopyWindowInfo(0, 0)
+    if not windows:
+        return False
+    try:
+        for index in range(cf.CFArrayGetCount(windows)):
+            window = cf.CFArrayGetValueAtIndex(windows, index)
+            if number(window, owner_key) == pid and number(window, layer_key) == 0:
+                return True
+        return False
+    finally:
+        cf.CFRelease(windows)
 
 
 def main():
@@ -16,22 +55,15 @@ def main():
         with open(directory + "/launch.log", "w+") as log:
             app = subprocess.Popen([str(executable)], cwd=directory, env=env, stdout=log, stderr=log)
             try:
-                if sys.platform == "darwin":
-                    swift = Path(directory) / "window.swift"
-                    swift.write_text('''import AppKit
-let pid = Int(CommandLine.arguments[1])!
-let windows = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-exit(windows.contains { ($0[kCGWindowOwnerPID as String] as? Int) == pid && ($0[kCGWindowLayer as String] as? Int) == 0 } ? 0 : 1)
-''')
-                    probe = ["swift", str(swift), str(app.pid)]
-                else:
-                    probe = ["xdotool", "search", "--onlyvisible", "--pid", str(app.pid)]
                 deadline = time.monotonic() + 60
                 visible = False
                 while time.monotonic() < deadline:
                     if app.poll() is not None:
                         raise RuntimeError(f"App exited during launch: {app.returncode}")
-                    if subprocess.run(probe, stdout=subprocess.DEVNULL, timeout=30).returncode == 0:
+                    visible_now = mac_has_window(app.pid) if sys.platform == "darwin" else subprocess.run(
+                        ["xdotool", "search", "--onlyvisible", "--pid", str(app.pid)],
+                        stdout=subprocess.DEVNULL, timeout=10).returncode == 0
+                    if visible_now:
                         visible = True
                         break
                     time.sleep(1)
