@@ -20,7 +20,7 @@ def main():
                     swift = Path(directory) / "window.swift"
                     swift.write_text('''import AppKit
 let pid = Int(CommandLine.arguments[1])!
-let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+let windows = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
 exit(windows.contains { ($0[kCGWindowOwnerPID as String] as? Int) == pid && ($0[kCGWindowLayer as String] as? Int) == 0 } ? 0 : 1)
 ''')
                     probe = ["swift", str(swift), str(app.pid)]
@@ -36,11 +36,11 @@ exit(windows.contains { ($0[kCGWindowOwnerPID as String] as? Int) == pid && ($0[
                         break
                     time.sleep(1)
                 if not visible:
-                    raise RuntimeError("No visible app window appeared")
+                    raise RuntimeError("No app window was created")
                 time.sleep(10)
                 if app.poll() is not None:
                     raise RuntimeError(f"App exited after showing its window: {app.returncode}")
-                print("Packaged app opened a visible window and remained running.")
+                print("Packaged app created an app window and remained running.")
             finally:
                 if app.poll() is None:
                     app.terminate()

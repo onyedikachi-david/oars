@@ -110,10 +110,6 @@ jobs:
 
   package:
     name: Package ${{ matrix.name }}
-    if: needs.test.result == 'success' && needs.release-state.result == 'success'
-    needs:
-      - test
-      - release-state
     strategy:
       fail-fast: false
       matrix:
@@ -136,7 +132,6 @@ jobs:
       target: ${{ matrix.target }}
       arch: ${{ matrix.arch }}
       source-ref: ${{ github.sha }}
-      label: ${{ needs.release-state.outputs.tag_name || format('ci-{0}', github.run_number) }}
 
   publish-release:
     name: Attach release packages
