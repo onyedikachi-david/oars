@@ -74,6 +74,8 @@ Linux requires a graphical desktop, GTK4, and WebKitGTK 6.0. On Ubuntu 24.04, in
 sudo apt install libgtk-4-1 libwebkitgtk-6.0-4
 ```
 
+Ubuntu may also require the Oars-specific AppArmor profile supplied by the cask. Follow the [Linux runtime setup](https://github.com/onyedikachi-david/homebrew-tap#linux-runtime) before launching.
+
 The Linux release is tested on Ubuntu 24.04 x86_64. Other distributions need compatible system libraries; Linux ARM builds are not published.
 
 ## Get started
