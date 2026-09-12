@@ -1,0 +1,78 @@
+name: Add Intel package to an existing release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable release tag to build
+        required: true
+        default: v0.5.0
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backfill-intel-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require an existing stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease --jq 'select(.isDraft == false and .isPrerelease == false)' | grep -q .
+  package:
+    needs: validate
+    uses: ./.github/workflows/package.yml
+    with:
+      runner: macos-15-intel
+      target: macos
+      arch: x86_64
+      source-ref: ${{ inputs.tag }}
+      label: ${{ inputs.tag }}
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: oars-macos-x86_64
+          path: release-assets
+      - name: Add assets without replacing existing packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          mkdir previous
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir previous
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets > previous/release.json
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          assets = {a['name']: a for a in json.loads(pathlib.Path('previous/release.json').read_text())['assets']}
+          sums = {}
+          for line in pathlib.Path('previous/SHA256SUMS').read_text().splitlines():
+              digest, name = line.split(None, 1)
+              if name != 'SHA256SUMS':
+                  sums[name] = digest
+          files = sorted(pathlib.Path('release-assets').glob('*.zip'))
+          # Validate every existing asset before uploading any new file.
+          for path in files:
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              if path.name in assets and assets[path.name].get('digest') != 'sha256:' + digest:
+                  raise SystemExit('Refusing to replace existing asset: ' + path.name)
+              sums[path.name] = digest
+          for path in files:
+              if path.name not in assets:
+                  subprocess.run(['gh', 'release', 'upload', os.environ['RELEASE_TAG'], str(path), '--repo', os.environ['GITHUB_REPOSITORY']], check=True)
+          pathlib.Path('release-assets/SHA256SUMS').write_text(''.join(f'{digest}  {name}\n' for name, digest in sorted(sums.items())))
+          PY
+          gh release upload "$RELEASE_TAG" release-assets/SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"

@@ -56,9 +56,25 @@ Use it to investigate a slow server, move files, deploy an application, run scri
 
 ## Download
 
-[**Download for macOS**](https://github.com/onyedikachi-david/oars/releases/latest/download/oars-macos.zip) · [**Download for Linux (x86_64)**](https://github.com/onyedikachi-david/oars/releases/latest/download/oars-linux-x86_64.tar.gz)
+[**Download for macOS (Apple Silicon)**](https://github.com/onyedikachi-david/oars/releases/latest/download/oars-macos.zip) · [**Download for macOS (Intel)**](https://github.com/onyedikachi-david/oars/releases/latest/download/oars-macos-x86_64.zip) · [**Download for Linux (x86_64)**](https://github.com/onyedikachi-david/oars/releases/latest/download/oars-linux-x86_64.tar.gz)
 
 These links download the latest release files directly. Public release downloads do not require a GitHub account. See [release notes and checksums](https://github.com/onyedikachi-david/oars/releases) for more details.
+
+On macOS (Apple Silicon or Intel) and Linux x86_64, you can also install Oars with Homebrew:
+
+```sh
+brew install --cask onyedikachi-david/tap/oars
+```
+
+Run `brew update` and `brew upgrade --cask onyedikachi-david/tap/oars` to update. The [Homebrew tap](https://github.com/onyedikachi-david/homebrew-tap) selects the package for your operating system and CPU. The macOS security instructions below still apply.
+
+Linux requires a graphical desktop, GTK4, and WebKitGTK 6.0. On Ubuntu 24.04, install the runtime libraries before launching `oars`:
+
+```sh
+sudo apt install libgtk-4-1 libwebkitgtk-6.0-4
+```
+
+The Linux release is tested on Ubuntu 24.04 x86_64. Other distributions need compatible system libraries; Linux ARM builds are not published.
 
 ## Get started
 
@@ -71,7 +87,7 @@ Oars runs on macOS and Linux and connects to Linux servers. Windows is not curre
 
 macOS packages are currently unsigned and not notarized. If macOS blocks a download you trust, follow [Apple's instructions for opening an unidentified app](https://support.apple.com/guide/mac-help/mh40616/mac).
 
-For newer builds, successful [CI runs](https://github.com/onyedikachi-david/oars/actions/workflows/ci.yml) provide `oars-macos` and `oars-linux` artifacts. These are release-optimized builds; downloading workflow artifacts requires a GitHub account.
+For newer builds, successful [CI runs](https://github.com/onyedikachi-david/oars/actions/workflows/ci.yml) provide `oars-macos-arm64`, `oars-macos-x86_64`, and `oars-linux-x86_64` artifacts. These are release-optimized builds; downloading workflow artifacts requires a GitHub account.
 
 ## In pictures
 
@@ -209,7 +225,11 @@ NATIVE_SDK_LOG_DIR=/tmp/oars-logs NATIVE_SDK_LOG_FORMAT=jsonl zig build run
 <details>
 <summary><strong>Release process</strong></summary>
 
-Release Please reads Conventional Commits on `main` and automatically maintains a release pull request containing the next SemVer version and a detailed `CHANGELOG.md`. Merge that release PR when it is ready. The same workflow then creates the `vX.Y.Z` tag and GitHub Release, builds both desktop packages, and attaches the macOS ZIP, Linux tarball, and SHA-256 checksums. Do not create release tags manually.
+Release Please reads Conventional Commits on `main` and automatically maintains a release pull request containing the next SemVer version and a detailed `CHANGELOG.md`. Merge that release PR when it is ready. The same workflow then creates the `vX.Y.Z` tag and GitHub Release, builds and launches the packages on Apple Silicon macOS, Intel macOS, and Linux x86_64, and attaches the macOS ZIPs, Linux tarball, and SHA-256 checksums. Do not create release tags manually.
+
+The [Homebrew tap](https://github.com/onyedikachi-david/homebrew-tap) checks for completed stable releases hourly and updates its cask after verifying all three packages and their checksums. Its **Update Oars** workflow can also be run manually after the release assets finish uploading. This uses the tap's own GitHub token and requires no additional secret in this repository.
+
+The **Add Intel package to an existing release** workflow builds an existing stable tag on an Intel Mac and adds its missing package without replacing existing archives. It updates `SHA256SUMS` after uploading the new files.
 
 The application version is synchronized through `version.txt`, `app.zon`, and `build.zig`. Repository settings must allow the release bot to write and open pull requests: **Settings → Actions → General → Workflow permissions → Read and write permissions**, then enable **Allow GitHub Actions to create and approve pull requests**.
 
