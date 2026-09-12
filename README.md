@@ -229,8 +229,6 @@ Release Please reads Conventional Commits on `main` and automatically maintains 
 
 The [Homebrew tap](https://github.com/onyedikachi-david/homebrew-tap) checks for completed stable releases hourly and updates its cask after verifying all three packages and their checksums. Its **Update Oars** workflow can also be run manually after the release assets finish uploading. This uses the tap's own GitHub token and requires no additional secret in this repository.
 
-The **Add Intel package to an existing release** workflow builds an existing stable tag on an Intel Mac and adds its missing package without replacing existing archives. It updates `SHA256SUMS` after uploading the new files.
-
 The application version is synchronized through `version.txt`, `app.zon`, and `build.zig`. Repository settings must allow the release bot to write and open pull requests: **Settings → Actions → General → Workflow permissions → Read and write permissions**, then enable **Allow GitHub Actions to create and approve pull requests**.
 
 Use Conventional Commit prefixes so the version and changelog category are calculated correctly: `feat:` for a minor release, `fix:` for a patch, and `feat!:`/`fix!:` or a `BREAKING CHANGE:` footer for a major release.

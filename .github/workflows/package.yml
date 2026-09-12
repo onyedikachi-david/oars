@@ -88,6 +88,7 @@ jobs:
         run: |
           APP=(zig-out/package/*/bin/oars)
           file "${APP[0]}" | grep 'ELF 64-bit.*x86-64'
+          bash .release-tools/scripts/enable-webkit-sandbox.sh "${APP[0]}"
           xvfb-run -a dbus-run-session -- python3 .release-tools/scripts/package-smoke.py "${APP[0]}"
       - name: Archive macOS package
         if: runner.os == 'macOS'
