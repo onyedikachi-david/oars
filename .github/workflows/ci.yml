@@ -20,6 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Test update publication guards
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Verify release version consistency
         shell: bash
         run: |
@@ -158,3 +160,38 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.release-state.outputs.tag_name }}
         run: gh release upload "$RELEASE_TAG" release-assets/* --clobber --repo "${{ github.repository }}"
+
+  publish-updates:
+    name: Publish signed update feeds
+    if: needs.release-state.outputs.is_release == 'true'
+    needs: [release-state, publish-release]
+    runs-on: macos-15
+    permissions:
+      contents: write
+    concurrency:
+      group: signed-update-feeds
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: oars-*
+          path: release-assets
+          merge-multiple: true
+      - name: Get published checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release-state.outputs.tag_name }}
+        run: gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir release-assets
+      - name: Generate and verify signed feeds
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          SPARKLE_PATH="$(bash scripts/fetch-sparkle.sh)"
+          python3 scripts/generate-update-feeds.py release-assets "$SPARKLE_PATH" update-feeds "$(cat version.txt)"
+      - name: Publish feeds after all release assets are ready
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/publish-update-feeds.sh update-feeds

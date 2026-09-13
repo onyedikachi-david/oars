@@ -138,6 +138,7 @@ pub fn build(b: *std.Build) void {
     const optimize_request = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size");
     const optimize = optimizeMode(b, optimize_request, .Debug);
     const package_optimize = optimizeMode(b, optimize_request, .ReleaseFast);
+    const sparkle_path = b.option([]const u8, "sparkle-path", "Path to the pinned Sparkle distribution (packaged macOS builds)");
     const platform_option = b.option(PlatformOption, "platform", "Desktop backend: auto, null, macos, linux, windows") orelse .auto;
     const trace_option = b.option(TraceOption, "trace", "Trace output: off, events, runtime, all") orelse .events;
     const debug_overlay = b.option(bool, "debug-overlay", "Enable debug overlay output") orelse false;
@@ -198,6 +199,7 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "automation", automation_enabled);
     options.addOption(bool, "js_bridge", js_bridge_enabled);
     options.addOption(bool, "web_layer", web_layer);
+    options.addOption([]const u8, "app_version", app_version);
     const options_mod = options.createModule();
 
     const runner_mod = localModule(b, target, optimize, "src/runner.zig");
@@ -231,7 +233,7 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag == .windows and optimize != .Debug) {
         exe.subsystem = .windows;
     }
-    linkPlatform(b, target, app_mod, exe, selected_platform, web_engine, web_layer, native_sdk_path, cef_dir, cef_auto_install);
+    linkPlatform(b, target, app_mod, exe, selected_platform, web_engine, web_layer, native_sdk_path, cef_dir, cef_auto_install, sparkle_path);
     b.installArtifact(exe);
 
     const frontend_install = b.addSystemCommand(&.{ "npm", "ci", "--prefix", "frontend" });
@@ -286,7 +288,7 @@ pub fn build(b: *std.Build) void {
         if (target.result.os.tag == .windows and package_optimize != .Debug) {
             built.subsystem = .windows;
         }
-        linkPlatform(b, target, package_app_mod, built, selected_platform, web_engine, web_layer, native_sdk_path, cef_dir, cef_auto_install);
+        linkPlatform(b, target, package_app_mod, built, selected_platform, web_engine, web_layer, native_sdk_path, cef_dir, cef_auto_install, sparkle_path);
         break :pkg built;
     };
 
@@ -443,12 +445,26 @@ fn externalModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
     });
 }
 
-fn linkPlatform(b: *std.Build, target: std.Build.ResolvedTarget, app_mod: *std.Build.Module, exe: *std.Build.Step.Compile, platform: PlatformOption, web_engine: WebEngineOption, web_layer: bool, native_sdk_path: []const u8, cef_dir: []const u8, cef_auto_install: bool) void {
+fn linkPlatform(b: *std.Build, target: std.Build.ResolvedTarget, app_mod: *std.Build.Module, exe: *std.Build.Step.Compile, platform: PlatformOption, web_engine: WebEngineOption, web_layer: bool, native_sdk_path: []const u8, cef_dir: []const u8, cef_auto_install: bool, sparkle_path: ?[]const u8) void {
+    app_mod.addIncludePath(b.path("src/c"));
+    if (platform != .macos and platform != .linux) {
+        app_mod.addCSourceFile(.{ .file = b.path("src/c/updates_stub.c"), .flags = &.{} });
+    }
     if (platform == .macos) {
         const secure_entry_sdk_include = if (b.sysroot) |sysroot| b.fmt("-I{s}/usr/include", .{sysroot}) else "";
         const secure_entry_flags: []const []const u8 = if (b.sysroot) |sysroot| &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=11.0", "-isysroot", sysroot, secure_entry_sdk_include } else &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=11.0" };
         app_mod.addIncludePath(b.path("src/c"));
         app_mod.addCSourceFile(.{ .file = b.path("src/c/ai_secure_entry_macos.m"), .flags = secure_entry_flags });
+        if (sparkle_path) |path| {
+            const flags = b.allocator.dupe([]const u8, secure_entry_flags) catch @panic("out of memory");
+            app_mod.addFrameworkPath(.{ .cwd_relative = path });
+            app_mod.addCSourceFile(.{ .file = b.path("src/c/updates_macos.m"), .flags = flags });
+            app_mod.linkFramework("Sparkle", .{});
+            app_mod.addRPathSpecial("@executable_path/../Frameworks");
+        } else {
+            app_mod.addCSourceFile(.{ .file = b.path("src/c/updates_stub.c"), .flags = &.{} });
+        }
+
         switch (web_engine) {
             .system => {
                 const sdk_include = if (b.sysroot) |sysroot| b.fmt("-I{s}/usr/include", .{sysroot}) else "";
@@ -497,6 +513,9 @@ fn linkPlatform(b: *std.Build, target: std.Build.ResolvedTarget, app_mod: *std.B
     } else if (platform == .linux) {
         app_mod.addIncludePath(b.path("src/c"));
         app_mod.addCSourceFile(.{ .file = b.path("src/c/ai_secure_entry_linux.c"), .flags = &.{} });
+        app_mod.addCSourceFile(.{ .file = b.path("src/c/updates_linux.c"), .flags = &.{} });
+        app_mod.linkSystemLibrary("libsoup-3.0", .{});
+        app_mod.linkSystemLibrary("gio-2.0", .{});
         switch (web_engine) {
             .system => if (web_layer) {
                 app_mod.addCSourceFile(.{ .file = nativeSdkPath(b, native_sdk_path, "src/platform/linux/gtk_host.c"), .flags = &.{} });

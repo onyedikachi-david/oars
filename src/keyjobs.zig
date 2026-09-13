@@ -650,6 +650,7 @@ pub const Registry = struct {
     io: ?std.Io = null,
     coordinator: ?std.Thread = null,
     local_worker: ?std.Thread = null,
+    active_workers: std.atomic.Value(usize) = .init(0),
     stop: std.atomic.Value(bool) = .init(false),
 
     pub fn init(allocator: std.mem.Allocator) Registry {
@@ -1187,10 +1188,12 @@ pub const Registry = struct {
         while (!self.stop.load(.acquire)) {
             if (self.claimNext()) |work| {
                 const driver = self.driver orelse continue;
+                _ = self.active_workers.fetchAdd(1, .acq_rel);
                 switch (work) {
                     .snapshot => |snap| driver.drive_snapshot(driver.context, self, snap),
                     .job => |job| driver.drive_job(driver.context, self, job),
                 }
+                _ = self.active_workers.fetchSub(1, .acq_rel);
                 continue;
             }
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch return;
@@ -1202,7 +1205,9 @@ pub const Registry = struct {
         while (!self.stop.load(.acquire)) {
             if (self.claimNextLocal()) |job| {
                 const driver = self.driver orelse continue;
+                _ = self.active_workers.fetchAdd(1, .acq_rel);
                 driver.drive_local_job(driver.context, self, job);
+                _ = self.active_workers.fetchSub(1, .acq_rel);
                 continue;
             }
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch return;

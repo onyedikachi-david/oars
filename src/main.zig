@@ -16,6 +16,7 @@ const ai = @import("ai.zig");
 const keyjobs = @import("keyjobs.zig");
 const vault = @import("vault.zig");
 const agent = @import("agent.zig");
+const updates = @import("updates.zig");
 
 // Zig 0.16 only collects test blocks from files that are actually
 // analyzed, and an unused import is never analyzed — so the env-gated
@@ -227,6 +228,7 @@ const App = struct {
             oars_enable_webview_fullscreen();
         }
         const self: *App = @ptrCast(@alignCast(context));
+        updates.c.oars_updates_start(updates.version.ptr, updates.feedCallback, bridge.updateGate, &self.bridge_ctx);
         self.ai_registry.credential_facade.install(.{
             .context = runtime,
             .set_fn = credentialSet,
@@ -237,6 +239,7 @@ const App = struct {
 
     fn stop(context: *anyopaque, _: *native_sdk.Runtime) anyerror!void {
         const self: *App = @ptrCast(@alignCast(context));
+        updates.c.oars_updates_stop();
         self.ai_registry.stopProviderTests();
         self.ai_registry.credential_facade.clear();
     }
@@ -2362,4 +2365,28 @@ test "spec 18: agent.list, agent auth method, and the forwarding toggle" {
     );
     try std.testing.expect(std.mem.indexOf(u8, cyc2, "\"ok\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, cyc2, "cycle") != null);
+}
+
+test "update restart gate fails closed and reserves bridge admission until canceled" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+    const ctx = &app.ctx;
+    try std.testing.expectEqual(@as(c_int, 1), bridge.updateGate(ctx, 0));
+    try std.testing.expect(ctx.manager.mutex.tryLock());
+    try std.testing.expectEqual(@as(c_int, 0), bridge.updateGate(ctx, 1));
+    ctx.manager.mutex.unlock();
+    try std.testing.expect(!ctx.update_restarting);
+    try std.testing.expect(ctx.ai.request_limiter.tryAcquire());
+    try std.testing.expectEqual(@as(c_int, 0), bridge.updateGate(ctx, 1));
+    ctx.ai.request_limiter.release();
+    ctx.keys.active_workers.store(1, .release);
+    try std.testing.expectEqual(@as(c_int, 0), bridge.updateGate(ctx, 1));
+    ctx.keys.active_workers.store(0, .release);
+    try std.testing.expectEqual(@as(c_int, 1), bridge.updateGate(ctx, 1));
+    const denied = app.dispatch("{\"id\":\"update-gate\",\"command\":\"oars.servers.list\",\"payload\":{}}");
+    try std.testing.expect(std.mem.indexOf(u8, denied, "restarting") != null);
+    try std.testing.expectEqual(@as(c_int, 1), bridge.updateGate(ctx, 2));
+    const allowed = app.dispatch("{\"id\":\"update-gate2\",\"command\":\"oars.servers.list\",\"payload\":{}}");
+    try std.testing.expect(std.mem.indexOf(u8, allowed, "restarting") == null);
 }

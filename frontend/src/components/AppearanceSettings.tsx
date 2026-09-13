@@ -1,6 +1,7 @@
+import { UpdateSettings } from "./UpdateSettings";
 import { useEffect, useId, useRef, useState } from "react";
 import { Terminal } from "xterm";
-import { Check, Database, Monitor, Moon, Sun, TerminalSquare, X, ArrowUpRight } from "lucide-react";
+import { Check, Database, Download, Monitor, Moon, Sun, TerminalSquare, X, ArrowUpRight } from "lucide-react";
 import { FitAddon } from "@xterm/addon-fit";
 import { useAppearance, updateAppearance, terminalTheme, terminalFont, type Appearance } from "../appearance";
 import { ApplicationOverlay } from "./ApplicationPortal";
@@ -31,15 +32,16 @@ function TerminalPreview({ settings }: { settings: Appearance }) {
   return <div className="prefs-preview" style={{ background: terminalTheme(settings).background }}><div ref={host} aria-label="Live terminal appearance preview" /></div>;
 }
 
-type Section = "appearance" | "terminal" | "data";
-export function AppearanceSettings({ onClose, onData }: { onClose: () => void; onData?: () => void }) {
+type Section = "appearance" | "terminal" | "data" | "updates";
+export function AppearanceSettings({ onClose, onData, initialSection = "appearance" }: { onClose: () => void; onData?: () => void; initialSection?: Section }) {
   const id = useId();
   const ref = useModalFocus(onClose);
   const settings = useAppearance();
-  const [section, setSection] = useState<Section>("appearance");
+  const [section, setSection] = useState<Section>(initialSection);
+  useEffect(() => setSection(initialSection), [initialSection]);
   const [error, setError] = useState("");
   const save = (patch: Partial<Appearance>) => setError(updateAppearance(patch) ? "" : "Changed for this session. Device storage is unavailable.");
-  const sections = [{ id: "appearance" as const, title: "Appearance", icon: Monitor }, { id: "terminal" as const, title: "Terminal", icon: TerminalSquare }, ...(onData ? [{ id: "data" as const, title: "Data", icon: Database }] : [])];
+  const sections = [{ id: "appearance" as const, title: "Appearance", icon: Monitor }, { id: "terminal" as const, title: "Terminal", icon: TerminalSquare }, { id: "updates" as const, title: "Updates", icon: Download }, ...(onData ? [{ id: "data" as const, title: "Data", icon: Database }] : [])];
   return <ApplicationOverlay quiet><div ref={ref} role="dialog" aria-modal="true" aria-labelledby={`${id}-title`} className="oars-modal preferences-dialog">
     <header className="preferences-header"><h2 id={`${id}-title`}>Settings</h2><Button size="icon-sm" variant="ghost" aria-label="Close settings" onClick={onClose}><X /></Button></header>
     <div className="preferences-layout">
@@ -57,6 +59,7 @@ export function AppearanceSettings({ onClose, onData }: { onClose: () => void; o
           <div className="prefs-form-row"><label htmlFor={`${id}-size`}>Font size</label><div className="prefs-font-size"><input id={`${id}-size`} type="number" min={10} max={24} value={settings.fontSize} onChange={event => { const size = Number(event.target.value); if (Number.isInteger(size) && size >= 10 && size <= 24) save({ fontSize: size }); }} /><span>px</span></div></div>
           <TerminalPreview settings={settings} />
         </>}
+        {section === "updates" && <UpdateSettings />}
         {section === "data" && <>
           <header><h3>Data</h3><p>Move your configuration between devices.</p></header>
           <div className="prefs-data-row"><Database size={20} aria-hidden /><div><h4>Export and import</h4><p>Connection profiles, scripts, and local journals.</p></div></div>
@@ -66,6 +69,6 @@ export function AppearanceSettings({ onClose, onData }: { onClose: () => void; o
         {error && <p className="oars-form-error" role="alert">{error}</p>}
       </section>
     </div>
-    <footer className="preferences-footer"><span>{error ? "Changes are not saved" : "Saved automatically"}</span><Button size="sm" variant="outline" onClick={onClose}>Done</Button></footer>
+    <footer className="preferences-footer"><span>{section === "updates" ? "Checks run while Oars is open" : error ? "Changes are not saved" : "Saved automatically"}</span><Button size="sm" variant="outline" onClick={onClose}>Done</Button></footer>
   </div></ApplicationOverlay>;
 }
