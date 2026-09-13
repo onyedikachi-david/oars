@@ -50,7 +50,7 @@ def mac_has_window(pid):
 def main():
     executable = Path(sys.argv[1]).resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="oars-package-smoke-") as directory:
-        env = dict(os.environ, OARS_DATA_DIR=directory + "/data")
+        env = dict(os.environ, OARS_DATA_DIR=directory + "/data", OARS_DISABLE_UPDATE_CHECKS="1")
         env.pop("NATIVE_SDK_FRONTEND_URL", None)
         with open(directory + "/launch.log", "w+") as log:
             app = subprocess.Popen([str(executable)], cwd=directory, env=env, stdout=log, stderr=log)

@@ -78,6 +78,12 @@ Ubuntu may also require the Oars-specific AppArmor profile supplied by the cask.
 
 The Linux release is tested on Ubuntu 24.04 x86_64. Other distributions need compatible system libraries; Linux ARM builds are not published.
 
+## Application updates
+
+In updater-enabled macOS builds, open **Settings → Updates** to control automatic checks and background downloads. Updates install on quit or after a restart that does not interrupt active work. Linux builds notify you when a release is available and direct Homebrew installations through Homebrew.
+
+Older versions need one normal upgrade to receive the updater. See [update setup and release signing](updates/README.md).
+
 ## Get started
 
 1. Choose your operating system from the [download links above](#download), or [build from source](#local-development).

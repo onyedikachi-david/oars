@@ -16,6 +16,7 @@ const ai = @import("ai.zig");
 const keyjobs = @import("keyjobs.zig");
 const vault = @import("vault.zig");
 const agent = @import("agent.zig");
+const updates = @import("updates.zig");
 
 // Zig 0.16 only collects test blocks from files that are actually
 // analyzed, and an unused import is never analyzed — so the env-gated
@@ -227,6 +228,7 @@ const App = struct {
             oars_enable_webview_fullscreen();
         }
         const self: *App = @ptrCast(@alignCast(context));
+        updates.c.oars_updates_start(updates.version.ptr, updates.feedCallback, bridge.updateGate, &self.bridge_ctx);
         self.ai_registry.credential_facade.install(.{
             .context = runtime,
             .set_fn = credentialSet,
@@ -237,6 +239,7 @@ const App = struct {
 
     fn stop(context: *anyopaque, _: *native_sdk.Runtime) anyerror!void {
         const self: *App = @ptrCast(@alignCast(context));
+        updates.c.oars_updates_stop();
         self.ai_registry.stopProviderTests();
         self.ai_registry.credential_facade.clear();
     }
@@ -1397,13 +1400,19 @@ test "sshkeys.localGenerate creates a key, is idempotent, and hides the passphra
     var poll_buf: [256]u8 = undefined;
     const poll_req = try std.fmt.bufPrint(&poll_buf, "{{\"id\":\"2\",\"command\":\"oars.sshkeys.jobPoll\",\"payload\":{{\"job_id\":\"{s}\"}}}}", .{job_id});
     var poll_resp: []const u8 = "";
+    const JobState = struct { result: struct { state: []const u8 } };
+    var completed = false;
     var attempts: usize = 0;
     while (attempts < 400) : (attempts += 1) {
         poll_resp = app.dispatch(poll_req);
-        if (std.mem.indexOf(u8, poll_resp, "\"state\":\"done\"") != null) break;
+        // A completed step does not mean the whole job has finished.
+        const snapshot = try std.json.parseFromSlice(JobState, std.testing.allocator, poll_resp, .{ .ignore_unknown_fields = true });
+        defer snapshot.deinit();
+        completed = std.mem.eql(u8, snapshot.value.result.state, "done");
+        if (completed) break;
         std.Io.sleep(io, std.Io.Duration.fromMilliseconds(25), .awake) catch {};
     }
-    try std.testing.expect(std.mem.indexOf(u8, poll_resp, "\"state\":\"done\"") != null);
+    try std.testing.expect(completed);
     // The passphrase never appears in the job result; the Keychain account
     // name tells the frontend where to store it.
     try std.testing.expect(std.mem.indexOf(u8, poll_resp, "hunter2-secret") == null);
@@ -1458,13 +1467,17 @@ test "sshkeys.localGenerate creates a key, is idempotent, and hides the passphra
     var dup_poll_buf: [256]u8 = undefined;
     const dup_poll_req = try std.fmt.bufPrint(&dup_poll_buf, "{{\"id\":\"4\",\"command\":\"oars.sshkeys.jobPoll\",\"payload\":{{\"job_id\":\"{s}\"}}}}", .{dup_id_buf[0..dup_id_len]});
     var dup_poll: []const u8 = "";
+    var refused = false;
     attempts = 0;
     while (attempts < 400) : (attempts += 1) {
         dup_poll = app.dispatch(dup_poll_req);
-        if (std.mem.indexOf(u8, dup_poll, "\"state\":\"done\"") != null or std.mem.indexOf(u8, dup_poll, "\"state\":\"partial\"") != null) break;
+        const snapshot = try std.json.parseFromSlice(JobState, std.testing.allocator, dup_poll, .{ .ignore_unknown_fields = true });
+        defer snapshot.deinit();
+        refused = std.mem.eql(u8, snapshot.value.result.state, "partial");
+        if (refused or std.mem.eql(u8, snapshot.value.result.state, "done")) break;
         std.Io.sleep(io, std.Io.Duration.fromMilliseconds(25), .awake) catch {};
     }
-    try std.testing.expect(std.mem.indexOf(u8, dup_poll, "\"state\":\"partial\"") != null);
+    try std.testing.expect(refused);
     try std.testing.expect(std.mem.indexOf(u8, dup_poll, "already exists") != null);
 
     // A relative destination is rejected before any work.
@@ -2362,4 +2375,51 @@ test "spec 18: agent.list, agent auth method, and the forwarding toggle" {
     );
     try std.testing.expect(std.mem.indexOf(u8, cyc2, "\"ok\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, cyc2, "cycle") != null);
+}
+
+test "update restart gate fails closed and reserves bridge admission until canceled" {
+    var app: TestApp = undefined;
+    try app.init();
+    defer app.deinit();
+    const ctx = &app.ctx;
+    try std.testing.expectEqual(@as(c_int, 1), bridge.updateGate(ctx, 0));
+    try std.testing.expect(ctx.manager.mutex.tryLock());
+    try std.testing.expectEqual(@as(c_int, 0), bridge.updateGate(ctx, 1));
+    ctx.manager.mutex.unlock();
+    try std.testing.expect(!ctx.update_restarting);
+    try std.testing.expect(ctx.ai.request_limiter.tryAcquire());
+    try std.testing.expectEqual(@as(c_int, 0), bridge.updateGate(ctx, 1));
+    ctx.ai.request_limiter.release();
+    ctx.keys.active_workers.store(1, .release);
+    try std.testing.expectEqual(@as(c_int, 0), bridge.updateGate(ctx, 1));
+    ctx.keys.active_workers.store(0, .release);
+    {
+        var scan = access.Scan{ .id = "update-test-scan" };
+        try ctx.access.scans.append(ctx.allocator, &scan);
+        defer _ = ctx.access.scans.pop();
+        try std.testing.expectEqual(@as(c_int, 0), bridge.updateGate(ctx, 1));
+        scan.finished_at_ns = 1;
+        try std.testing.expectEqual(@as(c_int, 1), bridge.updateGate(ctx, 0));
+        scan.finished_at_ns = 0;
+        scan.canceled = true;
+        try std.testing.expectEqual(@as(c_int, 1), bridge.updateGate(ctx, 0));
+    }
+    {
+        var job = access.Job{ .id = "update-test-job", .kind = .rotate, .identity_id = "update-test-identity" };
+        try job.items.append(std.testing.allocator, .{ .server_id = "update-test-server", .user = "test" });
+        defer job.items.deinit(std.testing.allocator);
+        try ctx.access.jobs.append(ctx.allocator, &job);
+        defer _ = ctx.access.jobs.pop();
+        try std.testing.expectEqual(@as(c_int, 0), bridge.updateGate(ctx, 1));
+        job.items.items[0].state = .running;
+        try std.testing.expectEqual(@as(c_int, 0), bridge.updateGate(ctx, 1));
+        job.items.items[0].state = .done;
+        try std.testing.expectEqual(@as(c_int, 1), bridge.updateGate(ctx, 0));
+    }
+    try std.testing.expectEqual(@as(c_int, 1), bridge.updateGate(ctx, 1));
+    const denied = app.dispatch("{\"id\":\"update-gate\",\"command\":\"oars.servers.list\",\"payload\":{}}");
+    try std.testing.expect(std.mem.indexOf(u8, denied, "restarting") != null);
+    try std.testing.expectEqual(@as(c_int, 1), bridge.updateGate(ctx, 2));
+    const allowed = app.dispatch("{\"id\":\"update-gate2\",\"command\":\"oars.servers.list\",\"payload\":{}}");
+    try std.testing.expect(std.mem.indexOf(u8, allowed, "restarting") == null);
 }

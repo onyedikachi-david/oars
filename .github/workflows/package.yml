@@ -49,7 +49,9 @@ jobs:
         uses: actions/checkout@v7
         with:
           path: .release-tools
-          sparse-checkout: scripts
+          sparse-checkout: |
+            scripts
+            updates
           persist-credentials: false
       - uses: actions/setup-node@v7
         with:
@@ -63,7 +65,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes pkg-config libgtk-4-dev libwebkitgtk-6.0-dev xvfb xdotool dbus-x11
+          sudo apt-get install --yes pkg-config libgtk-4-dev libwebkitgtk-6.0-dev libsoup-3.0-dev xvfb xdotool dbus-x11
       - name: Install Native SDK
         run: npm install --global @native-sdk/cli@0.7.1
       - name: Resolve Native SDK path
@@ -73,8 +75,28 @@ jobs:
       - name: Test native code on macOS
         if: runner.os == 'macOS'
         run: zig build test -Dplatform=null -Dnative-sdk-path="${{ steps.native-sdk.outputs.path }}"
+      - name: Fetch pinned Sparkle
+        if: runner.os == 'macOS'
+        id: sparkle
+        shell: bash
+        run: echo "path=$(bash .release-tools/scripts/fetch-sparkle.sh)" >> "$GITHUB_OUTPUT"
       - name: Build package
-        run: zig build package -Dpackage-target="$PACKAGE_TARGET" -Dnative-sdk-path="${{ steps.native-sdk.outputs.path }}"
+        shell: bash
+        env:
+          SPARKLE_PATH: ${{ steps.sparkle.outputs.path }}
+        run: |
+          EXTRA=()
+          if [ -n "$SPARKLE_PATH" ]; then EXTRA+=("-Dsparkle-path=$SPARKLE_PATH"); fi
+          zig build package -Dpackage-target="$PACKAGE_TARGET" -Dnative-sdk-path="${{ steps.native-sdk.outputs.path }}" "${EXTRA[@]}"
+      - name: Embed the macOS updater
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          SPARKLE_PATH: ${{ steps.sparkle.outputs.path }}
+        run: |
+          APP=(zig-out/package/*.app)
+          python3 .release-tools/scripts/package-updater.py "${APP[0]}" "$SPARKLE_PATH" "$PACKAGE_ARCH"
+          bash .release-tools/scripts/sign-macos-package.sh "${APP[0]}"
       - name: Validate and launch macOS package
         if: runner.os == 'macOS'
         shell: bash
@@ -90,6 +112,15 @@ jobs:
           file "${APP[0]}" | grep 'ELF 64-bit.*x86-64'
           bash .release-tools/scripts/enable-webkit-sandbox.sh "${APP[0]}"
           xvfb-run -a dbus-run-session -- python3 .release-tools/scripts/package-smoke.py "${APP[0]}"
+      - name: Test Linux update notifications
+        if: runner.os == 'Linux'
+        run: python3 scripts/test-updater-linux.py
+      - name: Test authenticated macOS updates
+        if: runner.os == 'macOS'
+        timeout-minutes: 6
+        env:
+          SPARKLE_PATH: ${{ steps.sparkle.outputs.path }}
+        run: python3 scripts/test-updater-macos.py "$SPARKLE_PATH"
       - name: Archive macOS package
         if: runner.os == 'macOS'
         shell: bash
