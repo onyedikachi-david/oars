@@ -1,9 +1,10 @@
-import { useId, useState } from "react";
-import { Download, RefreshCw } from "lucide-react";
+import { useEffect, useId, useState } from "react";
+import { AlertCircle, ArrowUpRight, CheckCircle2, Download, PauseCircle, RefreshCw, ShieldCheck } from "lucide-react";
 import { Button } from "./ui/button";
 import { ApplicationNotice } from "./ApplicationPortal";
 import { updateApi, useUpdates, type UpdateStatus } from "../updates";
 
+const appIcon = new URL("../../../assets/icon.png", import.meta.url).href;
 function statusText(status: UpdateStatus): string {
   switch (status.state) {
     case "unavailable": return "Updates are available in installed release builds.";
@@ -14,39 +15,65 @@ function statusText(status: UpdateStatus): string {
     case "blocked": return "Finish active work and disconnect sessions before restarting.";
     case "available": return `Oars ${status.latest_version} is available.`;
     case "error": return status.error || "Could not check for updates. Try again.";
-    default: return "Automatic checks run in the background. You can also check now.";
+    default: return "";
   }
+}
+function Preference({ id, title, description, checked, disabled, onChange }: {
+  id: string; title: string; description: string; checked: boolean; disabled: boolean; onChange: (checked: boolean) => void;
+}) {
+  return <label className="update-preference" htmlFor={id} data-disabled={disabled || undefined}>
+    <span className="update-preference-copy"><span id={`${id}-label`}>{title}</span><span id={`${id}-description`}>{description}</span></span>
+    <span className="update-toggle"><input id={id} type="checkbox" role="switch" aria-labelledby={`${id}-label`} aria-describedby={`${id}-description`} checked={checked} disabled={disabled} onChange={event => onChange(event.target.checked)} /><span className="update-toggle-track" aria-hidden="true" /></span>
+  </label>;
 }
 export function UpdateSettings() {
   const id = useId();
   const status = useUpdates();
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
+  const [optimistic, setOptimistic] = useState<{ checks: boolean; downloads: boolean } | null>(null);
+  useEffect(() => {
+    if (optimistic && status?.automatic_checks === optimistic.checks && status?.automatic_downloads === optimistic.downloads) setOptimistic(null);
+  }, [status?.automatic_checks, status?.automatic_downloads, optimistic]);
   async function perform(action: () => Promise<unknown>) {
     setPending(true); setError("");
-    try { await action(); } catch (e) { setError(e instanceof Error ? e.message : "The update action failed. Try again."); }
+    try { await action(); } catch (e) { setOptimistic(null); setError(e instanceof Error ? e.message : "The update action failed. Try again."); }
     finally { setPending(false); }
   }
-  return <>
-    <header><h3>Updates</h3><p>{status ? `Installed version: ${status.current_version}` : "Update controls are available in the desktop app."}</p></header>
-    {status && <>
-      <p role="status" className="prefs-data-note">{statusText(status)}</p>
-      {status.mode !== "unavailable" && <fieldset disabled={pending} className="prefs-update-options">
+  function save(checks: boolean, downloads: boolean) {
+    setOptimistic({ checks, downloads });
+    void perform(() => updateApi.preferences(checks, downloads));
+  }
+  const checks = optimistic?.checks ?? status?.automatic_checks ?? false;
+  const downloads = optimistic?.downloads ?? status?.automatic_downloads ?? false;
+  const updating = status && ["checking", "downloading", "verifying"].includes(status.state);
+  const StateIcon = status?.state === "error" ? AlertCircle : status?.state === "blocked" ? PauseCircle : status?.state === "ready" ? CheckCircle2 : updating ? RefreshCw : Download;
+  const showState = status && status.state !== "idle";
+  return <div className="update-settings">
+    <header className="update-heading"><h3>Updates</h3><p>Keep your workspace up to date.</p></header>
+    <div className="update-version-row">
+      <span className="update-brand-icon"><img src={appIcon} alt="" width={78} height={78} /></span>
+      <div className="update-version-copy"><strong>Oars</strong><span>{status ? `Version ${status.current_version}` : "Desktop application"}</span></div>
+      <Button variant="outline" size="sm" disabled={pending || !status?.can_check} onClick={() => void perform(updateApi.check)}><RefreshCw data-icon="inline-start" className={status?.state === "checking" ? "update-spinner" : undefined} />{status?.state === "checking" ? "Checking…" : status?.state === "ready" && status.mode === "sparkle" ? "Review update" : "Check for updates"}</Button>
+    </div>
+    {!status && <p className="update-unavailable">Update controls are available in the desktop app.</p>}
+    {showState && <div className="update-state" data-state={status.state} role="status">
+      <StateIcon aria-hidden="true" className={updating ? "update-spinner" : undefined} /><p>{statusText(status)}</p>
+      {status.can_resume && <Button size="sm" disabled={pending || status.busy} onClick={() => void perform(updateApi.resume)}>Restart to update</Button>}
+    </div>}
+    {status && status.mode !== "unavailable" && <>
+      <fieldset className="update-preferences" disabled={pending}>
         <legend>Update preferences</legend>
-        <label htmlFor={`${id}-checks`}><input id={`${id}-checks`} type="checkbox" checked={status.automatic_checks} onChange={e => void perform(() => updateApi.preferences(e.target.checked, status.automatic_downloads))} /> Check for updates automatically</label>
-        {status.mode === "sparkle" && <label htmlFor={`${id}-downloads`}><input id={`${id}-downloads`} type="checkbox" checked={status.automatic_downloads} onChange={e => void perform(() => updateApi.preferences(status.automatic_checks, e.target.checked))} /> Download updates in the background</label>}
-      </fieldset>}
-      {status.mode === "sparkle" && <p className="prefs-data-note">Downloads do not interrupt your work. Progress and installation choices appear in the update window.</p>}
-      {status.mode === "homebrew" && <><p className="prefs-data-note">Homebrew manages this installation. Finish active work and quit Oars, then run:</p><pre className="prefs-update-command">brew update{"\n"}brew upgrade --cask onyedikachi-david/tap/oars</pre></>}
-      {status.mode === "manual" && <p className="prefs-data-note">Download the latest Linux package from the releases page. Finish active work and quit Oars before replacing the installed files. Your settings and server data stay in place.</p>}
-      <div className="prefs-update-actions">
-        <Button variant="outline" disabled={pending || !status.can_check} onClick={() => void perform(updateApi.check)}><RefreshCw data-icon="inline-start" />{status.state === "ready" && status.mode === "sparkle" ? "Review update" : "Check for updates"}</Button>
-        {status.can_resume && <Button disabled={pending || status.busy} onClick={() => void perform(updateApi.resume)}>Restart to update</Button>}
-        {status.mode !== "unavailable" && <Button variant="ghost" disabled={pending} onClick={() => void perform(updateApi.releaseNotes)}>Release notes</Button>}
-      </div>
+        <Preference id={`${id}-checks`} title="Check for updates automatically" description="Look for new releases while Oars is open." checked={checks} disabled={pending} onChange={value => save(value, downloads)} />
+        {status.mode === "sparkle" && <Preference id={`${id}-downloads`} title="Download updates in the background" description="Keep working while updates download." checked={downloads} disabled={pending} onChange={value => save(checks, value)} />}
+      </fieldset>
+      {status.mode === "sparkle" && <div className="update-install-note"><ShieldCheck aria-hidden="true" /><p>Updates are verified before installation. Install when you quit, or restart when your work is finished.</p></div>}
+      {status.mode === "homebrew" && <div className="update-managed"><strong>Managed by Homebrew</strong><p>Finish active work and quit Oars, then run:</p><pre>brew update{"\n"}brew upgrade --cask onyedikachi-david/tap/oars</pre></div>}
+      {status.mode === "manual" && <div className="update-managed"><strong>Update from a download</strong><p>Download the latest Linux package from the releases page. Finish active work and quit Oars before replacing the installed files. Your settings and server data stay in place.</p></div>}
+      <div className="update-links"><Button variant="link" size="sm" disabled={pending} onClick={() => void perform(updateApi.releaseNotes)}>Release notes <ArrowUpRight data-icon="inline-end" /></Button></div>
     </>}
-    {error && <p className="oars-form-error" role="alert">{error}</p>}
-  </>;
+    {error && <p className="oars-form-error update-action-error" role="alert">{error}</p>}
+  </div>;
 }
 export function UpdateNotice({ onOpen }: { onOpen: () => void }) {
   const status = useUpdates();

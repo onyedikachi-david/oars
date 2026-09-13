@@ -45,6 +45,14 @@ describe("update controls", () => {
     expect(screen.queryByLabelText("Download updates in the background")).toBeNull();
     expect(screen.queryByRole("button", { name: "Restart to update" })).toBeNull();
   });
+  it("restores a preference when saving fails", async () => {
+    vi.mocked(updateApi.preferences).mockRejectedValue(new Error("Could not save update preferences. Try again."));
+    render(<UpdateSettings />);
+    const control = screen.getByRole("switch", { name: "Download updates in the background" }) as HTMLInputElement;
+    await userEvent.click(control);
+    await screen.findByRole("alert");
+    expect(control.checked).toBe(true);
+  });
   it("reports action failures without claiming success", async () => {
     vi.mocked(updateApi.check).mockRejectedValue(new Error("Offline. Check your connection and try again."));
     render(<UpdateSettings />);

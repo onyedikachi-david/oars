@@ -6,7 +6,8 @@ static OarsUpdateStatus status;
 static OarsUpdateGate gate;
 static void *gateContext;
 @interface OarsUpdater : NSObject <SPUUpdaterDelegate>
-@property(nonatomic, strong) SPUStandardUpdaterController *controller;
+@property(nonatomic, strong) SPUUpdater *updater;
+@property(nonatomic, strong) id<SPUUserDriver> userDriver;
 @property(nonatomic, copy) void (^resumeInstallation)(void);
 @property(nonatomic) BOOL installationPending;
 @end
@@ -45,6 +46,14 @@ static void setError(NSString *text) {
     strlcpy(status.message, text.UTF8String ?: "Unable to check for updates. Try again.", sizeof(status.message));
 }
 @implementation OarsUpdater
+- (BOOL)updater:(SPUUpdater *)updater mayPerformUpdateCheck:(SPUUpdateCheck)check error:(NSError * __autoreleasing *)error {
+    (void)updater; (void)check; (void)error;
+    if (status.state == OARS_UPDATE_IDLE || status.state == OARS_UPDATE_ERROR || status.state == OARS_UPDATE_AVAILABLE) {
+        status.state = OARS_UPDATE_CHECKING;
+        status.message[0] = 0;
+    }
+    return YES;
+}
 - (void)updater:(SPUUpdater *)updater didFindValidUpdate:(SUAppcastItem *)item {
     (void)updater;
     strlcpy(status.latest_version, item.displayVersionString.UTF8String ?: "", sizeof(status.latest_version));
@@ -123,14 +132,18 @@ void oars_updates_start(const char *version, OarsUpdateParse parse, OarsUpdateGa
         ![bundle objectForInfoDictionaryKey:@"SUPublicEDKey"] ||
         ![bundle objectForInfoDictionaryKey:@"SUFeedURL"]) return;
     service = [OarsUpdater new];
-    service.controller = [[SPUStandardUpdaterController alloc] initWithStartingUpdater:NO updaterDelegate:service userDriverDelegate:nil];
+    service.userDriver = [[SPUStandardUserDriver alloc] initWithHostBundle:bundle delegate:nil];
+    service.updater = [[SPUUpdater alloc] initWithHostBundle:bundle applicationBundle:bundle userDriver:service.userDriver delegate:service];
     status.mode = 1; status.state = OARS_UPDATE_IDLE;
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!service) return;
         quitDelegate = [OarsUpdateQuitDelegate new];
         quitDelegate.original = NSApp.delegate;
         NSApp.delegate = quitDelegate;
-        if (!getenv("OARS_DISABLE_UPDATE_CHECKS")) [service.controller startUpdater];
+        if (!getenv("OARS_DISABLE_UPDATE_CHECKS")) {
+            NSError *error = nil;
+            if (![service.updater startUpdater:&error]) setError(error.localizedDescription);
+        }
     });
 }
 void oars_updates_stop(void) {
@@ -139,23 +152,23 @@ void oars_updates_stop(void) {
 }
 void oars_updates_status(OarsUpdateStatus *out) {
     if (service) {
-        status.automatic_checks = service.controller.updater.automaticallyChecksForUpdates;
-        status.automatic_downloads = service.controller.updater.automaticallyDownloadsUpdates;
-        status.can_check = service.controller.updater.canCheckForUpdates;
+        status.automatic_checks = service.updater.automaticallyChecksForUpdates;
+        status.automatic_downloads = service.updater.automaticallyDownloadsUpdates;
+        status.can_check = service.updater.canCheckForUpdates;
         status.can_resume = service.resumeInstallation != nil;
     }
     *out = status;
 }
 int oars_updates_check(void) {
-    if (!service || !service.controller.updater.canCheckForUpdates) return 0;
+    if (!service || !service.updater.canCheckForUpdates) return 0;
     status.message[0] = 0; status.state = OARS_UPDATE_CHECKING;
-    [service.controller checkForUpdates:nil];
+    [service.updater checkForUpdates];
     return 1;
 }
 int oars_updates_preferences(int checks, int downloads) {
     if (!service) return 0;
-    service.controller.updater.automaticallyChecksForUpdates = checks != 0;
-    service.controller.updater.automaticallyDownloadsUpdates = downloads != 0;
+    service.updater.automaticallyChecksForUpdates = checks != 0;
+    service.updater.automaticallyDownloadsUpdates = downloads != 0;
     return 1;
 }
 int oars_updates_resume(void) {

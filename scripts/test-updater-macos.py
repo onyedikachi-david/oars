@@ -25,6 +25,27 @@ spec.loader.exec_module(feeds)
 HOST = r'''
 #import <Cocoa/Cocoa.h>
 #include "updates_macos.m"
+// Deterministic user choices for CI; production retains Sparkle's standard UI.
+@interface FixtureUserDriver : NSObject <SPUUserDriver>
+@end
+@implementation FixtureUserDriver
+- (void)showUpdatePermissionRequest:(SPUUpdatePermissionRequest *)request reply:(void (^)(SUUpdatePermissionResponse *))reply { (void)request; reply([[SUUpdatePermissionResponse alloc] initWithAutomaticUpdateChecks:YES automaticUpdateDownloading:@YES sendSystemProfile:NO]); }
+- (void)showUserInitiatedUpdateCheckWithCancellation:(void (^)(void))cancel { (void)cancel; }
+- (void)showUpdateFoundWithAppcastItem:(SUAppcastItem *)item state:(SPUUserUpdateState *)state reply:(void (^)(SPUUserUpdateChoice))reply { (void)item; (void)state; reply(SPUUserUpdateChoiceInstall); }
+- (void)showUpdateReleaseNotesWithDownloadData:(SPUDownloadData *)data { (void)data; }
+- (void)showUpdateReleaseNotesFailedToDownloadWithError:(NSError *)error { (void)error; }
+- (void)showUpdateNotFoundWithError:(NSError *)error acknowledgement:(void (^)(void))reply { (void)error; reply(); }
+- (void)showUpdaterError:(NSError *)error acknowledgement:(void (^)(void))reply { (void)error; reply(); }
+- (void)showDownloadInitiatedWithCancellation:(void (^)(void))cancel { (void)cancel; }
+- (void)showDownloadDidReceiveExpectedContentLength:(uint64_t)length { (void)length; }
+- (void)showDownloadDidReceiveDataOfLength:(uint64_t)length { (void)length; }
+- (void)showDownloadDidStartExtractingUpdate {}
+- (void)showExtractionReceivedProgress:(double)progress { (void)progress; }
+- (void)showReadyToInstallAndRelaunch:(void (^)(SPUUserUpdateChoice))reply { reply(SPUUserUpdateChoiceInstall); }
+- (void)showInstallingUpdateWithApplicationTerminated:(BOOL)terminated retryTerminatingApplication:(void (^)(void))retry { if (!terminated) retry(); }
+- (void)showUpdateInstalledAndRelaunched:(BOOL)relaunched acknowledgement:(void (^)(void))reply { (void)relaunched; reply(); }
+- (void)dismissUpdateInstallation {}
+@end
 static int testGate(void *context, int action) {
     (void)context;
     if (action == 2) return 1;
@@ -41,6 +62,8 @@ int main(void) {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
         oars_updates_start("1.0.0", NULL, testGate, NULL);
+        service.userDriver = [FixtureUserDriver new];
+        service.updater = [[SPUUpdater alloc] initWithHostBundle:NSBundle.mainBundle applicationBundle:NSBundle.mainBundle userDriver:service.userDriver delegate:service];
         __block BOOL requested = NO;
         __block int previous = -1;
         [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:YES block:^(NSTimer *timer) {
@@ -49,7 +72,7 @@ int main(void) {
             oars_updates_status(&snapshot);
             if (!requested && snapshot.can_check) {
                 requested = YES;
-                [service.controller.updater checkForUpdatesInBackground];
+                [service.updater checkForUpdatesInBackground];
             }
             if (snapshot.state != previous) {
                 previous = snapshot.state;

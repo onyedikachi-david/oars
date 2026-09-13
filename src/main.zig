@@ -1400,13 +1400,19 @@ test "sshkeys.localGenerate creates a key, is idempotent, and hides the passphra
     var poll_buf: [256]u8 = undefined;
     const poll_req = try std.fmt.bufPrint(&poll_buf, "{{\"id\":\"2\",\"command\":\"oars.sshkeys.jobPoll\",\"payload\":{{\"job_id\":\"{s}\"}}}}", .{job_id});
     var poll_resp: []const u8 = "";
+    const JobState = struct { result: struct { state: []const u8 } };
+    var completed = false;
     var attempts: usize = 0;
     while (attempts < 400) : (attempts += 1) {
         poll_resp = app.dispatch(poll_req);
-        if (std.mem.indexOf(u8, poll_resp, "\"state\":\"done\"") != null) break;
+        // A completed step does not mean the whole job has finished.
+        const snapshot = try std.json.parseFromSlice(JobState, std.testing.allocator, poll_resp, .{ .ignore_unknown_fields = true });
+        defer snapshot.deinit();
+        completed = std.mem.eql(u8, snapshot.value.result.state, "done");
+        if (completed) break;
         std.Io.sleep(io, std.Io.Duration.fromMilliseconds(25), .awake) catch {};
     }
-    try std.testing.expect(std.mem.indexOf(u8, poll_resp, "\"state\":\"done\"") != null);
+    try std.testing.expect(completed);
     // The passphrase never appears in the job result; the Keychain account
     // name tells the frontend where to store it.
     try std.testing.expect(std.mem.indexOf(u8, poll_resp, "hunter2-secret") == null);
@@ -1461,13 +1467,17 @@ test "sshkeys.localGenerate creates a key, is idempotent, and hides the passphra
     var dup_poll_buf: [256]u8 = undefined;
     const dup_poll_req = try std.fmt.bufPrint(&dup_poll_buf, "{{\"id\":\"4\",\"command\":\"oars.sshkeys.jobPoll\",\"payload\":{{\"job_id\":\"{s}\"}}}}", .{dup_id_buf[0..dup_id_len]});
     var dup_poll: []const u8 = "";
+    var refused = false;
     attempts = 0;
     while (attempts < 400) : (attempts += 1) {
         dup_poll = app.dispatch(dup_poll_req);
-        if (std.mem.indexOf(u8, dup_poll, "\"state\":\"done\"") != null or std.mem.indexOf(u8, dup_poll, "\"state\":\"partial\"") != null) break;
+        const snapshot = try std.json.parseFromSlice(JobState, std.testing.allocator, dup_poll, .{ .ignore_unknown_fields = true });
+        defer snapshot.deinit();
+        refused = std.mem.eql(u8, snapshot.value.result.state, "partial");
+        if (refused or std.mem.eql(u8, snapshot.value.result.state, "done")) break;
         std.Io.sleep(io, std.Io.Duration.fromMilliseconds(25), .awake) catch {};
     }
-    try std.testing.expect(std.mem.indexOf(u8, dup_poll, "\"state\":\"partial\"") != null);
+    try std.testing.expect(refused);
     try std.testing.expect(std.mem.indexOf(u8, dup_poll, "already exists") != null);
 
     // A relative destination is rejected before any work.
