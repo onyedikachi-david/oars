@@ -2393,6 +2393,29 @@ test "update restart gate fails closed and reserves bridge admission until cance
     ctx.keys.active_workers.store(1, .release);
     try std.testing.expectEqual(@as(c_int, 0), bridge.updateGate(ctx, 1));
     ctx.keys.active_workers.store(0, .release);
+    {
+        var scan = access.Scan{ .id = "update-test-scan" };
+        try ctx.access.scans.append(ctx.allocator, &scan);
+        defer _ = ctx.access.scans.pop();
+        try std.testing.expectEqual(@as(c_int, 0), bridge.updateGate(ctx, 1));
+        scan.finished_at_ns = 1;
+        try std.testing.expectEqual(@as(c_int, 1), bridge.updateGate(ctx, 0));
+        scan.finished_at_ns = 0;
+        scan.canceled = true;
+        try std.testing.expectEqual(@as(c_int, 1), bridge.updateGate(ctx, 0));
+    }
+    {
+        var job = access.Job{ .id = "update-test-job", .kind = .rotate, .identity_id = "update-test-identity" };
+        try job.items.append(std.testing.allocator, .{ .server_id = "update-test-server", .user = "test" });
+        defer job.items.deinit(std.testing.allocator);
+        try ctx.access.jobs.append(ctx.allocator, &job);
+        defer _ = ctx.access.jobs.pop();
+        try std.testing.expectEqual(@as(c_int, 0), bridge.updateGate(ctx, 1));
+        job.items.items[0].state = .running;
+        try std.testing.expectEqual(@as(c_int, 0), bridge.updateGate(ctx, 1));
+        job.items.items[0].state = .done;
+        try std.testing.expectEqual(@as(c_int, 1), bridge.updateGate(ctx, 0));
+    }
     try std.testing.expectEqual(@as(c_int, 1), bridge.updateGate(ctx, 1));
     const denied = app.dispatch("{\"id\":\"update-gate\",\"command\":\"oars.servers.list\",\"payload\":{}}");
     try std.testing.expect(std.mem.indexOf(u8, denied, "restarting") != null);

@@ -14282,6 +14282,12 @@ pub fn updateBusy(self: *Context) bool {
         defer tests.mutex.unlock();
         for (tests.operations.items) |op| if (!op.state.terminal()) return true;
     }
+    {
+        if (!self.access.mutex.tryLock()) return true;
+        defer self.access.mutex.unlock();
+        for (self.access.scans.items) |scan| if (!scan.canceled and scan.finished_at_ns == 0) return true;
+        for (self.access.jobs.items) |job| if (!job.finished()) return true;
+    }
     return false;
 }
 
