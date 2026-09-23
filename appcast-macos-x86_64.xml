@@ -1,0 +1,22 @@
+<?xml version="1.0" standalone="yes"?><!-- sparkle-sign-warning:
+IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires re-signing this file with generate_appcast or sign_update! The signed signature will be embedded at the end of this file.
+--><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>oars-0.7.0-macos-ReleaseFast</title>
+        <item>
+            <title>0.7.0</title>
+            <pubDate>Wed, 23 Sep 2026 19:14:27 +0000</pubDate>
+            <sparkle:version>0.7.0</sparkle:version>
+            <sparkle:shortVersionString>0.7.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>11.0</sparkle:minimumSystemVersion>
+            <description sparkle:format="plain-text"><![CDATA[Added
+
+* add in-app update dialog and idle installation (#17) (328cf87)
+* add signed macOS updates and Linux release notifications (#15) (93e4db4)]]></description>
+            <enclosure url="https://github.com/onyedikachi-david/oars/releases/download/v0.7.0/oars-v0.7.0-macos-x86_64.zip" length="5179584" type="application/octet-stream" sparkle:edSignature="iAeDbqU/OxZRh98YoHHDRqYXYqBpA3ruA6QSVy2DHOowby9AgNFRbM/t71ZJDk/Lab/lk6UMMv9GOjSgQDX7Aw=="></enclosure>
+        </item>
+    </channel>
+</rss><!-- sparkle-signatures:
+edSignature: ZDJuBkBrm/ebXpIAE8YNR7P4UnuKlFUj5t3CLWb8gNrB6/hoWRNJk7Df2eO2t/VM3SZdawYkFbPjWOKUD40WDQ==
+length: 1306
+-->
