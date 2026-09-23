@@ -71,6 +71,12 @@ pub fn writeStatus(output: []u8, busy: bool) ![]const u8 {
     try writer.writeAll(",\"error\":");
     const message = std.mem.sliceTo(&s.message, 0);
     try json.writeJsonString(&writer, if (std.unicode.utf8ValidateSlice(message)) message else "The update failed. Try again.");
+    try writer.writeAll(",\"release_notes\":");
+    const notes = std.mem.sliceTo(&s.release_notes, 0);
+    try json.writeJsonString(&writer, if (std.unicode.utf8ValidateSlice(notes)) notes else "");
+    try writer.print(",\"can_install\":{s},\"can_cancel\":{s},\"install_when_idle\":{s},\"downloaded_bytes\":{d},\"total_bytes\":{d}", .{
+        boolText(s.can_install != 0), boolText(s.can_cancel != 0), boolText(s.install_when_idle != 0), s.downloaded_bytes, s.total_bytes,
+    });
     try writer.print(",\"automatic_checks\":{s},\"automatic_downloads\":{s},\"can_check\":{s},\"can_resume\":{s},\"busy\":{s}}}", .{
         boolText(s.automatic_checks != 0), boolText(s.automatic_downloads != 0), boolText(s.can_check != 0), boolText(s.can_resume != 0), boolText(busy),
     });

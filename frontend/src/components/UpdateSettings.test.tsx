@@ -9,6 +9,7 @@ vi.mock("../updates", () => ({
   updateApi: { check: vi.fn(), preferences: vi.fn(), resume: vi.fn(), releaseNotes: vi.fn() },
 }));
 const fixture: UpdateStatus = {
+  can_install: false, can_cancel: false, install_when_idle: false, downloaded_bytes: 0, total_bytes: 0, release_notes: "",
   mode: "sparkle", state: "idle", current_version: "0.7.0", latest_version: "", error: "",
   automatic_checks: true, automatic_downloads: true, can_check: true, can_resume: false, busy: false,
 };

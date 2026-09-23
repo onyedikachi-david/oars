@@ -1,10 +1,9 @@
 import { useEffect, useId, useState } from "react";
 import { AlertCircle, ArrowUpRight, CheckCircle2, Download, PauseCircle, RefreshCw, ShieldCheck } from "lucide-react";
 import { Button } from "./ui/button";
-import { ApplicationNotice } from "./ApplicationPortal";
 import { updateApi, useUpdates, type UpdateStatus } from "../updates";
 
-const appIcon = new URL("../../../assets/icon.png", import.meta.url).href;
+import appIcon from "../../../assets/icon.png";
 function statusText(status: UpdateStatus): string {
   switch (status.state) {
     case "unavailable": return "Updates are available in installed release builds.";
@@ -59,6 +58,7 @@ export function UpdateSettings() {
     {!status && <p className="update-unavailable">Update controls are available in the desktop app.</p>}
     {showState && <div className="update-state" data-state={status.state} role="status">
       <StateIcon aria-hidden="true" className={updating ? "update-spinner" : undefined} /><p>{statusText(status)}</p>
+      {status.mode === "sparkle" && status.latest_version && <Button size="sm" variant="outline" onClick={() => window.dispatchEvent(new Event("oars:show-update"))}>View update</Button>}
       {status.can_resume && <Button size="sm" disabled={pending || status.busy} onClick={() => void perform(updateApi.resume)}>Restart to update</Button>}
     </div>}
     {status && status.mode !== "unavailable" && <>
@@ -67,7 +67,7 @@ export function UpdateSettings() {
         <Preference id={`${id}-checks`} title="Check for updates automatically" description="Look for new releases while Oars is open." checked={checks} disabled={pending} onChange={value => save(value, downloads)} />
         {status.mode === "sparkle" && <Preference id={`${id}-downloads`} title="Download updates in the background" description="Keep working while updates download." checked={downloads} disabled={pending} onChange={value => save(checks, value)} />}
       </fieldset>
-      {status.mode === "sparkle" && <div className="update-install-note"><ShieldCheck aria-hidden="true" /><p>Updates are verified before installation. Install when you quit, or restart when your work is finished.</p></div>}
+      {status.mode === "sparkle" && <div className="update-install-note"><ShieldCheck aria-hidden="true" /><p>Updates are verified before installation. Choose when to install, or let Oars wait until your work is finished.</p></div>}
       {status.mode === "homebrew" && <div className="update-managed"><strong>Managed by Homebrew</strong><p>Finish active work and quit Oars, then run:</p><pre>brew update{"\n"}brew upgrade --cask onyedikachi-david/tap/oars</pre></div>}
       {status.mode === "manual" && <div className="update-managed"><strong>Update from a download</strong><p>Download the latest Linux package from the releases page. Finish active work and quit Oars before replacing the installed files. Your settings and server data stay in place.</p></div>}
       <div className="update-links"><Button variant="link" size="sm" disabled={pending} onClick={() => void perform(updateApi.releaseNotes)}>Release notes <ArrowUpRight data-icon="inline-end" /></Button></div>
@@ -75,9 +75,4 @@ export function UpdateSettings() {
     {error && <p className="oars-form-error update-action-error" role="alert">{error}</p>}
   </div>;
 }
-export function UpdateNotice({ onOpen }: { onOpen: () => void }) {
-  const status = useUpdates();
-  const [dismissed, setDismissed] = useState("");
-  if (!status || !["available", "ready", "blocked"].includes(status.state) || !status.latest_version || dismissed === status.latest_version) return null;
-  return <ApplicationNotice><div className="oars-update-notice" role="status"><Download aria-hidden="true" /><span>{status.state === "blocked" ? "Finish active work and disconnect sessions before updating." : `Oars ${status.latest_version} is available.`}</span><Button size="sm" variant="outline" onClick={onOpen}>View update</Button><Button size="sm" variant="ghost" onClick={() => setDismissed(status.latest_version)}>Later</Button></div></ApplicationNotice>;
-}
+export { UpdateExperience as UpdateNotice } from "./UpdateDialog";
