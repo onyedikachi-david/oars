@@ -3,6 +3,12 @@ import { invoke } from "./bridge";
 export interface UpdateStatus {
   mode: "unavailable" | "sparkle" | "homebrew" | "manual";
   state: "unavailable" | "idle" | "checking" | "available" | "downloading" | "verifying" | "ready" | "blocked" | "error";
+  can_install: boolean;
+  can_cancel: boolean;
+  install_when_idle: boolean;
+  downloaded_bytes: number;
+  total_bytes: number;
+  release_notes: string;
   current_version: string;
   latest_version: string;
   error: string;
@@ -16,6 +22,8 @@ export const updateApi = {
   status: () => invoke<UpdateStatus>("oars.updates.status"),
   check: () => invoke("oars.updates.check"),
   preferences: (automatic_checks: boolean, automatic_downloads: boolean) => invoke("oars.updates.preferences", { automatic_checks, automatic_downloads }),
+  install: (when_idle: boolean) => invoke("oars.updates.install", { when_idle }),
+  cancel: () => invoke("oars.updates.cancel"),
   resume: () => invoke("oars.updates.resume"),
   releaseNotes: () => invoke("oars.updates.releaseNotes"),
 };

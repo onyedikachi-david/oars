@@ -153,3 +153,6 @@ int oars_updates_resume(void) { return 0; }
 void oars_updates_release_notes(void) {
     g_app_info_launch_default_for_uri("https://github.com/onyedikachi-david/oars/releases", NULL, NULL);
 }
+
+int oars_updates_install(int when_idle) { (void)when_idle; return 0; }
+int oars_updates_cancel(void) { return 0; }

@@ -33,6 +33,16 @@ def assert_signing_key(sparkle, key, expected_public):
         subprocess.run(["security", "delete-generic-password", "-a", account], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def release_notes(changelog, version):
+    """Select only this release's notes, as bounded plain text for the signed feed."""
+    match = re.search(r"^## \[?" + re.escape(version) + r"(?:\]|\s|$)[^\n]*\n(.*?)(?=^## |\Z)", changelog, re.M | re.S)
+    if not match:
+        return ""
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", match.group(1))
+    text = re.sub(r"^#{1,6} +", "", text, flags=re.M).replace("**", "")
+    return text.strip().encode("utf-8")[:3500].decode("utf-8", errors="ignore")
+
+
 def generate(assets, sparkle, output, version, key):
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
         raise ValueError("Expected a stable release version")
@@ -55,9 +65,13 @@ def generate(assets, sparkle, output, version, key):
             stage = Path(directory) / arch
             stage.mkdir()
             shutil.copy2(assets / name, stage / name)
+            changelog = Path(__file__).resolve().parents[1] / "CHANGELOG.md"
+            notes = release_notes(changelog.read_text(), version) if changelog.exists() else ""
+            if notes:
+                (stage / Path(name).with_suffix(".txt").name).write_text(notes)
             feed = output / f"appcast-macos-{arch}.xml"
             subprocess.run([str(sparkle / "bin/generate_appcast"), "--ed-key-file", "-",
-                            "--download-url-prefix", f"https://github.com/onyedikachi-david/oars/releases/download/v{version}/",
+                            "--embed-release-notes", "--download-url-prefix", f"https://github.com/onyedikachi-david/oars/releases/download/v{version}/",
                             "-o", str(feed.resolve()), str(stage)], input=key, text=True, check=True)
             root = ET.parse(feed).getroot()
             enclosures = root.findall("./channel/item/enclosure")

@@ -7,3 +7,6 @@ int oars_updates_check(void) { return 0; }
 int oars_updates_preferences(int c, int d) { (void)c; (void)d; return 0; }
 int oars_updates_resume(void) { return 0; }
 void oars_updates_release_notes(void) {}
+
+int oars_updates_install(int when_idle) { (void)when_idle; return 0; }
+int oars_updates_cancel(void) { return 0; }
