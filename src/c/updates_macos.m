@@ -96,7 +96,7 @@ static void setNotes(NSString *text, BOOL html) {
         reply(SPUUserUpdateChoiceInstall);
     } else {
         void (^resume)(void) = self.resumeInstallation ?: self.retryTermination;
-        self.resumeInstallation = nil;
+        self.resumeInstallation = nil; self.retryTermination = nil;
         resume();
     }
 }

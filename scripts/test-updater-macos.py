@@ -25,6 +25,35 @@ spec.loader.exec_module(feeds)
 HOST = r'''
 #import <Cocoa/Cocoa.h>
 #include "updates_macos.m"
+static int allowRestart(void *context, int action) { (void)context; (void)action; return 1; }
+static int testRetryConsumption(void) {
+    service = [OarsUpdater new]; gate = allowRestart;
+    service.installRequested = YES; status.install_when_idle = 1;
+    __block int calls = 0;
+    [service showInstallingUpdateWithApplicationTerminated:NO retryTerminatingApplication:^{ calls++; }];
+    for (int tick = 0; tick < 3; tick++) [service advanceInstallation];
+    OarsUpdateStatus snapshot; oars_updates_status(&snapshot);
+    if (calls != 1 || snapshot.can_install || snapshot.can_resume) return 20;
+
+    // A deferred resume takes precedence and consumes the stale retry too.
+    service.resumeInstallation = ^{ calls += 10; };
+    service.retryTermination = ^{ calls += 100; };
+    for (int tick = 0; tick < 3; tick++) [service advanceInstallation];
+    if (calls != 11 || service.resumeInstallation || service.retryTermination) return 21;
+
+    // Clear before invoking: Sparkle may synchronously supply a new retry.
+    service.retryTermination = ^{
+        calls++;
+        [service showInstallingUpdateWithApplicationTerminated:NO retryTerminatingApplication:^{ calls++; }];
+    };
+    [service advanceInstallation];
+    if (calls != 12 || !service.retryTermination) return 22;
+    for (int tick = 0; tick < 3; tick++) [service advanceInstallation];
+    oars_updates_status(&snapshot);
+    if (calls != 13 || snapshot.can_install || snapshot.can_resume) return 23;
+    puts("PASS: retry callbacks run once, clear action flags, and preserve replacement callbacks");
+    return 0;
+}
 static int testGate(void *context, int action) {
     (void)context;
     if (action == 2) return 1;
@@ -34,6 +63,7 @@ static int testGate(void *context, int action) {
 }
 int main(void) {
     @autoreleasepool {
+        if (getenv("OARS_TEST_RETRY")) return testRetryConsumption();
         if ([[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"] isEqualToString:@"2.0.0"]) {
             [@"ok" writeToFile:[NSBundle.mainBundle objectForInfoDictionaryKey:@"OarsTestRelaunchMarker"] atomically:YES encoding:NSUTF8StringEncoding error:NULL];
             return 0;
@@ -234,6 +264,8 @@ try:
         source.write_text(HOST)
         subprocess.run(["clang", "-fobjc-arc", "-fblocks", "-mmacosx-version-min=11.0", "-I", str(ROOT / "src/c"), "-F", str(SPARKLE),
                         "-framework", "Sparkle", "-framework", "Cocoa", "-Wl,-rpath,@executable_path/../Frameworks", str(source), "-o", str(directory / "host")], check=True)
+        subprocess.run([str(directory / "host")], check=True,
+                       env=dict(os.environ, OARS_TEST_RETRY="1", DYLD_FRAMEWORK_PATH=str(SPARKLE)))
         run_case(directory, public_key, private_key, corrupt=True)
         run_case(directory, public_key, private_key, mode="idle")
         run_case(directory, public_key, private_key, mode="resume")

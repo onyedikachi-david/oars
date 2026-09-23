@@ -66,9 +66,9 @@ def generate(assets, sparkle, output, version, key):
             stage.mkdir()
             shutil.copy2(assets / name, stage / name)
             changelog = Path(__file__).resolve().parents[1] / "CHANGELOG.md"
-            notes = release_notes(changelog.read_text(), version) if changelog.exists() else ""
+            notes = release_notes(changelog.read_text(encoding="utf-8"), version) if changelog.exists() else ""
             if notes:
-                (stage / Path(name).with_suffix(".txt").name).write_text(notes)
+                (stage / Path(name).with_suffix(".txt").name).write_text(notes, encoding="utf-8")
             feed = output / f"appcast-macos-{arch}.xml"
             subprocess.run([str(sparkle / "bin/generate_appcast"), "--ed-key-file", "-",
                             "--embed-release-notes", "--download-url-prefix", f"https://github.com/onyedikachi-david/oars/releases/download/v{version}/",
