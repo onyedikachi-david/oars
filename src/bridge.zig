@@ -36,7 +36,7 @@ const ssh = @import("ssh.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 154;
+const handler_count = 156;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -86,6 +86,8 @@ pub const Context = struct {
             .{ .name = "oars.updates.status", .context = self, .invoke_fn = handleUpdatesStatus },
             .{ .name = "oars.updates.check", .context = self, .invoke_fn = updateGuard(handleUpdatesCheck) },
             .{ .name = "oars.updates.preferences", .context = self, .invoke_fn = updateGuard(handleUpdatesPreferences) },
+            .{ .name = "oars.updates.install", .context = self, .invoke_fn = updateGuard(handleUpdatesInstall) },
+            .{ .name = "oars.updates.cancel", .context = self, .invoke_fn = updateGuard(handleUpdatesCancel) },
             .{ .name = "oars.updates.resume", .context = self, .invoke_fn = updateGuard(handleUpdatesResume) },
             .{ .name = "oars.updates.releaseNotes", .context = self, .invoke_fn = updateGuard(handleUpdatesReleaseNotes) },
             .{ .name = "oars.servers.list", .context = self, .invoke_fn = updateGuard(handleServersList) },
@@ -242,6 +244,8 @@ pub const Context = struct {
             .{ .name = "oars.updates.status", .origins = &allowed_origins },
             .{ .name = "oars.updates.check", .origins = &allowed_origins },
             .{ .name = "oars.updates.preferences", .origins = &allowed_origins },
+            .{ .name = "oars.updates.install", .origins = &allowed_origins },
+            .{ .name = "oars.updates.cancel", .origins = &allowed_origins },
             .{ .name = "oars.updates.resume", .origins = &allowed_origins },
             .{ .name = "oars.updates.releaseNotes", .origins = &allowed_origins },
             .{ .name = "oars.servers.list", .origins = &allowed_origins },
@@ -14249,7 +14253,7 @@ fn updateGuard(comptime handler: anytype) @TypeOf(&handleUpdatesCheck) {
 }
 
 pub fn updateBusy(self: *Context) bool {
-    if (self.manager.pending_disconnects.load(.acquire) != 0 or self.ai.request_limiter.count() != 0 or self.keys.active_workers.load(.acquire) != 0) return true;
+    if (self.manager.pending_disconnects.load(.acquire) != 0 or self.ai.request_limiter.count() != 0) return true;
     {
         if (!self.manager.mutex.tryLock()) return true;
         defer self.manager.mutex.unlock();
@@ -14259,6 +14263,7 @@ pub fn updateBusy(self: *Context) bool {
     {
         if (!self.keys.mutex.tryLock()) return true;
         defer self.keys.mutex.unlock();
+        if (self.keys.active_workers.load(.acquire) != 0) return true;
         for (self.keys.jobs.items) |job| if (!job.state.terminal()) return true;
         for (self.keys.snapshots.items) |snapshot| if (!snapshot.state.terminal()) return true;
     }
@@ -14325,4 +14330,15 @@ fn handleUpdatesReleaseNotes(_: *anyopaque, invocation: native_sdk.bridge.Invoca
     _ = invocation;
     updates.c.oars_updates_release_notes();
     return "{\"ok\":true}";
+}
+
+fn handleUpdatesInstall(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    var parsed = parsePayload(struct { when_idle: bool }, contextOf(context).allocator, invocation.request.payload) catch return respondError(output, "Invalid update choice.");
+    defer parsed.deinit();
+    if (!parsed.value.when_idle and updateBusy(contextOf(context))) return respondError(output, "Finish active work and disconnect sessions before restarting.");
+    return if (updates.c.oars_updates_install(@intFromBool(parsed.value.when_idle)) != 0) "{\"ok\":true}" else respondError(output, "This update is not ready. Check for updates and try again.");
+}
+fn handleUpdatesCancel(_: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    _ = invocation;
+    return if (updates.c.oars_updates_cancel() != 0) "{\"ok\":true}" else respondError(output, "The update can no longer be canceled.");
 }

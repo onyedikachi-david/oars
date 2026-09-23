@@ -9,6 +9,15 @@ feeds = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(feeds)
 
 class FeedPublicationTests(unittest.TestCase):
+    def test_release_notes_select_only_matching_version(self):
+        changelog = "## [0.8.0](https://example.test)\n### Fixed\n* Keep **working** [#12](https://example.test/12)\n## [0.7.0]\nOld notes\n"
+        notes = feeds.release_notes(changelog, "0.8.0")
+        self.assertIn("Keep working #12", notes)
+        self.assertNotIn("Old notes", notes)
+        self.assertEqual(feeds.release_notes(changelog, "0.9.0"), "")
+        bounded = feeds.release_notes("## 0.8.0\n" + "é" * 4000, "0.8.0")
+        self.assertLessEqual(len(bounded.encode()), 3500)
+
     def test_requires_stable_version_and_signing_key(self):
         with self.assertRaisesRegex(ValueError, "stable"):
             feeds.generate(Path("missing"), Path("missing"), Path("missing"), "0.7.0-beta", "key")

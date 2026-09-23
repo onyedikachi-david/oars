@@ -25,27 +25,6 @@ spec.loader.exec_module(feeds)
 HOST = r'''
 #import <Cocoa/Cocoa.h>
 #include "updates_macos.m"
-// Deterministic user choices for CI; production retains Sparkle's standard UI.
-@interface FixtureUserDriver : NSObject <SPUUserDriver>
-@end
-@implementation FixtureUserDriver
-- (void)showUpdatePermissionRequest:(SPUUpdatePermissionRequest *)request reply:(void (^)(SUUpdatePermissionResponse *))reply { (void)request; reply([[SUUpdatePermissionResponse alloc] initWithAutomaticUpdateChecks:YES automaticUpdateDownloading:@YES sendSystemProfile:NO]); }
-- (void)showUserInitiatedUpdateCheckWithCancellation:(void (^)(void))cancel { (void)cancel; }
-- (void)showUpdateFoundWithAppcastItem:(SUAppcastItem *)item state:(SPUUserUpdateState *)state reply:(void (^)(SPUUserUpdateChoice))reply { (void)item; (void)state; reply(SPUUserUpdateChoiceInstall); }
-- (void)showUpdateReleaseNotesWithDownloadData:(SPUDownloadData *)data { (void)data; }
-- (void)showUpdateReleaseNotesFailedToDownloadWithError:(NSError *)error { (void)error; }
-- (void)showUpdateNotFoundWithError:(NSError *)error acknowledgement:(void (^)(void))reply { (void)error; reply(); }
-- (void)showUpdaterError:(NSError *)error acknowledgement:(void (^)(void))reply { (void)error; reply(); }
-- (void)showDownloadInitiatedWithCancellation:(void (^)(void))cancel { (void)cancel; }
-- (void)showDownloadDidReceiveExpectedContentLength:(uint64_t)length { (void)length; }
-- (void)showDownloadDidReceiveDataOfLength:(uint64_t)length { (void)length; }
-- (void)showDownloadDidStartExtractingUpdate {}
-- (void)showExtractionReceivedProgress:(double)progress { (void)progress; }
-- (void)showReadyToInstallAndRelaunch:(void (^)(SPUUserUpdateChoice))reply { reply(SPUUserUpdateChoiceInstall); }
-- (void)showInstallingUpdateWithApplicationTerminated:(BOOL)terminated retryTerminatingApplication:(void (^)(void))retry { if (!terminated) retry(); }
-- (void)showUpdateInstalledAndRelaunched:(BOOL)relaunched acknowledgement:(void (^)(void))reply { (void)relaunched; reply(); }
-- (void)dismissUpdateInstallation {}
-@end
 static int testGate(void *context, int action) {
     (void)context;
     if (action == 2) return 1;
@@ -62,10 +41,9 @@ int main(void) {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
         oars_updates_start("1.0.0", NULL, testGate, NULL);
-        service.userDriver = [FixtureUserDriver new];
-        service.updater = [[SPUUpdater alloc] initWithHostBundle:NSBundle.mainBundle applicationBundle:NSBundle.mainBundle userDriver:service.userDriver delegate:service];
         __block BOOL requested = NO;
         __block int previous = -1;
+        __block BOOL scheduled = NO;
         [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:YES block:^(NSTimer *timer) {
             (void)timer;
             OarsUpdateStatus snapshot;
@@ -78,8 +56,35 @@ int main(void) {
                 previous = snapshot.state;
                 printf("STATE %d %s\n", snapshot.state, snapshot.message); fflush(stdout);
             }
-            if (snapshot.state == OARS_UPDATE_READY || snapshot.state == OARS_UPDATE_BLOCKED) {
-                [NSApp terminate:nil];
+            if (snapshot.downloaded_bytes > 0) { printf("BYTES %llu\n", (unsigned long long)snapshot.downloaded_bytes); fflush(stdout); }
+            if (getenv("OARS_TEST_CANCEL") && snapshot.can_cancel && snapshot.downloaded_bytes > 0) {
+                if (!oars_updates_cancel()) exit(10);
+                OarsUpdateStatus canceled; oars_updates_status(&canceled);
+                if (canceled.install_when_idle || canceled.can_cancel) exit(11);
+                printf("CANCELED\n"); fflush(stdout); [timer invalidate];
+            } else if (snapshot.can_resume && !scheduled) {
+                if (strstr(snapshot.release_notes, "Fixture release notes") == NULL) exit(12);
+                // A ready download cannot veto an ordinary quit while busy.
+                if ([quitDelegate applicationShouldTerminate:NSApp] != NSTerminateNow) exit(16);
+                if (getenv("OARS_TEST_RESUME")) {
+                    if ([[NSFileManager defaultManager] fileExistsAtPath:@(getenv("OARS_TEST_ALLOW"))]) {
+                        if (!oars_updates_resume()) exit(13);
+                        scheduled = YES;
+                    } else {
+                        if (oars_updates_resume()) exit(14);
+                        printf("WAITING_FOR_USER\n"); fflush(stdout);
+                    }
+                } else {
+                    if (!oars_updates_install(1)) exit(15);
+                    if (!oars_updates_cancel()) exit(17);
+                    OarsUpdateStatus canceled; oars_updates_status(&canceled);
+                    if (canceled.install_when_idle || !canceled.can_resume) exit(18);
+                    if (!oars_updates_install(1)) exit(19);
+                    printf("SCHEDULED\n"); fflush(stdout);
+                    scheduled = YES;
+                    // No UI polling drives the update after scheduling it.
+                    [timer invalidate];
+                }
             }
         }];
         [NSApp run];
@@ -97,8 +102,8 @@ def wait_for(predicate, message, timeout=90):
     raise AssertionError(message)
 
 
-def run_case(directory, public_key, private_key, corrupt):
-    name = "invalid" if corrupt else "valid"
+def run_case(directory, public_key, private_key, corrupt=False, mode="idle"):
+    name = "invalid" if corrupt else mode
     case = directory / name
     served = case / "served"
     served.mkdir(parents=True)
@@ -109,6 +114,14 @@ def run_case(directory, public_key, private_key, corrupt):
             super().__init__(*args, directory=str(served), **kwargs)
         def log_message(self, *_):
             pass
+        def copyfile(self, source, output):
+            if mode != "cancel":
+                return super().copyfile(source, output)
+            try:
+                while chunk := source.read(16384):
+                    output.write(chunk); output.flush(); time.sleep(0.01)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         def do_GET(self):
             requests.append(self.path)
             super().do_GET()
@@ -154,7 +167,8 @@ def run_case(directory, public_key, private_key, corrupt):
             print("PASS: publisher rejects a mismatched signing key")
         else:
             raise AssertionError("Publisher accepted the wrong signing key")
-    generated = subprocess.run([str(SPARKLE / "bin/generate_appcast"), "--ed-key-file", "-", "--download-url-prefix", url, str(served)], input=private_key, text=True, capture_output=True)
+    archive.with_suffix(".txt").write_text("Fixture release notes: verified in-app updates.")
+    generated = subprocess.run([str(SPARKLE / "bin/generate_appcast"), "--ed-key-file", "-", "--download-url-prefix", url, "--embed-release-notes", str(served)], input=private_key, text=True, capture_output=True)
     if generated.returncode:
         print((generated.stdout + generated.stderr).replace(private_key.strip(), "[redacted]"))
         generated.check_returncode()
@@ -165,6 +179,8 @@ def run_case(directory, public_key, private_key, corrupt):
     allowed, relaunched = case / "allow-restart", case / "relaunched"
     env = dict(os.environ, OARS_TEST_ALLOW=str(allowed), OARS_TEST_RELAUNCH=str(relaunched))
     env.pop("OARS_DISABLE_UPDATE_CHECKS", None)
+    if mode == "cancel": env["OARS_TEST_CANCEL"] = "1"
+    if mode == "resume": env["OARS_TEST_RESUME"] = "1"
     log_path = case / "host.log"
     proc = None
     try:
@@ -176,14 +192,20 @@ def run_case(directory, public_key, private_key, corrupt):
             assert plistlib.loads((app / "Contents/Info.plist").read_bytes())["CFBundleVersion"] == "1.0.0"
             assert not relaunched.exists()
             print("PASS: tampered archive rejected before installation")
+        elif mode == "cancel":
+            wait_for(lambda: "CANCELED" in log_path.read_text(), "Download was not canceled")
+            assert not relaunched.exists()
+            assert plistlib.loads((app / "Contents/Info.plist").read_bytes())["CFBundleVersion"] == "1.0.0"
+            print("PASS: real download progress and cancellation leave the installed version intact")
         else:
-            wait_for(lambda: "GATE 0" in log_path.read_text(), "Update did not reach the quit gate")
+            marker = "WAITING_FOR_USER" if mode == "resume" else "SCHEDULED"
+            wait_for(lambda: marker in log_path.read_text(), "Update did not reach the install choice")
             assert proc.poll() is None, "Busy app was terminated"
             assert plistlib.loads((app / "Contents/Info.plist").read_bytes())["CFBundleVersion"] == "1.0.0"
             allowed.write_text("idle")
             wait_for(lambda: relaunched.exists(), "Verified update was not installed and relaunched", timeout=120)
             assert plistlib.loads((app / "Contents/Info.plist").read_bytes())["CFBundleVersion"] == "2.0.0"
-            print("PASS: busy restart deferred, signed update installed and relaunched after idle")
+            print(f"PASS: {mode} choice blocks busy restart, then installs and relaunches a signed update")
     except Exception:
         print(log_path.read_text() if log_path.exists() else "No updater log")
         raise
@@ -213,6 +235,8 @@ try:
         subprocess.run(["clang", "-fobjc-arc", "-fblocks", "-mmacosx-version-min=11.0", "-I", str(ROOT / "src/c"), "-F", str(SPARKLE),
                         "-framework", "Sparkle", "-framework", "Cocoa", "-Wl,-rpath,@executable_path/../Frameworks", str(source), "-o", str(directory / "host")], check=True)
         run_case(directory, public_key, private_key, corrupt=True)
-        run_case(directory, public_key, private_key, corrupt=False)
+        run_case(directory, public_key, private_key, mode="idle")
+        run_case(directory, public_key, private_key, mode="resume")
+        run_case(directory, public_key, private_key, mode="cancel")
 finally:
     subprocess.run(["security", "delete-generic-password", "-a", account], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
