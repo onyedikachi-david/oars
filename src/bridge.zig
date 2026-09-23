@@ -31,11 +31,12 @@ const sshd_policy = @import("sshd_policy.zig");
 const backup = @import("backup.zig");
 const vault = @import("vault.zig");
 const agent = @import("agent.zig");
+const updates = @import("updates.zig");
 const ssh = @import("ssh.zig");
 
 pub const allowed_origins = [_][]const u8{ "zero://app", "http://127.0.0.1:5173" };
 
-const handler_count = 149;
+const handler_count = 154;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -52,6 +53,7 @@ pub const Context = struct {
     keys: keyjobs.Registry,
     backup: *backup.Registry,
     ai: *ai.Registry,
+    update_restarting: bool = false,
     handlers: [handler_count]native_sdk.BridgeHandler = undefined,
     policies: [handler_count]native_sdk.BridgeCommandPolicy = undefined,
 
@@ -81,157 +83,167 @@ pub const Context = struct {
 
     pub fn dispatcher(self: *Context) native_sdk.BridgeDispatcher {
         self.handlers = .{
-            .{ .name = "oars.servers.list", .context = self, .invoke_fn = handleServersList },
-            .{ .name = "oars.servers.save", .context = self, .invoke_fn = handleServersSave },
-            .{ .name = "oars.servers.delete", .context = self, .invoke_fn = handleServersDelete },
-            .{ .name = "oars.ssh.connect", .context = self, .invoke_fn = handleSshConnect },
-            .{ .name = "oars.ssh.disconnect", .context = self, .invoke_fn = handleSshDisconnect },
-            .{ .name = "oars.ssh.input", .context = self, .invoke_fn = handleSshInput },
-            .{ .name = "oars.ssh.exec", .context = self, .invoke_fn = handleSshExec },
-            .{ .name = "oars.ssh.closeChannel", .context = self, .invoke_fn = handleSshCloseChannel },
-            .{ .name = "oars.ssh.resize", .context = self, .invoke_fn = handleSshResize },
-            .{ .name = "oars.ssh.trust", .context = self, .invoke_fn = handleSshTrust },
-            .{ .name = "oars.ssh.retrust", .context = self, .invoke_fn = handleSshRetrust },
-            .{ .name = "oars.ssh.poll", .context = self, .invoke_fn = handleSshPoll },
-            .{ .name = "oars.monitor.poll", .context = self, .invoke_fn = handleMonitorPoll },
-            .{ .name = "oars.monitor.probe", .context = self, .invoke_fn = handleMonitorProbe },
-            .{ .name = "oars.monitor.cleanDiskEstimate", .context = self, .invoke_fn = handleMonitorCleanDiskEstimate },
-            .{ .name = "oars.monitor.cleanDisk", .context = self, .invoke_fn = handleMonitorCleanDisk },
-            .{ .name = "oars.monitor.dropCaches", .context = self, .invoke_fn = handleMonitorDropCaches },
-            .{ .name = "oars.logs.scan", .context = self, .invoke_fn = handleLogsScan },
-            .{ .name = "oars.logs.read", .context = self, .invoke_fn = handleLogsRead },
-            .{ .name = "oars.logs.follow", .context = self, .invoke_fn = handleLogsFollow },
-            .{ .name = "oars.logs.clear", .context = self, .invoke_fn = handleLogsClear },
-            .{ .name = "oars.logs.addSource", .context = self, .invoke_fn = handleLogsAddSource },
-            .{ .name = "oars.local.ls", .context = self, .invoke_fn = handleLocalLs },
-            .{ .name = "oars.sftp.ls", .context = self, .invoke_fn = handleSftpLs },
-            .{ .name = "oars.sftp.stat", .context = self, .invoke_fn = handleSftpStat },
-            .{ .name = "oars.sftp.read", .context = self, .invoke_fn = handleSftpRead },
-            .{ .name = "oars.sftp.write", .context = self, .invoke_fn = handleSftpWrite },
-            .{ .name = "oars.sftp.save", .context = self, .invoke_fn = handleSftpSave },
-            .{ .name = "oars.sftp.download", .context = self, .invoke_fn = handleSftpDownload },
-            .{ .name = "oars.sftp.uploadLocal", .context = self, .invoke_fn = handleSftpUploadLocal },
-            .{ .name = "oars.sftp.mkdir", .context = self, .invoke_fn = handleSftpMkdir },
-            .{ .name = "oars.sftp.rm", .context = self, .invoke_fn = handleSftpRm },
-            .{ .name = "oars.sftp.rename", .context = self, .invoke_fn = handleSftpRename },
-            .{ .name = "oars.sftp.chmod", .context = self, .invoke_fn = handleSftpChmod },
-            .{ .name = "oars.sftp.unzip", .context = self, .invoke_fn = handleSftpUnzip },
-            .{ .name = "oars.sftp.zipDownload", .context = self, .invoke_fn = handleSftpZipDownload },
-            .{ .name = "oars.sftp.folderSize", .context = self, .invoke_fn = handleSftpFolderSize },
-            .{ .name = "oars.sftp.poll", .context = self, .invoke_fn = handleSftpPoll },
-            .{ .name = "oars.sftp.cancel", .context = self, .invoke_fn = handleSftpCancel },
-            .{ .name = "oars.scripts.list", .context = self, .invoke_fn = handleScriptsList },
-            .{ .name = "oars.scripts.validate", .context = self, .invoke_fn = handleScriptsValidate },
-            .{ .name = "oars.scripts.save", .context = self, .invoke_fn = handleScriptsSave },
-            .{ .name = "oars.scripts.delete", .context = self, .invoke_fn = handleScriptsDelete },
-            .{ .name = "oars.scripts.run", .context = self, .invoke_fn = handleScriptsRun },
-            .{ .name = "oars.scripts.broadcastPrepare", .context = self, .invoke_fn = handleScriptsBroadcastPrepare },
-            .{ .name = "oars.scripts.broadcast", .context = self, .invoke_fn = handleScriptsBroadcast },
-            .{ .name = "oars.scripts.broadcastPrepareCancel", .context = self, .invoke_fn = handleScriptsBroadcastPrepareCancel },
-            .{ .name = "oars.scripts.broadcastPoll", .context = self, .invoke_fn = handleScriptsBroadcastPoll },
-            .{ .name = "oars.scripts.broadcastCancel", .context = self, .invoke_fn = handleScriptsBroadcastCancel },
-            .{ .name = "oars.deploy.apps.list", .context = self, .invoke_fn = handleDeployAppsList },
-            .{ .name = "oars.deploy.apps.save", .context = self, .invoke_fn = handleDeployAppsSave },
-            .{ .name = "oars.deploy.apps.secretPresence", .context = self, .invoke_fn = handleDeployAppsSecretPresence },
-            .{ .name = "oars.deploy.apps.delete", .context = self, .invoke_fn = handleDeployAppsDelete },
-            .{ .name = "oars.deploy.key.generate", .context = self, .invoke_fn = handleDeployKeyGenerate },
-            .{ .name = "oars.deploy.hostTrust", .context = self, .invoke_fn = handleDeployHostTrust },
-            .{ .name = "oars.deploy.preflight", .context = self, .invoke_fn = handleDeployPreflight },
-            .{ .name = "oars.deploy.preflightPoll", .context = self, .invoke_fn = handleDeployPreflightPoll },
-            .{ .name = "oars.deploy.preflightCancel", .context = self, .invoke_fn = handleDeployPreflightCancel },
-            .{ .name = "oars.deploy.run", .context = self, .invoke_fn = handleDeployRun },
-            .{ .name = "oars.deploy.poll", .context = self, .invoke_fn = handleDeployPoll },
-            .{ .name = "oars.deploy.cancel", .context = self, .invoke_fn = handleDeployCancel },
-            .{ .name = "oars.deploy.history", .context = self, .invoke_fn = handleDeployHistory },
-            .{ .name = "oars.sshkeys.inspect", .context = self, .invoke_fn = handleSshKeysInspect },
-            .{ .name = "oars.sshkeys.snapshot", .context = self, .invoke_fn = handleSshKeysSnapshot },
-            .{ .name = "oars.sshkeys.snapshotPoll", .context = self, .invoke_fn = handleSshKeysSnapshotPoll },
-            .{ .name = "oars.sshkeys.snapshotCancel", .context = self, .invoke_fn = handleSshKeysSnapshotCancel },
-            .{ .name = "oars.sshkeys.add", .context = self, .invoke_fn = handleSshKeysAdd },
-            .{ .name = "oars.sshkeys.revoke", .context = self, .invoke_fn = handleSshKeysRevoke },
-            .{ .name = "oars.sshkeys.rotate", .context = self, .invoke_fn = handleSshKeysRotate },
-            .{ .name = "oars.sshkeys.rotateCommit", .context = self, .invoke_fn = handleSshKeysRotateCommit },
-            .{ .name = "oars.sshkeys.jobPoll", .context = self, .invoke_fn = handleSshKeysJobPoll },
-            .{ .name = "oars.sshkeys.jobCancel", .context = self, .invoke_fn = handleSshKeysJobCancel },
-            .{ .name = "oars.sshkeys.localGenerate", .context = self, .invoke_fn = handleSshKeysLocalGenerate },
-            .{ .name = "oars.sshkeys.roles.plan", .context = self, .invoke_fn = handleSshKeysRolesPlan },
-            .{ .name = "oars.sshkeys.roles.commit", .context = self, .invoke_fn = handleSshKeysRolesCommit },
-            .{ .name = "oars.sshkeys.deployKeys.generate", .context = self, .invoke_fn = handleSshKeysDeployKeysGenerate },
-            .{ .name = "oars.sshkeys.deployKeys.delete", .context = self, .invoke_fn = handleSshKeysDeployKeysDelete },
-            .{ .name = "oars.access.scan", .context = self, .invoke_fn = handleAccessScan },
-            .{ .name = "oars.access.scanCancel", .context = self, .invoke_fn = handleAccessScanCancel },
-            .{ .name = "oars.access.poll", .context = self, .invoke_fn = handleAccessPoll },
-            .{ .name = "oars.access.key.inspect", .context = self, .invoke_fn = handleAccessKeyInspect },
-            .{ .name = "oars.access.identities.list", .context = self, .invoke_fn = handleAccessIdentitiesList },
-            .{ .name = "oars.access.identities.save", .context = self, .invoke_fn = handleAccessIdentitiesSave },
-            .{ .name = "oars.access.identities.delete", .context = self, .invoke_fn = handleAccessIdentitiesDelete },
-            .{ .name = "oars.access.offboard", .context = self, .invoke_fn = handleAccessOffboard },
-            .{ .name = "oars.access.onboard", .context = self, .invoke_fn = handleAccessOnboard },
-            .{ .name = "oars.access.rotate", .context = self, .invoke_fn = handleAccessRotate },
-            .{ .name = "oars.access.jobPoll", .context = self, .invoke_fn = handleAccessJobPoll },
-            .{ .name = "oars.access.jobCancel", .context = self, .invoke_fn = handleAccessJobCancel },
-            .{ .name = "oars.access.export", .context = self, .invoke_fn = handleAccessExport },
-            .{ .name = "oars.backup.jobs.list", .context = self, .invoke_fn = handleBackupJobsList },
-            .{ .name = "oars.backup.jobs.plan", .context = self, .invoke_fn = handleBackupJobsPlan },
-            .{ .name = "oars.backup.jobs.save", .context = self, .invoke_fn = handleBackupJobsSave },
-            .{ .name = "oars.backup.jobs.deletePlan", .context = self, .invoke_fn = handleBackupJobsDeletePlan },
-            .{ .name = "oars.backup.jobs.delete", .context = self, .invoke_fn = handleBackupJobsDelete },
-            .{ .name = "oars.backup.status", .context = self, .invoke_fn = handleBackupStatus },
-            .{ .name = "oars.backup.refresh", .context = self, .invoke_fn = handleBackupRefresh },
-            .{ .name = "oars.backup.operationPoll", .context = self, .invoke_fn = handleBackupOperationPoll },
-            .{ .name = "oars.backup.operationCancel", .context = self, .invoke_fn = handleBackupOperationCancel },
-            .{ .name = "oars.backup.install.plan", .context = self, .invoke_fn = handleBackupInstallPlan },
-            .{ .name = "oars.backup.test.plan", .context = self, .invoke_fn = handleBackupTestPlan },
-            .{ .name = "oars.backup.test", .context = self, .invoke_fn = handleBackupTest },
-            .{ .name = "oars.backup.run", .context = self, .invoke_fn = handleBackupRun },
-            .{ .name = "oars.backup.poll", .context = self, .invoke_fn = handleBackupPoll },
-            .{ .name = "oars.backup.cancel", .context = self, .invoke_fn = handleBackupCancel },
-            .{ .name = "oars.backup.history", .context = self, .invoke_fn = handleBackupHistory },
-            .{ .name = "oars.backup.historyLog", .context = self, .invoke_fn = handleBackupHistoryLog },
-            .{ .name = "oars.backup.install", .context = self, .invoke_fn = handleBackupInstall },
-            .{ .name = "oars.ai.provider.list", .context = self, .invoke_fn = handleAiProviderList },
-            .{ .name = "oars.ai.provider.save", .context = self, .invoke_fn = handleAiProviderSave },
-            .{ .name = "oars.ai.provider.delete", .context = self, .invoke_fn = handleAiProviderDelete },
-            .{ .name = "oars.ai.provider.test", .context = self, .invoke_fn = handleAiProviderTest },
-            .{ .name = "oars.ai.provider.testPoll", .context = self, .invoke_fn = handleAiProviderTestPoll },
-            .{ .name = "oars.ai.provider.testCancel", .context = self, .invoke_fn = handleAiProviderTestCancel },
-            .{ .name = "oars.ai.credential.configure", .context = self, .invoke_fn = handleAiCredentialConfigure },
-            .{ .name = "oars.ai.credential.status", .context = self, .invoke_fn = handleAiCredentialStatus },
-            .{ .name = "oars.ai.credential.delete", .context = self, .invoke_fn = handleAiCredentialDelete },
-            .{ .name = "oars.ai.context.get", .context = self, .invoke_fn = handleAiContextGet },
-            .{ .name = "oars.ai.context.refresh", .context = self, .invoke_fn = handleAiContextRefresh },
-            .{ .name = "oars.ai.context.poll", .context = self, .invoke_fn = handleAiContextPoll },
-            .{ .name = "oars.ai.context.cancel", .context = self, .invoke_fn = handleAiContextCancel },
-            .{ .name = "oars.ai.thread.list", .context = self, .invoke_fn = handleAiThreadList },
-            .{ .name = "oars.ai.thread.get", .context = self, .invoke_fn = handleAiThreadGet },
-            .{ .name = "oars.ai.thread.delete", .context = self, .invoke_fn = handleAiThreadDelete },
-            .{ .name = "oars.ai.turn.start", .context = self, .invoke_fn = handleAiTurnStart },
-            .{ .name = "oars.ai.turn.poll", .context = self, .invoke_fn = handleAiTurnPoll },
-            .{ .name = "oars.ai.turn.cancel", .context = self, .invoke_fn = handleAiTurnCancel },
-            .{ .name = "oars.ai.turn.summarize", .context = self, .invoke_fn = handleAiTurnSummarize },
-            .{ .name = "oars.ai.proposal.edit", .context = self, .invoke_fn = handleAiProposalEdit },
-            .{ .name = "oars.ai.proposal.run", .context = self, .invoke_fn = handleAiProposalRun },
-            .{ .name = "oars.ai.proposal.cancel", .context = self, .invoke_fn = handleAiProposalCancel },
-            .{ .name = "oars.vnc.start", .context = self, .invoke_fn = handleVncStart },
-            .{ .name = "oars.vnc.stop", .context = self, .invoke_fn = handleVncStop },
-            .{ .name = "oars.vnc.probe", .context = self, .invoke_fn = handleVncProbe },
-            .{ .name = "oars.vnc.setup", .context = self, .invoke_fn = handleVncSetup },
-            .{ .name = "oars.vnc.poll", .context = self, .invoke_fn = handleVncPoll },
-            .{ .name = "oars.history.record", .context = self, .invoke_fn = handleHistoryRecord },
-            .{ .name = "oars.history.list", .context = self, .invoke_fn = handleHistoryList },
-            .{ .name = "oars.history.clear", .context = self, .invoke_fn = handleHistoryClear },
-            .{ .name = "oars.history.replay", .context = self, .invoke_fn = handleHistoryReplay },
-            .{ .name = "oars.history.shellSetup", .context = self, .invoke_fn = handleShellSetup },
-            .{ .name = "oars.audit.list", .context = self, .invoke_fn = handleAuditList },
-            .{ .name = "oars.audit.clear", .context = self, .invoke_fn = handleAuditClear },
-            .{ .name = "oars.audit.export", .context = self, .invoke_fn = handleAuditExport },
-            .{ .name = "oars.vault.export", .context = self, .invoke_fn = handleVaultExport },
-            .{ .name = "oars.vault.import", .context = self, .invoke_fn = handleVaultImport },
-            .{ .name = "oars.vault.importConfirm", .context = self, .invoke_fn = handleVaultImportConfirm },
-            .{ .name = "oars.agent.list", .context = self, .invoke_fn = handleAgentList },
-            .{ .name = "oars.agent.forward", .context = self, .invoke_fn = handleAgentForward },
+            .{ .name = "oars.updates.status", .context = self, .invoke_fn = handleUpdatesStatus },
+            .{ .name = "oars.updates.check", .context = self, .invoke_fn = updateGuard(handleUpdatesCheck) },
+            .{ .name = "oars.updates.preferences", .context = self, .invoke_fn = updateGuard(handleUpdatesPreferences) },
+            .{ .name = "oars.updates.resume", .context = self, .invoke_fn = updateGuard(handleUpdatesResume) },
+            .{ .name = "oars.updates.releaseNotes", .context = self, .invoke_fn = updateGuard(handleUpdatesReleaseNotes) },
+            .{ .name = "oars.servers.list", .context = self, .invoke_fn = updateGuard(handleServersList) },
+            .{ .name = "oars.servers.save", .context = self, .invoke_fn = updateGuard(handleServersSave) },
+            .{ .name = "oars.servers.delete", .context = self, .invoke_fn = updateGuard(handleServersDelete) },
+            .{ .name = "oars.ssh.connect", .context = self, .invoke_fn = updateGuard(handleSshConnect) },
+            .{ .name = "oars.ssh.disconnect", .context = self, .invoke_fn = updateGuard(handleSshDisconnect) },
+            .{ .name = "oars.ssh.input", .context = self, .invoke_fn = updateGuard(handleSshInput) },
+            .{ .name = "oars.ssh.exec", .context = self, .invoke_fn = updateGuard(handleSshExec) },
+            .{ .name = "oars.ssh.closeChannel", .context = self, .invoke_fn = updateGuard(handleSshCloseChannel) },
+            .{ .name = "oars.ssh.resize", .context = self, .invoke_fn = updateGuard(handleSshResize) },
+            .{ .name = "oars.ssh.trust", .context = self, .invoke_fn = updateGuard(handleSshTrust) },
+            .{ .name = "oars.ssh.retrust", .context = self, .invoke_fn = updateGuard(handleSshRetrust) },
+            .{ .name = "oars.ssh.poll", .context = self, .invoke_fn = updateGuard(handleSshPoll) },
+            .{ .name = "oars.monitor.poll", .context = self, .invoke_fn = updateGuard(handleMonitorPoll) },
+            .{ .name = "oars.monitor.probe", .context = self, .invoke_fn = updateGuard(handleMonitorProbe) },
+            .{ .name = "oars.monitor.cleanDiskEstimate", .context = self, .invoke_fn = updateGuard(handleMonitorCleanDiskEstimate) },
+            .{ .name = "oars.monitor.cleanDisk", .context = self, .invoke_fn = updateGuard(handleMonitorCleanDisk) },
+            .{ .name = "oars.monitor.dropCaches", .context = self, .invoke_fn = updateGuard(handleMonitorDropCaches) },
+            .{ .name = "oars.logs.scan", .context = self, .invoke_fn = updateGuard(handleLogsScan) },
+            .{ .name = "oars.logs.read", .context = self, .invoke_fn = updateGuard(handleLogsRead) },
+            .{ .name = "oars.logs.follow", .context = self, .invoke_fn = updateGuard(handleLogsFollow) },
+            .{ .name = "oars.logs.clear", .context = self, .invoke_fn = updateGuard(handleLogsClear) },
+            .{ .name = "oars.logs.addSource", .context = self, .invoke_fn = updateGuard(handleLogsAddSource) },
+            .{ .name = "oars.local.ls", .context = self, .invoke_fn = updateGuard(handleLocalLs) },
+            .{ .name = "oars.sftp.ls", .context = self, .invoke_fn = updateGuard(handleSftpLs) },
+            .{ .name = "oars.sftp.stat", .context = self, .invoke_fn = updateGuard(handleSftpStat) },
+            .{ .name = "oars.sftp.read", .context = self, .invoke_fn = updateGuard(handleSftpRead) },
+            .{ .name = "oars.sftp.write", .context = self, .invoke_fn = updateGuard(handleSftpWrite) },
+            .{ .name = "oars.sftp.save", .context = self, .invoke_fn = updateGuard(handleSftpSave) },
+            .{ .name = "oars.sftp.download", .context = self, .invoke_fn = updateGuard(handleSftpDownload) },
+            .{ .name = "oars.sftp.uploadLocal", .context = self, .invoke_fn = updateGuard(handleSftpUploadLocal) },
+            .{ .name = "oars.sftp.mkdir", .context = self, .invoke_fn = updateGuard(handleSftpMkdir) },
+            .{ .name = "oars.sftp.rm", .context = self, .invoke_fn = updateGuard(handleSftpRm) },
+            .{ .name = "oars.sftp.rename", .context = self, .invoke_fn = updateGuard(handleSftpRename) },
+            .{ .name = "oars.sftp.chmod", .context = self, .invoke_fn = updateGuard(handleSftpChmod) },
+            .{ .name = "oars.sftp.unzip", .context = self, .invoke_fn = updateGuard(handleSftpUnzip) },
+            .{ .name = "oars.sftp.zipDownload", .context = self, .invoke_fn = updateGuard(handleSftpZipDownload) },
+            .{ .name = "oars.sftp.folderSize", .context = self, .invoke_fn = updateGuard(handleSftpFolderSize) },
+            .{ .name = "oars.sftp.poll", .context = self, .invoke_fn = updateGuard(handleSftpPoll) },
+            .{ .name = "oars.sftp.cancel", .context = self, .invoke_fn = updateGuard(handleSftpCancel) },
+            .{ .name = "oars.scripts.list", .context = self, .invoke_fn = updateGuard(handleScriptsList) },
+            .{ .name = "oars.scripts.validate", .context = self, .invoke_fn = updateGuard(handleScriptsValidate) },
+            .{ .name = "oars.scripts.save", .context = self, .invoke_fn = updateGuard(handleScriptsSave) },
+            .{ .name = "oars.scripts.delete", .context = self, .invoke_fn = updateGuard(handleScriptsDelete) },
+            .{ .name = "oars.scripts.run", .context = self, .invoke_fn = updateGuard(handleScriptsRun) },
+            .{ .name = "oars.scripts.broadcastPrepare", .context = self, .invoke_fn = updateGuard(handleScriptsBroadcastPrepare) },
+            .{ .name = "oars.scripts.broadcast", .context = self, .invoke_fn = updateGuard(handleScriptsBroadcast) },
+            .{ .name = "oars.scripts.broadcastPrepareCancel", .context = self, .invoke_fn = updateGuard(handleScriptsBroadcastPrepareCancel) },
+            .{ .name = "oars.scripts.broadcastPoll", .context = self, .invoke_fn = updateGuard(handleScriptsBroadcastPoll) },
+            .{ .name = "oars.scripts.broadcastCancel", .context = self, .invoke_fn = updateGuard(handleScriptsBroadcastCancel) },
+            .{ .name = "oars.deploy.apps.list", .context = self, .invoke_fn = updateGuard(handleDeployAppsList) },
+            .{ .name = "oars.deploy.apps.save", .context = self, .invoke_fn = updateGuard(handleDeployAppsSave) },
+            .{ .name = "oars.deploy.apps.secretPresence", .context = self, .invoke_fn = updateGuard(handleDeployAppsSecretPresence) },
+            .{ .name = "oars.deploy.apps.delete", .context = self, .invoke_fn = updateGuard(handleDeployAppsDelete) },
+            .{ .name = "oars.deploy.key.generate", .context = self, .invoke_fn = updateGuard(handleDeployKeyGenerate) },
+            .{ .name = "oars.deploy.hostTrust", .context = self, .invoke_fn = updateGuard(handleDeployHostTrust) },
+            .{ .name = "oars.deploy.preflight", .context = self, .invoke_fn = updateGuard(handleDeployPreflight) },
+            .{ .name = "oars.deploy.preflightPoll", .context = self, .invoke_fn = updateGuard(handleDeployPreflightPoll) },
+            .{ .name = "oars.deploy.preflightCancel", .context = self, .invoke_fn = updateGuard(handleDeployPreflightCancel) },
+            .{ .name = "oars.deploy.run", .context = self, .invoke_fn = updateGuard(handleDeployRun) },
+            .{ .name = "oars.deploy.poll", .context = self, .invoke_fn = updateGuard(handleDeployPoll) },
+            .{ .name = "oars.deploy.cancel", .context = self, .invoke_fn = updateGuard(handleDeployCancel) },
+            .{ .name = "oars.deploy.history", .context = self, .invoke_fn = updateGuard(handleDeployHistory) },
+            .{ .name = "oars.sshkeys.inspect", .context = self, .invoke_fn = updateGuard(handleSshKeysInspect) },
+            .{ .name = "oars.sshkeys.snapshot", .context = self, .invoke_fn = updateGuard(handleSshKeysSnapshot) },
+            .{ .name = "oars.sshkeys.snapshotPoll", .context = self, .invoke_fn = updateGuard(handleSshKeysSnapshotPoll) },
+            .{ .name = "oars.sshkeys.snapshotCancel", .context = self, .invoke_fn = updateGuard(handleSshKeysSnapshotCancel) },
+            .{ .name = "oars.sshkeys.add", .context = self, .invoke_fn = updateGuard(handleSshKeysAdd) },
+            .{ .name = "oars.sshkeys.revoke", .context = self, .invoke_fn = updateGuard(handleSshKeysRevoke) },
+            .{ .name = "oars.sshkeys.rotate", .context = self, .invoke_fn = updateGuard(handleSshKeysRotate) },
+            .{ .name = "oars.sshkeys.rotateCommit", .context = self, .invoke_fn = updateGuard(handleSshKeysRotateCommit) },
+            .{ .name = "oars.sshkeys.jobPoll", .context = self, .invoke_fn = updateGuard(handleSshKeysJobPoll) },
+            .{ .name = "oars.sshkeys.jobCancel", .context = self, .invoke_fn = updateGuard(handleSshKeysJobCancel) },
+            .{ .name = "oars.sshkeys.localGenerate", .context = self, .invoke_fn = updateGuard(handleSshKeysLocalGenerate) },
+            .{ .name = "oars.sshkeys.roles.plan", .context = self, .invoke_fn = updateGuard(handleSshKeysRolesPlan) },
+            .{ .name = "oars.sshkeys.roles.commit", .context = self, .invoke_fn = updateGuard(handleSshKeysRolesCommit) },
+            .{ .name = "oars.sshkeys.deployKeys.generate", .context = self, .invoke_fn = updateGuard(handleSshKeysDeployKeysGenerate) },
+            .{ .name = "oars.sshkeys.deployKeys.delete", .context = self, .invoke_fn = updateGuard(handleSshKeysDeployKeysDelete) },
+            .{ .name = "oars.access.scan", .context = self, .invoke_fn = updateGuard(handleAccessScan) },
+            .{ .name = "oars.access.scanCancel", .context = self, .invoke_fn = updateGuard(handleAccessScanCancel) },
+            .{ .name = "oars.access.poll", .context = self, .invoke_fn = updateGuard(handleAccessPoll) },
+            .{ .name = "oars.access.key.inspect", .context = self, .invoke_fn = updateGuard(handleAccessKeyInspect) },
+            .{ .name = "oars.access.identities.list", .context = self, .invoke_fn = updateGuard(handleAccessIdentitiesList) },
+            .{ .name = "oars.access.identities.save", .context = self, .invoke_fn = updateGuard(handleAccessIdentitiesSave) },
+            .{ .name = "oars.access.identities.delete", .context = self, .invoke_fn = updateGuard(handleAccessIdentitiesDelete) },
+            .{ .name = "oars.access.offboard", .context = self, .invoke_fn = updateGuard(handleAccessOffboard) },
+            .{ .name = "oars.access.onboard", .context = self, .invoke_fn = updateGuard(handleAccessOnboard) },
+            .{ .name = "oars.access.rotate", .context = self, .invoke_fn = updateGuard(handleAccessRotate) },
+            .{ .name = "oars.access.jobPoll", .context = self, .invoke_fn = updateGuard(handleAccessJobPoll) },
+            .{ .name = "oars.access.jobCancel", .context = self, .invoke_fn = updateGuard(handleAccessJobCancel) },
+            .{ .name = "oars.access.export", .context = self, .invoke_fn = updateGuard(handleAccessExport) },
+            .{ .name = "oars.backup.jobs.list", .context = self, .invoke_fn = updateGuard(handleBackupJobsList) },
+            .{ .name = "oars.backup.jobs.plan", .context = self, .invoke_fn = updateGuard(handleBackupJobsPlan) },
+            .{ .name = "oars.backup.jobs.save", .context = self, .invoke_fn = updateGuard(handleBackupJobsSave) },
+            .{ .name = "oars.backup.jobs.deletePlan", .context = self, .invoke_fn = updateGuard(handleBackupJobsDeletePlan) },
+            .{ .name = "oars.backup.jobs.delete", .context = self, .invoke_fn = updateGuard(handleBackupJobsDelete) },
+            .{ .name = "oars.backup.status", .context = self, .invoke_fn = updateGuard(handleBackupStatus) },
+            .{ .name = "oars.backup.refresh", .context = self, .invoke_fn = updateGuard(handleBackupRefresh) },
+            .{ .name = "oars.backup.operationPoll", .context = self, .invoke_fn = updateGuard(handleBackupOperationPoll) },
+            .{ .name = "oars.backup.operationCancel", .context = self, .invoke_fn = updateGuard(handleBackupOperationCancel) },
+            .{ .name = "oars.backup.install.plan", .context = self, .invoke_fn = updateGuard(handleBackupInstallPlan) },
+            .{ .name = "oars.backup.test.plan", .context = self, .invoke_fn = updateGuard(handleBackupTestPlan) },
+            .{ .name = "oars.backup.test", .context = self, .invoke_fn = updateGuard(handleBackupTest) },
+            .{ .name = "oars.backup.run", .context = self, .invoke_fn = updateGuard(handleBackupRun) },
+            .{ .name = "oars.backup.poll", .context = self, .invoke_fn = updateGuard(handleBackupPoll) },
+            .{ .name = "oars.backup.cancel", .context = self, .invoke_fn = updateGuard(handleBackupCancel) },
+            .{ .name = "oars.backup.history", .context = self, .invoke_fn = updateGuard(handleBackupHistory) },
+            .{ .name = "oars.backup.historyLog", .context = self, .invoke_fn = updateGuard(handleBackupHistoryLog) },
+            .{ .name = "oars.backup.install", .context = self, .invoke_fn = updateGuard(handleBackupInstall) },
+            .{ .name = "oars.ai.provider.list", .context = self, .invoke_fn = updateGuard(handleAiProviderList) },
+            .{ .name = "oars.ai.provider.save", .context = self, .invoke_fn = updateGuard(handleAiProviderSave) },
+            .{ .name = "oars.ai.provider.delete", .context = self, .invoke_fn = updateGuard(handleAiProviderDelete) },
+            .{ .name = "oars.ai.provider.test", .context = self, .invoke_fn = updateGuard(handleAiProviderTest) },
+            .{ .name = "oars.ai.provider.testPoll", .context = self, .invoke_fn = updateGuard(handleAiProviderTestPoll) },
+            .{ .name = "oars.ai.provider.testCancel", .context = self, .invoke_fn = updateGuard(handleAiProviderTestCancel) },
+            .{ .name = "oars.ai.credential.configure", .context = self, .invoke_fn = updateGuard(handleAiCredentialConfigure) },
+            .{ .name = "oars.ai.credential.status", .context = self, .invoke_fn = updateGuard(handleAiCredentialStatus) },
+            .{ .name = "oars.ai.credential.delete", .context = self, .invoke_fn = updateGuard(handleAiCredentialDelete) },
+            .{ .name = "oars.ai.context.get", .context = self, .invoke_fn = updateGuard(handleAiContextGet) },
+            .{ .name = "oars.ai.context.refresh", .context = self, .invoke_fn = updateGuard(handleAiContextRefresh) },
+            .{ .name = "oars.ai.context.poll", .context = self, .invoke_fn = updateGuard(handleAiContextPoll) },
+            .{ .name = "oars.ai.context.cancel", .context = self, .invoke_fn = updateGuard(handleAiContextCancel) },
+            .{ .name = "oars.ai.thread.list", .context = self, .invoke_fn = updateGuard(handleAiThreadList) },
+            .{ .name = "oars.ai.thread.get", .context = self, .invoke_fn = updateGuard(handleAiThreadGet) },
+            .{ .name = "oars.ai.thread.delete", .context = self, .invoke_fn = updateGuard(handleAiThreadDelete) },
+            .{ .name = "oars.ai.turn.start", .context = self, .invoke_fn = updateGuard(handleAiTurnStart) },
+            .{ .name = "oars.ai.turn.poll", .context = self, .invoke_fn = updateGuard(handleAiTurnPoll) },
+            .{ .name = "oars.ai.turn.cancel", .context = self, .invoke_fn = updateGuard(handleAiTurnCancel) },
+            .{ .name = "oars.ai.turn.summarize", .context = self, .invoke_fn = updateGuard(handleAiTurnSummarize) },
+            .{ .name = "oars.ai.proposal.edit", .context = self, .invoke_fn = updateGuard(handleAiProposalEdit) },
+            .{ .name = "oars.ai.proposal.run", .context = self, .invoke_fn = updateGuard(handleAiProposalRun) },
+            .{ .name = "oars.ai.proposal.cancel", .context = self, .invoke_fn = updateGuard(handleAiProposalCancel) },
+            .{ .name = "oars.vnc.start", .context = self, .invoke_fn = updateGuard(handleVncStart) },
+            .{ .name = "oars.vnc.stop", .context = self, .invoke_fn = updateGuard(handleVncStop) },
+            .{ .name = "oars.vnc.probe", .context = self, .invoke_fn = updateGuard(handleVncProbe) },
+            .{ .name = "oars.vnc.setup", .context = self, .invoke_fn = updateGuard(handleVncSetup) },
+            .{ .name = "oars.vnc.poll", .context = self, .invoke_fn = updateGuard(handleVncPoll) },
+            .{ .name = "oars.history.record", .context = self, .invoke_fn = updateGuard(handleHistoryRecord) },
+            .{ .name = "oars.history.list", .context = self, .invoke_fn = updateGuard(handleHistoryList) },
+            .{ .name = "oars.history.clear", .context = self, .invoke_fn = updateGuard(handleHistoryClear) },
+            .{ .name = "oars.history.replay", .context = self, .invoke_fn = updateGuard(handleHistoryReplay) },
+            .{ .name = "oars.history.shellSetup", .context = self, .invoke_fn = updateGuard(handleShellSetup) },
+            .{ .name = "oars.audit.list", .context = self, .invoke_fn = updateGuard(handleAuditList) },
+            .{ .name = "oars.audit.clear", .context = self, .invoke_fn = updateGuard(handleAuditClear) },
+            .{ .name = "oars.audit.export", .context = self, .invoke_fn = updateGuard(handleAuditExport) },
+            .{ .name = "oars.vault.export", .context = self, .invoke_fn = updateGuard(handleVaultExport) },
+            .{ .name = "oars.vault.import", .context = self, .invoke_fn = updateGuard(handleVaultImport) },
+            .{ .name = "oars.vault.importConfirm", .context = self, .invoke_fn = updateGuard(handleVaultImportConfirm) },
+            .{ .name = "oars.agent.list", .context = self, .invoke_fn = updateGuard(handleAgentList) },
+            .{ .name = "oars.agent.forward", .context = self, .invoke_fn = updateGuard(handleAgentForward) },
         };
         self.policies = .{
+            .{ .name = "oars.updates.status", .origins = &allowed_origins },
+            .{ .name = "oars.updates.check", .origins = &allowed_origins },
+            .{ .name = "oars.updates.preferences", .origins = &allowed_origins },
+            .{ .name = "oars.updates.resume", .origins = &allowed_origins },
+            .{ .name = "oars.updates.releaseNotes", .origins = &allowed_origins },
             .{ .name = "oars.servers.list", .origins = &allowed_origins },
             .{ .name = "oars.servers.save", .origins = &allowed_origins },
             .{ .name = "oars.servers.delete", .origins = &allowed_origins },
@@ -14224,4 +14236,93 @@ fn handleAuditExport(context: *anyopaque, invocation: native_sdk.bridge.Invocati
     var writer = std.Io.Writer.fixed(output);
     try writer.print("{{\"ok\":true,\"rows\":{d}}}", .{rows});
     return writer.buffered();
+}
+
+// Update restarts reserve the UI command boundary. A failed install releases it.
+fn updateGuard(comptime handler: anytype) @TypeOf(&handleUpdatesCheck) {
+    return &struct {
+        fn invoke(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+            if (contextOf(context).update_restarting) return respondError(output, "Oars is restarting to install an update.");
+            return handler(context, invocation, output);
+        }
+    }.invoke;
+}
+
+pub fn updateBusy(self: *Context) bool {
+    if (self.manager.pending_disconnects.load(.acquire) != 0 or self.ai.request_limiter.count() != 0 or self.keys.active_workers.load(.acquire) != 0) return true;
+    {
+        if (!self.manager.mutex.tryLock()) return true;
+        defer self.manager.mutex.unlock();
+        var iter = self.manager.sessions.valueIterator();
+        while (iter.next()) |item| if (!item.*.worker_done.load(.acquire)) return true;
+    }
+    {
+        if (!self.keys.mutex.tryLock()) return true;
+        defer self.keys.mutex.unlock();
+        for (self.keys.jobs.items) |job| if (!job.state.terminal()) return true;
+        for (self.keys.snapshots.items) |snapshot| if (!snapshot.state.terminal()) return true;
+    }
+    {
+        if (!self.backup.mutex.tryLock()) return true;
+        defer self.backup.mutex.unlock();
+        for (self.backup.ops.items) |op| if (!op.state.terminal()) return true;
+    }
+    {
+        if (!self.backup.runs.mutex.tryLock()) return true;
+        defer self.backup.runs.mutex.unlock();
+        for (self.backup.runs.list.items) |run| if (!run.finalized) return true;
+    }
+    if (self.ai.turns) |*turns| {
+        if (!turns.mutex.tryLock()) return true;
+        defer turns.mutex.unlock();
+        for (turns.turns.items) |turn| if (!turn.state.terminal()) return true;
+    }
+    if (self.ai.provider_tests) |*tests| {
+        if (!tests.mutex.tryLock()) return true;
+        defer tests.mutex.unlock();
+        for (tests.operations.items) |op| if (!op.state.terminal()) return true;
+    }
+    {
+        if (!self.access.mutex.tryLock()) return true;
+        defer self.access.mutex.unlock();
+        for (self.access.scans.items) |scan| if (!scan.canceled and scan.finished_at_ns == 0) return true;
+        for (self.access.jobs.items) |job| if (!job.finished()) return true;
+    }
+    return false;
+}
+
+pub fn updateGate(context: ?*anyopaque, action: c_int) callconv(.c) c_int {
+    const self: *Context = @ptrCast(@alignCast(context orelse return 0));
+    if (action == 2) {
+        self.update_restarting = false;
+        return 1;
+    }
+    if (self.update_restarting) return 1;
+    if (updateBusy(self)) return 0;
+    if (action == 1) self.update_restarting = true;
+    return 1;
+}
+fn handleUpdatesStatus(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    _ = invocation;
+    return updates.writeStatus(output, updateBusy(contextOf(context)));
+}
+fn handleUpdatesCheck(_: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    _ = invocation;
+    return if (updates.c.oars_updates_check() != 0) "{\"ok\":true}" else respondError(output, "An update check is unavailable or already running.");
+}
+fn handleUpdatesPreferences(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const Prefs = struct { automatic_checks: bool, automatic_downloads: bool };
+    var parsed = parsePayload(Prefs, contextOf(context).allocator, invocation.request.payload) catch return respondError(output, "Invalid update preferences.");
+    defer parsed.deinit();
+    return if (updates.c.oars_updates_preferences(@intFromBool(parsed.value.automatic_checks), @intFromBool(parsed.value.automatic_downloads)) != 0) "{\"ok\":true}" else respondError(output, "Could not save update preferences. Try again.");
+}
+fn handleUpdatesResume(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    _ = invocation;
+    if (updateBusy(contextOf(context))) return respondError(output, "Finish active work and disconnect sessions before restarting.");
+    return if (updates.c.oars_updates_resume() != 0) "{\"ok\":true}" else respondError(output, "There is no update waiting to restart.");
+}
+fn handleUpdatesReleaseNotes(_: *anyopaque, invocation: native_sdk.bridge.Invocation, _: []u8) anyerror![]const u8 {
+    _ = invocation;
+    updates.c.oars_updates_release_notes();
+    return "{\"ok\":true}";
 }

@@ -1,3 +1,4 @@
+import { UpdateNotice } from "./components/UpdateSettings";
 import { WorkspacePages } from "./components/WorkspacePages";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -476,6 +477,7 @@ export default function App() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteQ, setPaletteQ] = useState(() => readPaletteState().query);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [updateSettings, setUpdateSettings] = useState(false);
   const [dataOpen, setDataOpen] = useState(false);
   const closedTabs = useRef<Tab[]>([]);
   const [historyForPalette, setHistoryForPalette] = useState<HistoryEntry[]>([]);
@@ -1359,8 +1361,9 @@ export default function App() {
         setPaletteTarget(null);
       }} />}
       {moveServer && <GroupEditDialog servers={[moveServer]} group={moveServer.group} onUpdated={updateGroupServers} onClose={() => setMoveServer(null)} />}
+      <UpdateNotice onOpen={() => { setUpdateSettings(true); setSettingsOpen(true); }} />
       {dataOpen && <DataSettings onClose={() => setDataOpen(false)} onImported={() => void refreshServers()} />}
-      {settingsOpen && <AppearanceSettings onData={() => { setSettingsOpen(false); setDataOpen(true); }} onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && <AppearanceSettings initialSection={updateSettings ? "updates" : "appearance"} onData={() => { setSettingsOpen(false); setUpdateSettings(false); setDataOpen(true); }} onClose={() => { setSettingsOpen(false); setUpdateSettings(false); }} />}
       {modal && <ServerModal server={modal.server} servers={servers} onClose={() => setModal(null)} onSaved={handleSaved} onDeleted={handleDeleted} />}
 
       {paletteOpen && <CommandPalette
