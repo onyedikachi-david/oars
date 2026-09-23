@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.0](https://github.com/onyedikachi-david/oars/compare/v0.6.0...v0.7.0) (2026-09-23)
+
+
+### Added
+
+* add in-app update dialog and idle installation ([#17](https://github.com/onyedikachi-david/oars/issues/17)) ([328cf87](https://github.com/onyedikachi-david/oars/commit/328cf8766ee3283c5767a4e2e798032ecde471f2))
+* add signed macOS updates and Linux release notifications ([#15](https://github.com/onyedikachi-david/oars/issues/15)) ([93e4db4](https://github.com/onyedikachi-david/oars/commit/93e4db4f43557f67aa3fb210080939eb1f17680f))
+
 ## [0.6.0](https://github.com/onyedikachi-david/oars/compare/v0.5.0...v0.6.0) (2026-09-12)
 
 
