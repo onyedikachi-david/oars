@@ -2,22 +2,21 @@
 IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires re-signing this file with generate_appcast or sign_update! The signed signature will be embedded at the end of this file.
 --><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
     <channel>
-        <title>oars-0.7.0-macos-ReleaseFast</title>
+        <title>oars-0.8.0-macos-ReleaseFast</title>
         <item>
-            <title>0.7.0</title>
-            <pubDate>Wed, 23 Sep 2026 19:14:26 +0000</pubDate>
-            <sparkle:version>0.7.0</sparkle:version>
-            <sparkle:shortVersionString>0.7.0</sparkle:shortVersionString>
+            <title>0.8.0</title>
+            <pubDate>Thu, 24 Sep 2026 11:31:15 +0000</pubDate>
+            <sparkle:version>0.8.0</sparkle:version>
+            <sparkle:shortVersionString>0.8.0</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>11.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
             <description sparkle:format="plain-text"><![CDATA[Added
 
-* add in-app update dialog and idle installation (#17) (328cf87)
-* add signed macOS updates and Linux release notifications (#15) (93e4db4)]]></description>
-            <enclosure url="https://github.com/onyedikachi-david/oars/releases/download/v0.7.0/oars-v0.7.0-macos.zip" length="5035390" type="application/octet-stream" sparkle:edSignature="rY6ARZKSAlNcvsgQ9vXc/hekRfCXbjtGytY8YqNoGxs9jRBYkbd1CndweDJJb7F8qMP66iUpooR3ulPuGf0nAA=="></enclosure>
+* website: add roadmap, SEO, and branded social previews (#18) (602c9d8)]]></description>
+            <enclosure url="https://github.com/onyedikachi-david/oars/releases/download/v0.8.0/oars-v0.8.0-macos.zip" length="5035431" type="application/octet-stream" sparkle:edSignature="Yd19GtPdlmSdIUswSLra8q4JSq1MRNJICNohVEKPEr3BLw2sNqQ4QvugxO7dF3iwE6pJAgI2umEwfVozcyxVAA=="></enclosure>
         </item>
     </channel>
 </rss><!-- sparkle-signatures:
-edSignature: gfevKyOwMW8k5dzypE5UWhj7tdY1EuPkTXpwq4txEsvrZE0k4eG9jBZz3E3KoUjmy+YvrQIL7yerFslYKDiUAQ==
-length: 1378
+edSignature: nZ5AfoLNOtLITVwNEUTqfIgc6qskbSldCAbSmZiQg6mx7zAd5FZc7KNKh34WrH8SE/hWOkK8oMKZZtEiYptdAw==
+length: 1311
 -->
