@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "build": "tsc --noEmit && vite build && node scripts/prerender.mjs && npm run test:seo",
+    "preview": "vite preview",
+    "test:seo": "node --test scripts/seo.test.mjs"
   },
   "dependencies": {
     "react": "19.2.8",

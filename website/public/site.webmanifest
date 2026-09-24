@@ -4,8 +4,8 @@
   "description": "Local-first Linux server management over SSH.",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#f8f6f0",
-  "theme_color": "#f8f6f0",
+  "background_color": "#ffffff",
+  "theme_color": "#edf2f8",
   "icons": [
     {
       "src": "/icon-192.png",
