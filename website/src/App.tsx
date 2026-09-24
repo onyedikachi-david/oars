@@ -37,12 +37,15 @@ export default function App() {
     </header>
     <main id="main">
       <section className="hero" aria-labelledby="hero-title">
-        <div className="mode-picker" role="group" aria-label="Choose a workspace preview">{modes.map((mode, i) => <button key={mode.id} aria-pressed={selected === i} aria-controls="hero-preview" onClick={() => setSelected(i)}><Icon name={mode.icon} />{mode.title}</button>)}</div>
         <h1 id="hero-title">Your servers.<br />One calm workspace.</h1>
         <p className="hero-intro">Everything you need to work with your Linux servers.<br className="desktop-break" /> Terminals, files, logs, and remote desktops, together in one open source app.</p>
         <DownloadButtons />
         <p className="hero-note">Free and open source · macOS & Linux</p>
-        <div id="hero-preview" className="hero-preview"><ProductShot key={active.shot} name={active.shot} caption={false} priority /><p aria-live="polite">{active.caption}</p></div>
+        <div id="hero-preview" className="hero-preview">
+          <div className="mode-picker" role="group" aria-label="Choose a workspace preview">{modes.map((mode, i) => <button key={mode.id} type="button" aria-pressed={selected === i} aria-controls="hero-preview-image" onClick={() => setSelected(i)}><Icon name={mode.icon} />{mode.title}</button>)}</div>
+          <div id="hero-preview-image"><ProductShot key={active.shot} name={active.shot} caption={false} priority /></div>
+          <p aria-live="polite">{active.caption}</p>
+        </div>
       </section>
 
       <section className="section intro-section" id="features">

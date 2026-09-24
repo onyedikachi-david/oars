@@ -21,7 +21,7 @@ section[id] { scroll-margin-top: 90px; }
 .cta-small { min-height: 40px; padding: 9px 17px; background: #202831; color: white; font-size: 13px; }
 .cta-small:hover { background: #384757; }
 .hero { margin: 0 16px; padding: 56px 24px 0; text-align: center; border-radius: 24px; background: #edf2f8; }
-.mode-picker { display: inline-flex; flex-wrap: wrap; justify-content: center; padding: 5px; gap: 4px; background: #ffffffad; border: 1px solid #e2e8f0; border-radius: 30px; margin-bottom: 30px; }
+.mode-picker { display: inline-flex; flex-wrap: wrap; justify-content: center; padding: 5px; gap: 4px; background: #ffffffad; border: 1px solid #e2e8f0; border-radius: 30px; margin-bottom: 16px; }
 .mode-picker button { display: flex; align-items: center; gap: 7px; padding: 9px 15px; background: transparent; color: #586575; border: 0; border-radius: 24px; font-size: 13px; cursor: pointer; }
 .mode-picker button[aria-pressed="true"] { background: white; color: #1d56a7; box-shadow: 0 2px 5px #223d5812; }
 .mode-picker button:hover { color: #164983; }
