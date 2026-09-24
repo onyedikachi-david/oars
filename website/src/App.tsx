@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { ProductShot, ScreenshotGallery } from "./components/ProductScreenshots";
 import { MemoryBenchmark } from "./components/MemoryBenchmark";
+import { Roadmap } from "./components/Roadmap";
 import { downloads, githubUrl, sponsorUrl } from "./downloads";
 import "./landing.css";
 
@@ -31,7 +32,7 @@ export default function App() {
     <a className="skip-link" href="#main">Skip to content</a>
     <header className="site-nav">
       <a href="#" className="site-brand" aria-label="Oars home"><img src="/brand/oars-symbol.svg" width="36" height="36" alt="" />Oars</a>
-      <nav aria-label="Main navigation"><a href="#features">Product</a><a href="#pictures">In pictures</a><a href="#faq">FAQ</a></nav>
+      <nav aria-label="Main navigation"><a href="#features">Product</a><a href="#pictures">In pictures</a><a href="#roadmap">Roadmap</a><a href="#faq">FAQ</a></nav>
       <div className="nav-actions"><a className="star-link" href={githubUrl} aria-label="Star Oars on GitHub"><Icon name="star" /><span>Star on GitHub</span></a><a className="cta cta-small" href="#download">Download</a></div>
     </header>
     <main id="main">
@@ -63,18 +64,20 @@ export default function App() {
 
       <section className="pictures-section" id="pictures"><div className="section"><div className="section-heading centered"><span className="section-label">The app, at work</span><h2>In pictures</h2><p>Take a look around before you connect your first server.</p></div><ScreenshotGallery /></div></section>
 
+      <Roadmap />
+
       <section className="section ownership"><div><span className="section-label">Open source. Local first.</span><h2>Your infrastructure.<br />Your way of working.</h2><p>Oars connects directly to your servers over SSH. Connection credentials use your OS credential store, and profiles and history live on your device.</p><p>AI assistance is optional. Choose your provider, review the context you share, and approve proposed commands before they run.</p></div><div className="community-panel"><Icon name="star" /><h3>Built in the open.<br />Better with you.</h3><p>Found Oars useful? Give it a star, report a bug, or help build what comes next.</p><a className="cta cta-primary" href={githubUrl}><Icon name="star" />Star Oars on GitHub</a><a className="inline-link" href={sponsorUrl}>Sponsor development <Icon name="arrow" /></a><div className="launch-badges"><a className="product-hunt-badge" href="https://www.producthunt.com/products/oars?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-oars" target="_blank" rel="noopener noreferrer"><img alt="Oars - Your Linux servers, together in one local workspace | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1244223&amp;theme=light&amp;t=1788819703482" loading="lazy" decoding="async" /></a><a className="smol-launchpad-badge" href="https://smollaunchpad.com/projects/oars?utm_source=badge" target="_blank" rel="noopener noreferrer"><img src="https://smollaunchpad.com/smollaunchpad/images/badges/featured-on-light.svg" alt="Featured on Smol LaunchPad" width="150" height="44" loading="lazy" decoding="async" /></a></div></div></section>
 
       <section className="section faq-section" id="faq"><div><span className="section-label">Good to know</span><h2>A few questions,<br />before you connect.</h2><a className="inline-link" href={`${githubUrl}/issues`}>Ask on GitHub <Icon name="arrow" /></a></div><div className="faq-list">
         <details><summary>Is Oars free?</summary><p>Yes. Oars is open source under the MIT license. You can use it, inspect the code, and contribute. Sponsorship is optional.</p></details>
         <details><summary>Do I need an account to download it?</summary><p>No GitHub account is needed to download a public release. The download buttons link directly to the release files. GitHub Actions artifacts are separate and require a GitHub account.</p></details>
-        <details><summary>Which operating systems are supported?</summary><p>Oars runs on macOS and Linux and manages Linux servers over SSH. The Linux download is for x86_64 and requires GTK4 and WebKitGTK 6.0. Windows is not currently supported.</p></details>
+        <details><summary>Which operating systems are supported?</summary><p>Oars runs on macOS and Linux and manages Linux servers over SSH. The Linux download is for x86_64 and requires GTK4 and WebKitGTK 6.0. Windows support is planned. See the <a href="#roadmap">roadmap</a> for what’s next.</p></details>
         <details><summary>Do I need to install an agent on my servers?</summary><p>Terminal access, files, logs, and monitoring use SSH without a separate Oars agent. Some features need remote tools, such as rclone for backups and a VNC server with a desktop environment for remote desktop access.</p></details>
         <details><summary>Why does macOS show a security prompt?</summary><p>Oars is currently unsigned and not notarized. If you trust the download, follow <a href="https://support.apple.com/guide/mac-help/mh40616/mac">Apple’s instructions for opening an unidentified app</a>.</p></details>
       </div></section>
 
       <section className="download-section" id="download"><img src="/brand/oars-symbol.svg" width="64" height="64" alt="" /><h2>Bring your servers together.</h2><p>A little less juggling. A lot more room to work.</p><DownloadButtons /><p className="download-meta">Latest release · macOS ZIP · Linux x86_64 tar.gz</p><a className="inline-link" href={`${githubUrl}/releases`}>Release notes & checksums <Icon name="arrow" /></a></section>
     </main>
-    <footer className="site-footer"><div><a className="site-brand" href="#"><img src="/brand/oars-symbol.svg" width="30" height="30" alt="" />Oars</a><p>Your Linux servers, in one local window.</p></div><nav aria-label="Footer navigation"><a href="#download">Download</a><a href={githubUrl}>Star on GitHub</a><a href={sponsorUrl}>Sponsor</a><a href={`${githubUrl}/blob/main/LICENSE`}>MIT license</a></nav></footer>
+    <footer className="site-footer"><div><a className="site-brand" href="#"><img src="/brand/oars-symbol.svg" width="30" height="30" alt="" />Oars</a><p>Your Linux servers, in one local window.</p></div><nav aria-label="Footer navigation"><a href="#download">Download</a><a href="#roadmap">Roadmap</a><a href={githubUrl}>Star on GitHub</a><a href={sponsorUrl}>Sponsor</a><a href={`${githubUrl}/blob/main/LICENSE`}>MIT license</a></nav></footer>
   </>;
 }
