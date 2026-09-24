@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/onyedikachi-david/oars/compare/v0.7.0...v0.8.0) (2026-09-24)
+
+
+### Added
+
+* **website:** add roadmap, SEO, and branded social previews ([#18](https://github.com/onyedikachi-david/oars/issues/18)) ([602c9d8](https://github.com/onyedikachi-david/oars/commit/602c9d8c3a618f639e59057163e894e33b8af35e))
+
 ## [0.7.0](https://github.com/onyedikachi-david/oars/compare/v0.6.0...v0.7.0) (2026-09-23)
 
 
