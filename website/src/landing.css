@@ -85,6 +85,7 @@ h3 { font-size: 19px; font-weight: 600; letter-spacing: -.025em; }
 .launch-badges { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 26px; }
 .product-hunt-badge { display: block; width: 250px; max-width: 100%; }
 .smol-launchpad-badge { display: block; width: 150px; max-width: 100%; }
+.trymacapps-badge { display: block; width: 200px; max-width: 100%; }
 .launch-badges img { display: block; width: 100%; height: auto; }
 .faq-section { display: grid; grid-template-columns: 1fr 1.2fr; gap: 90px; padding: 20px 0 100px; }
 .faq-section > div > .inline-link { margin-top: 25px; }
