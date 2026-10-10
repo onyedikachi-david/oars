@@ -27,8 +27,12 @@ NAME="oars-dev-sshd"
 IMAGE="oars-dev-sshd"
 NETWORK="oars-dev-net"
 MINIO_NAME="oars-dev-minio"
-# Same upstream image as the former Docker Hub latest, pinned for repeatable CI.
-MINIO_IMAGE="quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
+# Chainguard's public MinIO build. Upstream minio/minio was removed from
+# Docker Hub (Sep 2026) and quay.io/minio stopped allowing anonymous pulls
+# (24 Sep 2026, 401 unauthorized), so the pinned quay.io image no longer
+# works in fresh CI. cgr.dev pulls anonymously and accepts the same
+# `server /data` invocation and MINIO_ROOT_* env vars.
+MINIO_IMAGE="cgr.dev/chainguard/minio:latest"
 PORT="${OARS_DEV_SSHD_PORT:-2222}"
 MINIO_PORT="${OARS_DEV_MINIO_PORT:-9000}"
 ENV_FILE="$SCRIPT_DIR/.dev-sshd.env"
