@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/onyedikachi-david/oars/compare/v0.8.0...v0.9.0) (2026-10-10)
+
+
+### Added
+
+* **website:** add TryMacApps badge for directory listing ([#20](https://github.com/onyedikachi-david/oars/issues/20)) ([7795b6e](https://github.com/onyedikachi-david/oars/commit/7795b6e250cb44486f75218f9f8d2d44ec483826))
+
 ## [0.8.0](https://github.com/onyedikachi-david/oars/compare/v0.7.0...v0.8.0) (2026-09-24)
 
 
