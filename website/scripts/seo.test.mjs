@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile, access } from 'node:fs/promises';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { summarizeReleases, fetchAllReleaseStats } from '../api/downloads.js';
 const dist = resolve(dirname(fileURLToPath(import.meta.url)), '../dist');
 const html = await readFile(resolve(dist, 'index.html'), 'utf8');
 const meta = name => html.match(new RegExp(`<meta\\s+(?:name|property)="${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"\\s+content="([^"]+)"`))?.[1];
@@ -55,4 +56,29 @@ test('public media and page anchors referenced by generated HTML exist', async (
   const ids = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]));
   for (const [,anchor] of html.matchAll(/href="#([^"]+)"/g)) assert.ok(ids.has(anchor), `Missing anchor ${anchor}`);
   assert.equal((await readFile(resolve(dist, '404.html'), 'utf8')).includes('content="noindex, follow"'), true);
+});
+test('download counter sums release archives and excludes SHA256SUMS and drafts', async () => {
+  const sampleReleases = [
+    {
+      draft: false,
+      assets: [
+        { name: 'oars-macos.zip', download_count: 42 },
+        { name: 'oars-v0.8.0-macos.zip', download_count: 18 },
+        { name: 'oars-v0.8.0-macos-x86_64.zip', download_count: 5 },
+        { name: 'oars-linux-x86_64.tar.gz', download_count: 15 },
+        { name: 'oars-v0.8.0-linux-x86_64.tar.gz', download_count: 10 },
+        { name: 'SHA256SUMS', download_count: 99 },
+      ],
+    },
+    {
+      draft: true,
+      assets: [{ name: 'oars-macos.zip', download_count: 500 }],
+    },
+  ];
+  assert.deepEqual(summarizeReleases(sampleReleases), { total: 90, macos: 65, linux: 25 });
+  const fetched = await fetchAllReleaseStats(async () => ({
+    ok: true,
+    json: async () => sampleReleases,
+  }));
+  assert.deepEqual(fetched, { total: 90, macos: 65, linux: 25 });
 });
