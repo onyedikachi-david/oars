@@ -1,8 +1,15 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ProductShot, ScreenshotGallery } from "./components/ProductScreenshots";
 import { MemoryBenchmark } from "./components/MemoryBenchmark";
 import { Roadmap } from "./components/Roadmap";
-import { downloads, githubUrl, sponsorUrl } from "./downloads";
+import {
+  downloads,
+  fetchDownloadStats,
+  formatDownloadCount,
+  githubUrl,
+  recordLocalDownload,
+  sponsorUrl,
+} from "./downloads";
 import "./landing.css";
 
 function Icon({ name }: { name: "download" | "star" | "arrow" | "terminal" | "desktop" | "files" }) {
@@ -16,8 +23,8 @@ function Icon({ name }: { name: "download" | "star" | "arrow" | "terminal" | "de
   };
   return <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={paths[name]} /></svg>;
 }
-function DownloadButtons() {
-  return <div className="download-buttons"><a className="cta cta-primary" href={downloads.macos}><Icon name="download" />Download for macOS</a><a className="cta cta-secondary" href={downloads.linux}><Icon name="download" />Download for Linux</a></div>;
+function DownloadButtons({ onDownload }: { onDownload?: (platform: "macos" | "linux") => void }) {
+  return <div className="download-buttons"><a className="cta cta-primary" href={downloads.macos} onClick={() => onDownload?.("macos")}><Icon name="download" />Download for macOS</a><a className="cta cta-secondary" href={downloads.linux} onClick={() => onDownload?.("linux")}><Icon name="download" />Download for Linux</a></div>;
 }
 const modes = [
   { id: "files", title: "Files & operations", icon: "files", shot: "files", caption: "Your files. Both sides of the connection." },
@@ -27,7 +34,23 @@ const modes = [
 
 export default function App() {
   const [selected, setSelected] = useState(0);
+  const [downloadCount, setDownloadCount] = useState<number | null>(null);
   const active = modes[selected];
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetchDownloadStats(controller.signal).then((stats) => {
+      if (stats && stats.total > 0) setDownloadCount(stats.total);
+    });
+    return () => controller.abort();
+  }, []);
+
+  const handleDownload = (platform: "macos" | "linux") => {
+    recordLocalDownload(platform);
+    setDownloadCount((current) => (current !== null ? current + 1 : current));
+  };
+  const downloadSuffix = downloadCount !== null && downloadCount > 0 ? ` · ${formatDownloadCount(downloadCount)}` : "";
+
   return <>
     <a className="skip-link" href="#main">Skip to content</a>
     <header className="site-nav">
@@ -39,8 +62,8 @@ export default function App() {
       <section className="hero" aria-labelledby="hero-title">
         <h1 id="hero-title">Your servers.<br />One calm workspace.</h1>
         <p className="hero-intro">Everything you need to work with your Linux servers.<br className="desktop-break" /> Terminals, files, logs, and remote desktops, together in one open source app.</p>
-        <DownloadButtons />
-        <p className="hero-note">Free and open source · macOS & Linux</p>
+        <DownloadButtons onDownload={handleDownload} />
+        <p className="hero-note">Free and open source · macOS & Linux{downloadSuffix}</p>
         <div id="hero-preview" className="hero-preview">
           <div className="mode-picker" role="group" aria-label="Choose a workspace preview">{modes.map((mode, i) => <button key={mode.id} type="button" aria-pressed={selected === i} aria-controls="hero-preview-image" onClick={() => setSelected(i)}><Icon name={mode.icon} />{mode.title}</button>)}</div>
           <div id="hero-preview-image"><ProductShot key={active.shot} name={active.shot} caption={false} priority /></div>
@@ -79,7 +102,7 @@ export default function App() {
         <details><summary>Why does macOS show a security prompt?</summary><p>Oars is currently unsigned and not notarized. If you trust the download, follow <a href="https://support.apple.com/guide/mac-help/mh40616/mac">Apple’s instructions for opening an unidentified app</a>.</p></details>
       </div></section>
 
-      <section className="download-section" id="download"><img src="/brand/oars-symbol.svg" width="64" height="64" alt="" /><h2>Bring your servers together.</h2><p>A little less juggling. A lot more room to work.</p><DownloadButtons /><p className="download-meta">Latest release · macOS ZIP · Linux x86_64 tar.gz</p><a className="inline-link" href={`${githubUrl}/releases`}>Release notes & checksums <Icon name="arrow" /></a></section>
+      <section className="download-section" id="download"><img src="/brand/oars-symbol.svg" width="64" height="64" alt="" /><h2>Bring your servers together.</h2><p>A little less juggling. A lot more room to work.</p><DownloadButtons onDownload={handleDownload} /><p className="download-meta">Latest release · macOS ZIP · Linux x86_64 tar.gz{downloadSuffix}</p><a className="inline-link" href={`${githubUrl}/releases`}>Release notes & checksums <Icon name="arrow" /></a></section>
     </main>
     <footer className="site-footer"><div><a className="site-brand" href="#"><img src="/brand/oars-symbol.svg" width="30" height="30" alt="" />Oars</a><p>Your Linux servers, in one local window.</p></div><nav aria-label="Footer navigation"><a href="#download">Download</a><a href="#roadmap">Roadmap</a><a href={githubUrl}>Star on GitHub</a><a href={sponsorUrl}>Sponsor</a><a href={`${githubUrl}/blob/main/LICENSE`}>MIT license</a></nav></footer>
   </>;
