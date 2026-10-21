@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.9.0](https://github.com/onyedikachi-david/oars/compare/v0.8.0...v0.9.0) (2026-10-21)
+
+
+### Added
+
+* **website:** add TryMacApps badge for directory listing ([#20](https://github.com/onyedikachi-david/oars/issues/20)) ([7795b6e](https://github.com/onyedikachi-david/oars/commit/7795b6e250cb44486f75218f9f8d2d44ec483826))
+* **website:** add Vercel Web Analytics ([#23](https://github.com/onyedikachi-david/oars/issues/23)) ([810f2e9](https://github.com/onyedikachi-david/oars/commit/810f2e92cab9d6430c88efee7cc07c66851774e6))
+* **website:** track and display release download counts ([#22](https://github.com/onyedikachi-david/oars/issues/22)) ([147d693](https://github.com/onyedikachi-david/oars/commit/147d693088ec3b19088c810e4649c9bedf3fa1e8))
+
 ## [0.8.0](https://github.com/onyedikachi-david/oars/compare/v0.7.0...v0.8.0) (2026-09-24)
 
 
