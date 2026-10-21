@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Analytics, track } from "@vercel/analytics/react";
 import { ProductShot, ScreenshotGallery } from "./components/ProductScreenshots";
 import { MemoryBenchmark } from "./components/MemoryBenchmark";
 import { Roadmap } from "./components/Roadmap";
@@ -46,6 +47,7 @@ export default function App() {
   }, []);
 
   const handleDownload = (platform: "macos" | "linux") => {
+    track("download", { platform });
     recordLocalDownload(platform);
     setDownloadCount((current) => (current !== null ? current + 1 : current));
   };
@@ -105,5 +107,6 @@ export default function App() {
       <section className="download-section" id="download"><img src="/brand/oars-symbol.svg" width="64" height="64" alt="" /><h2>Bring your servers together.</h2><p>A little less juggling. A lot more room to work.</p><DownloadButtons onDownload={handleDownload} /><p className="download-meta">Latest release · macOS ZIP · Linux x86_64 tar.gz{downloadSuffix}</p><a className="inline-link" href={`${githubUrl}/releases`}>Release notes & checksums <Icon name="arrow" /></a></section>
     </main>
     <footer className="site-footer"><div><a className="site-brand" href="#"><img src="/brand/oars-symbol.svg" width="30" height="30" alt="" />Oars</a><p>Your Linux servers, in one local window.</p></div><nav aria-label="Footer navigation"><a href="#download">Download</a><a href="#roadmap">Roadmap</a><a href={githubUrl}>Star on GitHub</a><a href={sponsorUrl}>Sponsor</a><a href={`${githubUrl}/blob/main/LICENSE`}>MIT license</a></nav></footer>
+    <Analytics />
   </>;
 }
